@@ -1,2 +1,5 @@
 /target/
 *.local.toml
+__pycache__/
+*.pyc
+build/

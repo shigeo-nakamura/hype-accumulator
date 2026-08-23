@@ -1,0 +1,7 @@
+# Research protocol
+
+`make research` verifies all hashes and writes `build/research-report.json`. It compares deposit-aware equal-daily and equal-weekly DCA with bounded adaptive pacing across no-deposit, one-deposit, and a varied path containing before/after-decision deposits, multiple same-day deposits, a withdrawal, and a late-December deposit.
+
+The report includes acquisition VWAP, cohort utilization, completion/infeasibility, trade count, inventory drawdown, turnover/cost, skipped-day reasons, a small declared sensitivity grid, and signal ablations. Parameters are fixed before evaluation; the runner does not choose the best in-sample value. For real data, evaluation periods must be chronological walk-forward folds with parameters frozen before each test fold, and results reported per fold plus aggregate stability—not selected from a single optimum.
+
+The committed recommendation is **no-go**. Synthetic data test accounting and temporal mechanics, not economics. Bounded adaptive pacing requires licensed point-in-time archives, enough chronological folds, stable parameter/ablation behavior, and credible costs. ETF flow remains a lagged pacing/risk input, never a standalone HYPE entry trigger.

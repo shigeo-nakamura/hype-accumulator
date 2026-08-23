@@ -1,0 +1,1 @@
+{"schema_version":1,"capital_path_id":"one","as_of":"2025-12-31T23:59:59Z","files":{"events":{"path":"capital-one.csv","sha256":"9a2914c5fdcb9a9635e74ba7b853da57545b3c3f76dab95065f0eefd59fd0cb4"}},"contract":"Only unique event_id rows with first_usable_at <= decision_at are admitted."}

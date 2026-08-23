@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "as_of": "2025-12-31T23:59:59Z",
+  "dataset_manifest": "dataset-manifest.json",
+  "capital_paths": [
+    {"name": "no-deposits", "manifest": "capital-none-manifest.json"},
+    {"name": "one-deposit", "manifest": "capital-one-manifest.json"},
+    {"name": "frequent-before-after-multiple-withdrawal-late", "manifest": "capital-varied-manifest.json"}
+  ],
+  "execution": {"min_trade_usd": 10, "max_trade_usd": 25, "fee_bps": 5, "half_spread_bps": 3, "slippage_bps": 2},
+  "policies": [
+    {"name": "deposit-aware-equal-daily", "kind": "fixed", "cadence": "daily", "horizon": "2025-12-31", "features": []},
+    {"name": "deposit-aware-equal-weekly", "kind": "fixed", "cadence": "weekly", "horizon": "2025-12-31", "features": []},
+    {"name": "bounded-adaptive", "kind": "adaptive", "cadence": "daily", "horizon": "2025-12-31", "features": ["btc_etf_flow_usd", "hype_trend"], "sensitivity": 0.25, "min_multiplier": 0.5, "max_multiplier": 1.5, "stale_after_days": 3, "stale_behavior": "fixed"}
+  ],
+  "sensitivity": {"adaptive_sensitivity": [0.0, 0.1, 0.25, 0.5]},
+  "ablations": [[], ["btc_etf_flow_usd"], ["hype_trend"], ["btc_etf_flow_usd", "hype_trend"]]
+}
