@@ -69,6 +69,10 @@ All gates are conjunctive and fail closed:
    undelegate-only.
 7. An ambiguous action response moves the workflow to reconciliation or manual
    review; it never causes a blind retry.
+8. Manual halt denies every new signed action, including staking deposit and
+   delegation, while unsigned reconciliation remains active. Recovery actions
+   require the separate offline recovery procedure; runtime configuration has no
+   halt bypass.
 
 Limits are positive, finite integer minor units. Zero means disabled, never
 unlimited. Production configuration must set all of these explicitly:

@@ -10,12 +10,12 @@ reserve_microusd = 0
 max_slippage_bps = 0
 book_stale_after_seconds = 0
 account_history_stale_after_seconds = 0
+signal_stale_after_seconds = 0
 
 [staking]
 enabled = false
 validator_allowlist = []
 residual_hype_wei = 0
-continue_after_manual_halt = false
 
 [operator]
 dry_run = true
