@@ -72,6 +72,14 @@ ciphertext, host alias, or production filesystem path.
    period IDs, and insert or lock one unique row. A clean-directory restore must
    reproduce those rows and reject a changed scheme, host-clock input, duplicate,
    overlap, or altered boundary without restoring room.
+   Authorize an order immediately before UTC midnight but leave it `authorized`.
+   After the boundary, race its claim against a new authorization that requests
+   the full new-day limit. Both paths must first materialize the old record's
+   authorization-ID-keyed full-`N` mirror on the new daily row, so their combined
+   notional cannot exceed the limit and the mirror is not duplicated. If the new
+   request is denied, the carried mirror must still commit. Repeat with concurrent
+   instances, expiry, restart, and restore; expiry removes both the originating
+   reservation and every mirror before releasing the active slot.
    At claim, test every input freshness horizon and the exact effective-expiry
    boundary; neither an expired `authorized` record nor an ambiguous claimed record
    may return to a reusable state. Verify the exact

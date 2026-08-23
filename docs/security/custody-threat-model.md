@@ -163,7 +163,17 @@ duplicate row, unsupported timestamp, or restore/replay mismatch fails closed.
 Each daily purchase-notional row has checked `reserved`, `spent`, and
 `mirrored_encumbrance` counters and enforces
 `reserved + spent + mirrored_encumbrance <= limit`. Authorization-ID-keyed
-entries make every increment and later transition idempotent.
+entries make every increment and later transition idempotent. Before a
+current-day row can authorize a new purchase or claim an older authorization,
+the serializable transaction locks active records in stable authorization-ID
+order. It terminalizes expired `authorized` records and materializes a full-`N`
+`mirrored_encumbrance` keyed by `(authorization ID, current period ID)` for every
+unexpired `authorized`, `submission_claimed`, or `order_bound` record whose
+originating day is earlier. Existing entries are verified, not added twice. These
+carry-forward entries commit even when the requested new authorization is denied;
+they are existing obligations, not a partial reservation for the rejected
+request. Concurrent authorization, claim, expiry, and reconciliation transactions
+serialize on the same rows.
 The same schemes assign authoritative fill timestamps to execution periods.
 
 The record is committed before the API wallet signs the canonical unsigned
@@ -172,16 +182,19 @@ from `authorized` to `submission_claimed` with that template digest before
 signing. It may append only the resulting signature before submitting the exact
 payload. The same transaction uses the ledger's authoritative UTC clock to require
 `now_ms < effective_expiry_ms`, rechecks that the effective expiry does not exceed
-any bound input's freshness horizon, and validates the exact signed
-`expiresAfter_ms`. The equality boundary, a future/missing input timestamp, or a
-failed claim forbids submission. An expired record still in `authorized` moves
+any bound input's freshness horizon, validates the exact signed
+`expiresAfter_ms`, and performs the current-day carry-forward operation above.
+If the claim day differs from the originating day, this record's full-`N` mirror
+must exist and fit before the state transition commits. Missing room or a failed
+claim leaves the record `authorized` and forbids signing. An expired record still
+in `authorized` moves
 atomically to a terminal unused state, returns each committed cash slice to
 `uncommitted` in its same originating admission allocation, subtracts its full
-`N` from the originating daily row's `reserved` counter, releases every other
-policy and decision reservation, and clears the decision's active slot. A
+`N` from the originating daily row's `reserved` counter and every existing
+mirror, releases every other policy and decision reservation, and clears the
+decision's active slot. A
 transport-ambiguous submission stays claimed until authoritative CLOID
-reconciliation and never
-releases room or retries blindly.
+reconciliation and never releases room or retries blindly.
 
 The approved live policy authorizes IOC plus the signed request expiry only: the
 venue rejects late acceptance and immediately cancels every unfilled remainder of
@@ -235,15 +248,18 @@ supplying a fresh approval wrapper cannot create a new decision chain. A
 caller-supplied decision, authorization record, or policy snapshot is correlation
 data only.
 
-An unresolved `submission_claimed` or `order_bound` reservation never disappears
-at a daily or yearly boundary. Its `N` remains charged to its originating daily
-period and is also deducted as a conservative encumbrance from each later daily
-period row opened before terminal reconciliation. Its `C` remains `committed`
-inside the same admission allocations, whose originating yearly and lifetime
-ceiling charges never roll over or repeat; an old admitted slice can be committed
-after a year boundary without consuming the new year's admission room. There is
-no independent process-local rollover job. Hot-exposure reservations remain
-continuously charged. Terminal reconciliation atomically charges actual notional
+An unexpired `authorized` or unresolved `submission_claimed` or `order_bound`
+reservation never disappears at a daily or yearly boundary. Its `N` remains
+charged to its originating daily period and is also deducted as the conservative
+authorization-ID-keyed encumbrance from every later daily row prepared before
+expiry or terminal reconciliation. Thus a pre-midnight authorization competes
+for next-day room before either a next-day authorization or its own claim can
+commit. Its `C` remains `committed` inside the same admission allocations, whose
+originating yearly and lifetime ceiling charges never roll over or repeat; an old
+admitted slice can be committed after a year boundary without consuming the new
+year's admission room. There is no independent process-local rollover job.
+Hot-exposure reservations remain continuously charged. Terminal reconciliation
+atomically charges actual notional
 to the execution-day periods with the reserved-to-spent transition above, moves
 actual cash debit including fees to `spent`, returns only proven unused `C` to the
 same slices' `uncommitted` state, and preserves the conserved audit trail; a
@@ -455,8 +471,9 @@ All gates are conjunctive and fail closed:
     `running` to `halt_draining`, record its cutoff, reject every subsequent
     authorization, claim, or signature, and atomically move each unclaimed
     `authorized` record to terminal unused while returning its `C` slices to the
-    same allocations' `uncommitted` state, releasing its other policy and
-    decision reservations, and clearing its decision active slot. The same
+    same allocations' `uncommitted` state, subtracting its full `N` from the
+    originating `reserved` counter and every mirror, releasing its other policy
+    and decision reservations, and clearing its decision active slot. The same
     transaction snapshots every `submission_claimed` and `order_bound` record with
     its CLOID and signed `expiresAfter_ms`. A claim is treated as possibly signed
     even if local persistence says otherwise. The service must not report `halted`
@@ -481,10 +498,9 @@ All gates are conjunctive and fail closed:
     `uncommitted` state, subtract its full `N` from the originating `reserved`
     counter and every mirror, release its other policy and decision reservations,
     and clear its decision active slot. It remains unresolved before that point.
-    After
-    every
-    claimed/bound record is terminal and a fresh account query returns no open
-    order, one transaction may move `halt_draining` to `halted`. A delayed request
+    After every claimed/bound record is terminal and a fresh account query
+    returns no open order, one transaction may move `halt_draining` to `halted`.
+    A delayed request
     discovered during that drain is handled before the transition. Lost responses
     are re-queried; unavailable or stale histories, an unresolved claim, an open
     order, or an unavailable cancel-only signer keeps the system visibly
@@ -636,8 +652,9 @@ Before production secrets or funds are present, attach evidence for:
   Gregorian-year boundaries; all instances and clean-directory restores must
   derive identical IDs and half-open bounds, reuse one unique row, preserve prior
   daily spend, admission allocations, and unresolved encumbrances, and reject
-  host-clock, overlap, duplicate,
-  unsupported-schema, and boundary-tampering cases;
+  host-clock, overlap, duplicate, unsupported-schema, and boundary-tampering
+  cases. A pre-boundary `authorized` record must be mirrored idempotently before
+  either a later-day claim or new authorization can commit;
 - authorization-expiry tests proving effective expiry is capped by every input
   freshness horizon, `expiresAfter_ms` is exactly one millisecond earlier and
   included in the L1 action hash and canonical unsigned request-template digest,
@@ -645,12 +662,16 @@ Before production secrets or funds are present, attach evidence for:
   expiry; delay a valid signed payload beyond the horizon and prove venue rejection
   with no fill;
 - TIF and rollover tests proving GTC/ALO/resting envelopes are rejected, IOC fills
-  cannot be accepted at or beyond effective expiry, ambiguous `N` reduces each
-  later daily period until terminal settlement without double release, and
-  ambiguous `C` remains in its originating commitment without consuming a later
-  year's admission room. Terminal settlement must convert the originating
-  reservation and every mirror to actual execution-day spend in one transaction,
-  leaving no unused `N - N_f` charged;
+  cannot be accepted at or beyond effective expiry, and every unexpired
+  `authorized`, `submission_claimed`, or `order_bound` record reduces each later
+  daily period before a new authorization or later-day claim can commit. Race a
+  pre-midnight `authorized` record's claim against a full-limit next-day
+  authorization and prove their authorization-ID-keyed mirrors serialize without
+  omission or duplication, including when the new request is denied, across
+  restart and restore. Ambiguous `C` remains in its originating commitment
+  without consuming a later year's admission room. Terminal settlement must
+  convert the originating reservation and every mirror to actual execution-day
+  spend in one transaction, leaving no unused `N - N_f` charged;
 - acknowledgement tests proving a changed, missing, malformed, or differently
   normalized parent-account value invalidates the effective-policy digest;
 - the user's explicit choice of custody option, host, limits, and exact small-probe
