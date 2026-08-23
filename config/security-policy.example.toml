@@ -15,7 +15,10 @@ max_hot_trading_balance_microusd = 0
 # The only alternative is "traced_parent_transfer" with explicit approval.
 funding_mode = "external_deposit_only"
 allow_traced_parent_transfer_admission = false
-# Empty disables inheritance; never place an account address in this file.
+# Empty disables inheritance; never place an account address in this file. In
+# live mode the named variable must resolve at startup to a valid canonical
+# account address. The resolved value (not only this name) is included in the
+# effective-policy digest covered by the live acknowledgement.
 admitted_parent_account_env = ""
 
 [execution]
@@ -34,5 +37,8 @@ no_eligible_validator_policy = "hold_in_spot"
 [operator]
 dry_run = true
 manual_halt = true
+# Versioned acknowledgement of the effective-policy digest, which excludes this
+# value itself and includes startup-resolved identities such as the admitted
+# parent account.
 live_acknowledgement = ""
 live_acknowledgement_expires_at = ""

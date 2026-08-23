@@ -66,6 +66,18 @@ cumulative room against an independently loaded approved policy and immutable
 ledger anchor. Missing, stale, ambiguous, or mismatched evidence is rejected into
 manual review without signing.
 
+Before producing a signature, the signer durably and atomically claims the unique
+`(account, workflow ID, action phase)` key together with the canonical intent
+digest and nonce. Deposit and delegation are separate, ordered phases, and each
+may be claimed only once; a later phase also requires authoritative
+reconciliation of its predecessor. A conflicting digest or nonce is rejected; a
+duplicate of a completed phase may return only the previously stored
+byte-identical result, never a fresh signature or nonce. A crash or write
+ambiguity between claim, signing, and result persistence leaves the phase blocked
+for authoritative reconciliation and manual review. It must not be cleared by
+caller retry, process restart, snapshot restore, or a later balance increase. The
+consumed-phase ledger is included in the hash chain and off-host restore checks.
+
 Until this boundary is implemented and rehearsed, automatic staking remains
 disabled. Storing a general-purpose master private key in the bot process is not
 an acceptable default.
@@ -75,7 +87,12 @@ an acceptable default.
 All gates are conjunctive and fail closed:
 
 1. `dry_run` is true by default. Live mode requires a versioned acknowledgement
-   that binds the config hash, account, signer mode, validator set, and expiry.
+   that binds an effective-policy digest: the canonical approval-relevant config
+   (excluding the acknowledgement value itself), execution account, signer mode,
+   normalized validator set, expiry, and the normalized resolved parent-account
+   value or an explicit null marker. Environment-variable names alone are not
+   part of the approval boundary. Any resolved-value change or resolution failure
+   invalidates the acknowledgement and fails closed.
 2. System-wide deployable capital originates from authoritative external USDC
    movement history with a stable event ID. Raw balance delta, order
    holds/releases, fills, fees, internal transfers, dust, and reconciliation
@@ -90,7 +107,10 @@ All gates are conjunctive and fail closed:
 4. An untraced, mismatched, duplicate, or excess internal transfer remains visible
    but unallocated and halts new purchases pending reconciliation. Parent
    inheritance is disabled unless the approved funding mode and parent-account
-   identity are explicitly configured. Valid live combinations are
+   identity are explicitly configured. At startup the configured environment
+   name is resolved to a canonical validated account address and included in the
+   effective-policy digest before the acknowledgement is checked. Valid live
+   combinations are
    `external_deposit_only` with inheritance disabled and no parent, or
    `traced_parent_transfer` with inheritance enabled and a non-empty approved
    parent-account environment name; every other combination is rejected.
@@ -129,13 +149,13 @@ unlimited. Production configuration must set all of these explicitly:
 | --- | --- | --- |
 | Co-host compromise | isolated Unix user, read-only config, no master key in trading process, least-privilege IAM, signer action allowlist | revoke API wallet from an offline master path; halt; reconcile from authoritative history |
 | Leaked API key | full trading authority assumed; dedicated balance-bounded execution account, one named agent per process, no unrelated funds or address reuse | alert on unknown signer/order or hot-balance breach; halt, revoke, reconcile, and generate a new address |
-| Replay or nonce pruning | durable atomic nonce, unique signer per process, bounded expiry where supported, never reuse deregistered/expired agent | reconcile by CLOID/history; rotate signer; never resend an unknown action blindly |
+| Replay or nonce pruning | durable atomic nonce, unique signer per process, bounded expiry where supported, signer-side one-time workflow/action-phase claims, never reuse deregistered/expired agent | reconcile by CLOID/history; block ambiguous phase claims; rotate signer; never resend an unknown action blindly |
 | Malicious validator selection | exact-address allowlist, no yield-based auto-switch, active/not-jailed/not-undelegate-only checks | stop new delegation and require allowlist-owner review |
 | Dependency compromise | lockfile, checksums, minimal signing interface, CI audit/review gate | artifact provenance and rollback; rotate signer if signing material may have been exposed |
 | State rollback/truncation | hash-chained append-only ledger, atomic snapshot, versioned off-host backup | replay and checksum verification; fail closed on divergence |
 | Deposit spoofing or dust | authoritative external movement IDs plus confirmation/admission policy | expose observed vs confirmed vs admitted totals separately; manual classification correction |
 | Capital-event misclassification | typed movement categories; transfers inherit only from a traced admitted parent residual and never increase system-wide admission | invariant checks against parent/child account histories, idempotent transfer IDs, and the conserved capital equation |
-| Operator error | schema validation, config hash acknowledgement, two-step live/staking gates, exact validator/notional display | manual halt, immutable audit trail, rehearsed restore and key rotation |
+| Operator error | schema validation, effective-policy digest acknowledgement, two-step live/staking gates, exact validator/notional display | manual halt, immutable audit trail, rehearsed restore and key rotation |
 
 ## Validator governance
 
@@ -166,6 +186,10 @@ Before production secrets or funds are present, attach evidence for:
   isolation, including the maximum hot balance and breach behavior;
 - conservation, idempotency, source/destination, and excess-transfer tests when
   parent-admission inheritance is enabled;
+- signer crash/retry/restore tests proving each workflow action phase is consumed
+  before signing and cannot be reauthorized with a different nonce;
+- acknowledgement tests proving a changed, missing, malformed, or differently
+  normalized parent-account value invalidates the effective-policy digest;
 - the user's explicit choice of custody option, host, validator, limits, and
   exact small-probe configuration.
 
@@ -176,4 +200,3 @@ Before production secrets or funds are present, attach evidence for:
 - Hyperliquid, [Exchange endpoint](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/exchange-endpoint)
 - Hyperliquid, [Staking](https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/staking)
 - Hyperliquid, [Sub-accounts](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/sub-accounts)
-

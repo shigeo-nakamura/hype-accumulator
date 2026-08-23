@@ -8,8 +8,11 @@ ciphertext, host alias, or production filesystem path.
 - Live mode and automatic staking are disabled.
 - The selected custody option and host have explicit user approval.
 - The operator has recorded the expected account, fresh agent public address,
-  config hash, validator allowlist hash, and expiry through the private change
-  record.
+  canonical config, normalized validator allowlist, acknowledgement expiry, and
+  every startup-resolved policy identity through the private change record. For
+  traced parent funding, independently verify the resolved parent account and
+  record the resulting effective-policy digest rather than approving only the
+  environment-variable name.
 - Backups have passed checksum and clean-directory restore tests.
 
 ## Install
@@ -23,7 +26,11 @@ ciphertext, host alias, or production filesystem path.
 5. Verify the account query uses the actual account address and returns the
    expected read-only state. Do not submit an action.
 6. Confirm the service rejects live config without a current acknowledgement and
+   rejects a missing, malformed, or changed resolved policy identity. Confirm it
    rejects staking when the separate signer is unavailable.
+7. Fault-test the signer around claim, signature, and result persistence. A
+   consumed or ambiguous `(account, workflow ID, action phase)` must remain
+   blocked across caller retry, restart, restore, and a retry with a new nonce.
 
 ## Rotate
 
@@ -94,4 +101,3 @@ PASS/FAIL for install, rotate, API-wallet revoke, master-signer containment,
 funded-account migration, restore, and read-only restart. Never copy
 private keys, signed payloads, wallet addresses, or encrypted blobs into CI logs
 or issues.
-
