@@ -47,7 +47,8 @@ The trading service emits a content-addressed staking intent after an
 authoritative fill and balance reconciliation. A separate signer accepts only a
 fully specified intent containing:
 
-- workflow and daily decision IDs;
+- workflow and daily decision IDs plus the stable authoritative order and fill
+  IDs for the purchase;
 - account, validator, asset, and exact integer `wei` amount;
 - hashes of the admitted-capital snapshot, order/fill evidence, and current
   staking state;
@@ -61,22 +62,29 @@ identifiers, not proof that the referenced state or limits are genuine.
 For every initial request and retry, the signer authenticates the caller and
 independently queries authoritative order, fill, spot-balance, staking, and
 validator state using the actual account address. It verifies the newly purchased
-HYPE amount, residual balance, validator eligibility, intent expiry, and daily and
-cumulative room against an independently loaded approved policy and immutable
-ledger anchor. Missing, stale, ambiguous, or mismatched evidence is rejected into
-manual review without signing.
+HYPE amount and derives the canonical set of stable order/fill IDs rather than
+trusting caller-supplied identifiers. It also verifies residual balance,
+validator eligibility, intent expiry, and daily and cumulative room against an
+independently loaded approved policy and immutable ledger anchor. Missing, stale,
+ambiguous, or mismatched evidence is rejected into manual review without signing.
 
-Before producing a signature, the signer durably and atomically claims the unique
-`(account, workflow ID, action phase)` key together with the canonical intent
-digest and nonce. Deposit and delegation are separate, ordered phases, and each
-may be claimed only once; a later phase also requires authoritative
-reconciliation of its predecessor. A conflicting digest or nonce is rejected; a
-duplicate of a completed phase may return only the previously stored
-byte-identical result, never a fresh signature or nonce. A crash or write
-ambiguity between claim, signing, and result persistence leaves the phase blocked
-for authoritative reconciliation and manual review. It must not be cleared by
-caller retry, process restart, snapshot restore, or a later balance increase. The
-consumed-phase ledger is included in the hash chain and off-host restore checks.
+Before producing a signature, one durable atomic transaction establishes an
+immutable mapping from every authoritative fill ID in the canonical purchase set
+to exactly one account, workflow ID, and purchased amount, then claims the unique
+`(account, workflow ID, action phase)` key with that fill set, the canonical
+intent digest, and nonce. All fills in an aggregate purchase succeed or fail as a
+unit; a fill already mapped to any workflow rejects the entire request even when
+the caller supplies a fresh workflow, daily decision, or nonce. Deposit and
+delegation are separate, ordered phases, and each may be claimed only once; a
+later phase also requires authoritative reconciliation of its predecessor. A
+conflicting fill set, amount, digest, or nonce is rejected. A duplicate of a
+completed phase may return only the previously stored byte-identical result,
+never a fresh signature or nonce. A crash or write ambiguity between claim,
+signing, and result persistence leaves the fill mapping and phase blocked for
+authoritative reconciliation and manual review. Neither may be cleared by caller
+retry, process restart, snapshot restore, or a later balance increase. The fill
+mapping and consumed-phase ledger are included in the hash chain and off-host
+restore checks.
 
 Until this boundary is implemented and rehearsed, automatic staking remains
 disabled. Storing a general-purpose master private key in the bot process is not
@@ -149,7 +157,7 @@ unlimited. Production configuration must set all of these explicitly:
 | --- | --- | --- |
 | Co-host compromise | isolated Unix user, read-only config, no master key in trading process, least-privilege IAM, signer action allowlist | revoke API wallet from an offline master path; halt; reconcile from authoritative history |
 | Leaked API key | full trading authority assumed; dedicated balance-bounded execution account, one named agent per process, no unrelated funds or address reuse | alert on unknown signer/order or hot-balance breach; halt, revoke, reconcile, and generate a new address |
-| Replay or nonce pruning | durable atomic nonce, unique signer per process, bounded expiry where supported, signer-side one-time workflow/action-phase claims, never reuse deregistered/expired agent | reconcile by CLOID/history; block ambiguous phase claims; rotate signer; never resend an unknown action blindly |
+| Replay or nonce pruning | durable atomic nonce, unique signer per process, bounded expiry where supported, immutable one-fill-to-workflow mapping, signer-side one-time workflow/action-phase claims, never reuse deregistered/expired agent | reconcile by CLOID/history; block ambiguous fill and phase claims; rotate signer; never resend an unknown action blindly |
 | Malicious validator selection | exact-address allowlist, no yield-based auto-switch, active/not-jailed/not-undelegate-only checks | stop new delegation and require allowlist-owner review |
 | Dependency compromise | lockfile, checksums, minimal signing interface, CI audit/review gate | artifact provenance and rollback; rotate signer if signing material may have been exposed |
 | State rollback/truncation | hash-chained append-only ledger, atomic snapshot, versioned off-host backup | replay and checksum verification; fail closed on divergence |
@@ -188,6 +196,9 @@ Before production secrets or funds are present, attach evidence for:
   parent-admission inheritance is enabled;
 - signer crash/retry/restore tests proving each workflow action phase is consumed
   before signing and cannot be reauthorized with a different nonce;
+- adversarial replay tests proving the same authoritative fill set cannot be
+  remapped under fresh workflow or daily decision IDs, including after a later
+  purchase replenishes balances;
 - acknowledgement tests proving a changed, missing, malformed, or differently
   normalized parent-account value invalidates the effective-policy digest;
 - the user's explicit choice of custody option, host, validator, limits, and

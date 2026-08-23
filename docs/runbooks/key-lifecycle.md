@@ -31,6 +31,8 @@ ciphertext, host alias, or production filesystem path.
 7. Fault-test the signer around claim, signature, and result persistence. A
    consumed or ambiguous `(account, workflow ID, action phase)` must remain
    blocked across caller retry, restart, restore, and a retry with a new nonce.
+   Repackage the same authoritative fill IDs under new workflow and daily
+   decision IDs and confirm the durable one-fill-to-workflow mapping rejects it.
 
 ## Rotate
 
