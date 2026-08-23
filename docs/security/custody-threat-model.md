@@ -105,8 +105,12 @@ The allowlist owner is an operator independent from runtime policy. Changes are
 reviewed at least monthly and immediately after a jailed, inactive,
 undelegate-only, or commission-change alert. Runtime code may remove a validator
 from eligibility but may never add or switch one. When no approved validator is
-eligible, purchased HYPE remains reconciled in spot or the staking account per
-the configured continuation policy and raises an alert.
+eligible, the typed
+`no_eligible_validator_policy` controls the next step and raises an alert. The
+default `hold_in_spot` value forbids `cDeposit`. The only alternative,
+`hold_undelegated_in_staking`, requires separate explicit approval and permits
+only `cDeposit`, never delegation; operators must accept its seven-day return
+queue. Unknown policy values fail configuration validation.
 
 Automatic `cWithdraw` and undelegation are absent from the service. Staking to
 spot has a seven-day queue and limited pending withdrawals; recovery procedures

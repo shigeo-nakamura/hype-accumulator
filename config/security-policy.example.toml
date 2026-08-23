@@ -16,6 +16,8 @@ signal_stale_after_seconds = 0
 enabled = false
 validator_allowlist = []
 residual_hype_wei = 0
+# Safe default; the staking-account alternative requires explicit approval.
+no_eligible_validator_policy = "hold_in_spot"
 
 [operator]
 dry_run = true
