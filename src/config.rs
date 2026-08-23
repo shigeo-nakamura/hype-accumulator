@@ -60,6 +60,8 @@ const fn default_true() -> bool {
     true
 }
 
+const MAX_SLIPPAGE_BPS_HARD_CAP: u16 = 100;
+
 pub trait Environment {
     fn get(&self, name: &str) -> Option<String>;
 }
@@ -119,6 +121,11 @@ impl Config {
         positive("pacing.min_order_usdc", self.pacing.min_order_usdc)?;
         positive("pacing.max_order_usdc", self.pacing.max_order_usdc)?;
         positive("execution.max_order_usdc", self.execution.max_order_usdc)?;
+        if self.execution.max_slippage_bps > MAX_SLIPPAGE_BPS_HARD_CAP {
+            return Err(ConfigError::Invalid(format!(
+                "execution.max_slippage_bps must not exceed {MAX_SLIPPAGE_BPS_HARD_CAP}"
+            )));
+        }
         if self.capital.min_deposit_confirmations == 0 {
             return Err(ConfigError::Invalid(
                 "min_deposit_confirmations must be positive".into(),
@@ -164,7 +171,12 @@ impl Config {
                 "explicit live approval is absent".into(),
             ));
         }
-        if self.validator_allowlist.is_empty() {
+        if self.validator_allowlist.is_empty()
+            || self
+                .validator_allowlist
+                .iter()
+                .any(|validator| validator.trim().is_empty())
+        {
             return Err(ConfigError::Invalid("validator allowlist is empty".into()));
         }
         for name in [

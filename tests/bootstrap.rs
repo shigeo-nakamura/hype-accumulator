@@ -84,6 +84,54 @@ fn fully_deployed_admitted_capital_cannot_be_reused() {
 }
 
 #[test]
+fn remaining_admission_is_capped_by_current_balance_after_spend() {
+    let snapshot = CapitalSnapshot {
+        observed_spot_usdc: 40.0,
+        confirmed_deposits_usdc: 100.0,
+        admitted_deposits_usdc: 100.0,
+        deployed_this_year_usdc: 60.0,
+        deployed_cumulative_usdc: 60.0,
+    };
+    let deployable = automatically_deployable(&snapshot, &fixture().capital);
+    assert!((deployable - 40.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn invalid_capital_snapshot_fails_closed() {
+    let snapshot = CapitalSnapshot {
+        observed_spot_usdc: f64::NAN,
+        confirmed_deposits_usdc: 100.0,
+        admitted_deposits_usdc: 100.0,
+        deployed_this_year_usdc: 0.0,
+        deployed_cumulative_usdc: 0.0,
+    };
+    assert!(automatically_deployable(&snapshot, &fixture().capital).abs() < f64::EPSILON);
+}
+
+#[test]
+fn excessive_slippage_is_rejected() {
+    let mut config = fixture();
+    config.execution.max_slippage_bps = 101;
+    assert!(matches!(
+        config.validate(&HashMap::new()),
+        Err(ConfigError::Invalid(_))
+    ));
+}
+
+#[test]
+fn blank_live_validator_is_rejected() {
+    let mut config = fixture();
+    config.dry_run = false;
+    config.manual_halt = false;
+    config.live_approved = true;
+    config.validator_allowlist = vec![" ".into()];
+    assert!(matches!(
+        config.validate(&HashMap::new()),
+        Err(ConfigError::Invalid(_))
+    ));
+}
+
+#[test]
 fn dry_run_exchange_only_simulates() {
     let mut exchange = DryRunExchange::default();
     let intent = OrderIntent {
