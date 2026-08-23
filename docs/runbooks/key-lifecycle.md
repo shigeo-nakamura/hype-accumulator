@@ -49,8 +49,15 @@ ciphertext, host alias, or production filesystem path.
    cash debit `C = N + F` from an independently fetched fee schedule. Race two
    authorizations whose combined `C` exceeds admitted, reserve, yearly, or
    cumulative cash room, or whose combined `N` exceeds daily notional room, and
-   verify one fails without a partial record. Repeat at exact and one-microunit
-   fee/cash boundaries, with partial fills, builder fees, rebates, overflow, stale
+   verify one fails without a partial record. With global caps deliberately left
+   sufficient, race two authorizer instances using the same authenticated decision
+   and distinct CLOIDs;
+   exactly one may reserve the decision's `Q` and `N` and create an active record.
+   Reconcile a partial fill and verify a new-CLOID reissue can reserve only the
+   remaining `Q_D` and `N_D`. An ambiguous predecessor, changed daily-decision ID,
+   fresh wrapper, restart, or restore must retain the active slot and reject a
+   second authorization. Repeat at exact and one-microunit fee/cash boundaries,
+   with partial fills, builder fees, rebates, overflow, stale
    or above-ceiling schedules, unknown fixed/non-USDC fees, and an ambiguous fee
    response; cash room must retain `C` while daily notional retains only `N`.
    Run authorizer instances under different host timezones at one second before,

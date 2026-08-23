@@ -59,8 +59,9 @@ account_history_stale_after_seconds = 0
 # Required positive in live mode; missing, future, or age-at-limit fee data fails.
 fee_schedule_stale_after_seconds = 0
 # Live mode rejects false. The independent signer-side authorizer must commit the
-# exact decision, CLOID, unsigned request including nonce/expiresAfter, fee-capped
-# cash debit, ledger limits, and expiry before submission.
+# exact decision-chain quantity/notional caps and one active slot, CLOID, unsigned
+# request including nonce/expiresAfter, fee-capped cash debit, ledger limits, and
+# expiry before submission.
 require_prepurchase_authorization = true
 # Required positive in live mode. Signal age must be non-negative and strictly
 # below this threshold; a missing, malformed, or future timestamp fails closed.

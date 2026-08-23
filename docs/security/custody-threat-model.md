@@ -79,8 +79,11 @@ account and strategy inputs, and either recomputes the deterministic approved
 decision or verifies an authenticated approval artifact issued outside the trading
 service. It checks admitted capital, reserve, daily/yearly/cumulative room, signal
 freshness, the authoritative fee schedule, slippage, and hot-exposure enforcement
-against its own immutable policy anchor. In checked integer microunits, it computes
-maximum purchase notional
+against its own immutable policy anchor. The authenticated decision contains an
+immutable canonical decision-chain ID and digest plus exact maximum base quantity
+`Q_D` and purchase notional `N_D` in checked integer units; missing, non-positive,
+or unrepresentable decision caps reject authorization. For the requested exact
+base quantity `Q`, it computes maximum purchase notional
 `N = ceil(limit price * quantity in micro-USDC)`, maximum fee
 `F = ceil(N * max_purchase_fee_bps / 10000)`, and maximum total cash debit
 `C = N + F`. The configured fee ceiling must be an independently verified upper
@@ -92,18 +95,27 @@ non-proportional, differently denominated, or above-ceiling fees reject the
 purchase; arithmetic overflow or unrepresentable rounding also fails closed.
 
 One durable atomic transaction against a single strongly consistent ledger, using
-that ledger's authoritative UTC database clock, reserves `C` against the admitted
-tranche while preserving the configured cash reserve and against yearly and
-cumulative deployable-capital room. It separately reserves `N` against daily
+that ledger's authoritative UTC database clock, inserts or locks the unique
+`(execution account, canonical decision-chain ID)` row. That row stores `Q_D`,
+`N_D`, permanently consumed fill quantity/notional, the active authorization ID,
+and its reserved `Q` and `N`. The transaction requires no unresolved predecessor
+and atomically reserves `Q` and `N` no greater than both decision remainders; a
+decision can have only one active authorization.
+
+In that same transaction, the authorizer reserves `C` against the admitted tranche
+while preserving the configured cash reserve and against yearly and cumulative
+deployable-capital room. It separately reserves `N` against daily
 purchase-notional room and uses the appropriate full-asset exposure for the hot
-limit. The transaction then commits the one-time pre-purchase authorization. If
-every complete reservation is unavailable, neither a partial reservation nor a
-record is created. Concurrent authorizer instances serialize on the same
-limit-ledger rows; a process-local clock or ledger snapshot cannot authorize a
-purchase.
+limit. It then commits the one-time pre-purchase authorization. If any complete
+decision or policy reservation is unavailable, neither a partial reservation nor
+a record is created. Concurrent authorizer instances serialize on both the
+decision row and limit-ledger rows; a process-local clock or ledger snapshot
+cannot authorize a purchase.
 The record contains:
 
-- an authorization ID and canonical daily-decision ID and digest;
+- an authorization ID, canonical decision-chain ID and digest, `Q_D`, `N_D`,
+  requested `Q` and `N`, the predecessor authorization ID or explicit null marker,
+  and decision room before and after reservation;
 - the actual execution account, policy version, market, buy side, mandatory IOC
   TIF, exact client order ID (CLOID), quantity, limit price, and L1 nonce;
 - `N`, the independently checked fee schedule and maximum fee `F`, maximum total
@@ -154,9 +166,10 @@ payload. The same transaction uses the ledger's authoritative UTC clock to requi
 any bound input's freshness horizon, and validates the exact signed
 `expiresAfter_ms`. The equality boundary, a future/missing input timestamp, or a
 failed claim forbids submission. An expired record still in `authorized` moves
-atomically to a terminal unused state and releases its reservation. A
-transport-ambiguous submission stays claimed until authoritative CLOID
-reconciliation and never releases room or retries blindly.
+atomically to a terminal unused state, releases every policy and decision
+reservation, and clears the decision's active slot. A transport-ambiguous
+submission stays claimed until authoritative CLOID reconciliation and never
+releases room or retries blindly.
 
 The approved live policy authorizes IOC plus the signed request expiry only: the
 venue rejects late acceptance and immediately cancels every unfilled remainder of
@@ -175,16 +188,23 @@ As soon as an exact CLOID query finds the order, even before it is terminal, the
 reconciler atomically binds the stable venue order ID and moves
 `submission_claimed` to `order_bound`. Later polls validate that immutable binding
 without repeating the transition. A conclusively absent claim moves to a terminal
-unused state and releases its reservation; no terminal authorization is reusable.
-This is not an exchange action and grants no generic master-signer capability. A
-retry or residual reissue requires a new CLOID and authorization after authoritative
-reconciliation of its predecessor. That reconciliation atomically charges actual
-executed notional to the notional ledger and actual consideration plus every
-authoritative fee to the cash ledgers. It releases only conclusively unfilled
-notional and unused fee headroom from `C`; ambiguous fee or fill state retains the
-full reservation. Any reissue is debited from the remaining decision and policy
-room. A caller-supplied decision, authorization record, or policy snapshot is
-correlation data only.
+unused state, releases every policy and decision reservation, and clears the
+decision's active slot in the same transaction; no terminal authorization is
+reusable. This is not an exchange action and grants no generic master-signer
+capability. A retry or residual reissue requires a new CLOID and authorization
+after authoritative reconciliation of its predecessor. That reconciliation
+atomically charges actual executed notional to the notional ledger and actual
+consideration plus every authoritative fee to the cash ledgers. It releases only
+conclusively unfilled notional and unused fee headroom from `C`; ambiguous fee or
+fill state retains the full reservation. In the same transaction, actual filled
+base quantity `Q_f` and executed notional `N_f` are permanently consumed from the
+decision row, and only the proven `Q - Q_f` and `N - N_f` remainders are released
+before the active authorization is cleared. An ambiguous predecessor retains its
+full decision reservation and active slot. Only then may a new CLOID reserve no
+more than both remaining decision caps; changing the daily-decision ID or
+supplying a fresh approval wrapper cannot create a new decision chain. A
+caller-supplied decision, authorization record, or policy snapshot is correlation
+data only.
 
 An unresolved `submission_claimed` or `order_bound` reservation never disappears
 at a daily or yearly boundary. It remains charged to its recorded originating
@@ -353,10 +373,12 @@ All gates are conjunctive and fail closed:
    non-negative age strictly below the positive
    `fee_schedule_stale_after_seconds`; missing, malformed, future, or age-at-limit
    data rejects the purchase. It also requires no unknown movement, no balance
-   mismatch, no halt, available daily purchase-notional room, available yearly and
-   cumulative deployable-capital room, available slippage room, and independently
-   enforced post-purchase hot-exposure room. A service-side threshold alone cannot
-   satisfy the final condition. Before order submission, the signer-side
+   mismatch, no halt, no active predecessor and sufficient remaining `Q_D` and
+   `N_D` in the authenticated decision chain, available daily purchase-notional
+   room, available yearly and cumulative deployable-capital room, available
+   slippage room, and independently enforced post-purchase hot-exposure room. A
+   service-side threshold alone cannot satisfy the final condition. Before order
+   submission, the signer-side
    authorizer must durably bind the independently verified decision, exact CLOID
    and canonical unsigned request template, policy version, fee ceiling, effective
    expiry, exact signed
@@ -423,6 +445,7 @@ configuration must set all of these explicitly:
 | Leaked API key | full trading authority assumed; dedicated execution account with no unrelated funds; no loss-cap credit without external enforcement proof; one named agent per process and no address reuse | alert on unknown signer/order or operational threshold breach; halt, cancel, revoke, reconcile, and generate a new address |
 | Replay or nonce pruning | durable atomic nonce, unique signer per process, bounded expiry where supported, purchase-time one-fill-to-workflow mapping, lot consumption, one-time authorization/order claims, never reuse deregistered/expired agent | reconcile by CLOID/history; block ambiguous order claims; rotate signer; never resend an unknown action blindly |
 | Unauthorized API-wallet order | signer-side durable pre-purchase decision and CLOID authorization before execution; exact order-envelope binding | unmatched or mismatched fills remain permanently ineligible for automatic staking; halt and reconcile the trading-account compromise |
+| Concurrent decision reuse | unique decision-chain row; one active authorization; atomic `Q` and `N` decision reservations with global policy reservations | ambiguous predecessor retains the active slot; terminal reconciliation consumes fills and releases only proven remainder before reissue |
 | Delayed or stale order | signed `expiresAfter = effective_expiry_ms - 1` plus IOC-only live policy; GTC/ALO and missing/changed expiry rejected; no process-local expiry credit | venue rejects delayed acceptance; any impossible post-expiry fill halts live action, remains charged, and is ineligible for automatic staking |
 | Delayed staking acceptance | automatic staking disabled because user-signed staking actions lack a venue-enforced acceptance deadline; no runtime signer, endpoint, or client | configuration rejects any enabled value before live capability; HYPE remains in spot and staking is manual/offline |
 | Fee under-reservation | checked `C = N + ceil(N * aggregate fee bps / 10000)` reserves admitted, reserve, yearly, and cumulative cash room while daily notional separately reserves `N` | authoritative fee reconciliation retains full reservation while ambiguous and halts on an unknown, stale, differently denominated, or above-ceiling fee |
@@ -503,6 +526,14 @@ Before production secrets or funds are present, attach evidence for:
   reserved against daily notional and appropriate exposure is reserved against the
   hot limit; release occurs only for conclusively unfilled or never-submitted
   terminal records with authoritative fee reconciliation;
+- decision-concurrency tests racing distinct CLOIDs from separate authorizer
+  instances against one authenticated decision while global caps have room;
+  exactly one may reserve the unique decision row and create a record. Partial
+  fill reconciliation must permanently consume actual `Q_f` and `N_f`, release
+  only the proven remainder, and permit a new-CLOID reissue only within both
+  remaining decision caps; ambiguity, altered daily-decision IDs, fresh wrappers,
+  restart, and restore must not clear the active slot or create another decision
+  chain;
 - fee-boundary tests covering ceiling equality, one microunit below cash room,
   upward rounding, partial fills, fee rebates, stale or above-ceiling schedules,
   builder/referral fees, overflow, unknown fixed or non-USDC fees, and ambiguous
