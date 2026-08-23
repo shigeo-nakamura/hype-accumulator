@@ -82,8 +82,8 @@ created. Concurrent authorization requests serialize on the same limit ledger.
 The record contains:
 
 - an authorization ID and canonical daily-decision ID and digest;
-- the actual execution account, policy version, market, buy side, TIF, exact
-  client order ID (CLOID), quantity, and limit price;
+- the actual execution account, policy version, market, buy side, mandatory IOC
+  TIF, exact client order ID (CLOID), quantity, and limit price;
 - the maximum notional and slippage, the amount reserved in each named ledger,
   and checked room before and after reservation; and
 - issue time and an effective expiry no later than the earliest deadline for the
@@ -101,6 +101,18 @@ to a terminal unused state and releases its reservation. A transport-ambiguous
 submission stays claimed until authoritative CLOID reconciliation and never
 releases room or retries blindly.
 
+The approved live policy authorizes IOC only: the venue immediately cancels every
+unfilled remainder, so the order cannot rest across the authorization horizon.
+GTC, ALO, and any other resting TIF fail configuration and envelope validation
+because this venue path provides no approved per-order expiry at that horizon. A
+process-local cancel timer is not credited as containment. Adding a resting order
+requires a separate design with a venue-enforced expiry no later than the
+authorization horizon, mandatory authoritative cancellation, and explicit
+approval. Reconciliation also rejects any fill whose authoritative execution
+timestamp is at or beyond the authorization's effective expiry; the purchase
+remains visible and charged to capital but is permanently ineligible for automatic
+staking.
+
 As soon as an exact CLOID query finds the order, even before it is terminal, the
 reconciler atomically binds the stable venue order ID and moves
 `submission_claimed` to `order_bound`. Later polls validate that immutable binding
@@ -112,6 +124,15 @@ reconciliation of its predecessor. That reconciliation atomically charges the
 filled amount, releases only conclusively unfilled reserved room, and debits any
 reissue from the remaining decision and policy room. A caller-supplied decision,
 authorization record, or policy snapshot is correlation data only.
+
+An unresolved `submission_claimed` or `order_bound` reservation never disappears
+at a daily or yearly rollover. It remains charged to its originating period and is
+also deducted as a conservative cross-period encumbrance from each newly opened
+daily/yearly room until terminal reconciliation. Admitted-capital, cumulative, and
+hot-exposure reservations remain continuously charged. Terminal reconciliation
+atomically charges the actual fill to its authoritative execution period, releases
+only the proven unfilled remainder and mirrored encumbrances, and preserves a
+conserved audit trail; rollover alone cannot make room reusable.
 
 An independent signer-side reconciler, not the intent caller, advances a durable
 monotonic cursor over authoritative fills. When a purchase workflow becomes
@@ -125,12 +146,13 @@ the sorted authorization, order, and fill IDs, every exact purchased quantity an
 their checked total, policy version, and a canonical content-addressed workflow ID
 derived from the complete authorization and fill evidence. Every fill must be
 registered within a configured deadline after its first authoritative observation.
-A cursor gap, late or absent authorization, mismatched order or fill, a claim
-recorded at or after effective expiry or beyond an input freshness horizon, a
-historical fill first presented after the deadline, or a fill absent from this
-purchase-time ledger makes the entire workflow permanently ineligible for
-automatic staking and sends it to manual review; neither the reconciler nor
-staking request path can backfill or override that state.
+A cursor gap, late or absent authorization, non-IOC or mismatched order or fill,
+a claim recorded at or after effective expiry or beyond an input freshness
+horizon, a fill executed at or beyond effective expiry, a historical fill first
+presented after the deadline, or a fill absent from this purchase-time ledger
+makes the entire workflow permanently ineligible for automatic staking and sends
+it to manual review; neither the reconciler nor staking request path can backfill
+or override that state.
 Automatic staking is full-fill-set only: the intent amount must equal the sum of
 the exact registered quantities for its mapped authoritative fills. The signer
 does not create sub-lots, accept a partial amount, or split one workflow across
@@ -289,8 +311,10 @@ All gates are conjunctive and fail closed:
    order envelope, policy version, effective expiry, and remaining limits while
    atomically reserving the worst-case notional against every applicable room
    ledger. The executor must reject a claim at or beyond that expiry or beyond any
-   input freshness horizon. No matching authorization means no service order; any
-   bypass fill is permanently ineligible for automatic staking.
+   input freshness horizon. Only IOC is authorized; every resting TIF is rejected.
+   No matching authorization means no service order; any bypass or post-expiry fill
+   is permanently ineligible for automatic staking. Unresolved reservations carry
+   into and reduce new daily/yearly room until terminal settlement.
 8. A staking deposit requires reconciled newly purchased HYPE in `eligible_spot`
    and a configured residual buffer. When no validator is eligible it is permitted
    only by the separately approved `hold_undelegated_in_staking` policy; the
@@ -339,6 +363,7 @@ unlimited. Production configuration must set all of these explicitly:
 | Leaked API key | full trading authority assumed; dedicated execution account with no unrelated funds; no loss-cap credit without external enforcement proof; one named agent per process and no address reuse | alert on unknown signer/order or operational threshold breach; halt, cancel, revoke, reconcile, and generate a new address |
 | Replay or nonce pruning | durable atomic nonce, unique signer per process, bounded expiry where supported, purchase-time one-fill-to-workflow mapping, lot consumption, signer-side one-time workflow/action-phase claims, never reuse deregistered/expired agent | reconcile by CLOID/history; block ambiguous lot and phase claims; rotate signer; never resend an unknown action blindly |
 | Unauthorized API-wallet order | signer-side durable pre-purchase decision and CLOID authorization before execution; exact order-envelope binding | unmatched or mismatched fills remain permanently ineligible for automatic staking; halt and reconcile the trading-account compromise |
+| Stale resting order | IOC-only live policy; GTC/ALO rejected; no process-local expiry credit | post-expiry fills are charged but ineligible for automatic staking; unresolved reservations encumber new ledger periods until terminal |
 | Malicious validator selection | exact-address allowlist, no yield-based auto-switch, active/not-jailed/not-undelegate-only checks | stop new delegation and require allowlist-owner review |
 | Dependency compromise | lockfile, checksums, minimal signing interface, CI audit/review gate | artifact provenance and rollback; rotate signer if signing material may have been exposed |
 | State rollback/truncation | hash-chained append-only ledger, atomic snapshot, versioned off-host backup | replay and checksum verification; fail closed on divergence |
@@ -424,6 +449,9 @@ Before production secrets or funds are present, attach evidence for:
 - authorization-expiry tests proving effective expiry is capped by every input
   freshness horizon and the claim rejects the exact boundary, stale inputs, and
   post-expiry execution;
+- TIF and rollover tests proving GTC/ALO/resting envelopes are rejected, IOC fills
+  at or beyond effective expiry are ineligible, and ambiguous reservations reduce
+  each new daily/yearly period until terminal settlement without double release;
 - acknowledgement tests proving a changed, missing, malformed, or differently
   normalized parent-account value invalidates the effective-policy digest;
 - the user's explicit choice of custody option, host, validator, limits, and

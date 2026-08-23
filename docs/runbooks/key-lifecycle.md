@@ -47,7 +47,11 @@ ciphertext, host alias, or production filesystem path.
    each applicable room ledger and verify one fails without a partial record.
    At claim, test every input freshness horizon and the exact effective-expiry
    boundary; neither an expired `authorized` record nor an ambiguous claimed record
-   may return to a reusable state.
+   may return to a reusable state. Confirm GTC, ALO, and every resting TIF fail
+   live validation and only the exact IOC envelope can be claimed. Carry an
+   ambiguous IOC claim across daily and yearly boundaries and verify its worst-case
+   reservation reduces each new period until terminal settlement; a fill at or
+   beyond effective expiry must remain charged but automatic-staking ineligible.
 8. Fault-test the signer around claim, signature, and result persistence. A
    consumed or ambiguous `(account, workflow ID, action phase)` must remain
    blocked across caller retry, restart, restore, and a retry with a new nonce.
