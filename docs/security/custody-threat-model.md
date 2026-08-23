@@ -85,7 +85,9 @@ The record contains:
 - the actual execution account, policy version, market, buy side, mandatory IOC
   TIF, exact client order ID (CLOID), quantity, and limit price;
 - the maximum notional and slippage, the amount reserved in each named ledger,
-  and checked room before and after reservation; and
+  checked room before and after reservation, and any exact HYPE quantity reserved
+  to fill the current `residual_hype_wei` deficit before staking eligibility is
+  constructed; and
 - issue time and an effective expiry no later than the earliest deadline for the
   policy acknowledgement, decision, signal, book, or account data, plus the
   authorizer's authenticated record digest.
@@ -142,10 +144,12 @@ staking-eligible, the reconciler requires a distinct signer-side
 decision, CLOID, canonical order envelope, limit, and expiry must match exactly,
 and all authorizations must belong to the same decision chain. It atomically binds
 the terminal fill evidence to each existing immutable order binding and records
-the sorted authorization, order, and fill IDs, every exact purchased quantity and
-their checked total, policy version, and a canonical content-addressed workflow ID
-derived from the complete authorization and fill evidence. Every fill must be
-registered within a configured deadline after its first authoritative observation.
+the sorted authorization, order, and fill IDs, every exact purchased quantity,
+the authorizer-bound residual reservation, each deterministic residual/staking
+allocation, their checked total, policy version, and a canonical
+content-addressed workflow ID derived from that complete evidence. Every fill
+must be registered within a configured deadline after its first authoritative
+observation.
 A cursor gap, late or absent authorization, non-IOC or mismatched order or fill,
 a claim recorded at or after effective expiry or beyond an input freshness
 horizon, a fill executed at or beyond effective expiry, a historical fill first
@@ -153,15 +157,35 @@ presented after the deadline, or a fill absent from this purchase-time ledger
 makes the entire workflow permanently ineligible for automatic staking and sends
 it to manual review; neither the reconciler nor staking request path can backfill
 or override that state.
-Automatic staking is full-fill-set only: the intent amount must equal the sum of
-the exact registered quantities for its mapped authoritative fills. The signer
-does not create sub-lots, accept a partial amount, or split one workflow across
-multiple deposit or delegation phase keys.
+Before constructing the staking-eligible fill allocation, the authorizer
+atomically reserves the positive deficit between `residual_hype_wei` and already
+reconciled, unconsumed `residual_spot`. While that positive top-up reservation is
+unresolved, every later purchase authorization fails closed; concurrent requests
+cannot reserve or rely on the same deficit. At terminal fill reconciliation, the
+reconciler assigns
+`min(reserved deficit, total exact fill quantity)` to `residual_spot` and only the
+remainder to `eligible_spot`, consuming fills in canonical
+`(execution time, order ID, fill ID)` order. It releases any unfilled residual
+reservation only with the corresponding terminal order reconciliation. If fills
+do not exceed the reserved deficit, the workflow has no staking-eligible amount
+and emits no intent. This is the sole permitted split of a purchased fill: both
+allocations and their source fill IDs are immutable, remain in one workflow, and
+must satisfy exactly
+`purchased = residual_spot + eligible_spot`. A caller cannot choose or revise the
+split, and a residual allocation can never later become staking-eligible.
 
-The reconciler maintains amount-conserving lot states: `eligible_spot`,
+Automatic staking is full eligible-allocation only: the intent amount must equal
+the sum of every exact `eligible_spot` allocation for its mapped authoritative
+fills after the residual carve-out. The signer does not create further sub-lots,
+accept a partial eligible amount, or split one workflow across multiple deposit
+or delegation phase keys.
+
+The reconciler maintains amount-conserving lot states: `residual_spot`,
+`eligible_spot`,
 `deposit_reserved`, `deposited_undelegated`, `delegation_reserved`, `delegated`,
 and terminal spent, moved, expired, or ineligible states. A deposit reservation
-moves the entire exact mapped `eligible_spot` quantity to `deposit_reserved`;
+moves the entire exact mapped eligible allocation from `eligible_spot` to
+`deposit_reserved` while leaving `residual_spot` in spot;
 authoritative `cDeposit` completion moves that same quantity to
 `deposited_undelegated`.
 A delegation reservation starts only from `deposited_undelegated`, moves it to
@@ -173,12 +197,16 @@ authoritative fill and movement cursors must be caught up through a fresh common
 watermark; a gap or concurrent state that cannot be ordered against that watermark
 fails closed.
 
-Non-workflow sales and transfers debit registered lots deterministically in
-ascending `(authoritative fill time, stable order ID, stable fill ID)` order. Any
-partial consumption makes the workflow ineligible for automatic staking: the
-consumed quantity enters its terminal state and the remainder cannot be enrolled
-as a sub-lot. Staking reservations consume the entire exact mapped fill set in
-their workflow.
+Non-workflow sales and transfers debit registered spot allocations
+deterministically in ascending
+`(authoritative fill time, stable order ID, stable fill ID, allocation kind)`
+order, with `residual_spot` before `eligible_spot` for the final tie-break. Any
+partial consumption of an eligible allocation makes the workflow
+ineligible for automatic staking: the consumed quantity enters its terminal state
+and the remainder cannot be enrolled as a sub-lot. Consumed `residual_spot`
+reopens a deficit but cannot promote any old allocation; only a new
+pre-authorized purchase may refill it. Staking reservations consume the entire
+exact mapped eligible allocation in their workflow.
 `lot_eligibility_max_age_seconds` makes a remaining lot eligible only while
 `now < authoritative fill time + max age`; the boundary itself is expired. The
 only supported
@@ -209,13 +237,16 @@ not proof that the referenced state or limits are genuine.
 For every initial request and retry, the signer authenticates the caller and
 independently queries authoritative order, fill, spot-balance, and staking state
 using the actual account address. It verifies that the canonical stable order/fill
-set, workflow ID, and amount exactly match the purchase-time mapping instead of
-trusting caller-supplied identifiers or aggregate balance. For `cDeposit`, it
+set, workflow ID, residual carve-out, and eligible amount exactly match the
+purchase-time mapping instead of trusting caller-supplied identifiers or aggregate
+balance. For `cDeposit`, it
 requires every durable pre-purchase authorization and venue order binding to
 remain authentic, consistent, `order_bound` to this workflow, and unused by any
 other workflow. It verifies
-the intent amount equals the entire mapped `eligible_spot` quantity and that
-authoritative spot balance covers it. For `tokenDelegate`, it instead
+the intent amount equals the entire mapped eligible allocation, tracked unconsumed
+`residual_spot` is at least `residual_hype_wei`, and authoritative spot balance
+after subtracting the intent amount remains at least that same positive buffer.
+For `tokenDelegate`, it instead
 verifies a completed reconciled deposit predecessor and that the same full amount
 remains in `deposited_undelegated` with sufficient authoritative undelegated
 staking balance; it never requires or reserves `eligible_spot` again. It also
@@ -232,9 +263,10 @@ ambiguous, or mismatched evidence is rejected into manual review without signing
 
 Before producing a signature, one durable atomic transaction verifies every fill
 is already mapped to this workflow, performs the action-specific reservation, and
-claims the unique `(account, workflow ID, action phase)` key with the fill set,
-canonical intent digest, and nonce. The deposit phase must atomically move
-the full mapped quantity from `eligible_spot` to `deposit_reserved`. The
+claims the unique `(account, workflow ID, action phase)` key with the immutable
+fill allocations, canonical intent digest, and nonce. The deposit phase must
+atomically move the full mapped eligible allocation from `eligible_spot` to
+`deposit_reserved`. The
 delegation phase must atomically verify its reconciled deposit predecessor and move
 the same mapped quantity from `deposited_undelegated` to
 `delegation_reserved`; it cannot reserve `eligible_spot`. The signer never creates
@@ -316,12 +348,19 @@ All gates are conjunctive and fail closed:
    is permanently ineligible for automatic staking. Unresolved reservations carry
    into and reduce new daily/yearly room until terminal settlement.
 8. A staking deposit requires reconciled newly purchased HYPE in `eligible_spot`
-   and a configured residual buffer. When no validator is eligible it is permitted
-   only by the separately approved `hold_undelegated_in_staking` policy; the
-   deposit request has no validator field. Delegation requires the same mapped
-   quantity in `deposited_undelegated` after authoritative deposit reconciliation,
-   plus an explicitly specified, allowlisted active validator that is neither
-   jailed nor undelegate-only.
+   after the authorizer-reserved residual deficit has been carved out into
+   `residual_spot`. On an initially empty account, serial terminal purchases must
+   first accumulate the configured positive `residual_hype_wei` in spot before
+   any remainder can become staking-eligible; a fill no larger than the current
+   deficit produces no staking intent. The signer independently requires the
+   tracked and post-deposit authoritative residual to meet the configured buffer.
+   When no validator is eligible, a deposit is permitted only by the separately
+   approved `hold_undelegated_in_staking` policy; the request has no validator
+   field.
+   Delegation requires the same mapped eligible quantity in
+   `deposited_undelegated` after authoritative deposit reconciliation, plus an
+   explicitly specified, allowlisted active validator that is neither jailed nor
+   undelegate-only.
 9. An ambiguous exposure-creating action response moves the workflow to
    reconciliation or manual review; it never causes a blind retry.
 10. Engaging manual halt atomically denies new order placement, staking deposit,
@@ -419,8 +458,15 @@ Before production secrets or funds are present, attach evidence for:
 - action-specific lot-state tests proving deposit and delegation reserve
   `eligible_spot` and `deposited_undelegated` respectively, including ambiguous
   responses, restore, and rejection of double reservation;
-- full-fill-set tests proving undersized, oversized, partially consumed, and
-  attempted sub-lot intents are rejected without creating another phase key;
+- amount-conservation tests starting from zero HYPE and covering a fill below, at,
+  and above the residual deficit, partial fills, concurrent residual reservations,
+  deterministic multi-fill allocation, consumed residual, and restore; every case
+  must prove exact `purchased = residual_spot + eligible_spot` accounting and
+  preserve the configured post-deposit residual, with later authorizations denied
+  while a residual top-up is unresolved;
+- full-eligible-allocation tests proving undersized, oversized, partially
+  consumed, and attempted caller-chosen sub-lot intents are rejected without
+  creating another phase key;
 - purchase-time registration and adversarial replay tests proving an unmapped or
   consumed historical fill cannot be enrolled under fresh workflow or daily
   decision IDs, including after a later purchase replenishes balances;

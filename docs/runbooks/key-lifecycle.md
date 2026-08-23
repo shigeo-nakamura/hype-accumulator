@@ -69,11 +69,22 @@ ciphertext, host alias, or production filesystem path.
    still rejects delegation. Deposit intents containing a validator and delegation
    intents missing one must fail schema validation. Under `hold_in_spot`, stale or
    unavailable validator state must also reject the deposit. Complete a deposit
-   and verify the exact lot quantity moves from `eligible_spot` through
-   `deposit_reserved` to `deposited_undelegated`; delegation must reserve only that
+   from a zero-HYPE account: a terminal total fill below or equal to the atomically
+   reserved residual deficit must produce only `residual_spot` and no staking
+   intent, while a total fill above the deficit, including a partial fill of a
+   larger requested order, must conserve the exact purchase as
+   `residual_spot + eligible_spot` using the canonical fill order. Race two
+   purchases and verify every later authorization fails while the first residual
+   top-up remains unresolved. Consume residual spot and confirm no old eligible
+   allocation is promoted and no deposit proceeds until a new authorized purchase
+   refills the deficit. Then
+   verify the full eligible allocation moves from `eligible_spot` through
+   `deposit_reserved` to `deposited_undelegated` while the configured positive
+   residual remains in authoritative spot; delegation must reserve only that
    undelegated state, never debit `eligible_spot` again. Submit undersized,
-   oversized, and attempted sub-lot amounts and partially consume a workflow;
-   every case must reject automatic staking without creating another phase key.
+   oversized, and caller-chosen sub-lot amounts and partially consume an eligible
+   allocation; every case must reject automatic staking without creating another
+   phase key.
    Exercise ambiguous responses, restart, and restore at both reservation
    boundaries.
 9. Rehearse manual halt with a resting test order. Confirm new order and staking
