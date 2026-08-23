@@ -70,14 +70,19 @@ observation. A cursor gap, a historical fill first presented after the deadline,
 or a fill absent from this purchase-time ledger is ineligible for automatic
 staking and goes to manual review; the staking request path never backfills it.
 
-The reconciler maintains lot-level lifecycle state. Sales and transfers consume
-eligible quantity; a staking reservation moves exact eligible quantity to a
-reserved state, and a completed action finalizes that reservation without a
-second debit. Each transition is atomic. A spent, moved, expired, or otherwise
-ineligible lot never becomes eligible again because fungible spot or undelegated
-balance later increases. Before any staking reservation, the authoritative fill
-and movement cursors must be caught up through a fresh common watermark; a gap or
-concurrent state that cannot be ordered against that watermark fails closed.
+The reconciler maintains amount-conserving lot states: `eligible_spot`,
+`deposit_reserved`, `deposited_undelegated`, `delegation_reserved`, `delegated`,
+and terminal spent, moved, expired, or ineligible states. A deposit reservation
+moves exact `eligible_spot` quantity to `deposit_reserved`; authoritative
+`cDeposit` completion moves that same quantity to `deposited_undelegated`.
+A delegation reservation starts only from `deposited_undelegated`, moves it to
+`delegation_reserved`, and authoritative `tokenDelegate` completion moves it to
+`delegated`. Delegation never debits or reserves the original spot quantity again.
+Each transition is atomic. A terminal lot never becomes eligible again because
+fungible spot or undelegated balance later increases. Before any reservation, the
+authoritative fill and movement cursors must be caught up through a fresh common
+watermark; a gap or concurrent state that cannot be ordered against that watermark
+fails closed.
 
 Non-workflow sales and transfers debit registered lots deterministically in
 ascending `(authoritative fill time, stable order ID, stable fill ID)` order.
@@ -112,11 +117,15 @@ not proof that the referenced state or limits are genuine.
 For every initial request and retry, the signer authenticates the caller and
 independently queries authoritative order, fill, spot-balance, and staking state
 using the actual account address. It verifies that the canonical stable order/fill
-set, workflow ID, amount, and remaining eligible lot quantity exactly match the
-purchase-time mapping instead of trusting caller-supplied identifiers or aggregate
-balance. It also verifies residual balance, intent expiry, and daily, yearly, and
-cumulative room against an independently loaded approved policy and immutable
-ledger anchor.
+set, workflow ID, and amount exactly match the purchase-time mapping instead of
+trusting caller-supplied identifiers or aggregate balance. For `cDeposit`, it
+verifies sufficient `eligible_spot` quantity and authoritative spot balance. For
+`tokenDelegate`, it instead verifies a completed reconciled deposit predecessor,
+sufficient `deposited_undelegated` quantity for the same mapped fills, and
+authoritative undelegated staking balance; it never requires or reserves
+`eligible_spot` again. It also verifies residual balance, intent expiry, and daily,
+yearly, and cumulative room against an independently loaded approved policy and
+immutable ledger anchor.
 For a deposit under the default `hold_in_spot` policy, it independently queries
 the complete allowlist and requires at least one currently eligible validator,
 without accepting or selecting a validator in the intent. Missing or stale
@@ -127,21 +136,25 @@ allowlisted, active, not jailed, and not undelegate-only. Missing, stale, consum
 ambiguous, or mismatched evidence is rejected into manual review without signing.
 
 Before producing a signature, one durable atomic transaction verifies every fill
-is already mapped to this workflow with sufficient eligible quantity, reserves
-that quantity, and claims the unique `(account, workflow ID, action phase)` key
-with the fill set, canonical intent digest, and nonce. The signer never creates or
-changes the fill-to-workflow mapping while processing an intent. All fills in an
-aggregate purchase succeed or fail as a unit. Deposit and delegation are
-separate, ordered phases, and each may be claimed only once; a later phase also
-requires authoritative reconciliation of its predecessor. A conflicting or
-unmapped fill set, amount, digest, or nonce is rejected. A duplicate of a
-completed phase may return only the previously stored byte-identical result,
-never a fresh signature or nonce. A crash or write ambiguity between reservation,
-signing, and result persistence leaves the lot and phase blocked for authoritative
-reconciliation and manual review. Neither may be cleared by caller retry, process
-restart, snapshot restore, or a later balance increase. The purchase-time mapping,
-lot lifecycle, and consumed-phase ledger are included in the hash chain and
-off-host restore checks.
+is already mapped to this workflow, performs the action-specific reservation, and
+claims the unique `(account, workflow ID, action phase)` key with the fill set,
+canonical intent digest, and nonce. The deposit phase must atomically move
+sufficient mapped quantity from `eligible_spot` to `deposit_reserved`. The
+delegation phase must atomically verify its reconciled deposit predecessor and move
+the same mapped quantity from `deposited_undelegated` to
+`delegation_reserved`; it cannot reserve `eligible_spot`. The signer never creates
+or changes the fill-to-workflow mapping while processing an intent. All fills in
+an aggregate purchase succeed or fail as a unit. Deposit and delegation are
+separate, ordered phases, and each may be claimed only once. Authoritative success
+finalizes the reservation into `deposited_undelegated` or `delegated` respectively.
+A conflicting state, unmapped fill set, amount, digest, or nonce is rejected. A
+duplicate of a completed phase may return only the previously stored byte-identical
+result, never a fresh signature or nonce. A crash or write ambiguity between
+reservation, signing, and result persistence leaves the action-specific
+reservation and phase blocked for authoritative reconciliation and manual review.
+Neither may be cleared by caller retry, process restart, snapshot restore, or a
+later balance increase. The purchase-time mapping, lot lifecycle, and
+consumed-phase ledger are included in the hash chain and off-host restore checks.
 
 Until this boundary is implemented and rehearsed, automatic staking remains
 disabled. Storing a general-purpose master private key in the bot process is not
@@ -187,16 +200,22 @@ All gates are conjunctive and fail closed:
    ceiling.
 6. Committed plus spent USDC cannot exceed admitted deposits minus reconciled
    withdrawals and reserves.
-7. A purchase requires fresh book/account data, no unknown movement, no balance
-   mismatch, no halt, available daily purchase-notional room, available yearly
-   and cumulative deployable-capital room, available slippage room, and
-   independently enforced post-purchase hot-exposure room. A service-side
-   threshold alone cannot satisfy the final condition.
-8. A staking deposit requires reconciled newly purchased HYPE and a configured
-   residual buffer. When no validator is eligible it is permitted only by the
-   separately approved `hold_undelegated_in_staking` policy; the deposit request
-   has no validator field. Delegation alone requires an explicitly specified,
-   allowlisted active validator that is neither jailed nor undelegate-only.
+7. A purchase requires fresh book/account data and a trusted decision-signal
+   generation timestamp whose non-negative age is strictly less than the positive
+   configured `signal_stale_after_seconds`. A missing, malformed, future, or
+   expired signal timestamp rejects the purchase even when book and account data
+   remain fresh. It also requires no unknown movement, no balance mismatch, no
+   halt, available daily purchase-notional room, available yearly and cumulative
+   deployable-capital room, available slippage room, and independently enforced
+   post-purchase hot-exposure room. A service-side threshold alone cannot satisfy
+   the final condition.
+8. A staking deposit requires reconciled newly purchased HYPE in `eligible_spot`
+   and a configured residual buffer. When no validator is eligible it is permitted
+   only by the separately approved `hold_undelegated_in_staking` policy; the
+   deposit request has no validator field. Delegation requires the same mapped
+   quantity in `deposited_undelegated` after authoritative deposit reconciliation,
+   plus an explicitly specified, allowlisted active validator that is neither
+   jailed nor undelegate-only.
 9. An ambiguous exposure-creating action response moves the workflow to
    reconciliation or manual review; it never causes a blind retry.
 10. Engaging manual halt atomically denies new order placement, staking deposit,
@@ -289,6 +308,9 @@ Before production secrets or funds are present, attach evidence for:
   parent-admission inheritance is enabled;
 - signer crash/retry/restore tests proving each workflow action phase is consumed
   before signing and cannot be reauthorized with a different nonce;
+- action-specific lot-state tests proving deposit and delegation reserve
+  `eligible_spot` and `deposited_undelegated` respectively, including partial
+  quantities, ambiguous responses, restore, and rejection of double reservation;
 - purchase-time registration and adversarial replay tests proving an unmapped or
   consumed historical fill cannot be enrolled under fresh workflow or daily
   decision IDs, including after a later purchase replenishes balances;
@@ -300,6 +322,9 @@ Before production secrets or funds are present, attach evidence for:
   availability while preserving every non-validator gate;
 - yearly and lifetime boundary tests proving an operator admission cannot bypass
   either acknowledged deployable-capital ceiling;
+- signal-freshness boundary tests proving a missing, malformed, future, or
+  age-at-limit decision timestamp rejects a purchase while book/account data is
+  otherwise fresh;
 - acknowledgement tests proving a changed, missing, malformed, or differently
   normalized parent-account value invalidates the effective-policy digest;
 - the user's explicit choice of custody option, host, validator, limits, and

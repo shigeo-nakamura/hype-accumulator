@@ -40,6 +40,8 @@ admitted_parent_account_env = ""
 max_slippage_bps = 0
 book_stale_after_seconds = 0
 account_history_stale_after_seconds = 0
+# Required positive in live mode. Signal age must be non-negative and strictly
+# below this threshold; a missing, malformed, or future timestamp fails closed.
 signal_stale_after_seconds = 0
 # Required in live mode. While halted, only exact open-order IDs independently
 # returned by the authoritative account query may be cancelled.

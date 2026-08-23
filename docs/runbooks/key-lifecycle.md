@@ -44,7 +44,11 @@ ciphertext, host alias, or production filesystem path.
    `hold_undelegated_in_staking` mode accepts a validator-free deposit intent and
    still rejects delegation. Deposit intents containing a validator and delegation
    intents missing one must fail schema validation. Under `hold_in_spot`, stale or
-   unavailable validator state must also reject the deposit.
+   unavailable validator state must also reject the deposit. Complete a deposit
+   and verify the exact lot quantity moves from `eligible_spot` through
+   `deposit_reserved` to `deposited_undelegated`; delegation must reserve only that
+   undelegated state, never debit `eligible_spot` again. Exercise partial amounts,
+   ambiguous responses, restart, and restore at both reservation boundaries.
 8. Rehearse manual halt with a resting test order. Confirm new order and staking
    signatures stop before the cancel-only path independently discovers and
    cancels the exact open order. Drop the cancellation response and verify it
@@ -61,6 +65,10 @@ ciphertext, host alias, or production filesystem path.
     neither direct admission nor a separately recorded operator admission permits
     another purchase. Year rollover may restore only yearly room; exceeding either
     acknowledged ceiling requires a newly acknowledged policy.
+11. Keep book and account feeds fresh while supplying a missing, malformed, future,
+    exactly-at-limit, and expired decision-signal timestamp. Confirm every case
+    rejects purchase and that only a non-negative age strictly below the configured
+    positive signal-staleness threshold passes this gate.
 
 ## Rotate
 
