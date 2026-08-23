@@ -77,7 +77,7 @@ Before any HYPE purchase order is submitted, an independent signer-side
 authorizer authenticates the caller, independently obtains the authoritative
 account and strategy inputs, and either recomputes the deterministic approved
 decision or verifies an authenticated approval artifact issued outside the trading
-service. It checks admitted capital, reserve, daily/yearly/cumulative room, signal
+service. It checks admitted-uncommitted capital, reserve, daily room, signal
 freshness, the authoritative fee schedule, slippage, and hot-exposure enforcement
 against its own immutable policy anchor. The authenticated decision contains an
 immutable canonical decision-chain ID and digest plus exact maximum base quantity
@@ -102,15 +102,19 @@ and its reserved `Q` and `N`. The transaction requires no unresolved predecessor
 and atomically reserves `Q` and `N` no greater than both decision remainders; a
 decision can have only one active authorization.
 
-In that same transaction, the authorizer reserves `C` against the admitted tranche
-while preserving the configured cash reserve and against yearly and cumulative
-deployable-capital room. It separately reserves `N` against daily
-purchase-notional room and uses the appropriate full-asset exposure for the hot
-limit. It then commits the one-time pre-purchase authorization. If any complete
-decision or policy reservation is unavailable, neither a partial reservation nor
-a record is created. Concurrent authorizer instances serialize on both the
-decision row and limit-ledger rows; a process-local clock or ledger snapshot
-cannot authorize a purchase.
+In that same transaction, the authorizer deterministically selects
+admitted-uncommitted tranche slices in stable `(confirmation time, movement ID)`
+order and moves exactly `C` from their `uncommitted` state to `committed` while
+preserving the configured cash reserve. This is an amount-conserving state
+transition inside admission allocations already charged to their originating
+yearly and lifetime ceilings; it does not reserve `C` against either ceiling a
+second time. It separately reserves `N` against daily purchase-notional room and
+uses the appropriate full-asset exposure for the hot limit. It then commits the
+one-time pre-purchase authorization. If any complete decision, tranche, or policy
+reservation is unavailable, neither a partial transition nor a record is created.
+Concurrent authorizer instances serialize on the decision row, selected tranche
+rows, and limit-ledger rows; a process-local clock or ledger snapshot cannot
+authorize a purchase.
 The record contains:
 
 - an authorization ID, canonical decision-chain ID and digest, `Q_D`, `N_D`,
@@ -119,8 +123,9 @@ The record contains:
 - the actual execution account, policy version, market, buy side, mandatory IOC
   TIF, exact client order ID (CLOID), quantity, limit price, and L1 nonce;
 - `N`, the independently checked fee schedule and maximum fee `F`, maximum total
-  cash debit `C`, maximum slippage, the amount reserved in each named cash,
-  notional, and exposure ledger, canonical daily/yearly period IDs and exact
+  cash debit `C`, maximum slippage, each originating admission allocation and
+  tranche slice moved from `uncommitted` to `committed`, the amount reserved in
+  each named notional and exposure ledger, canonical daily period IDs and exact
   half-open UTC boundaries, checked room before and after reservation, and any
   exact HYPE quantity reserved to fill the current `residual_hype_wei` deficit
   before staking eligibility is constructed; and
@@ -166,8 +171,10 @@ payload. The same transaction uses the ledger's authoritative UTC clock to requi
 any bound input's freshness horizon, and validates the exact signed
 `expiresAfter_ms`. The equality boundary, a future/missing input timestamp, or a
 failed claim forbids submission. An expired record still in `authorized` moves
-atomically to a terminal unused state, releases every policy and decision
-reservation, and clears the decision's active slot. A transport-ambiguous
+atomically to a terminal unused state, returns each committed cash slice to
+`uncommitted` in its same originating admission allocation, releases every other
+policy and decision reservation, and clears the decision's active slot. A
+transport-ambiguous
 submission stays claimed until authoritative CLOID reconciliation and never
 releases room or retries blindly.
 
@@ -188,15 +195,20 @@ As soon as an exact CLOID query finds the order, even before it is terminal, the
 reconciler atomically binds the stable venue order ID and moves
 `submission_claimed` to `order_bound`. Later polls validate that immutable binding
 without repeating the transition. A conclusively absent claim moves to a terminal
-unused state, releases every policy and decision reservation, and clears the
-decision's active slot in the same transaction; no terminal authorization is
-reusable. This is not an exchange action and grants no generic master-signer
+unused state, returns each committed cash slice to `uncommitted` in its same
+originating admission allocation, releases every other policy and decision
+reservation, and clears the decision's active slot in the same transaction; no
+terminal authorization is reusable. This is not an exchange action and grants no
+generic master-signer
 capability. A retry or residual reissue requires a new CLOID and authorization
 after authoritative reconciliation of its predecessor. That reconciliation
-atomically charges actual executed notional to the notional ledger and actual
-consideration plus every authoritative fee to the cash ledgers. It releases only
-conclusively unfilled notional and unused fee headroom from `C`; ambiguous fee or
-fill state retains the full reservation. In the same transaction, actual filled
+atomically charges actual executed notional to the notional ledger and moves
+actual consideration plus every authoritative fee from `committed` to `spent` in
+the originating admission allocations. It returns only conclusively unfilled cash
+and unused fee headroom from `committed` to `uncommitted` in those same
+allocations; ambiguous fee or fill state retains the full commitment. Neither
+transition changes the yearly or lifetime admission-allocation counters. In the
+same transaction, actual filled
 base quantity `Q_f` and executed notional `N_f` are permanently consumed from the
 decision row, and only the proven `Q - Q_f` and `N - N_f` remainders are released
 before the active authorization is cleared. An ambiguous predecessor retains its
@@ -207,16 +219,19 @@ caller-supplied decision, authorization record, or policy snapshot is correlatio
 data only.
 
 An unresolved `submission_claimed` or `order_bound` reservation never disappears
-at a daily or yearly boundary. It remains charged to its recorded originating
-period IDs and is also deducted as a conservative cross-period encumbrance from
-each canonical period row opened by a later reservation transaction until terminal
-reconciliation. There is no independent process-local rollover job.
-Admitted-capital, cumulative, and hot-exposure reservations remain continuously
-charged. Terminal reconciliation atomically charges the actual fill to the
-canonical execution-period IDs derived from its authoritative timestamp, records
-actual notional separately from actual cash debit including fees, releases only
-the proven unfilled remainder, unused fee headroom, and mirrored encumbrances, and
-preserves a conserved audit trail; a boundary alone cannot make room reusable.
+at a daily or yearly boundary. Its `N` remains charged to its originating daily
+period and is also deducted as a conservative encumbrance from each later daily
+period row opened before terminal reconciliation. Its `C` remains `committed`
+inside the same admission allocations, whose originating yearly and lifetime
+ceiling charges never roll over or repeat; an old admitted slice can be committed
+after a year boundary without consuming the new year's admission room. There is
+no independent process-local rollover job. Hot-exposure reservations remain
+continuously charged. Terminal reconciliation atomically charges actual notional
+to the execution-day period derived from its authoritative timestamp, moves
+actual cash debit including fees to `spent`, returns only proven unused `C` to the
+same slices' `uncommitted` state, releases daily mirrored encumbrances, and
+preserves the conserved audit trail; a boundary alone cannot release a commitment
+or restore admission room.
 
 The following lot bookkeeping is dormant, unsigned eligibility accounting. It
 does not authorize, sign, or submit a staking action and cannot override the
@@ -340,9 +355,10 @@ All gates are conjunctive and fail closed:
    create a child tranche only by inheriting an already confirmed and admitted
    parent-account deposit. The ledger binds stable parent-deposit and transfer
    IDs, approved source and destination accounts, and an amount no greater than
-   the parent tranche's unallocated residual. It atomically debits that residual
-   and credits the child exactly once; replay is idempotent and system-wide
-   admitted capital is unchanged.
+   the parent tranche's admitted-uncommitted residual. It atomically moves that
+   residual, including its originating admission-allocation IDs, to the child's
+   `uncommitted` state exactly once; replay is idempotent, no admission counter is
+   incremented, and system-wide admitted capital is unchanged.
 4. An untraced, mismatched, duplicate, or excess internal transfer remains visible
    but unallocated and halts new purchases pending reconciliation. Parent
    inheritance is disabled unless the approved funding mode and parent-account
@@ -353,18 +369,35 @@ All gates are conjunctive and fail closed:
    `external_deposit_only` with inheritance disabled and no parent, or
    `traced_parent_transfer` with inheritance enabled and a non-empty approved
    parent-account environment name; every other combination is rejected.
-5. A deposit above the per-deposit limit remains visible but unallocated until a
-   separately recorded operator admission. Capital beyond yearly room remains
-   unallocated until the next canonical `utc_calendar_year_v1` period begins or a
-   newly acknowledged policy raises the ceiling; capital beyond the lifetime
-   cumulative room requires such a newly acknowledged policy. Operator admission
-   alone never overrides either ceiling.
-6. Committed maximum cash debit `C` plus spent order consideration and
-   authoritative fees cannot exceed admitted deposits minus reconciled withdrawals
-   and the configured reserve. The separate daily purchase-notional ledger excludes
-   fees by definition; no cash-capital, yearly, or cumulative deployable ledger
-   does. Fee rebates are reconciliation events and never pre-credit authorization
-   room.
+5. Admission is the only transition that consumes yearly or lifetime
+   deployable-capital room. One serializable transaction locks a confirmed
+   external movement's stable ID and the current `utc_calendar_year_v1` plus
+   lifetime admission-allocation rows, moves an exact amount from
+   `confirmed_unallocated` to a tranche's `uncommitted` state, and increments
+   both allocation counters by that amount exactly once. The move requires the
+   resulting counters to remain at or below their acknowledged ceilings. A
+   deposit above the per-deposit limit remains visible but unallocated until a
+   separately recorded operator admission performs this same transaction; any
+   remainder beyond yearly room stays `confirmed_unallocated` until the next
+   canonical year or a newly acknowledged ceiling, and any remainder beyond
+   lifetime room requires a newly acknowledged ceiling. Operator admission,
+   replay, purchase authorization, fill settlement, release, rebate, withdrawal,
+   or internal transfer cannot increment twice, decrement, or otherwise restore
+   either admission-allocation counter.
+6. Each admitted allocation obeys the checked integer conservation invariant
+   `admitted = uncommitted + committed + spent + withdrawn`. Authorization moves
+   cash only from `uncommitted` to `committed`; settlement moves actual
+   consideration and authoritative fees to `spent` and returns proven unused
+   headroom to `uncommitted`; a reconciled withdrawal moves available cash to
+   `withdrawn`. A reconciled fee rebate may move value from `spent` back to
+   `uncommitted` but never changes `admitted`. The system-wide sum of committed
+   maximum cash debit `C` plus spent cash cannot exceed admitted deposits minus
+   reconciled withdrawals and the configured reserve. The separate daily
+   purchase-notional ledger excludes fees by definition; `C` and `spent` include
+   them. Therefore admitting 100 units under 100-unit yearly and lifetime
+   ceilings leaves zero admission room but 100 units `uncommitted`: a purchase
+   may commit those units, while a second deposit cannot be admitted. Requiring
+   fresh admission room at purchase authorization is invalid.
 7. A purchase requires fresh book/account data and a trusted decision-signal
    generation timestamp whose non-negative age is strictly less than the positive
    configured `signal_stale_after_seconds`. A missing, malformed, future, or
@@ -374,23 +407,26 @@ All gates are conjunctive and fail closed:
    `fee_schedule_stale_after_seconds`; missing, malformed, future, or age-at-limit
    data rejects the purchase. It also requires no unknown movement, no balance
    mismatch, no halt, no active predecessor and sufficient remaining `Q_D` and
-   `N_D` in the authenticated decision chain, available daily purchase-notional
-   room, available yearly and cumulative deployable-capital room, available
-   slippage room, and independently enforced post-purchase hot-exposure room. A
+   `N_D` in the authenticated decision chain, enough admitted-uncommitted cash
+   after the reserve, available daily purchase-notional room, available slippage
+   room, and independently enforced post-purchase hot-exposure room. A
    service-side threshold alone cannot satisfy the final condition. Before order
    submission, the signer-side
    authorizer must durably bind the independently verified decision, exact CLOID
    and canonical unsigned request template, policy version, fee ceiling, effective
    expiry, exact signed
-   `expiresAfter`, and remaining limits while atomically reserving `C` against
-   admitted, reserve, yearly, and cumulative cash room and `N` against daily
-   purchase-notional room. The executor must reject a claim at or beyond that
+   `expiresAfter`, and remaining limits while atomically moving `C` from the
+   selected admitted allocations' `uncommitted` state to `committed` and
+   reserving `N` against daily purchase-notional room. The executor must reject a
+   claim at or beyond that
    expiry or beyond any input freshness horizon. Only IOC with the venue-enforced
    signed request expiry is authorized; every resting TIF, omitted or altered
    expiry, and delayed venue acceptance is rejected. No matching authorization
    means no service order; any bypass or impossible post-expiry fill is permanently
-   ineligible for automatic staking and halts live action. Unresolved reservations
-   carry into and reduce new daily/yearly room until terminal settlement.
+   ineligible for automatic staking and halts live action. Unresolved notional
+   reservations reduce new daily room until terminal settlement; unresolved `C`
+   stays committed inside its already charged admission allocations and never
+   consumes a second yearly or lifetime allocation.
 8. Automatic staking is disabled. Because the signed staking actions lack a
    venue-enforced acceptance deadline, the service never creates a deposit or
    delegation reservation, intent, signature, or outbound request. Dormant
@@ -402,8 +438,9 @@ All gates are conjunctive and fail closed:
 10. A manual-halt request uses one serializable ledger transaction to move
     `running` to `halt_draining`, record its cutoff, reject every subsequent
     authorization, claim, or signature, and atomically move each unclaimed
-    `authorized` record to terminal unused while releasing all of its policy and
-    decision reservations and clearing its decision active slot. The same
+    `authorized` record to terminal unused while returning its `C` slices to the
+    same allocations' `uncommitted` state, releasing its other policy and
+    decision reservations, and clearing its decision active slot. The same
     transaction snapshots every `submission_claimed` and `order_bound` record with
     its CLOID and signed `expiresAfter_ms`. A claim is treated as possibly signed
     even if local persistence says otherwise. The service must not report `halted`
@@ -424,8 +461,10 @@ All gates are conjunctive and fail closed:
     Only after the ledger clock has passed a snapshotted `expiresAfter_ms` and
     authoritative order/fill histories have a gap-free watermark later than that
     expiry may a still-invisible CLOID be atomically marked conclusively absent and
-    terminal unused, release its policy and decision reservations, and clear its
-    decision active slot. It remains unresolved before that point. After every
+    terminal unused, return its `C` slices to the same allocations'
+    `uncommitted` state, release its other policy and decision reservations, and
+    clear its decision active slot. It remains unresolved before that point. After
+    every
     claimed/bound record is terminal and a fresh account query returns no open
     order, one transaction may move `halt_draining` to `halted`. A delayed request
     discovered during that drain is handled before the transition. Lost responses
@@ -443,7 +482,7 @@ configuration must set all of these explicitly:
 
 - maximum automatically admitted deposit;
 - maximum daily purchase notional;
-- maximum yearly and cumulative deployable capital;
+- maximum yearly and lifetime admission allocations of deployable capital;
 - exact `utc_calendar_day_v1` and `utc_calendar_year_v1` limit-period schemes;
 - maximum order slippage;
 - aggregate maximum purchase-fee rate and mandatory venue-enforced signed expiry;
@@ -470,7 +509,7 @@ configuration must set all of these explicitly:
 | Concurrent decision reuse | unique decision-chain row; one active authorization; atomic `Q` and `N` decision reservations with global policy reservations | ambiguous predecessor retains the active slot; terminal reconciliation consumes fills and releases only proven remainder before reissue |
 | Delayed or stale order | signed `expiresAfter = effective_expiry_ms - 1` plus IOC-only live policy; GTC/ALO and missing/changed expiry rejected; no process-local expiry credit | venue rejects delayed acceptance; any impossible post-expiry fill halts live action, remains charged, and is ineligible for automatic staking |
 | Delayed staking acceptance | automatic staking disabled because user-signed staking actions lack a venue-enforced acceptance deadline; no runtime signer, endpoint, or client | configuration rejects any enabled value before live capability; HYPE remains in spot and staking is manual/offline |
-| Fee under-reservation | checked `C = N + ceil(N * aggregate fee bps / 10000)` reserves admitted, reserve, yearly, and cumulative cash room while daily notional separately reserves `N` | authoritative fee reconciliation retains full reservation while ambiguous and halts on an unknown, stale, differently denominated, or above-ceiling fee |
+| Fee under-reservation | checked `C = N + ceil(N * aggregate fee bps / 10000)` moves admitted-uncommitted cash to `committed` while preserving the reserve; daily notional separately reserves `N` and admission ceilings are not charged twice | authoritative fee reconciliation retains the full commitment while ambiguous and halts on an unknown, stale, differently denominated, or above-ceiling fee |
 | Malicious validator selection | no runtime staking capability; validator data is advisory for offline manual review only | keep HYPE in spot and require a separately approved offline operation |
 | Dependency compromise | lockfile, checksums, minimal signing interface, CI audit/review gate | artifact provenance and rollback; rotate signer if signing material may have been exposed |
 | State rollback/truncation | hash-chained append-only ledger, atomic snapshot, versioned off-host backup | replay and checksum verification; fail closed on divergence |
@@ -533,8 +572,13 @@ Before production secrets or funds are present, attach evidence for:
   decision IDs, including after a later purchase replenishes balances;
 - deterministic multi-lot partial-sale/transfer tests, including identical
   timestamps, stable-ID tie-breaking, expiry boundaries, and replay after restore;
-- yearly and lifetime boundary tests proving an operator admission cannot bypass
-  either acknowledged deployable-capital ceiling;
+- yearly and lifetime boundary tests proving direct and operator admission share
+  one serializable `confirmed_unallocated -> uncommitted` transition, increment
+  both admission-allocation counters exactly once, and cannot bypass either
+  acknowledged ceiling. Race admissions at the exact boundary; prove only a new
+  half-open year restores yearly admission room, lifetime room never resets, and
+  purchase, release, settlement, rebate, withdrawal, transfer, replay, restart,
+  and restore never change those counters;
 - signal-freshness boundary tests proving a missing, malformed, future, or
   age-at-limit decision timestamp rejects a purchase while book/account data is
   otherwise fresh;
@@ -547,11 +591,13 @@ Before production secrets or funds are present, attach evidence for:
   residual reissue without a new authorization remain permanently ineligible for
   automatic staking across retry and restore; fault injection must cover the
   `authorized`, `submission_claimed`, and `order_bound` transitions;
-- concurrent-authorization tests proving `C` is atomically reserved against
-  admitted, reserve, yearly, and cumulative cash room while `N` is separately
-  reserved against daily notional and appropriate exposure is reserved against the
-  hot limit; release occurs only for conclusively unfilled or never-submitted
-  terminal records with authoritative fee reconciliation;
+- concurrent-authorization tests proving exact tranche slices totaling `C` move
+  atomically from `uncommitted` to `committed` while preserving the reserve,
+  without changing yearly or lifetime admission allocations; `N` is separately
+  reserved against daily notional and appropriate exposure is reserved against
+  the hot limit. Terminal reconciliation must move actual cash to `spent` and
+  return only conclusively unused headroom to the same slices, preserving
+  `admitted = uncommitted + committed + spent + withdrawn`;
 - decision-concurrency tests racing distinct CLOIDs from separate authorizer
   instances against one authenticated decision while global caps have room;
   exactly one may reserve the unique decision row and create a record. Partial
@@ -568,7 +614,8 @@ Before production secrets or funds are present, attach evidence for:
   timezones across one second before, exactly at, and one second after UTC day and
   Gregorian-year boundaries; all instances and clean-directory restores must
   derive identical IDs and half-open bounds, reuse one unique row, preserve prior
-  spend and unresolved encumbrances, and reject host-clock, overlap, duplicate,
+  daily spend, admission allocations, and unresolved encumbrances, and reject
+  host-clock, overlap, duplicate,
   unsupported-schema, and boundary-tampering cases;
 - authorization-expiry tests proving effective expiry is capped by every input
   freshness horizon, `expiresAfter_ms` is exactly one millisecond earlier and
@@ -577,9 +624,10 @@ Before production secrets or funds are present, attach evidence for:
   expiry; delay a valid signed payload beyond the horizon and prove venue rejection
   with no fill;
 - TIF and rollover tests proving GTC/ALO/resting envelopes are rejected, IOC fills
-  cannot be accepted at or beyond effective expiry, and ambiguous reservations
-  reduce each new daily/yearly period until terminal settlement without double
-  release;
+  cannot be accepted at or beyond effective expiry, ambiguous `N` reduces each
+  later daily period until terminal settlement without double release, and
+  ambiguous `C` remains in its originating commitment without consuming a later
+  year's admission room;
 - acknowledgement tests proving a changed, missing, malformed, or differently
   normalized parent-account value invalidates the effective-policy digest;
 - the user's explicit choice of custody option, host, limits, and exact small-probe

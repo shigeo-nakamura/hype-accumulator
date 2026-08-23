@@ -2,11 +2,15 @@
 [capital]
 max_auto_deposit_microusd = 0
 max_daily_notional_microusd = 0
+# These ceilings are consumed exactly once when confirmed external capital moves
+# into an admitted-uncommitted allocation. Purchase commitments transfer within
+# that allocation and never charge these ceilings again.
 max_yearly_deployable_microusd = 0
 max_cumulative_deployable_microusd = 0
 reserve_microusd = 0
 # These exact v1 schemes are the only live values. They use half-open UTC periods,
 # are bound into the policy digest, and reject local-time or rolling alternatives.
+# The yearly scheme applies to admission allocation; daily applies to purchases.
 daily_limit_period = "utc_calendar_day_v1"
 yearly_limit_period = "utc_calendar_year_v1"
 

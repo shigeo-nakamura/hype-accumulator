@@ -47,11 +47,12 @@ ciphertext, host alias, or production filesystem path.
    ensure terminal enrollment accepts that existing binding without transitioning
    it again. Compute maximum notional `N`, upward-rounded worst-case fee `F`, and
    cash debit `C = N + F` from an independently fetched fee schedule. Race two
-   authorizations whose combined `C` exceeds admitted, reserve, yearly, or
-   cumulative cash room, or whose combined `N` exceeds daily notional room, and
-   verify one fails without a partial record. With global caps deliberately left
-   sufficient, race two authorizer instances using the same authenticated decision
-   and distinct CLOIDs;
+   authorizations whose combined `C` exceeds admitted-uncommitted cash after the
+   reserve, or whose combined `N` exceeds daily notional room, and verify one
+   fails without a partial tranche transition or record. Verify the winner moves
+   `C` to `committed` without changing either yearly or lifetime admission
+   allocation. With global caps deliberately left sufficient, race two authorizer
+   instances using the same authenticated decision and distinct CLOIDs;
    exactly one may reserve the decision's `Q` and `N` and create an active record.
    Reconcile a partial fill and verify a new-CLOID reissue can reserve only the
    remaining `Q_D` and `N_D`. An ambiguous predecessor, changed daily-decision ID,
@@ -75,9 +76,10 @@ ciphertext, host alias, or production filesystem path.
    horizon and prove the venue rejects it without a fill. Confirm GTC, ALO, and
    every resting TIF fail live validation and only the exact IOC-plus-expiry
    envelope can be claimed. Carry an ambiguous IOC claim across daily and yearly
-   boundaries and verify its `C` and `N` reservations reduce each appropriate
-   new-period ledger until terminal settlement; an impossible fill at or beyond
-   effective expiry must remain charged, halt live action, and be
+   boundaries and verify `N` reduces each later daily ledger until terminal
+   settlement while `C` remains committed in its originating admitted slices
+   without charging the new year's admission room; an impossible fill at or
+   beyond effective expiry must remain charged, halt live action, and be
    automatic-staking ineligible.
 8. Prove the automatic-staking boundary is absent, not merely guarded at runtime.
    Build and deployment artifacts must contain no staking signer process,
@@ -114,10 +116,15 @@ ciphertext, host alias, or production filesystem path.
    Verify the sweep threshold plus worst-case headroom does not exceed the hard
    maximum, and verify the acknowledged evidence SHA-256 and private change-record
    reference before enabling live mode.
-11. At the exact `utc_calendar_year_v1` and lifetime cumulative capital
-    boundaries, verify that neither direct admission nor a separately recorded
-    operator admission permits another purchase. Only the half-open UTC boundary
-    may restore yearly room; exceeding either acknowledged ceiling requires a
+11. At the exact `utc_calendar_year_v1` and lifetime admission-allocation
+    boundaries, race direct and separately recorded operator admissions and
+    verify the exact admitted amount moves once from `confirmed_unallocated` to
+    `uncommitted` while both counters increment once. No admission may exceed
+    either ceiling. The half-open UTC year boundary opens only fresh yearly
+    admission room; it does not reset lifetime room. Existing admitted slices may
+    later move to `committed` without consuming that fresh room, and release,
+    settlement, rebate, withdrawal, transfer, replay, restart, or restore must
+    never restore either counter. Exceeding an acknowledged ceiling requires a
     newly acknowledged policy.
 12. Keep book and account feeds fresh while supplying a missing, malformed, future,
     exactly-at-limit, and expired decision-signal timestamp. Confirm every case
