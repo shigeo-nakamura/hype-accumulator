@@ -40,8 +40,14 @@ ciphertext, host alias, or production filesystem path.
    or quantity, reused/unknown CLOID, expired or late authorization, and residual
    reissue lacking a new authorization; none may be backfilled after restart or
    restore. Drop the submission response after the authorization claim and verify
-   it remains `submission_claimed` until authoritative CLOID reconciliation, never
-   returning to a reusable state.
+   it remains `submission_claimed` until authoritative CLOID reconciliation. When
+   the order first appears, verify exactly one transition to `order_bound` and
+   ensure terminal enrollment accepts that existing binding without transitioning
+   it again. Race two authorizations whose combined worst-case notional exceeds
+   each applicable room ledger and verify one fails without a partial record.
+   At claim, test every input freshness horizon and the exact effective-expiry
+   boundary; neither an expired `authorized` record nor an ambiguous claimed record
+   may return to a reusable state.
 8. Fault-test the signer around claim, signature, and result persistence. A
    consumed or ambiguous `(account, workflow ID, action phase)` must remain
    blocked across caller retry, restart, restore, and a retry with a new nonce.

@@ -74,21 +74,38 @@ account and strategy inputs, and either recomputes the deterministic approved
 decision or verifies an authenticated approval artifact issued outside the trading
 service. It checks admitted capital, reserve, daily/yearly/cumulative room, signal
 freshness, slippage, and hot-exposure enforcement against its own immutable policy
-anchor, then durably commits a one-time pre-purchase authorization containing:
+anchor. One durable atomic transaction both reserves the order's worst-case
+notional against its admitted-capital tranche and every daily, yearly, cumulative,
+and hot-exposure limit and commits the one-time pre-purchase authorization. If the
+complete reservation is unavailable, neither a partial reservation nor a record is
+created. Concurrent authorization requests serialize on the same limit ledger.
+The record contains:
 
 - an authorization ID and canonical daily-decision ID and digest;
 - the actual execution account, policy version, market, buy side, TIF, exact
   client order ID (CLOID), quantity, and limit price;
-- the maximum notional and slippage plus the remaining approved limits; and
-- issue/expiry times and the authorizer's authenticated record digest.
+- the maximum notional and slippage, the amount reserved in each named ledger,
+  and checked room before and after reservation; and
+- issue time and an effective expiry no later than the earliest deadline for the
+  policy acknowledgement, decision, signal, book, or account data, plus the
+  authorizer's authenticated record digest.
 
 The record is committed before the API wallet signs or submits the byte-identical
 order envelope. The executor must atomically move exactly one record from
-`authorized` to `submission_claimed` with that envelope digest before signing; a
-failed claim forbids submission. A transport-ambiguous submission stays claimed
-until authoritative CLOID reconciliation and is never released or retried blindly.
-The reconciler moves a matched claim to `order_bound` or a conclusively absent,
-expired claim to a terminal unused state; no terminal authorization is reusable.
+`authorized` to `submission_claimed` with that envelope digest before signing. The
+same transaction uses a trusted clock to require `now < effective expiry` and
+rechecks that the effective expiry does not exceed any bound input's freshness
+horizon; the equality boundary, a future/missing input timestamp, or a failed
+claim forbids submission. An expired record still in `authorized` moves atomically
+to a terminal unused state and releases its reservation. A transport-ambiguous
+submission stays claimed until authoritative CLOID reconciliation and never
+releases room or retries blindly.
+
+As soon as an exact CLOID query finds the order, even before it is terminal, the
+reconciler atomically binds the stable venue order ID and moves
+`submission_claimed` to `order_bound`. Later polls validate that immutable binding
+without repeating the transition. A conclusively absent claim moves to a terminal
+unused state and releases its reservation; no terminal authorization is reusable.
 This is not an exchange action and grants no generic master-signer capability. A
 retry or residual reissue requires a new CLOID and authorization after authoritative
 reconciliation of its predecessor. That reconciliation atomically charges the
@@ -100,20 +117,20 @@ An independent signer-side reconciler, not the intent caller, advances a durable
 monotonic cursor over authoritative fills. When a purchase workflow becomes
 terminal and its canonical order/fill set is final, and before it can become
 staking-eligible, the reconciler requires a distinct signer-side
-`submission_claimed` authorization for every order in the set. Every account,
+`order_bound` authorization for every order in the set. Every account,
 decision, CLOID, canonical order envelope, limit, and expiry must match exactly,
 and all authorizations must belong to the same decision chain. It atomically binds
-each resulting stable venue order ID to its authorization, transitions the claim
-to `order_bound`, and records the sorted authorization, order, and fill IDs, every
-exact purchased quantity and their checked total, policy version, and a canonical
-content-addressed workflow ID derived from the complete authorization and fill
-evidence. Every fill must be
+the terminal fill evidence to each existing immutable order binding and records
+the sorted authorization, order, and fill IDs, every exact purchased quantity and
+their checked total, policy version, and a canonical content-addressed workflow ID
+derived from the complete authorization and fill evidence. Every fill must be
 registered within a configured deadline after its first authoritative observation.
-A cursor gap, late or absent authorization, mismatched order or fill, expired
-authorization at submission, historical fill first presented after the deadline,
-or fill absent from this purchase-time ledger makes the entire workflow permanently
-ineligible for automatic staking and sends it to manual review; neither the
-reconciler nor staking request path can backfill or override that state.
+A cursor gap, late or absent authorization, mismatched order or fill, a claim
+recorded at or after effective expiry or beyond an input freshness horizon, a
+historical fill first presented after the deadline, or a fill absent from this
+purchase-time ledger makes the entire workflow permanently ineligible for
+automatic staking and sends it to manual review; neither the reconciler nor
+staking request path can backfill or override that state.
 Automatic staking is full-fill-set only: the intent amount must equal the sum of
 the exact registered quantities for its mapped authoritative fills. The signer
 does not create sub-lots, accept a partial amount, or split one workflow across
@@ -269,9 +286,11 @@ All gates are conjunctive and fail closed:
    post-purchase hot-exposure room. A service-side threshold alone cannot satisfy
    the final condition. Before order submission, the signer-side authorizer must
    durably bind the independently verified decision, exact CLOID and canonical
-   order envelope, policy version, expiry, and remaining limits. No matching
-   authorization means no service order; any bypass fill is permanently ineligible
-   for automatic staking.
+   order envelope, policy version, effective expiry, and remaining limits while
+   atomically reserving the worst-case notional against every applicable room
+   ledger. The executor must reject a claim at or beyond that expiry or beyond any
+   input freshness horizon. No matching authorization means no service order; any
+   bypass fill is permanently ineligible for automatic staking.
 8. A staking deposit requires reconciled newly purchased HYPE in `eligible_spot`
    and a configured residual buffer. When no validator is eligible it is permitted
    only by the separately approved `hold_undelegated_in_staking` policy; the
@@ -399,6 +418,12 @@ Before production secrets or funds are present, attach evidence for:
   residual reissue without a new authorization remain permanently ineligible for
   automatic staking across retry and restore; fault injection must cover the
   `authorized`, `submission_claimed`, and `order_bound` transitions;
+- concurrent-authorization tests proving worst-case notional is atomically reserved
+  against admitted, daily, yearly, cumulative, and hot-exposure room and released
+  only for conclusively unfilled or never-submitted terminal records;
+- authorization-expiry tests proving effective expiry is capped by every input
+  freshness horizon and the claim rejects the exact boundary, stale inputs, and
+  post-expiry execution;
 - acknowledgement tests proving a changed, missing, malformed, or differently
   normalized parent-account value invalidates the effective-policy digest;
 - the user's explicit choice of custody option, host, validator, limits, and
