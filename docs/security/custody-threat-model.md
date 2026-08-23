@@ -50,10 +50,13 @@ document does not grant it.
 The effective-policy digest binds the enforcement mode, hard maximum, sweep
 threshold, worst-case outage headroom, lowercase SHA-256 evidence digest, opaque
 approved change-record reference, and the canonical daily/yearly limit-period
-schemes. A bounded live mode requires positive finite values,
+schemes. It also binds the aggregate purchase-fee ceiling and mandatory
+venue-enforced signed-request-expiry mode. A bounded live mode requires positive
+finite values,
 `sweep threshold + headroom <= hard maximum`, and non-empty valid evidence fields;
-`unapproved`, unknown modes or period schemes, malformed hashes, and inconsistent
-combinations fail closed. Changing any field invalidates the acknowledgement.
+`unapproved`, unknown modes or period schemes, a disabled signed expiry, malformed
+hashes, and inconsistent combinations fail closed. Changing any field invalidates
+the acknowledgement.
 
 `cDeposit` and `tokenDelegate` use the user-signed EIP-712 scheme, while spot
 orders use the L1 action scheme. The production design therefore treats staking
@@ -74,28 +77,57 @@ authorizer authenticates the caller, independently obtains the authoritative
 account and strategy inputs, and either recomputes the deterministic approved
 decision or verifies an authenticated approval artifact issued outside the trading
 service. It checks admitted capital, reserve, daily/yearly/cumulative room, signal
-freshness, slippage, and hot-exposure enforcement against its own immutable policy
-anchor. One durable atomic transaction against a single strongly consistent
-ledger, using that ledger's authoritative UTC database clock, both reserves the
-order's worst-case notional against its admitted-capital tranche and every daily,
-yearly, cumulative, and hot-exposure limit and commits the one-time pre-purchase
-authorization. If the complete reservation is unavailable, neither a partial
-reservation nor a record is created. Concurrent authorizer instances serialize on
-the same limit-ledger rows; a process-local clock or ledger snapshot cannot
-authorize a purchase.
+freshness, the authoritative fee schedule, slippage, and hot-exposure enforcement
+against its own immutable policy anchor. In checked integer microunits, it computes
+maximum purchase notional
+`N = ceil(limit price * quantity in micro-USDC)`, maximum fee
+`F = ceil(N * max_purchase_fee_bps / 10000)`, and maximum total cash debit
+`C = N + F`. The configured fee ceiling must be an independently verified upper
+bound for every venue tier or schedule change possible through effective expiry,
+plus any builder, referral, or other proportional execution fee in the exact order
+envelope. A current schedule below that bound does not lower `F`. If no such hard
+upper bound is available, live purchase is rejected. Unknown, stale,
+non-proportional, differently denominated, or above-ceiling fees reject the
+purchase; arithmetic overflow or unrepresentable rounding also fails closed.
+
+One durable atomic transaction against a single strongly consistent ledger, using
+that ledger's authoritative UTC database clock, reserves `C` against the admitted
+tranche while preserving the configured cash reserve and against yearly and
+cumulative deployable-capital room. It separately reserves `N` against daily
+purchase-notional room and uses the appropriate full-asset exposure for the hot
+limit. The transaction then commits the one-time pre-purchase authorization. If
+every complete reservation is unavailable, neither a partial reservation nor a
+record is created. Concurrent authorizer instances serialize on the same
+limit-ledger rows; a process-local clock or ledger snapshot cannot authorize a
+purchase.
 The record contains:
 
 - an authorization ID and canonical daily-decision ID and digest;
 - the actual execution account, policy version, market, buy side, mandatory IOC
-  TIF, exact client order ID (CLOID), quantity, and limit price;
-- the maximum notional and slippage, the amount reserved in each named ledger,
-  canonical daily/yearly period IDs and exact half-open UTC boundaries, checked
-  room before and after reservation, and any exact HYPE quantity reserved to fill
-  the current `residual_hype_wei` deficit before staking eligibility is
-  constructed; and
-- issue time and an effective expiry no later than the earliest deadline for the
-  policy acknowledgement, decision, signal, book, or account data, plus the
-  authorizer's authenticated record digest.
+  TIF, exact client order ID (CLOID), quantity, limit price, and L1 nonce;
+- `N`, the independently checked fee schedule and maximum fee `F`, maximum total
+  cash debit `C`, maximum slippage, the amount reserved in each named cash,
+  notional, and exposure ledger, canonical daily/yearly period IDs and exact
+  half-open UTC boundaries, checked room before and after reservation, and any
+  exact HYPE quantity reserved to fill the current `residual_hype_wei` deficit
+  before staking eligibility is constructed; and
+- issue time, integer `effective_expiry_ms` no later than the earliest deadline for
+  the policy acknowledgement, decision, signal, book, account, or fee-schedule
+  data, exact `expiresAfter_ms = effective_expiry_ms - 1`, and the authorizer's
+  authenticated record digest.
+
+Live order placement requires Hyperliquid's venue-enforced `expiresAfter` field.
+The checked subtraction above must produce a positive representable integer
+millisecond. The authorizer binds that exact value into both its record and the
+canonical unsigned exchange-request-template digest. The executor passes the same
+value into the L1 action hash before signing and sends the byte-identical `action`,
+nonce, `vaultAddress`, `expiresAfter`, and signature payload. An omitted, changed,
+recomputed, or unsupported expiry fails envelope validation or signature
+verification. Because the venue rejects the request after `expiresAfter_ms`,
+choosing one millisecond before `effective_expiry_ms` prevents acceptance at or
+beyond the authorization horizon even if a valid signed request is delayed or
+withheld in transit. Local pre-submit checks remain defense in depth, not the
+expiry enforcement boundary.
 
 The only live period schemes are `utc_calendar_day_v1` and
 `utc_calendar_year_v1`. For a non-negative UTC POSIX second `t` obtained inside
@@ -112,28 +144,31 @@ serializable reservation transaction. A conflicting boundary, overlapping or
 duplicate row, unsupported timestamp, or restore/replay mismatch fails closed.
 The same schemes assign authoritative fill timestamps to execution periods.
 
-The record is committed before the API wallet signs or submits the byte-identical
-order envelope. The executor must atomically move exactly one record from
-`authorized` to `submission_claimed` with that envelope digest before signing. The
-same transaction uses the ledger's authoritative UTC clock to require
-`now < effective expiry` and rechecks that the effective expiry does not exceed any
-bound input's freshness horizon; the equality boundary, a future/missing input
-timestamp, or a failed claim forbids submission. An expired record still in
-`authorized` moves atomically to a terminal unused state and releases its
-reservation. A transport-ambiguous submission stays claimed until authoritative
-CLOID reconciliation and never releases room or retries blindly.
+The record is committed before the API wallet signs the canonical unsigned
+exchange-request template. The executor must atomically move exactly one record
+from `authorized` to `submission_claimed` with that template digest before
+signing. It may append only the resulting signature before submitting the exact
+payload. The same transaction uses the ledger's authoritative UTC clock to require
+`now_ms < effective_expiry_ms`, rechecks that the effective expiry does not exceed
+any bound input's freshness horizon, and validates the exact signed
+`expiresAfter_ms`. The equality boundary, a future/missing input timestamp, or a
+failed claim forbids submission. An expired record still in `authorized` moves
+atomically to a terminal unused state and releases its reservation. A
+transport-ambiguous submission stays claimed until authoritative CLOID
+reconciliation and never releases room or retries blindly.
 
-The approved live policy authorizes IOC only: the venue immediately cancels every
-unfilled remainder, so the order cannot rest across the authorization horizon.
-GTC, ALO, and any other resting TIF fail configuration and envelope validation
-because this venue path provides no approved per-order expiry at that horizon. A
-process-local cancel timer is not credited as containment. Adding a resting order
-requires a separate design with a venue-enforced expiry no later than the
-authorization horizon, mandatory authoritative cancellation, and explicit
-approval. Reconciliation also rejects any fill whose authoritative execution
-timestamp is at or beyond the authorization's effective expiry; the purchase
-remains visible and charged to capital but is permanently ineligible for automatic
-staking.
+The approved live policy authorizes IOC plus the signed request expiry only: the
+venue rejects late acceptance and immediately cancels every unfilled remainder of
+an accepted request, so the order cannot be accepted or rest across the
+authorization horizon. GTC, ALO, and any other resting TIF fail configuration and
+envelope validation because this venue path provides no approved per-order expiry
+at that horizon. A process-local cancel timer is not credited as containment.
+Adding a resting order requires a separate design with a venue-enforced expiry no
+later than the authorization horizon, mandatory authoritative cancellation, and
+explicit approval. Any authoritative fill timestamped at or beyond effective
+expiry proves a bypass, mismatch, or venue invariant failure: the purchase remains
+visible and charged to capital but is permanently ineligible for automatic
+staking and triggers halt/manual review.
 
 As soon as an exact CLOID query finds the order, even before it is terminal, the
 reconciler atomically binds the stable venue order ID and moves
@@ -142,10 +177,13 @@ without repeating the transition. A conclusively absent claim moves to a termina
 unused state and releases its reservation; no terminal authorization is reusable.
 This is not an exchange action and grants no generic master-signer capability. A
 retry or residual reissue requires a new CLOID and authorization after authoritative
-reconciliation of its predecessor. That reconciliation atomically charges the
-filled amount, releases only conclusively unfilled reserved room, and debits any
-reissue from the remaining decision and policy room. A caller-supplied decision,
-authorization record, or policy snapshot is correlation data only.
+reconciliation of its predecessor. That reconciliation atomically charges actual
+executed notional to the notional ledger and actual consideration plus every
+authoritative fee to the cash ledgers. It releases only conclusively unfilled
+notional and unused fee headroom from `C`; ambiguous fee or fill state retains the
+full reservation. Any reissue is debited from the remaining decision and policy
+room. A caller-supplied decision, authorization record, or policy snapshot is
+correlation data only.
 
 An unresolved `submission_claimed` or `order_bound` reservation never disappears
 at a daily or yearly boundary. It remains charged to its recorded originating
@@ -154,9 +192,10 @@ each canonical period row opened by a later reservation transaction until termin
 reconciliation. There is no independent process-local rollover job.
 Admitted-capital, cumulative, and hot-exposure reservations remain continuously
 charged. Terminal reconciliation atomically charges the actual fill to the
-canonical execution-period IDs derived from its authoritative timestamp, releases
-only the proven unfilled remainder and mirrored encumbrances, and preserves a
-conserved audit trail; a boundary alone cannot make room reusable.
+canonical execution-period IDs derived from its authoritative timestamp, records
+actual notional separately from actual cash debit including fees, releases only
+the proven unfilled remainder, unused fee headroom, and mirrored encumbrances, and
+preserves a conserved audit trail; a boundary alone cannot make room reusable.
 
 An independent signer-side reconciler, not the intent caller, advances a durable
 monotonic cursor over authoritative fills. When a purchase workflow becomes
@@ -350,25 +389,36 @@ All gates are conjunctive and fail closed:
    newly acknowledged policy raises the ceiling; capital beyond the lifetime
    cumulative room requires such a newly acknowledged policy. Operator admission
    alone never overrides either ceiling.
-6. Committed plus spent USDC cannot exceed admitted deposits minus reconciled
-   withdrawals and reserves.
+6. Committed maximum cash debit `C` plus spent order consideration and
+   authoritative fees cannot exceed admitted deposits minus reconciled withdrawals
+   and the configured reserve. The separate daily purchase-notional ledger excludes
+   fees by definition; no cash-capital, yearly, or cumulative deployable ledger
+   does. Fee rebates are reconciliation events and never pre-credit authorization
+   room.
 7. A purchase requires fresh book/account data and a trusted decision-signal
    generation timestamp whose non-negative age is strictly less than the positive
    configured `signal_stale_after_seconds`. A missing, malformed, future, or
    expired signal timestamp rejects the purchase even when book and account data
-   remain fresh. It also requires no unknown movement, no balance mismatch, no
-   halt, available daily purchase-notional room, available yearly and cumulative
-   deployable-capital room, available slippage room, and independently enforced
-   post-purchase hot-exposure room. A service-side threshold alone cannot satisfy
-   the final condition. Before order submission, the signer-side authorizer must
-   durably bind the independently verified decision, exact CLOID and canonical
-   order envelope, policy version, effective expiry, and remaining limits while
-   atomically reserving the worst-case notional against every applicable room
-   ledger. The executor must reject a claim at or beyond that expiry or beyond any
-   input freshness horizon. Only IOC is authorized; every resting TIF is rejected.
-   No matching authorization means no service order; any bypass or post-expiry fill
-   is permanently ineligible for automatic staking. Unresolved reservations carry
-   into and reduce new daily/yearly room until terminal settlement.
+   remain fresh. Independently obtained fee-schedule data must likewise have a
+   non-negative age strictly below the positive
+   `fee_schedule_stale_after_seconds`; missing, malformed, future, or age-at-limit
+   data rejects the purchase. It also requires no unknown movement, no balance
+   mismatch, no halt, available daily purchase-notional room, available yearly and
+   cumulative deployable-capital room, available slippage room, and independently
+   enforced post-purchase hot-exposure room. A service-side threshold alone cannot
+   satisfy the final condition. Before order submission, the signer-side
+   authorizer must durably bind the independently verified decision, exact CLOID
+   and canonical unsigned request template, policy version, fee ceiling, effective
+   expiry, exact signed
+   `expiresAfter`, and remaining limits while atomically reserving `C` against
+   admitted, reserve, yearly, and cumulative cash room and `N` against daily
+   purchase-notional room. The executor must reject a claim at or beyond that
+   expiry or beyond any input freshness horizon. Only IOC with the venue-enforced
+   signed request expiry is authorized; every resting TIF, omitted or altered
+   expiry, and delayed venue acceptance is rejected. No matching authorization
+   means no service order; any bypass or impossible post-expiry fill is permanently
+   ineligible for automatic staking and halts live action. Unresolved reservations
+   carry into and reduce new daily/yearly room until terminal settlement.
 8. A staking deposit requires reconciled newly purchased HYPE in `eligible_spot`
    after the authorizer-reserved residual deficit has been carved out into
    `residual_spot`. On an initially empty account, serial terminal purchases must
@@ -398,16 +448,21 @@ All gates are conjunctive and fail closed:
     procedure without re-enabling exposure. All other recovery actions require
     that separate procedure; runtime configuration has no general halt bypass.
 
-Limits are positive, finite integer minor units. Zero means disabled, never
-unlimited. Production configuration must set all of these explicitly:
+Cash and quantity limits are positive, finite integer minor units. Basis-point
+fields are non-negative bounded integers, and duration fields are positive bounded
+integers. Zero disables a capability or limit and never means unlimited;
+`max_purchase_fee_bps = 0` is a strict zero-fee ceiling and permits live purchase
+only when authoritative inputs independently prove no fee. Production
+configuration must set all of these explicitly:
 
 - maximum automatically admitted deposit;
 - maximum daily purchase notional;
 - maximum yearly and cumulative deployable capital;
 - exact `utc_calendar_day_v1` and `utc_calendar_year_v1` limit-period schemes;
 - maximum order slippage;
+- aggregate maximum purchase-fee rate and mandatory venue-enforced signed expiry;
 - minimum reserve and residual HYPE buffer;
-- market/book, account-history, and signal staleness limits;
+- market/book, account-history, fee-schedule, and signal staleness limits;
 - purchase-fill registration deadline plus deterministic lot allocation and
   expiration policy;
 - externally enforced hot-balance mode, limit, sweep threshold, and worst-case
@@ -425,7 +480,8 @@ unlimited. Production configuration must set all of these explicitly:
 | Leaked API key | full trading authority assumed; dedicated execution account with no unrelated funds; no loss-cap credit without external enforcement proof; one named agent per process and no address reuse | alert on unknown signer/order or operational threshold breach; halt, cancel, revoke, reconcile, and generate a new address |
 | Replay or nonce pruning | durable atomic nonce, unique signer per process, bounded expiry where supported, purchase-time one-fill-to-workflow mapping, lot consumption, signer-side one-time workflow/action-phase claims, never reuse deregistered/expired agent | reconcile by CLOID/history; block ambiguous lot and phase claims; rotate signer; never resend an unknown action blindly |
 | Unauthorized API-wallet order | signer-side durable pre-purchase decision and CLOID authorization before execution; exact order-envelope binding | unmatched or mismatched fills remain permanently ineligible for automatic staking; halt and reconcile the trading-account compromise |
-| Stale resting order | IOC-only live policy; GTC/ALO rejected; no process-local expiry credit | post-expiry fills are charged but ineligible for automatic staking; unresolved reservations encumber new ledger periods until terminal |
+| Delayed or stale order | signed `expiresAfter = effective_expiry_ms - 1` plus IOC-only live policy; GTC/ALO and missing/changed expiry rejected; no process-local expiry credit | venue rejects delayed acceptance; any impossible post-expiry fill halts live action, remains charged, and is ineligible for automatic staking |
+| Fee under-reservation | checked `C = N + ceil(N * aggregate fee bps / 10000)` reserves admitted, reserve, yearly, and cumulative cash room while daily notional separately reserves `N` | authoritative fee reconciliation retains full reservation while ambiguous and halts on an unknown, stale, differently denominated, or above-ceiling fee |
 | Malicious validator selection | exact-address allowlist, no yield-based auto-switch, active/not-jailed/not-undelegate-only checks | stop new delegation and require allowlist-owner review |
 | Dependency compromise | lockfile, checksums, minimal signing interface, CI audit/review gate | artifact provenance and rollback; rotate signer if signing material may have been exposed |
 | State rollback/truncation | hash-chained append-only ledger, atomic snapshot, versioned off-host backup | replay and checksum verification; fail closed on divergence |
@@ -512,9 +568,15 @@ Before production secrets or funds are present, attach evidence for:
   residual reissue without a new authorization remain permanently ineligible for
   automatic staking across retry and restore; fault injection must cover the
   `authorized`, `submission_claimed`, and `order_bound` transitions;
-- concurrent-authorization tests proving worst-case notional is atomically reserved
-  against admitted, daily, yearly, cumulative, and hot-exposure room and released
-  only for conclusively unfilled or never-submitted terminal records;
+- concurrent-authorization tests proving `C` is atomically reserved against
+  admitted, reserve, yearly, and cumulative cash room while `N` is separately
+  reserved against daily notional and appropriate exposure is reserved against the
+  hot limit; release occurs only for conclusively unfilled or never-submitted
+  terminal records with authoritative fee reconciliation;
+- fee-boundary tests covering ceiling equality, one microunit below cash room,
+  upward rounding, partial fills, fee rebates, stale or above-ceiling schedules,
+  builder/referral fees, overflow, unknown fixed or non-USDC fees, and ambiguous
+  fee responses without treating fees as purchase notional or admitted capital;
 - canonical-period tests running multiple authorizers under different host
   timezones across one second before, exactly at, and one second after UTC day and
   Gregorian-year boundaries; all instances and clean-directory restores must
@@ -522,11 +584,15 @@ Before production secrets or funds are present, attach evidence for:
   spend and unresolved encumbrances, and reject host-clock, overlap, duplicate,
   unsupported-schema, and boundary-tampering cases;
 - authorization-expiry tests proving effective expiry is capped by every input
-  freshness horizon and the claim rejects the exact boundary, stale inputs, and
-  post-expiry execution;
+  freshness horizon, `expiresAfter_ms` is exactly one millisecond earlier and
+  included in the L1 action hash and canonical unsigned request-template digest,
+  and the claim rejects the exact boundary, stale inputs, and omitted or changed
+  expiry; delay a valid signed payload beyond the horizon and prove venue rejection
+  with no fill;
 - TIF and rollover tests proving GTC/ALO/resting envelopes are rejected, IOC fills
-  at or beyond effective expiry are ineligible, and ambiguous reservations reduce
-  each new daily/yearly period until terminal settlement without double release;
+  cannot be accepted at or beyond effective expiry, and ambiguous reservations
+  reduce each new daily/yearly period until terminal settlement without double
+  release;
 - acknowledgement tests proving a changed, missing, malformed, or differently
   normalized parent-account value invalidates the effective-policy digest;
 - the user's explicit choice of custody option, host, validator, limits, and

@@ -34,17 +34,25 @@ ciphertext, host alias, or production filesystem path.
    rejects staking when the separate signer is unavailable.
 7. Before order submission, verify the signer-side authorizer independently
    validates the decision and policy inputs and durably binds the exact account,
-   decision, CLOID, order envelope, limits, and expiry. Submit an unauthorized
-   order with non-production material and confirm its fills remain permanently
-   ineligible for automatic staking. Repeat with a forged decision, changed price
-   or quantity, reused/unknown CLOID, expired or late authorization, and residual
-   reissue lacking a new authorization; none may be backfilled after restart or
-   restore. Drop the submission response after the authorization claim and verify
-   it remains `submission_claimed` until authoritative CLOID reconciliation. When
+   decision, CLOID, unsigned request template, L1 nonce, signed `expiresAfter`,
+   fee ceiling, `N`/`F`/`C` values, ledger limits, and expiry. Submit an
+   unauthorized order with non-production material and confirm its fills remain
+   permanently ineligible for automatic staking. Repeat with a forged decision,
+   changed price or quantity, reused/unknown CLOID, expired or late authorization,
+   and residual reissue lacking a new authorization; none may be backfilled after
+   restart or restore. Drop the submission response after the authorization claim
+   and verify it remains `submission_claimed` until authoritative CLOID
+   reconciliation. When
    the order first appears, verify exactly one transition to `order_bound` and
    ensure terminal enrollment accepts that existing binding without transitioning
-   it again. Race two authorizations whose combined worst-case notional exceeds
-   each applicable room ledger and verify one fails without a partial record.
+   it again. Compute maximum notional `N`, upward-rounded worst-case fee `F`, and
+   cash debit `C = N + F` from an independently fetched fee schedule. Race two
+   authorizations whose combined `C` exceeds admitted, reserve, yearly, or
+   cumulative cash room, or whose combined `N` exceeds daily notional room, and
+   verify one fails without a partial record. Repeat at exact and one-microunit
+   fee/cash boundaries, with partial fills, builder fees, rebates, overflow, stale
+   or above-ceiling schedules, unknown fixed/non-USDC fees, and an ambiguous fee
+   response; cash room must retain `C` while daily notional retains only `N`.
    Run authorizer instances under different host timezones at one second before,
    exactly at, and one second after UTC day and Gregorian-year boundaries. Verify
    they use the shared ledger clock, derive identical half-open bounds and durable
@@ -53,11 +61,17 @@ ciphertext, host alias, or production filesystem path.
    overlap, or altered boundary without restoring room.
    At claim, test every input freshness horizon and the exact effective-expiry
    boundary; neither an expired `authorized` record nor an ambiguous claimed record
-   may return to a reusable state. Confirm GTC, ALO, and every resting TIF fail
-   live validation and only the exact IOC envelope can be claimed. Carry an
-   ambiguous IOC claim across daily and yearly boundaries and verify its worst-case
-   reservation reduces each new period until terminal settlement; a fill at or
-   beyond effective expiry must remain charged but automatic-staking ineligible.
+   may return to a reusable state. Verify the exact
+   `expiresAfter_ms = effective_expiry_ms - 1` is in the authorization, canonical
+   unsigned request-template digest, L1 action hash, and submitted payload.
+   Omission or alteration must fail; hold a valid signed IOC request until the
+   horizon and prove the venue rejects it without a fill. Confirm GTC, ALO, and
+   every resting TIF fail live validation and only the exact IOC-plus-expiry
+   envelope can be claimed. Carry an ambiguous IOC claim across daily and yearly
+   boundaries and verify its `C` and `N` reservations reduce each appropriate
+   new-period ledger until terminal settlement; an impossible fill at or beyond
+   effective expiry must remain charged, halt live action, and be
+   automatic-staking ineligible.
 8. Fault-test the signer around claim, signature, and result persistence. A
    consumed or ambiguous `(account, workflow ID, action phase)` must remain
    blocked across caller retry, restart, restore, and a retry with a new nonce.

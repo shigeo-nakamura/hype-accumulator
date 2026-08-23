@@ -46,12 +46,21 @@ admitted_parent_account_env = ""
 
 [execution]
 max_slippage_bps = 0
+# Aggregate venue, builder, and other proportional purchase-fee ceiling. Zero
+# permits live purchase only when independently verified authoritative fees are 0.
+max_purchase_fee_bps = 0
 # Only IOC is approved. GTC, ALO, and unknown/resting values fail live validation.
 authorized_order_tif = "ioc"
+# Live mode rejects false. The exact Hyperliquid expiresAfter millisecond is part
+# of the signed request hash and is one millisecond before effective expiry.
+require_signed_request_expiry = true
 book_stale_after_seconds = 0
 account_history_stale_after_seconds = 0
+# Required positive in live mode; missing, future, or age-at-limit fee data fails.
+fee_schedule_stale_after_seconds = 0
 # Live mode rejects false. The independent signer-side authorizer must commit the
-# exact decision, CLOID, order envelope, limits, and expiry before submission.
+# exact decision, CLOID, unsigned request including nonce/expiresAfter, fee-capped
+# cash debit, ledger limits, and expiry before submission.
 require_prepurchase_authorization = true
 # Required positive in live mode. Signal age must be non-negative and strictly
 # below this threshold; a missing, malformed, or future timestamp fails closed.
