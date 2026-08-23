@@ -132,6 +132,45 @@ fn blank_live_validator_is_rejected() {
 }
 
 #[test]
+fn automatic_cap_is_cumulative_not_reusable() {
+    let mut snapshot = CapitalSnapshot {
+        observed_spot_usdc: 500.0,
+        confirmed_deposits_usdc: 500.0,
+        admitted_deposits_usdc: 500.0,
+        deployed_this_year_usdc: 0.0,
+        deployed_cumulative_usdc: 0.0,
+    };
+    let limits = fixture().capital;
+    let initial = automatically_deployable(&snapshot, &limits);
+    assert!((initial - 100.0).abs() < f64::EPSILON);
+
+    snapshot.observed_spot_usdc = 400.0;
+    snapshot.deployed_this_year_usdc = 100.0;
+    snapshot.deployed_cumulative_usdc = 100.0;
+    assert!(automatically_deployable(&snapshot, &limits).abs() < f64::EPSILON);
+}
+
+#[test]
+fn live_account_and_signing_env_names_must_differ() {
+    let mut config = fixture();
+    config.dry_run = false;
+    config.manual_halt = false;
+    config.live_approved = true;
+    config.validator_allowlist = vec!["validator-a".into()];
+    config.hyperliquid.account_env = "SHARED_IDENTITY".into();
+    config.hyperliquid.signing_key_env = "SHARED_IDENTITY".into();
+    let env = HashMap::from([(String::from("SHARED_IDENTITY"), String::from("present"))]);
+    let called = Rc::new(Cell::new(false));
+    let marker = Rc::clone(&called);
+    let result = bootstrap(&config, &env, move |_| {
+        marker.set(true);
+        Box::new(DryRunExchange::default())
+    });
+    assert!(matches!(result, Err(ConfigError::Invalid(_))));
+    assert!(!called.get());
+}
+
+#[test]
 fn dry_run_exchange_only_simulates() {
     let mut exchange = DryRunExchange::default();
     let intent = OrderIntent {

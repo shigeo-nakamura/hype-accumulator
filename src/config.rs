@@ -171,6 +171,11 @@ impl Config {
                 "explicit live approval is absent".into(),
             ));
         }
+        if self.hyperliquid.account_env.trim() == self.hyperliquid.signing_key_env.trim() {
+            return Err(ConfigError::Invalid(
+                "account and signing key must use distinct environment variables".into(),
+            ));
+        }
         if self.validator_allowlist.is_empty()
             || self
                 .validator_allowlist
