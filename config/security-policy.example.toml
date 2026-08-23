@@ -1,0 +1,24 @@
+# Non-production shape only. Zero disables a capability; it never means unlimited.
+[capital]
+max_auto_deposit_microusd = 0
+max_daily_notional_microusd = 0
+max_yearly_deployable_microusd = 0
+max_cumulative_deployable_microusd = 0
+reserve_microusd = 0
+
+[execution]
+max_slippage_bps = 0
+book_stale_after_seconds = 0
+account_history_stale_after_seconds = 0
+
+[staking]
+enabled = false
+validator_allowlist = []
+residual_hype_wei = 0
+continue_after_manual_halt = false
+
+[operator]
+dry_run = true
+manual_halt = true
+live_acknowledgement = ""
+live_acknowledgement_expires_at = ""
