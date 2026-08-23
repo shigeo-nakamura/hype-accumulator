@@ -92,11 +92,21 @@ ciphertext, host alias, or production filesystem path.
    deadline in the signed staking action. Confirm purchase lots and residual
    amounts remain unsigned bookkeeping and HYPE remains in spot across restart
    and restore.
-9. Rehearse manual halt with a resting test order. Confirm new order and staking
-   signatures are already unavailable before the cancel-only path discovers and
-   cancels the exact open order. Drop the cancellation response and verify it
-   re-queries authoritative state before retrying; signer loss must alert and
-   escalate without clearing the halt.
+9. Rehearse the `running` to `halt_draining` to `halted` state machine. Race the
+   halt request against authorization and claim transactions; the cutoff must
+   reject every post-cutoff authorization, claim, and signature and terminalize
+   unclaimed `authorized` records atomically. Hold a valid signed request after it
+   reaches `submission_claimed` and confirm the service reports
+   `halt_draining`, never `halted`. Submit it just before `expiresAfter_ms`;
+   the cancel-only path must discover and bind it, cancel it if open, and reconcile
+   every fill. For a withheld request that never appears, require the ledger clock
+   to pass expiry plus a gap-free authoritative order/fill watermark later than
+   expiry. Only after every snapshotted claim is terminal and a fresh query shows
+   no open orders may the service report `halted`. Drop cancellation and query
+   responses, restart, restore, stale the history watermark, and remove the
+   cancel-only signer; every case must remain visibly `halt_draining`, re-query
+   when possible, alert, and escalate. Staking signatures remain unavailable in
+   every state.
 10. Prove the claimed hot-balance enforcement outside the API-wallet process.
    Include retained HYPE appreciation, partial fills, delayed custody movement,
    and enforcement outage. Treat `max_hot_trading_balance_microusd` only as an
@@ -116,10 +126,10 @@ ciphertext, host alias, or production filesystem path.
 
 ## Rotate
 
-1. Halt new decisions, cancel authoritatively discovered open orders through the
-   cancel-only path, and keep reconciliation active.
-2. Resolve all ambiguous orders and staking intents. Rotation is blocked while
-   an external action is not conclusively reconciled.
+1. Request manual halt and keep reconciliation/cancel-only containment active
+   until the service reaches `halted`; do not treat `halt_draining` as complete.
+2. Resolve all ambiguous orders and externally observed manual staking movements.
+   Rotation is blocked while an external action is not conclusively reconciled.
 3. Generate and approve a new named agent with a new address.
 4. Atomically switch the encrypted reference and nonce namespace.
 5. Complete read-only health checks, then deregister the old agent.
@@ -127,8 +137,8 @@ ciphertext, host alias, or production filesystem path.
 
 ## Revoke after suspected API-wallet compromise
 
-1. Engage manual halt and deny new exposure-increasing signing requests. Do not
-   use a suspected signer for the cancel-only path.
+1. Request manual halt; it may remain `halt_draining` while pre-cutoff claims
+   expire or reconcile. Do not use a suspected signer for the cancel-only path.
 2. From an independent device, deregister the agent. Do not register a new key
    at the same address.
 3. Query authoritative orders, fills, movements, staking state, and delegation
@@ -146,9 +156,10 @@ An exfiltrated master-wallet key cannot be revoked or rotated in place. API-wall
 deregistration does not contain it. Treat the funded master account as compromised
 and execute this procedure only from a clean, independent recovery environment:
 
-1. Engage manual halt and verify no runtime staking signer or master credential is
-   deployed. Revoke any accidentally present host, IAM, KMS, and network access;
-   do not use the suspected key or environment again.
+1. Request manual halt and keep its claim drain visible until `halted`. Verify no
+   runtime staking signer or master credential is deployed. Revoke any accidentally
+   present host, IAM, KMS, and network access; do not use the suspected key or
+   environment again.
 2. Establish a fresh master account under the approved offline recovery process.
    Record its policy and account identifiers in the private change record before
    moving value.

@@ -399,18 +399,40 @@ All gates are conjunctive and fail closed:
    operator acknowledgement permits `cDeposit` or `tokenDelegate`.
 9. An ambiguous exposure-creating action response moves the workflow to
    reconciliation or manual review; it never causes a blind retry.
-10. Engaging manual halt atomically denies new order placement, staking deposit,
-    delegation, and every other exposure-increasing signed action before
-    cancellation begins. Unsigned reconciliation and a mandatory cancel-only
-    execution path remain active. That path independently queries the configured
-    account and may sign only cancellations for exact, currently open order IDs
-    returned by the authoritative query; it cannot accept caller-supplied order
-    identities, place or amend an order, perform a staking or transfer action, or
-    clear the halt. After every cancellation response it re-queries before
-    retrying and continues until no open orders remain. An unavailable signer or
-    unresolved cancellation raises an alert and escalates to the offline recovery
-    procedure without re-enabling exposure. All other recovery actions require
-    that separate procedure; runtime configuration has no general halt bypass.
+10. A manual-halt request uses one serializable ledger transaction to move
+    `running` to `halt_draining`, record its cutoff, reject every subsequent
+    authorization, claim, or signature, and atomically move each unclaimed
+    `authorized` record to terminal unused while releasing all of its policy and
+    decision reservations and clearing its decision active slot. The same
+    transaction snapshots every `submission_claimed` and `order_bound` record with
+    its CLOID and signed `expiresAfter_ms`. A claim is treated as possibly signed
+    even if local persistence says otherwise. The service must not report `halted`
+    or assert that service-originated placement has stopped while any snapshot
+    record is unresolved.
+
+    Unsigned reconciliation and a mandatory cancel-only execution path remain
+    active in both `halt_draining` and `halted`. That path independently queries
+    the configured account and outstanding CLOIDs and may sign only cancellations
+    for exact, currently open order IDs returned by the authoritative query; it
+    cannot accept caller-supplied order identities, place or amend an order,
+    perform a staking or transfer action, or clear either halt state. A claimed
+    request not yet visible remains pending and is re-queried because it may
+    surface before its venue-enforced expiry. If it becomes visible, the
+    reconciler binds it, cancels it if open, and accounts for every fill before
+    marking it terminal.
+
+    Only after the ledger clock has passed a snapshotted `expiresAfter_ms` and
+    authoritative order/fill histories have a gap-free watermark later than that
+    expiry may a still-invisible CLOID be atomically marked conclusively absent and
+    terminal unused, release its policy and decision reservations, and clear its
+    decision active slot. It remains unresolved before that point. After every
+    claimed/bound record is terminal and a fresh account query returns no open
+    order, one transaction may move `halt_draining` to `halted`. A delayed request
+    discovered during that drain is handled before the transition. Lost responses
+    are re-queried; unavailable or stale histories, an unresolved claim, an open
+    order, or an unavailable cancel-only signer keeps the system visibly
+    `halt_draining`, raises an alert, and escalates to the offline recovery
+    procedure. Runtime configuration has no bypass.
 
 Cash and quantity limits are positive, finite integer minor units. Basis-point
 fields are non-negative bounded integers, and duration fields are positive bounded
@@ -432,7 +454,7 @@ configuration must set all of these explicitly:
 - mandatory `staking.enabled = false` with no runtime staking signer or client;
 - externally enforced hot-balance mode, limit, sweep threshold, and worst-case
   headroom evidence, or separately approved uncapped-authority acceptance;
-- mandatory cancel-only containment while halted;
+- mandatory cancel-only containment throughout `halt_draining` and `halted`;
 - execution-account kind and funding mode, parent-account identity, and whether
   traced transfer admission inheritance is enabled;
 - validator allowlist and live acknowledgement expiry.
@@ -454,7 +476,7 @@ configuration must set all of these explicitly:
 | State rollback/truncation | hash-chained append-only ledger, atomic snapshot, versioned off-host backup | replay and checksum verification; fail closed on divergence |
 | Deposit spoofing or dust | authoritative external movement IDs plus confirmation/admission policy | expose observed vs confirmed vs admitted totals separately; manual classification correction |
 | Capital-event misclassification | typed movement categories; transfers inherit only from a traced admitted parent residual and never increase system-wide admission | invariant checks against parent/child account histories, idempotent transfer IDs, and the conserved capital equation |
-| Operator error | schema validation, effective-policy digest acknowledgement, live gate, mandatory disabled-staking invariant, exact notional display | manual halt with authoritative cancel-only containment, immutable audit trail, rehearsed restore and key rotation |
+| Operator error | schema validation, effective-policy digest acknowledgement, live gate, mandatory disabled-staking invariant, exact notional display | `halt_draining` until all signed claims expire/reconcile and open orders cancel; immutable audit trail, rehearsed restore and key rotation |
 
 ## Validator governance
 
@@ -479,9 +501,13 @@ Before production secrets or funds are present, attach evidence for:
   testnet/replay;
 - a dry-run key install/rotate/revoke rehearsal using non-production material;
 - ledger restore and stale/ambiguous-response fault tests;
-- halt-transition tests proving new exposure is denied before exact authoritative
-  open-order cancellations begin, including lost-response re-query and
-  unavailable-signer escalation;
+- halt-transition tests proving the cutoff atomically blocks new
+  authorizations/claims/signatures but remains visibly `halt_draining` while a
+  pre-cutoff `submission_claimed` request is withheld. Inject its acceptance just
+  before `expiresAfter_ms` and prove discovery, binding, cancellation, and fill
+  reconciliation occur before `halted`; absent claims require a gap-free
+  post-expiry history watermark. Lost responses, stale history, restart, restore,
+  and unavailable signer must preserve draining state and escalation;
 - IAM and filesystem permission review;
 - proof of venue-enforced agent restrictions or dedicated-account balance
   isolation, including whether a hard venue bound or separately controlled

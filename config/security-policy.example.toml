@@ -66,8 +66,9 @@ require_prepurchase_authorization = true
 # Required positive in live mode. Signal age must be non-negative and strictly
 # below this threshold; a missing, malformed, or future timestamp fails closed.
 signal_stale_after_seconds = 0
-# Required in live mode. While halted, only exact open-order IDs independently
-# returned by the authoritative account query may be cancelled.
+# Required in live mode. During halt_draining and halted, only exact open-order IDs
+# independently returned by authoritative queries may be cancelled. halted cannot
+# be reported until all pre-cutoff claims expire/reconcile and no open orders remain.
 cancel_known_open_orders_while_halted = true
 
 [staking]
@@ -94,6 +95,8 @@ no_eligible_validator_policy = "hold_in_spot"
 
 [operator]
 dry_run = true
+# A request enters halt_draining. It is not halted until all pre-cutoff claims
+# expire or reconcile and authoritative queries prove no open orders.
 manual_halt = true
 # Versioned acknowledgement of the effective-policy digest, which excludes this
 # value itself and includes startup-resolved identities such as the admitted
