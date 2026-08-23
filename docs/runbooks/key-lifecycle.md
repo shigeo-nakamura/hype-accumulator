@@ -39,7 +39,11 @@ ciphertext, host alias, or production filesystem path.
    Delay sale/movement ingestion and confirm staking fails until both cursors
    reach a fresh common watermark. Create multiple lots, partially consume them,
    and verify replay selects the same oldest lot using fill time, order ID, then
-   fill ID; verify expired lots cannot be reserved.
+   fill ID; verify expired lots cannot be reserved. With no eligible validator,
+   verify `hold_in_spot` rejects `cDeposit`, while the separately approved
+   `hold_undelegated_in_staking` mode accepts a validator-free deposit intent and
+   still rejects delegation. Deposit intents containing a validator and delegation
+   intents missing one must fail schema validation.
 8. Rehearse manual halt with a resting test order. Confirm new order and staking
    signatures stop before the cancel-only path independently discovers and
    cancels the exact open order. Drop the cancellation response and verify it

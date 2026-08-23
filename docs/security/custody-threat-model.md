@@ -95,25 +95,31 @@ fully specified intent containing:
 
 - workflow and daily decision IDs plus the stable authoritative order and fill
   IDs for the purchase;
-- account, validator, asset, and exact integer `wei` amount;
+- account, action phase, asset, and exact integer `wei` amount; a delegation
+  intent also contains exactly one validator, while a deposit intent contains no
+  validator field;
 - hashes of the admitted-capital snapshot, order/fill evidence, and current
   staking state;
 - an expiry and a fresh monotonic nonce;
 - the remaining approved daily and cumulative limits.
 
-The signer has no generic JSON/action endpoint. It supports only staking deposit
-and delegation and rejects unknown fields. Intent-supplied hashes are correlation
-identifiers, not proof that the referenced state or limits are genuine.
+The signer has no generic JSON/action endpoint. It uses separate strict schemas
+for staking deposit and delegation and rejects unknown fields. In particular,
+`cDeposit` neither accepts nor infers a validator, while `tokenDelegate` requires
+the exact validator address. Intent-supplied hashes are correlation identifiers,
+not proof that the referenced state or limits are genuine.
 
 For every initial request and retry, the signer authenticates the caller and
-independently queries authoritative order, fill, spot-balance, staking, and
-validator state using the actual account address. It verifies that the canonical
-stable order/fill set, workflow ID, amount, and remaining eligible lot quantity
-exactly match the purchase-time mapping instead of trusting caller-supplied
-identifiers or aggregate balance. It also verifies residual balance, validator
-eligibility, intent expiry, and daily and cumulative room against an independently
-loaded approved policy and immutable ledger anchor. Missing, stale, consumed,
-ambiguous, or mismatched evidence is rejected into manual review without signing.
+independently queries authoritative order, fill, spot-balance, and staking state
+using the actual account address. It verifies that the canonical stable order/fill
+set, workflow ID, amount, and remaining eligible lot quantity exactly match the
+purchase-time mapping instead of trusting caller-supplied identifiers or aggregate
+balance. It also verifies residual balance, intent expiry, and daily and cumulative
+room against an independently loaded approved policy and immutable ledger anchor.
+For delegation only, it additionally queries validator state and verifies the
+specified validator is allowlisted, active, not jailed, and not undelegate-only.
+Missing, stale, consumed, ambiguous, or mismatched evidence is rejected into manual
+review without signing.
 
 Before producing a signature, one durable atomic transaction verifies every fill
 is already mapped to this workflow with sufficient eligible quantity, reserves
@@ -176,9 +182,11 @@ All gates are conjunctive and fail closed:
    mismatch, no halt, available daily/cumulative notional and slippage room, and
    independently enforced post-purchase hot-exposure room. A service-side
    threshold alone cannot satisfy the final condition.
-8. Delegation requires reconciled newly purchased HYPE, a configured residual
-   buffer, and an allowlisted active validator that is neither jailed nor
-   undelegate-only.
+8. A staking deposit requires reconciled newly purchased HYPE and a configured
+   residual buffer. When no validator is eligible it is permitted only by the
+   separately approved `hold_undelegated_in_staking` policy; the deposit request
+   has no validator field. Delegation alone requires an explicitly specified,
+   allowlisted active validator that is neither jailed nor undelegate-only.
 9. An ambiguous exposure-creating action response moves the workflow to
    reconciliation or manual review; it never causes a blind retry.
 10. Engaging manual halt atomically denies new order placement, staking deposit,
@@ -236,8 +244,10 @@ eligible, the typed
 `no_eligible_validator_policy` controls the next step and raises an alert. The
 default `hold_in_spot` value forbids `cDeposit`. The only alternative,
 `hold_undelegated_in_staking`, requires separate explicit approval and permits
-only `cDeposit`, never delegation; operators must accept its seven-day return
-queue. Unknown policy values fail configuration validation. `hold_in_spot`
+only a validator-free `cDeposit`, never delegation; the signer skips validator
+lookup and eligibility checks for that action while retaining every purchase,
+lot, balance, limit, expiry, and phase-consumption check. Operators must accept
+its seven-day return queue. Unknown policy values fail configuration validation. `hold_in_spot`
 does not provide a leaked-key balance cap: if retained or appreciated HYPE could
 exceed the independently enforced bound, no further purchase is authorized and
 production remains unapproved until an external containment design is proven.
@@ -271,6 +281,9 @@ Before production secrets or funds are present, attach evidence for:
   decision IDs, including after a later purchase replenishes balances;
 - deterministic multi-lot partial-sale/transfer tests, including identical
   timestamps, stable-ID tie-breaking, expiry boundaries, and replay after restore;
+- action-schema tests proving deposit intents reject a validator field, delegation
+  intents require one, and approved deposit-only continuation succeeds when no
+  validator is eligible without weakening any non-validator gate;
 - acknowledgement tests proving a changed, missing, malformed, or differently
   normalized parent-account value invalidates the effective-policy digest;
 - the user's explicit choice of custody option, host, validator, limits, and
