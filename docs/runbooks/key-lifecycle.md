@@ -6,7 +6,9 @@ ciphertext, host alias, or production filesystem path.
 ## Preconditions
 
 - Live mode and automatic staking are disabled.
-- The selected custody option and host have explicit user approval.
+- The selected custody option, typed execution-account kind, and host have explicit
+  user approval. Automatic staking uses only a dedicated master execution account
+  that exactly matches the separately controlled signer.
 - The operator has recorded the expected account, fresh agent public address,
   canonical config, normalized validator allowlist, acknowledgement expiry, and
   every startup-resolved policy identity through the private change record. For
@@ -24,7 +26,9 @@ ciphertext, host alias, or production filesystem path.
 4. Install with owner-only permissions while the service is stopped or in a
    read-only validation mode.
 5. Verify the account query uses the actual account address and returns the
-   expected read-only state. Do not submit an action.
+   expected read-only state. Do not submit an action. Confirm automatic staking is
+   rejected for subaccount, vault, unknown, and master-signer/account mismatch
+   configurations; the service has no implicit child-to-master transfer path.
 6. Confirm the service rejects live config without a current acknowledgement and
    rejects a missing, malformed, or changed resolved policy identity. Confirm it
    rejects staking when the separate signer is unavailable.
@@ -47,8 +51,11 @@ ciphertext, host alias, or production filesystem path.
    unavailable validator state must also reject the deposit. Complete a deposit
    and verify the exact lot quantity moves from `eligible_spot` through
    `deposit_reserved` to `deposited_undelegated`; delegation must reserve only that
-   undelegated state, never debit `eligible_spot` again. Exercise partial amounts,
-   ambiguous responses, restart, and restore at both reservation boundaries.
+   undelegated state, never debit `eligible_spot` again. Submit undersized,
+   oversized, and attempted sub-lot amounts and partially consume a workflow;
+   every case must reject automatic staking without creating another phase key.
+   Exercise ambiguous responses, restart, and restore at both reservation
+   boundaries.
 8. Rehearse manual halt with a resting test order. Confirm new order and staking
    signatures stop before the cancel-only path independently discovers and
    cancels the exact open order. Drop the cancellation response and verify it

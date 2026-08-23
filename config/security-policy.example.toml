@@ -10,6 +10,10 @@ reserve_microusd = 0
 # Service-side order limits do not constrain a leaked API wallet.
 api_wallet_authority = "full_assigned_account_trading"
 require_dedicated_execution_account = true
+# Required in live mode: "dedicated_master", "subaccount", or "vault". Automatic
+# staking requires "dedicated_master" and an exact master-signer account match.
+# "unapproved" and unknown values fail closed.
+execution_account_kind = "unapproved"
 # Operational halt/alert while enforcement is unapproved. With approved external
 # enforcement, this is the acknowledged hard maximum.
 max_hot_trading_balance_microusd = 0
@@ -48,6 +52,8 @@ signal_stale_after_seconds = 0
 cancel_known_open_orders_while_halted = true
 
 [staking]
+# A subaccount or vault must keep this false; no automatic child-to-master transfer
+# is authorized by this policy.
 enabled = false
 validator_allowlist = []
 residual_hype_wei = 0

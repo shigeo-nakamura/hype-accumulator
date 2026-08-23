@@ -30,20 +30,22 @@ is therefore the complete marked-to-market value reachable by that wallet, not
 the configured `max_hot_trading_balance_microusd`.
 
 A dedicated execution master account, subaccount, or vault with no unrelated
-funds is necessary but is not by itself a security cap. Production may claim a
-bounded maximum loss only after evidence demonstrates either a venue/account-level
-hard bound or a separately controlled custody mechanism outside the API wallet's
-authority that moves accumulating or appreciated assets beyond that authority
-before the bound can be exceeded. The mechanism must cover `hold_in_spot`,
-price appreciation, partial fills, retry ambiguity, and outages, and must enforce
-a lower admission threshold with measured worst-case headroom. Any custody mover
-that expands the action allowlist requires a separate design and explicit
-approval; none is authorized here. Until such enforcement is proven,
-`hot_balance_enforcement` remains `unapproved`, live mode is rejected, and the
-configured threshold is only an operational halt/alert. Venue-enforced agent
-restrictions receive credit only after capability tests. Accepting full authority
-over the account's actual uncapped value instead of claiming a cap requires a
-separate explicit policy mode and user approval; this document does not grant it.
+funds is necessary but is not by itself a security cap. Its typed
+`execution_account_kind` is bound into the effective-policy acknowledgement.
+Production may claim a bounded maximum loss only after evidence demonstrates
+either a venue/account-level hard bound or a separately controlled custody
+mechanism outside the API wallet's authority that moves accumulating or
+appreciated assets beyond that authority before the bound can be exceeded. The
+mechanism must cover `hold_in_spot`, price appreciation, partial fills, retry
+ambiguity, and outages, and must enforce a lower admission threshold with measured
+worst-case headroom. Any custody mover that expands the action allowlist requires
+a separate design and explicit approval; none is authorized here. Until such
+enforcement is proven, `hot_balance_enforcement` remains `unapproved`, live mode
+is rejected, and the configured threshold is only an operational halt/alert.
+Venue-enforced agent restrictions receive credit only after capability tests.
+Accepting full authority over the account's actual uncapped value instead of
+claiming a cap requires a separate explicit policy mode and user approval; this
+document does not grant it.
 
 The effective-policy digest binds the enforcement mode, hard maximum, sweep
 threshold, worst-case outage headroom, lowercase SHA-256 evidence digest, and
@@ -56,25 +58,38 @@ combinations fail closed. Changing any field invalidates the acknowledgement.
 orders use the L1 action scheme. The production design therefore treats staking
 as master-authority until a testnet or explicitly approved probe demonstrates a
 narrower supported authority. An API wallet succeeding at order placement is
-not evidence that it can authorize staking.
+not evidence that it can authorize staking. These approved staking actions contain
+no child-account target, so automatic staking is available only when
+`execution_account_kind = "dedicated_master"` and the execution account exactly
+matches the account recovered from the master signer. A subaccount or vault must
+keep `staking.enabled = false`; purchased HYPE remains in spot. A child-to-master
+transfer path would expand the signer capability and requires a separate design,
+threat model, and explicit approval; this service does not infer or perform one.
 
 ## Required process isolation
 
 An independent signer-side reconciler, not the intent caller, advances a durable
-monotonic cursor over authoritative fills. As each purchase fill becomes final,
-and before it can become staking-eligible, the reconciler atomically records its
-stable account, order/fill IDs, exact purchased quantity, policy version, and a
-canonical content-addressed workflow ID derived from that evidence. Registration
-must occur within a configured deadline at the fill's first authoritative
-observation. A cursor gap, a historical fill first presented after the deadline,
-or a fill absent from this purchase-time ledger is ineligible for automatic
-staking and goes to manual review; the staking request path never backfills it.
+monotonic cursor over authoritative fills. When a purchase workflow becomes
+terminal and its canonical order/fill set is final, and before it can become
+staking-eligible, the reconciler atomically records the stable account, sorted
+order/fill IDs, every exact purchased quantity and their checked total, policy
+version, and a canonical content-addressed workflow ID derived from that complete
+evidence. Every fill must be registered within a configured deadline after its
+first authoritative observation. A cursor gap, a historical fill first presented
+after the deadline, or a fill absent from this purchase-time ledger makes the
+entire workflow ineligible for automatic staking and sends it to manual review;
+the staking request path never backfills it.
+Automatic staking is full-fill-set only: the intent amount must equal the sum of
+the exact registered quantities for its mapped authoritative fills. The signer
+does not create sub-lots, accept a partial amount, or split one workflow across
+multiple deposit or delegation phase keys.
 
 The reconciler maintains amount-conserving lot states: `eligible_spot`,
 `deposit_reserved`, `deposited_undelegated`, `delegation_reserved`, `delegated`,
 and terminal spent, moved, expired, or ineligible states. A deposit reservation
-moves exact `eligible_spot` quantity to `deposit_reserved`; authoritative
-`cDeposit` completion moves that same quantity to `deposited_undelegated`.
+moves the entire exact mapped `eligible_spot` quantity to `deposit_reserved`;
+authoritative `cDeposit` completion moves that same quantity to
+`deposited_undelegated`.
 A delegation reservation starts only from `deposited_undelegated`, moves it to
 `delegation_reserved`, and authoritative `tokenDelegate` completion moves it to
 `delegated`. Delegation never debits or reserves the original spot quantity again.
@@ -85,8 +100,11 @@ watermark; a gap or concurrent state that cannot be ordered against that waterma
 fails closed.
 
 Non-workflow sales and transfers debit registered lots deterministically in
-ascending `(authoritative fill time, stable order ID, stable fill ID)` order.
-Staking reservations consume only the exact mapped lots in their workflow.
+ascending `(authoritative fill time, stable order ID, stable fill ID)` order. Any
+partial consumption makes the workflow ineligible for automatic staking: the
+consumed quantity enters its terminal state and the remainder cannot be enrolled
+as a sub-lot. Staking reservations consume the entire exact mapped fill set in
+their workflow.
 `lot_eligibility_max_age_seconds` makes a remaining lot eligible only while
 `now < authoritative fill time + max age`; the boundary itself is expired. The
 only supported
@@ -119,13 +137,13 @@ independently queries authoritative order, fill, spot-balance, and staking state
 using the actual account address. It verifies that the canonical stable order/fill
 set, workflow ID, and amount exactly match the purchase-time mapping instead of
 trusting caller-supplied identifiers or aggregate balance. For `cDeposit`, it
-verifies sufficient `eligible_spot` quantity and authoritative spot balance. For
-`tokenDelegate`, it instead verifies a completed reconciled deposit predecessor,
-sufficient `deposited_undelegated` quantity for the same mapped fills, and
-authoritative undelegated staking balance; it never requires or reserves
-`eligible_spot` again. It also verifies residual balance, intent expiry, and daily,
-yearly, and cumulative room against an independently loaded approved policy and
-immutable ledger anchor.
+verifies the intent amount equals the entire mapped `eligible_spot` quantity and
+that authoritative spot balance covers it. For `tokenDelegate`, it instead
+verifies a completed reconciled deposit predecessor and that the same full amount
+remains in `deposited_undelegated` with sufficient authoritative undelegated
+staking balance; it never requires or reserves `eligible_spot` again. It also
+verifies residual balance, intent expiry, and daily, yearly, and cumulative room
+against an independently loaded approved policy and immutable ledger anchor.
 For a deposit under the default `hold_in_spot` policy, it independently queries
 the complete allowlist and requires at least one currently eligible validator,
 without accepting or selecting a validator in the intent. Missing or stale
@@ -139,7 +157,7 @@ Before producing a signature, one durable atomic transaction verifies every fill
 is already mapped to this workflow, performs the action-specific reservation, and
 claims the unique `(account, workflow ID, action phase)` key with the fill set,
 canonical intent digest, and nonce. The deposit phase must atomically move
-sufficient mapped quantity from `eligible_spot` to `deposit_reserved`. The
+the full mapped quantity from `eligible_spot` to `deposit_reserved`. The
 delegation phase must atomically verify its reconciled deposit predecessor and move
 the same mapped quantity from `deposited_undelegated` to
 `delegation_reserved`; it cannot reserve `eligible_spot`. The signer never creates
@@ -166,11 +184,14 @@ All gates are conjunctive and fail closed:
 
 1. `dry_run` is true by default. Live mode requires a versioned acknowledgement
    that binds an effective-policy digest: the canonical approval-relevant config
-   (excluding the acknowledgement value itself), execution account, signer mode,
-   normalized validator set, expiry, and the normalized resolved parent-account
-   value or an explicit null marker. Environment-variable names alone are not
-   part of the approval boundary. Any resolved-value change or resolution failure
-   invalidates the acknowledgement and fails closed.
+   (excluding the acknowledgement value itself), execution account and its typed
+   kind, signer mode, normalized validator set, expiry, and the normalized resolved
+   parent-account value or an explicit null marker. Environment-variable names
+   alone are not part of the approval boundary. Any resolved-value change or
+   resolution failure invalidates the acknowledgement and fails closed. Automatic
+   staking additionally requires the execution account to be the dedicated master
+   account recovered from the approved signer; subaccount, vault, unknown, and
+   mismatched combinations fail closed.
 2. System-wide deployable capital originates from authoritative external USDC
    movement history with a stable event ID. Raw balance delta, order
    holds/releases, fills, fees, internal transfers, dust, and reconciliation
@@ -245,8 +266,8 @@ unlimited. Production configuration must set all of these explicitly:
 - externally enforced hot-balance mode, limit, sweep threshold, and worst-case
   headroom evidence, or separately approved uncapped-authority acceptance;
 - mandatory cancel-only containment while halted;
-- execution-account funding mode, parent-account identity, and whether traced
-  transfer admission inheritance is enabled;
+- execution-account kind and funding mode, parent-account identity, and whether
+  traced transfer admission inheritance is enabled;
 - validator allowlist and live acknowledgement expiry.
 
 ## Threat analysis
@@ -309,8 +330,10 @@ Before production secrets or funds are present, attach evidence for:
 - signer crash/retry/restore tests proving each workflow action phase is consumed
   before signing and cannot be reauthorized with a different nonce;
 - action-specific lot-state tests proving deposit and delegation reserve
-  `eligible_spot` and `deposited_undelegated` respectively, including partial
-  quantities, ambiguous responses, restore, and rejection of double reservation;
+  `eligible_spot` and `deposited_undelegated` respectively, including ambiguous
+  responses, restore, and rejection of double reservation;
+- full-fill-set tests proving undersized, oversized, partially consumed, and
+  attempted sub-lot intents are rejected without creating another phase key;
 - purchase-time registration and adversarial replay tests proving an unmapped or
   consumed historical fill cannot be enrolled under fresh workflow or daily
   decision IDs, including after a later purchase replenishes balances;
@@ -325,6 +348,9 @@ Before production secrets or funds are present, attach evidence for:
 - signal-freshness boundary tests proving a missing, malformed, future, or
   age-at-limit decision timestamp rejects a purchase while book/account data is
   otherwise fresh;
+- account-target tests proving automatic staking accepts only a dedicated master
+  execution account that exactly matches the signer and rejects subaccount, vault,
+  unknown, and master-account mismatch configurations;
 - acknowledgement tests proving a changed, missing, malformed, or differently
   normalized parent-account value invalidates the effective-policy digest;
 - the user's explicit choice of custody option, host, validator, limits, and
