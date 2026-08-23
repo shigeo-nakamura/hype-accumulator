@@ -33,10 +33,16 @@ ciphertext, host alias, or production filesystem path.
    blocked across caller retry, restart, restore, and a retry with a new nonce.
    Repackage the same authoritative fill IDs under new workflow and daily
    decision IDs and confirm the durable one-fill-to-workflow mapping rejects it.
+8. Rehearse manual halt with a resting test order. Confirm new order and staking
+   signatures stop before the cancel-only path independently discovers and
+   cancels the exact open order. Drop the cancellation response and verify it
+   re-queries authoritative state before retrying; signer loss must alert and
+   escalate without clearing the halt.
 
 ## Rotate
 
-1. Halt new decisions but keep reconciliation active.
+1. Halt new decisions, cancel authoritatively discovered open orders through the
+   cancel-only path, and keep reconciliation active.
 2. Resolve all ambiguous orders and staking intents. Rotation is blocked while
    an external action is not conclusively reconciled.
 3. Generate and approve a new named agent with a new address.
@@ -46,7 +52,8 @@ ciphertext, host alias, or production filesystem path.
 
 ## Revoke after suspected API-wallet compromise
 
-1. Engage manual halt and deny new signing requests.
+1. Engage manual halt and deny new exposure-increasing signing requests. Do not
+   use a suspected signer for the cancel-only path.
 2. From an independent device, deregister the agent. Do not register a new key
    at the same address.
 3. Query authoritative orders, fills, movements, staking state, and delegation

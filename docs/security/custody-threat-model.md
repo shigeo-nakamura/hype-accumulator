@@ -131,12 +131,20 @@ All gates are conjunctive and fail closed:
 8. Delegation requires reconciled newly purchased HYPE, a configured residual
    buffer, and an allowlisted active validator that is neither jailed nor
    undelegate-only.
-9. An ambiguous action response moves the workflow to reconciliation or manual
-   review; it never causes a blind retry.
-10. Manual halt denies every new signed action, including staking deposit and
-    delegation, while unsigned reconciliation remains active. Recovery actions
-    require the separate offline recovery procedure; runtime configuration has no
-    halt bypass.
+9. An ambiguous exposure-creating action response moves the workflow to
+   reconciliation or manual review; it never causes a blind retry.
+10. Engaging manual halt atomically denies new order placement, staking deposit,
+    delegation, and every other exposure-increasing signed action before
+    cancellation begins. Unsigned reconciliation and a mandatory cancel-only
+    execution path remain active. That path independently queries the configured
+    account and may sign only cancellations for exact, currently open order IDs
+    returned by the authoritative query; it cannot accept caller-supplied order
+    identities, place or amend an order, perform a staking or transfer action, or
+    clear the halt. After every cancellation response it re-queries before
+    retrying and continues until no open orders remain. An unavailable signer or
+    unresolved cancellation raises an alert and escalates to the offline recovery
+    procedure without re-enabling exposure. All other recovery actions require
+    that separate procedure; runtime configuration has no general halt bypass.
 
 Limits are positive, finite integer minor units. Zero means disabled, never
 unlimited. Production configuration must set all of these explicitly:
@@ -147,6 +155,7 @@ unlimited. Production configuration must set all of these explicitly:
 - maximum order slippage;
 - minimum reserve and residual HYPE buffer;
 - market/book, account-history, and signal staleness limits;
+- mandatory cancel-only containment while halted;
 - execution-account funding mode, parent-account identity, and whether traced
   transfer admission inheritance is enabled;
 - validator allowlist and live acknowledgement expiry.
@@ -163,7 +172,7 @@ unlimited. Production configuration must set all of these explicitly:
 | State rollback/truncation | hash-chained append-only ledger, atomic snapshot, versioned off-host backup | replay and checksum verification; fail closed on divergence |
 | Deposit spoofing or dust | authoritative external movement IDs plus confirmation/admission policy | expose observed vs confirmed vs admitted totals separately; manual classification correction |
 | Capital-event misclassification | typed movement categories; transfers inherit only from a traced admitted parent residual and never increase system-wide admission | invariant checks against parent/child account histories, idempotent transfer IDs, and the conserved capital equation |
-| Operator error | schema validation, effective-policy digest acknowledgement, two-step live/staking gates, exact validator/notional display | manual halt, immutable audit trail, rehearsed restore and key rotation |
+| Operator error | schema validation, effective-policy digest acknowledgement, two-step live/staking gates, exact validator/notional display | manual halt with authoritative cancel-only containment, immutable audit trail, rehearsed restore and key rotation |
 
 ## Validator governance
 
@@ -189,6 +198,9 @@ Before production secrets or funds are present, attach evidence for:
 - deterministic signature vectors and signer-capability tests on testnet/replay;
 - a dry-run key install/rotate/revoke rehearsal using non-production material;
 - ledger restore and stale/ambiguous-response fault tests;
+- halt-transition tests proving new exposure is denied before exact authoritative
+  open-order cancellations begin, including lost-response re-query and
+  unavailable-signer escalation;
 - IAM and filesystem permission review;
 - proof of venue-enforced agent restrictions or dedicated-account balance
   isolation, including the maximum hot balance and breach behavior;

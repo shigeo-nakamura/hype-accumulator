@@ -26,6 +26,9 @@ max_slippage_bps = 0
 book_stale_after_seconds = 0
 account_history_stale_after_seconds = 0
 signal_stale_after_seconds = 0
+# Required in live mode. While halted, only exact open-order IDs independently
+# returned by the authoritative account query may be cancelled.
+cancel_known_open_orders_while_halted = true
 
 [staking]
 enabled = false
