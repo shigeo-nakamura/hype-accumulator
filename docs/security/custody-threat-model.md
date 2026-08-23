@@ -76,25 +76,39 @@ All gates are conjunctive and fail closed:
 
 1. `dry_run` is true by default. Live mode requires a versioned acknowledgement
    that binds the config hash, account, signer mode, validator set, and expiry.
-2. A deployable tranche originates from authoritative external USDC movement
-   history and has a stable event ID. Raw balance delta, order holds/releases,
-   fills, fees, internal transfers, dust, and reconciliation corrections never
-   create deployable capital.
-3. A deposit above the per-deposit limit or beyond yearly/cumulative room remains
+2. System-wide deployable capital originates from authoritative external USDC
+   movement history with a stable event ID. Raw balance delta, order
+   holds/releases, fills, fees, internal transfers, dust, and reconciliation
+   corrections never create new admitted capital.
+3. An authoritative transfer into an approved isolated execution account may
+   create a child tranche only by inheriting an already confirmed and admitted
+   parent-account deposit. The ledger binds stable parent-deposit and transfer
+   IDs, approved source and destination accounts, and an amount no greater than
+   the parent tranche's unallocated residual. It atomically debits that residual
+   and credits the child exactly once; replay is idempotent and system-wide
+   admitted capital is unchanged.
+4. An untraced, mismatched, duplicate, or excess internal transfer remains visible
+   but unallocated and halts new purchases pending reconciliation. Parent
+   inheritance is disabled unless the approved funding mode and parent-account
+   identity are explicitly configured. Valid live combinations are
+   `external_deposit_only` with inheritance disabled and no parent, or
+   `traced_parent_transfer` with inheritance enabled and a non-empty approved
+   parent-account environment name; every other combination is rejected.
+5. A deposit above the per-deposit limit or beyond yearly/cumulative room remains
    visible but unallocated until a separately recorded operator admission.
-4. Committed plus spent USDC cannot exceed admitted deposits minus reconciled
+6. Committed plus spent USDC cannot exceed admitted deposits minus reconciled
    withdrawals and reserves.
-5. A purchase requires fresh book/account data, no unknown movement, no balance
+7. A purchase requires fresh book/account data, no unknown movement, no balance
    mismatch, no halt, and available daily/cumulative notional and slippage room.
-6. Delegation requires reconciled newly purchased HYPE, a configured residual
+8. Delegation requires reconciled newly purchased HYPE, a configured residual
    buffer, and an allowlisted active validator that is neither jailed nor
    undelegate-only.
-7. An ambiguous action response moves the workflow to reconciliation or manual
+9. An ambiguous action response moves the workflow to reconciliation or manual
    review; it never causes a blind retry.
-8. Manual halt denies every new signed action, including staking deposit and
-   delegation, while unsigned reconciliation remains active. Recovery actions
-   require the separate offline recovery procedure; runtime configuration has no
-   halt bypass.
+10. Manual halt denies every new signed action, including staking deposit and
+    delegation, while unsigned reconciliation remains active. Recovery actions
+    require the separate offline recovery procedure; runtime configuration has no
+    halt bypass.
 
 Limits are positive, finite integer minor units. Zero means disabled, never
 unlimited. Production configuration must set all of these explicitly:
@@ -105,6 +119,8 @@ unlimited. Production configuration must set all of these explicitly:
 - maximum order slippage;
 - minimum reserve and residual HYPE buffer;
 - market/book, account-history, and signal staleness limits;
+- execution-account funding mode, parent-account identity, and whether traced
+  transfer admission inheritance is enabled;
 - validator allowlist and live acknowledgement expiry.
 
 ## Threat analysis
@@ -118,7 +134,7 @@ unlimited. Production configuration must set all of these explicitly:
 | Dependency compromise | lockfile, checksums, minimal signing interface, CI audit/review gate | artifact provenance and rollback; rotate signer if signing material may have been exposed |
 | State rollback/truncation | hash-chained append-only ledger, atomic snapshot, versioned off-host backup | replay and checksum verification; fail closed on divergence |
 | Deposit spoofing or dust | authoritative external movement IDs plus confirmation/admission policy | expose observed vs confirmed vs admitted totals separately; manual classification correction |
-| Capital-event misclassification | typed movement categories; balance alone cannot admit funds | invariant checks against account history and total capital equation |
+| Capital-event misclassification | typed movement categories; transfers inherit only from a traced admitted parent residual and never increase system-wide admission | invariant checks against parent/child account histories, idempotent transfer IDs, and the conserved capital equation |
 | Operator error | schema validation, config hash acknowledgement, two-step live/staking gates, exact validator/notional display | manual halt, immutable audit trail, rehearsed restore and key rotation |
 
 ## Validator governance
@@ -148,6 +164,8 @@ Before production secrets or funds are present, attach evidence for:
 - IAM and filesystem permission review;
 - proof of venue-enforced agent restrictions or dedicated-account balance
   isolation, including the maximum hot balance and breach behavior;
+- conservation, idempotency, source/destination, and excess-transfer tests when
+  parent-admission inheritance is enabled;
 - the user's explicit choice of custody option, host, validator, limits, and
   exact small-probe configuration.
 

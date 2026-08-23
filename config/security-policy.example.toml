@@ -11,6 +11,12 @@ reserve_microusd = 0
 api_wallet_authority = "full_assigned_account_trading"
 require_dedicated_execution_account = true
 max_hot_trading_balance_microusd = 0
+# Safe default: only direct external deposits can originate admitted capital.
+# The only alternative is "traced_parent_transfer" with explicit approval.
+funding_mode = "external_deposit_only"
+allow_traced_parent_transfer_admission = false
+# Empty disables inheritance; never place an account address in this file.
+admitted_parent_account_env = ""
 
 [execution]
 max_slippage_bps = 0
