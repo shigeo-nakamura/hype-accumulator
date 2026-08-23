@@ -160,6 +160,10 @@ Each ledger row has a uniqueness constraint on
 start/end seconds. Period opening is an insert-or-lock operation in the same
 serializable reservation transaction. A conflicting boundary, overlapping or
 duplicate row, unsupported timestamp, or restore/replay mismatch fails closed.
+Each daily purchase-notional row has checked `reserved`, `spent`, and
+`mirrored_encumbrance` counters and enforces
+`reserved + spent + mirrored_encumbrance <= limit`. Authorization-ID-keyed
+entries make every increment and later transition idempotent.
 The same schemes assign authoritative fill timestamps to execution periods.
 
 The record is committed before the API wallet signs the canonical unsigned
@@ -172,10 +176,11 @@ any bound input's freshness horizon, and validates the exact signed
 `expiresAfter_ms`. The equality boundary, a future/missing input timestamp, or a
 failed claim forbids submission. An expired record still in `authorized` moves
 atomically to a terminal unused state, returns each committed cash slice to
-`uncommitted` in its same originating admission allocation, releases every other
+`uncommitted` in its same originating admission allocation, subtracts its full
+`N` from the originating daily row's `reserved` counter, releases every other
 policy and decision reservation, and clears the decision's active slot. A
-transport-ambiguous
-submission stays claimed until authoritative CLOID reconciliation and never
+transport-ambiguous submission stays claimed until authoritative CLOID
+reconciliation and never
 releases room or retries blindly.
 
 The approved live policy authorizes IOC plus the signed request expiry only: the
@@ -196,19 +201,31 @@ reconciler atomically binds the stable venue order ID and moves
 `submission_claimed` to `order_bound`. Later polls validate that immutable binding
 without repeating the transition. A conclusively absent claim moves to a terminal
 unused state, returns each committed cash slice to `uncommitted` in its same
-originating admission allocation, releases every other policy and decision
-reservation, and clears the decision's active slot in the same transaction; no
-terminal authorization is reusable. This is not an exchange action and grants no
-generic master-signer
+originating admission allocation, subtracts its full `N` from the originating
+daily row's `reserved` counter and every later mirrored encumbrance, releases
+every other policy and decision reservation, and clears the decision's active
+slot in the same transaction; no terminal authorization is reusable. This is not
+an exchange action and grants no generic master-signer
 capability. A retry or residual reissue requires a new CLOID and authorization
 after authoritative reconciliation of its predecessor. That reconciliation
-atomically charges actual executed notional to the notional ledger and moves
-actual consideration plus every authoritative fee from `committed` to `spent` in
-the originating admission allocations. It returns only conclusively unfilled cash
-and unused fee headroom from `committed` to `uncommitted` in those same
-allocations; ambiguous fee or fill state retains the full commitment. Neither
-transition changes the yearly or lifetime admission-allocation counters. In the
-same transaction, actual filled
+locks the originating daily row, every later mirrored row, and every canonical
+execution-day row. For each execution day `d`, let `N_f,d` be the checked sum of
+authoritative fill notional in that day and let `N_f = sum_d(N_f,d) <= N`. One
+atomic transition subtracts the full `N` from the originating `reserved` counter,
+removes every full-`N` mirrored encumbrance, and adds each `N_f,d` exactly once to
+that day's `spent` counter. If origin and execution are the same row, these are
+coalesced into `reserved -= N; spent += N_f`; if no fill occurred, `N_f = 0`.
+Thus `N - N_f` is released and `N_f` is never left reserved or charged twice.
+Underflow, an inconsistent mirror, `N_f > N`, or an execution-day limit breach
+fails closed without a partial transition, retains the full reservations, and
+halts for reconciliation; the authoritative raw fill evidence remains durable.
+
+The same transaction moves actual consideration plus every authoritative fee
+from `committed` to `spent` in the originating admission allocations. It returns
+only conclusively unfilled cash and unused fee headroom from `committed` to
+`uncommitted` in those same allocations; ambiguous fee or fill state retains the
+full cash commitment and full daily-notional reservation. Neither transition
+changes the yearly or lifetime admission-allocation counters. Actual filled
 base quantity `Q_f` and executed notional `N_f` are permanently consumed from the
 decision row, and only the proven `Q - Q_f` and `N - N_f` remainders are released
 before the active authorization is cleared. An ambiguous predecessor retains its
@@ -227,11 +244,10 @@ ceiling charges never roll over or repeat; an old admitted slice can be committe
 after a year boundary without consuming the new year's admission room. There is
 no independent process-local rollover job. Hot-exposure reservations remain
 continuously charged. Terminal reconciliation atomically charges actual notional
-to the execution-day period derived from its authoritative timestamp, moves
+to the execution-day periods with the reserved-to-spent transition above, moves
 actual cash debit including fees to `spent`, returns only proven unused `C` to the
-same slices' `uncommitted` state, releases daily mirrored encumbrances, and
-preserves the conserved audit trail; a boundary alone cannot release a commitment
-or restore admission room.
+same slices' `uncommitted` state, and preserves the conserved audit trail; a
+boundary alone cannot release a commitment or restore admission room.
 
 The following lot bookkeeping is dormant, unsigned eligibility accounting. It
 does not authorize, sign, or submit a staking action and cannot override the
@@ -462,8 +478,10 @@ All gates are conjunctive and fail closed:
     authoritative order/fill histories have a gap-free watermark later than that
     expiry may a still-invisible CLOID be atomically marked conclusively absent and
     terminal unused, return its `C` slices to the same allocations'
-    `uncommitted` state, release its other policy and decision reservations, and
-    clear its decision active slot. It remains unresolved before that point. After
+    `uncommitted` state, subtract its full `N` from the originating `reserved`
+    counter and every mirror, release its other policy and decision reservations,
+    and clear its decision active slot. It remains unresolved before that point.
+    After
     every
     claimed/bound record is terminal and a fresh account query returns no open
     order, one transaction may move `halt_draining` to `halted`. A delayed request
@@ -597,7 +615,10 @@ Before production secrets or funds are present, attach evidence for:
   reserved against daily notional and appropriate exposure is reserved against
   the hot limit. Terminal reconciliation must move actual cash to `spent` and
   return only conclusively unused headroom to the same slices, preserving
-  `admitted = uncommitted + committed + spent + withdrawn`;
+  `admitted = uncommitted + committed + spent + withdrawn`. Zero, partial, full,
+  and cross-day fill cases must also atomically subtract reserved `N`, add `N_f`
+  exactly once to canonical execution-day spend, release `N - N_f`, and remove
+  mirrors without underflow or double charge;
 - decision-concurrency tests racing distinct CLOIDs from separate authorizer
   instances against one authenticated decision while global caps have room;
   exactly one may reserve the unique decision row and create a record. Partial
@@ -627,7 +648,9 @@ Before production secrets or funds are present, attach evidence for:
   cannot be accepted at or beyond effective expiry, ambiguous `N` reduces each
   later daily period until terminal settlement without double release, and
   ambiguous `C` remains in its originating commitment without consuming a later
-  year's admission room;
+  year's admission room. Terminal settlement must convert the originating
+  reservation and every mirror to actual execution-day spend in one transaction,
+  leaving no unused `N - N_f` charged;
 - acknowledgement tests proving a changed, missing, malformed, or differently
   normalized parent-account value invalidates the effective-policy digest;
 - the user's explicit choice of custody option, host, limits, and exact small-probe

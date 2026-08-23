@@ -54,10 +54,15 @@ ciphertext, host alias, or production filesystem path.
    allocation. With global caps deliberately left sufficient, race two authorizer
    instances using the same authenticated decision and distinct CLOIDs;
    exactly one may reserve the decision's `Q` and `N` and create an active record.
-   Reconcile a partial fill and verify a new-CLOID reissue can reserve only the
-   remaining `Q_D` and `N_D`. An ambiguous predecessor, changed daily-decision ID,
-   fresh wrapper, restart, or restore must retain the active slot and reject a
-   second authorization. Repeat at exact and one-microunit fee/cash boundaries,
+   Reconcile zero, partial, and full fills and verify one atomic daily-ledger
+   transition subtracts the full reserved `N`, adds actual `N_f` exactly once to
+   the canonical execution-day `spent` counter, and releases `N - N_f`. For a
+   cross-day fill, it must also remove every full-`N` mirror without double
+   charging `N_f`. Verify a new-CLOID reissue can reserve only the remaining `Q_D`
+   and `N_D`. An ambiguous predecessor, changed daily-decision ID, fresh wrapper,
+   restart, or restore must retain the full notional reservation, active slot, and
+   reject a second authorization. Repeat at exact and one-microunit fee/cash
+   boundaries,
    with partial fills, builder fees, rebates, overflow, stale
    or above-ceiling schedules, unknown fixed/non-USDC fees, and an ambiguous fee
    response; cash room must retain `C` while daily notional retains only `N`.
@@ -78,9 +83,10 @@ ciphertext, host alias, or production filesystem path.
    envelope can be claimed. Carry an ambiguous IOC claim across daily and yearly
    boundaries and verify `N` reduces each later daily ledger until terminal
    settlement while `C` remains committed in its originating admitted slices
-   without charging the new year's admission room; an impossible fill at or
-   beyond effective expiry must remain charged, halt live action, and be
-   automatic-staking ineligible.
+   without charging the new year's admission room. At terminal settlement, verify
+   each mirror is removed in the same reserved-to-spent transition and no daily
+   row retains unused `N - N_f`. An impossible fill at or beyond effective expiry
+   must remain charged, halt live action, and be automatic-staking ineligible.
 8. Prove the automatic-staking boundary is absent, not merely guarded at runtime.
    Build and deployment artifacts must contain no staking signer process,
    master-key credential, staking intent endpoint, or outbound `cDeposit` or
