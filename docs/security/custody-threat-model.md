@@ -43,10 +43,20 @@ fully specified intent containing:
 - the remaining approved daily and cumulative limits.
 
 The signer has no generic JSON/action endpoint. It supports only staking deposit
-and delegation, rejects unknown fields, and re-queries state before signing an
-ambiguous retry. Until this boundary is implemented and rehearsed, automatic
-staking remains disabled. Storing a general-purpose master private key in the
-bot process is not an acceptable default.
+and delegation and rejects unknown fields. Intent-supplied hashes are correlation
+identifiers, not proof that the referenced state or limits are genuine.
+
+For every initial request and retry, the signer authenticates the caller and
+independently queries authoritative order, fill, spot-balance, staking, and
+validator state using the actual account address. It verifies the newly purchased
+HYPE amount, residual balance, validator eligibility, intent expiry, and daily and
+cumulative room against an independently loaded approved policy and immutable
+ledger anchor. Missing, stale, ambiguous, or mismatched evidence is rejected into
+manual review without signing.
+
+Until this boundary is implemented and rehearsed, automatic staking remains
+disabled. Storing a general-purpose master private key in the bot process is not
+an acceptable default.
 
 ## Capital admission and action gates
 

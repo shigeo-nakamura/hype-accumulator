@@ -35,7 +35,7 @@ ciphertext, host alias, or production filesystem path.
 5. Complete read-only health checks, then deregister the old agent.
 6. Mark the old address permanently retired and archive the audit evidence.
 
-## Revoke after suspected compromise
+## Revoke after suspected API-wallet compromise
 
 1. Engage manual halt and deny new signing requests.
 2. From an independent device, deregister the agent. Do not register a new key
@@ -49,6 +49,36 @@ ciphertext, host alias, or production filesystem path.
 6. Resume only after the capital equation and spot/staking balances reconcile and
    the user approves a new config acknowledgement.
 
+## Contain suspected master-signer compromise
+
+An exfiltrated master-wallet key cannot be revoked or rotated in place. API-wallet
+deregistration does not contain it. Treat the funded master account as compromised
+and execute this procedure only from a clean, independent recovery environment:
+
+1. Engage manual halt, disconnect the staking signer, and revoke its host, IAM,
+   KMS, and network access. Do not send another request through the suspected
+   signer or host.
+2. Establish a fresh master account and separately controlled signer under the
+   approved offline recovery process. Record its policy and account identifiers
+   in the private change record before moving value.
+3. Query authoritative orders, fills, balances, movements, staking state, pending
+   withdrawals, delegations, and rewards for the compromised account from the
+   clean environment. Preserve an incident cutoff and continue monitoring for
+   competing actions.
+4. If trustworthy control remains, cancel only known orders and migrate immediately
+   transferable assets to the pre-approved fresh account using explicit offline
+   recovery transactions. The unattended service performs none of these actions.
+5. Recover locked or delegated HYPE only through the separately approved manual
+   undelegation and withdrawal path, observing protocol locks and the seven-day
+   return queue before migration. If exclusive control cannot be established,
+   stop and escalate to account-level incident response rather than racing blindly.
+6. Retire the compromised master account and every derived API wallet permanently.
+   Create new nonce namespaces, credentials, approvals, and ledger migration
+   corrections; never reuse an old address as a service signer.
+7. Resume on the fresh account only after old and new account histories, capital
+   equations, spot/staking balances, and migration records reconcile and the user
+   explicitly approves a new configuration acknowledgement.
+
 ## Funded-account recovery
 
 The service never initiates funding, withdrawal, undelegation, or `cWithdraw`.
@@ -60,7 +90,8 @@ not convert a recovery into an unattended runtime capability.
 
 Record timestamps from the system clock, operator identity, config/artifact
 hashes, redacted command outcomes, ledger sequence/hash before and after, and
-PASS/FAIL for install, rotate, revoke, restore, and read-only restart. Never copy
+PASS/FAIL for install, rotate, API-wallet revoke, master-signer containment,
+funded-account migration, restore, and read-only restart. Never copy
 private keys, signed payloads, wallet addresses, or encrypted blobs into CI logs
 or issues.
 
