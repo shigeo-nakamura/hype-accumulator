@@ -45,6 +45,13 @@ restrictions receive credit only after capability tests. Accepting full authorit
 over the account's actual uncapped value instead of claiming a cap requires a
 separate explicit policy mode and user approval; this document does not grant it.
 
+The effective-policy digest binds the enforcement mode, hard maximum, sweep
+threshold, worst-case outage headroom, lowercase SHA-256 evidence digest, and
+opaque approved change-record reference. A bounded live mode requires positive
+finite values, `sweep threshold + headroom <= hard maximum`, and non-empty valid
+evidence fields; `unapproved`, unknown modes, malformed hashes, and inconsistent
+combinations fail closed. Changing any field invalidates the acknowledgement.
+
 `cDeposit` and `tokenDelegate` use the user-signed EIP-712 scheme, while spot
 orders use the L1 action scheme. The production design therefore treats staking
 as master-authority until a testnet or explicitly approved probe demonstrates a
@@ -63,13 +70,24 @@ observation. A cursor gap, a historical fill first presented after the deadline,
 or a fill absent from this purchase-time ledger is ineligible for automatic
 staking and goes to manual review; the staking request path never backfills it.
 
-The reconciler maintains lot-level lifecycle state. Sales, transfers, staking
-reservations, and completed staking actions atomically consume the corresponding
-registered quantity. A spent, moved, expired, or otherwise ineligible lot never
-becomes eligible again because fungible spot or undelegated balance later
-increases. Before any staking reservation, the authoritative fill and movement
-cursors must be caught up through a fresh common watermark; a gap or concurrent
-state that cannot be ordered against that watermark fails closed.
+The reconciler maintains lot-level lifecycle state. Sales and transfers consume
+eligible quantity; a staking reservation moves exact eligible quantity to a
+reserved state, and a completed action finalizes that reservation without a
+second debit. Each transition is atomic. A spent, moved, expired, or otherwise
+ineligible lot never becomes eligible again because fungible spot or undelegated
+balance later increases. Before any staking reservation, the authoritative fill
+and movement cursors must be caught up through a fresh common watermark; a gap or
+concurrent state that cannot be ordered against that watermark fails closed.
+
+Non-workflow sales and transfers debit registered lots deterministically in
+ascending `(authoritative fill time, stable order ID, stable fill ID)` order.
+Staking reservations consume only the exact mapped lots in their workflow.
+`lot_eligibility_max_age_seconds` makes a remaining lot eligible only while
+`now < authoritative fill time + max age`; the boundary itself is expired. The
+only supported
+`lot_consumption_policy` is `oldest_authoritative_fill_first`; zero expiry,
+unknown policies, missing stable tie-breakers, and arithmetic remainder fail
+closed rather than selecting an implementation-dependent lot.
 
 The trading service emits a content-addressed staking intent after an
 authoritative fill and balance reconciliation. A separate signer accepts only a
@@ -185,7 +203,8 @@ unlimited. Production configuration must set all of these explicitly:
 - maximum order slippage;
 - minimum reserve and residual HYPE buffer;
 - market/book, account-history, and signal staleness limits;
-- purchase-fill registration deadline and lot-consumption policy;
+- purchase-fill registration deadline plus deterministic lot allocation and
+  expiration policy;
 - externally enforced hot-balance mode, limit, sweep threshold, and worst-case
   headroom evidence, or separately approved uncapped-authority acceptance;
 - mandatory cancel-only containment while halted;
@@ -241,7 +260,8 @@ Before production secrets or funds are present, attach evidence for:
 - proof of venue-enforced agent restrictions or dedicated-account balance
   isolation, including whether a hard venue bound or separately controlled
   custody mechanism keeps purchases, retained HYPE, appreciation, and outages
-  below the claimed maximum loss;
+  below the claimed maximum loss; bind its sweep threshold, worst-case headroom,
+  evidence SHA-256, and approved change-record reference into the policy digest;
 - conservation, idempotency, source/destination, and excess-transfer tests when
   parent-admission inheritance is enabled;
 - signer crash/retry/restore tests proving each workflow action phase is consumed
@@ -249,6 +269,8 @@ Before production secrets or funds are present, attach evidence for:
 - purchase-time registration and adversarial replay tests proving an unmapped or
   consumed historical fill cannot be enrolled under fresh workflow or daily
   decision IDs, including after a later purchase replenishes balances;
+- deterministic multi-lot partial-sale/transfer tests, including identical
+  timestamps, stable-ID tie-breaking, expiry boundaries, and replay after restore;
 - acknowledgement tests proving a changed, missing, malformed, or differently
   normalized parent-account value invalidates the effective-policy digest;
 - the user's explicit choice of custody option, host, validator, limits, and

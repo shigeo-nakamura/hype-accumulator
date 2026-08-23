@@ -37,7 +37,9 @@ ciphertext, host alias, or production filesystem path.
    fill under new workflow and daily decision IDs; the lot ledger must reject it.
    An old fill missing the purchase-time mapping must also remain ineligible.
    Delay sale/movement ingestion and confirm staking fails until both cursors
-   reach a fresh common watermark.
+   reach a fresh common watermark. Create multiple lots, partially consume them,
+   and verify replay selects the same oldest lot using fill time, order ID, then
+   fill ID; verify expired lots cannot be reserved.
 8. Rehearse manual halt with a resting test order. Confirm new order and staking
    signatures stop before the cancel-only path independently discovers and
    cancels the exact open order. Drop the cancellation response and verify it
@@ -47,6 +49,9 @@ ciphertext, host alias, or production filesystem path.
    Include retained HYPE appreciation, partial fills, delayed custody movement,
    and enforcement outage. Treat `max_hot_trading_balance_microusd` only as an
    operational alert and reject live mode while enforcement is `unapproved`.
+   Verify the sweep threshold plus worst-case headroom does not exceed the hard
+   maximum, and verify the acknowledged evidence SHA-256 and private change-record
+   reference before enabling live mode.
 
 ## Rotate
 
