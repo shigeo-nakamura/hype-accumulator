@@ -15,7 +15,7 @@ gain a capability from the presence of a private key.
 | --- | --- | --- | --- |
 | Read/reconcile | unsigned account address | metadata, book, balances, orders, fills, movements, staking state | every exchange action |
 | Spot execution | dedicated, named API wallet used by one process | venue-authorized trading actions for its assigned account; service policy submits only capped HYPE/USDC orders and cancels | user-signed transfers, staking, withdrawals, agent approval |
-| Staking approval | separately controlled master-wallet signer, pending user approval | `cDeposit` and `tokenDelegate` only, for a reconciled workflow | `cWithdraw`, undelegation, transfers, orders, agent approval |
+| Staking approval | separately controlled master-wallet signer, pending user approval | durable off-exchange purchase-authorization records plus `cDeposit` and `tokenDelegate`, for a reconciled workflow | `cWithdraw`, undelegation, transfers, orders, agent approval |
 | Recovery | offline master-wallet procedure | revoke/replace agent and recover funded account | unattended service access |
 
 Hyperliquid account queries use the actual master or subaccount address, never
@@ -68,17 +68,52 @@ threat model, and explicit approval; this service does not infer or perform one.
 
 ## Required process isolation
 
+Before any HYPE purchase order is submitted, an independent signer-side
+authorizer authenticates the caller, independently obtains the authoritative
+account and strategy inputs, and either recomputes the deterministic approved
+decision or verifies an authenticated approval artifact issued outside the trading
+service. It checks admitted capital, reserve, daily/yearly/cumulative room, signal
+freshness, slippage, and hot-exposure enforcement against its own immutable policy
+anchor, then durably commits a one-time pre-purchase authorization containing:
+
+- an authorization ID and canonical daily-decision ID and digest;
+- the actual execution account, policy version, market, buy side, TIF, exact
+  client order ID (CLOID), quantity, and limit price;
+- the maximum notional and slippage plus the remaining approved limits; and
+- issue/expiry times and the authorizer's authenticated record digest.
+
+The record is committed before the API wallet signs or submits the byte-identical
+order envelope. The executor must atomically move exactly one record from
+`authorized` to `submission_claimed` with that envelope digest before signing; a
+failed claim forbids submission. A transport-ambiguous submission stays claimed
+until authoritative CLOID reconciliation and is never released or retried blindly.
+The reconciler moves a matched claim to `order_bound` or a conclusively absent,
+expired claim to a terminal unused state; no terminal authorization is reusable.
+This is not an exchange action and grants no generic master-signer capability. A
+retry or residual reissue requires a new CLOID and authorization after authoritative
+reconciliation of its predecessor. That reconciliation atomically charges the
+filled amount, releases only conclusively unfilled reserved room, and debits any
+reissue from the remaining decision and policy room. A caller-supplied decision,
+authorization record, or policy snapshot is correlation data only.
+
 An independent signer-side reconciler, not the intent caller, advances a durable
 monotonic cursor over authoritative fills. When a purchase workflow becomes
 terminal and its canonical order/fill set is final, and before it can become
-staking-eligible, the reconciler atomically records the stable account, sorted
-order/fill IDs, every exact purchased quantity and their checked total, policy
-version, and a canonical content-addressed workflow ID derived from that complete
-evidence. Every fill must be registered within a configured deadline after its
-first authoritative observation. A cursor gap, a historical fill first presented
-after the deadline, or a fill absent from this purchase-time ledger makes the
-entire workflow ineligible for automatic staking and sends it to manual review;
-the staking request path never backfills it.
+staking-eligible, the reconciler requires a distinct signer-side
+`submission_claimed` authorization for every order in the set. Every account,
+decision, CLOID, canonical order envelope, limit, and expiry must match exactly,
+and all authorizations must belong to the same decision chain. It atomically binds
+each resulting stable venue order ID to its authorization, transitions the claim
+to `order_bound`, and records the sorted authorization, order, and fill IDs, every
+exact purchased quantity and their checked total, policy version, and a canonical
+content-addressed workflow ID derived from the complete authorization and fill
+evidence. Every fill must be
+registered within a configured deadline after its first authoritative observation.
+A cursor gap, late or absent authorization, mismatched order or fill, expired
+authorization at submission, historical fill first presented after the deadline,
+or fill absent from this purchase-time ledger makes the entire workflow permanently
+ineligible for automatic staking and sends it to manual review; neither the
+reconciler nor staking request path can backfill or override that state.
 Automatic staking is full-fill-set only: the intent amount must equal the sum of
 the exact registered quantities for its mapped authoritative fills. The signer
 does not create sub-lots, accept a partial amount, or split one workflow across
@@ -117,7 +152,7 @@ authoritative fill and balance reconciliation. A separate signer accepts only a
 fully specified intent containing:
 
 - workflow and daily decision IDs plus the stable authoritative order and fill
-  IDs for the purchase;
+  IDs and signer-side pre-purchase authorization IDs for the purchase;
 - account, action phase, asset, and exact integer `wei` amount; a delegation
   intent also contains exactly one validator, while a deposit intent contains no
   validator field;
@@ -137,8 +172,11 @@ independently queries authoritative order, fill, spot-balance, and staking state
 using the actual account address. It verifies that the canonical stable order/fill
 set, workflow ID, and amount exactly match the purchase-time mapping instead of
 trusting caller-supplied identifiers or aggregate balance. For `cDeposit`, it
-verifies the intent amount equals the entire mapped `eligible_spot` quantity and
-that authoritative spot balance covers it. For `tokenDelegate`, it instead
+requires every durable pre-purchase authorization and venue order binding to
+remain authentic, consistent, `order_bound` to this workflow, and unused by any
+other workflow. It verifies
+the intent amount equals the entire mapped `eligible_spot` quantity and that
+authoritative spot balance covers it. For `tokenDelegate`, it instead
 verifies a completed reconciled deposit predecessor and that the same full amount
 remains in `deposited_undelegated` with sufficient authoritative undelegated
 staking balance; it never requires or reserves `eligible_spot` again. It also
@@ -229,7 +267,11 @@ All gates are conjunctive and fail closed:
    halt, available daily purchase-notional room, available yearly and cumulative
    deployable-capital room, available slippage room, and independently enforced
    post-purchase hot-exposure room. A service-side threshold alone cannot satisfy
-   the final condition.
+   the final condition. Before order submission, the signer-side authorizer must
+   durably bind the independently verified decision, exact CLOID and canonical
+   order envelope, policy version, expiry, and remaining limits. No matching
+   authorization means no service order; any bypass fill is permanently ineligible
+   for automatic staking.
 8. A staking deposit requires reconciled newly purchased HYPE in `eligible_spot`
    and a configured residual buffer. When no validator is eligible it is permitted
    only by the separately approved `hold_undelegated_in_staking` policy; the
@@ -277,6 +319,7 @@ unlimited. Production configuration must set all of these explicitly:
 | Co-host compromise | isolated Unix user, read-only config, no master key in trading process, least-privilege IAM, signer action allowlist | revoke API wallet from an offline master path; halt; reconcile from authoritative history |
 | Leaked API key | full trading authority assumed; dedicated execution account with no unrelated funds; no loss-cap credit without external enforcement proof; one named agent per process and no address reuse | alert on unknown signer/order or operational threshold breach; halt, cancel, revoke, reconcile, and generate a new address |
 | Replay or nonce pruning | durable atomic nonce, unique signer per process, bounded expiry where supported, purchase-time one-fill-to-workflow mapping, lot consumption, signer-side one-time workflow/action-phase claims, never reuse deregistered/expired agent | reconcile by CLOID/history; block ambiguous lot and phase claims; rotate signer; never resend an unknown action blindly |
+| Unauthorized API-wallet order | signer-side durable pre-purchase decision and CLOID authorization before execution; exact order-envelope binding | unmatched or mismatched fills remain permanently ineligible for automatic staking; halt and reconcile the trading-account compromise |
 | Malicious validator selection | exact-address allowlist, no yield-based auto-switch, active/not-jailed/not-undelegate-only checks | stop new delegation and require allowlist-owner review |
 | Dependency compromise | lockfile, checksums, minimal signing interface, CI audit/review gate | artifact provenance and rollback; rotate signer if signing material may have been exposed |
 | State rollback/truncation | hash-chained append-only ledger, atomic snapshot, versioned off-host backup | replay and checksum verification; fail closed on divergence |
@@ -351,6 +394,11 @@ Before production secrets or funds are present, attach evidence for:
 - account-target tests proving automatic staking accepts only a dedicated master
   execution account that exactly matches the signer and rejects subaccount, vault,
   unknown, and master-account mismatch configurations;
+- adversarial pre-authorization tests proving a forged decision, unknown or reused
+  CLOID, changed order envelope or limits, late authorization, unmatched fill, and
+  residual reissue without a new authorization remain permanently ineligible for
+  automatic staking across retry and restore; fault injection must cover the
+  `authorized`, `submission_claimed`, and `order_bound` transitions;
 - acknowledgement tests proving a changed, missing, malformed, or differently
   normalized parent-account value invalidates the effective-policy digest;
 - the user's explicit choice of custody option, host, validator, limits, and

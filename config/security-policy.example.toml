@@ -44,6 +44,9 @@ admitted_parent_account_env = ""
 max_slippage_bps = 0
 book_stale_after_seconds = 0
 account_history_stale_after_seconds = 0
+# Live mode rejects false. The independent signer-side authorizer must commit the
+# exact decision, CLOID, order envelope, limits, and expiry before submission.
+require_prepurchase_authorization = true
 # Required positive in live mode. Signal age must be non-negative and strictly
 # below this threshold; a missing, malformed, or future timestamp fails closed.
 signal_stale_after_seconds = 0

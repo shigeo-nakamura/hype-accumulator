@@ -32,7 +32,17 @@ ciphertext, host alias, or production filesystem path.
 6. Confirm the service rejects live config without a current acknowledgement and
    rejects a missing, malformed, or changed resolved policy identity. Confirm it
    rejects staking when the separate signer is unavailable.
-7. Fault-test the signer around claim, signature, and result persistence. A
+7. Before order submission, verify the signer-side authorizer independently
+   validates the decision and policy inputs and durably binds the exact account,
+   decision, CLOID, order envelope, limits, and expiry. Submit an unauthorized
+   order with non-production material and confirm its fills remain permanently
+   ineligible for automatic staking. Repeat with a forged decision, changed price
+   or quantity, reused/unknown CLOID, expired or late authorization, and residual
+   reissue lacking a new authorization; none may be backfilled after restart or
+   restore. Drop the submission response after the authorization claim and verify
+   it remains `submission_claimed` until authoritative CLOID reconciliation, never
+   returning to a reusable state.
+8. Fault-test the signer around claim, signature, and result persistence. A
    consumed or ambiguous `(account, workflow ID, action phase)` must remain
    blocked across caller retry, restart, restore, and a retry with a new nonce.
    Confirm purchase fills are mapped by the independent reconciler at first
@@ -56,23 +66,23 @@ ciphertext, host alias, or production filesystem path.
    every case must reject automatic staking without creating another phase key.
    Exercise ambiguous responses, restart, and restore at both reservation
    boundaries.
-8. Rehearse manual halt with a resting test order. Confirm new order and staking
+9. Rehearse manual halt with a resting test order. Confirm new order and staking
    signatures stop before the cancel-only path independently discovers and
    cancels the exact open order. Drop the cancellation response and verify it
    re-queries authoritative state before retrying; signer loss must alert and
    escalate without clearing the halt.
-9. Prove the claimed hot-balance enforcement outside the API-wallet process.
+10. Prove the claimed hot-balance enforcement outside the API-wallet process.
    Include retained HYPE appreciation, partial fills, delayed custody movement,
    and enforcement outage. Treat `max_hot_trading_balance_microusd` only as an
    operational alert and reject live mode while enforcement is `unapproved`.
    Verify the sweep threshold plus worst-case headroom does not exceed the hard
    maximum, and verify the acknowledged evidence SHA-256 and private change-record
    reference before enabling live mode.
-10. At the exact yearly and lifetime cumulative capital boundaries, verify that
+11. At the exact yearly and lifetime cumulative capital boundaries, verify that
     neither direct admission nor a separately recorded operator admission permits
     another purchase. Year rollover may restore only yearly room; exceeding either
     acknowledged ceiling requires a newly acknowledged policy.
-11. Keep book and account feeds fresh while supplying a missing, malformed, future,
+12. Keep book and account feeds fresh while supplying a missing, malformed, future,
     exactly-at-limit, and expired decision-signal timestamp. Confirm every case
     rejects purchase and that only a non-negative age strictly below the configured
     positive signal-staleness threshold passes this gate.
