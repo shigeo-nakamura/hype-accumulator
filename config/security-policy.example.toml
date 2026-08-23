@@ -10,7 +10,12 @@ reserve_microusd = 0
 # Service-side order limits do not constrain a leaked API wallet.
 api_wallet_authority = "full_assigned_account_trading"
 require_dedicated_execution_account = true
+# Operational halt/alert only; this does not bound a leaked wallet.
 max_hot_trading_balance_microusd = 0
+# Safe default. Live mode rejects this. Any externally enforced or explicitly
+# accepted uncapped-authority mode requires separate evidence and must be bound
+# into the effective-policy acknowledgement.
+hot_balance_enforcement = "unapproved"
 # Safe default: only direct external deposits can originate admitted capital.
 # The only alternative is "traced_parent_transfer" with explicit approval.
 funding_mode = "external_deposit_only"
@@ -34,6 +39,9 @@ cancel_known_open_orders_while_halted = true
 enabled = false
 validator_allowlist = []
 residual_hype_wei = 0
+# Zero disables automatic staking. Eligible fills must be registered by the
+# independent reconciler within this period after first authoritative observation.
+fill_registration_deadline_seconds = 0
 # Safe default; the staking-account alternative requires explicit approval.
 no_eligible_validator_policy = "hold_in_spot"
 

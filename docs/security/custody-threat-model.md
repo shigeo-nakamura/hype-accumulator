@@ -24,16 +24,26 @@ new, dedicated API wallet and a durable monotonic allocator. A deregistered or
 expired API-wallet address is never reused.
 
 An API wallet is modeled as having full trading authority over its assigned
-account. Service-side asset, notional, and slippage checks do not constrain a
-leaked key and are defense in depth only. Production therefore requires a
-dedicated execution master account, subaccount, or vault whose available trading
-balance is independently bounded by the approved hot-balance cap and contains no
-unrelated funds. Reconciliation halts before signing if that balance exceeds the
-cap. Any venue-enforced agent restrictions must be proven by capability tests
-before receiving credit; none are assumed by this design. If account isolation
-is incompatible with the approved staking flow, custody remains unapproved unless
-the user explicitly accepts full trading authority over the funded account and
-its stated maximum loss.
+account. Service-side asset, notional, slippage, and hot-balance checks do not
+constrain a leaked key and are defense in depth only. The leaked-key maximum loss
+is therefore the complete marked-to-market value reachable by that wallet, not
+the configured `max_hot_trading_balance_microusd`.
+
+A dedicated execution master account, subaccount, or vault with no unrelated
+funds is necessary but is not by itself a security cap. Production may claim a
+bounded maximum loss only after evidence demonstrates either a venue/account-level
+hard bound or a separately controlled custody mechanism outside the API wallet's
+authority that moves accumulating or appreciated assets beyond that authority
+before the bound can be exceeded. The mechanism must cover `hold_in_spot`,
+price appreciation, partial fills, retry ambiguity, and outages, and must enforce
+a lower admission threshold with measured worst-case headroom. Any custody mover
+that expands the action allowlist requires a separate design and explicit
+approval; none is authorized here. Until such enforcement is proven,
+`hot_balance_enforcement` remains `unapproved`, live mode is rejected, and the
+configured threshold is only an operational halt/alert. Venue-enforced agent
+restrictions receive credit only after capability tests. Accepting full authority
+over the account's actual uncapped value instead of claiming a cap requires a
+separate explicit policy mode and user approval; this document does not grant it.
 
 `cDeposit` and `tokenDelegate` use the user-signed EIP-712 scheme, while spot
 orders use the L1 action scheme. The production design therefore treats staking
@@ -42,6 +52,24 @@ narrower supported authority. An API wallet succeeding at order placement is
 not evidence that it can authorize staking.
 
 ## Required process isolation
+
+An independent signer-side reconciler, not the intent caller, advances a durable
+monotonic cursor over authoritative fills. As each purchase fill becomes final,
+and before it can become staking-eligible, the reconciler atomically records its
+stable account, order/fill IDs, exact purchased quantity, policy version, and a
+canonical content-addressed workflow ID derived from that evidence. Registration
+must occur within a configured deadline at the fill's first authoritative
+observation. A cursor gap, a historical fill first presented after the deadline,
+or a fill absent from this purchase-time ledger is ineligible for automatic
+staking and goes to manual review; the staking request path never backfills it.
+
+The reconciler maintains lot-level lifecycle state. Sales, transfers, staking
+reservations, and completed staking actions atomically consume the corresponding
+registered quantity. A spent, moved, expired, or otherwise ineligible lot never
+becomes eligible again because fungible spot or undelegated balance later
+increases. Before any staking reservation, the authoritative fill and movement
+cursors must be caught up through a fresh common watermark; a gap or concurrent
+state that cannot be ordered against that watermark fails closed.
 
 The trading service emits a content-addressed staking intent after an
 authoritative fill and balance reconciliation. A separate signer accepts only a
@@ -61,30 +89,30 @@ identifiers, not proof that the referenced state or limits are genuine.
 
 For every initial request and retry, the signer authenticates the caller and
 independently queries authoritative order, fill, spot-balance, staking, and
-validator state using the actual account address. It verifies the newly purchased
-HYPE amount and derives the canonical set of stable order/fill IDs rather than
-trusting caller-supplied identifiers. It also verifies residual balance,
-validator eligibility, intent expiry, and daily and cumulative room against an
-independently loaded approved policy and immutable ledger anchor. Missing, stale,
+validator state using the actual account address. It verifies that the canonical
+stable order/fill set, workflow ID, amount, and remaining eligible lot quantity
+exactly match the purchase-time mapping instead of trusting caller-supplied
+identifiers or aggregate balance. It also verifies residual balance, validator
+eligibility, intent expiry, and daily and cumulative room against an independently
+loaded approved policy and immutable ledger anchor. Missing, stale, consumed,
 ambiguous, or mismatched evidence is rejected into manual review without signing.
 
-Before producing a signature, one durable atomic transaction establishes an
-immutable mapping from every authoritative fill ID in the canonical purchase set
-to exactly one account, workflow ID, and purchased amount, then claims the unique
-`(account, workflow ID, action phase)` key with that fill set, the canonical
-intent digest, and nonce. All fills in an aggregate purchase succeed or fail as a
-unit; a fill already mapped to any workflow rejects the entire request even when
-the caller supplies a fresh workflow, daily decision, or nonce. Deposit and
-delegation are separate, ordered phases, and each may be claimed only once; a
-later phase also requires authoritative reconciliation of its predecessor. A
-conflicting fill set, amount, digest, or nonce is rejected. A duplicate of a
+Before producing a signature, one durable atomic transaction verifies every fill
+is already mapped to this workflow with sufficient eligible quantity, reserves
+that quantity, and claims the unique `(account, workflow ID, action phase)` key
+with the fill set, canonical intent digest, and nonce. The signer never creates or
+changes the fill-to-workflow mapping while processing an intent. All fills in an
+aggregate purchase succeed or fail as a unit. Deposit and delegation are
+separate, ordered phases, and each may be claimed only once; a later phase also
+requires authoritative reconciliation of its predecessor. A conflicting or
+unmapped fill set, amount, digest, or nonce is rejected. A duplicate of a
 completed phase may return only the previously stored byte-identical result,
-never a fresh signature or nonce. A crash or write ambiguity between claim,
-signing, and result persistence leaves the fill mapping and phase blocked for
-authoritative reconciliation and manual review. Neither may be cleared by caller
-retry, process restart, snapshot restore, or a later balance increase. The fill
-mapping and consumed-phase ledger are included in the hash chain and off-host
-restore checks.
+never a fresh signature or nonce. A crash or write ambiguity between reservation,
+signing, and result persistence leaves the lot and phase blocked for authoritative
+reconciliation and manual review. Neither may be cleared by caller retry, process
+restart, snapshot restore, or a later balance increase. The purchase-time mapping,
+lot lifecycle, and consumed-phase ledger are included in the hash chain and
+off-host restore checks.
 
 Until this boundary is implemented and rehearsed, automatic staking remains
 disabled. Storing a general-purpose master private key in the bot process is not
@@ -127,7 +155,9 @@ All gates are conjunctive and fail closed:
 6. Committed plus spent USDC cannot exceed admitted deposits minus reconciled
    withdrawals and reserves.
 7. A purchase requires fresh book/account data, no unknown movement, no balance
-   mismatch, no halt, and available daily/cumulative notional and slippage room.
+   mismatch, no halt, available daily/cumulative notional and slippage room, and
+   independently enforced post-purchase hot-exposure room. A service-side
+   threshold alone cannot satisfy the final condition.
 8. Delegation requires reconciled newly purchased HYPE, a configured residual
    buffer, and an allowlisted active validator that is neither jailed nor
    undelegate-only.
@@ -155,6 +185,9 @@ unlimited. Production configuration must set all of these explicitly:
 - maximum order slippage;
 - minimum reserve and residual HYPE buffer;
 - market/book, account-history, and signal staleness limits;
+- purchase-fill registration deadline and lot-consumption policy;
+- externally enforced hot-balance mode, limit, sweep threshold, and worst-case
+  headroom evidence, or separately approved uncapped-authority acceptance;
 - mandatory cancel-only containment while halted;
 - execution-account funding mode, parent-account identity, and whether traced
   transfer admission inheritance is enabled;
@@ -165,8 +198,8 @@ unlimited. Production configuration must set all of these explicitly:
 | Threat | Prevent | Detect / recover |
 | --- | --- | --- |
 | Co-host compromise | isolated Unix user, read-only config, no master key in trading process, least-privilege IAM, signer action allowlist | revoke API wallet from an offline master path; halt; reconcile from authoritative history |
-| Leaked API key | full trading authority assumed; dedicated balance-bounded execution account, one named agent per process, no unrelated funds or address reuse | alert on unknown signer/order or hot-balance breach; halt, revoke, reconcile, and generate a new address |
-| Replay or nonce pruning | durable atomic nonce, unique signer per process, bounded expiry where supported, immutable one-fill-to-workflow mapping, signer-side one-time workflow/action-phase claims, never reuse deregistered/expired agent | reconcile by CLOID/history; block ambiguous fill and phase claims; rotate signer; never resend an unknown action blindly |
+| Leaked API key | full trading authority assumed; dedicated execution account with no unrelated funds; no loss-cap credit without external enforcement proof; one named agent per process and no address reuse | alert on unknown signer/order or operational threshold breach; halt, cancel, revoke, reconcile, and generate a new address |
+| Replay or nonce pruning | durable atomic nonce, unique signer per process, bounded expiry where supported, purchase-time one-fill-to-workflow mapping, lot consumption, signer-side one-time workflow/action-phase claims, never reuse deregistered/expired agent | reconcile by CLOID/history; block ambiguous lot and phase claims; rotate signer; never resend an unknown action blindly |
 | Malicious validator selection | exact-address allowlist, no yield-based auto-switch, active/not-jailed/not-undelegate-only checks | stop new delegation and require allowlist-owner review |
 | Dependency compromise | lockfile, checksums, minimal signing interface, CI audit/review gate | artifact provenance and rollback; rotate signer if signing material may have been exposed |
 | State rollback/truncation | hash-chained append-only ledger, atomic snapshot, versioned off-host backup | replay and checksum verification; fail closed on divergence |
@@ -185,7 +218,10 @@ eligible, the typed
 default `hold_in_spot` value forbids `cDeposit`. The only alternative,
 `hold_undelegated_in_staking`, requires separate explicit approval and permits
 only `cDeposit`, never delegation; operators must accept its seven-day return
-queue. Unknown policy values fail configuration validation.
+queue. Unknown policy values fail configuration validation. `hold_in_spot`
+does not provide a leaked-key balance cap: if retained or appreciated HYPE could
+exceed the independently enforced bound, no further purchase is authorized and
+production remains unapproved until an external containment design is proven.
 
 Automatic `cWithdraw` and undelegation are absent from the service. Staking to
 spot has a seven-day queue and limited pending withdrawals; recovery procedures
@@ -203,14 +239,16 @@ Before production secrets or funds are present, attach evidence for:
   unavailable-signer escalation;
 - IAM and filesystem permission review;
 - proof of venue-enforced agent restrictions or dedicated-account balance
-  isolation, including the maximum hot balance and breach behavior;
+  isolation, including whether a hard venue bound or separately controlled
+  custody mechanism keeps purchases, retained HYPE, appreciation, and outages
+  below the claimed maximum loss;
 - conservation, idempotency, source/destination, and excess-transfer tests when
   parent-admission inheritance is enabled;
 - signer crash/retry/restore tests proving each workflow action phase is consumed
   before signing and cannot be reauthorized with a different nonce;
-- adversarial replay tests proving the same authoritative fill set cannot be
-  remapped under fresh workflow or daily decision IDs, including after a later
-  purchase replenishes balances;
+- purchase-time registration and adversarial replay tests proving an unmapped or
+  consumed historical fill cannot be enrolled under fresh workflow or daily
+  decision IDs, including after a later purchase replenishes balances;
 - acknowledgement tests proving a changed, missing, malformed, or differently
   normalized parent-account value invalidates the effective-policy digest;
 - the user's explicit choice of custody option, host, validator, limits, and

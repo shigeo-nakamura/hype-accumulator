@@ -31,13 +31,22 @@ ciphertext, host alias, or production filesystem path.
 7. Fault-test the signer around claim, signature, and result persistence. A
    consumed or ambiguous `(account, workflow ID, action phase)` must remain
    blocked across caller retry, restart, restore, and a retry with a new nonce.
-   Repackage the same authoritative fill IDs under new workflow and daily
-   decision IDs and confirm the durable one-fill-to-workflow mapping rejects it.
+   Confirm purchase fills are mapped by the independent reconciler at first
+   authoritative observation, not by the staking request. Sell or otherwise
+   consume a registered lot, replenish aggregate balance, then repackage the old
+   fill under new workflow and daily decision IDs; the lot ledger must reject it.
+   An old fill missing the purchase-time mapping must also remain ineligible.
+   Delay sale/movement ingestion and confirm staking fails until both cursors
+   reach a fresh common watermark.
 8. Rehearse manual halt with a resting test order. Confirm new order and staking
    signatures stop before the cancel-only path independently discovers and
    cancels the exact open order. Drop the cancellation response and verify it
    re-queries authoritative state before retrying; signer loss must alert and
    escalate without clearing the halt.
+9. Prove the claimed hot-balance enforcement outside the API-wallet process.
+   Include retained HYPE appreciation, partial fills, delayed custody movement,
+   and enforcement outage. Treat `max_hot_trading_balance_microusd` only as an
+   operational alert and reject live mode while enforcement is `unapproved`.
 
 ## Rotate
 
