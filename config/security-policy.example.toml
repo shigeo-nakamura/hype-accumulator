@@ -73,6 +73,11 @@ cancel_known_open_orders_while_halted = true
 # A subaccount or vault must keep this false; no automatic child-to-master transfer
 # is authorized by this policy.
 enabled = false
+# cDeposit/tokenDelegate do not support expiresAfter. This is the only live mode:
+# the signer submits once itself and never returns a signature or action payload.
+submission_mode = "signer_submit_once"
+# Required positive for automatic staking. At the exact margin, do not sign.
+submission_min_remaining_ms = 0
 validator_allowlist = []
 # Required positive for automatic staking. The authorizer reserves any deficit
 # from a purchase; only the exact remainder may become staking-eligible.

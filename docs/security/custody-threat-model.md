@@ -51,8 +51,9 @@ The effective-policy digest binds the enforcement mode, hard maximum, sweep
 threshold, worst-case outage headroom, lowercase SHA-256 evidence digest, opaque
 approved change-record reference, and the canonical daily/yearly limit-period
 schemes. It also binds the aggregate purchase-fee ceiling and mandatory
-venue-enforced signed-request-expiry mode. A bounded live mode requires positive
-finite values,
+venue-enforced signed-request-expiry mode. For staking it binds the signer-only
+submit-once mode and positive minimum time remaining before intent expiry. A
+bounded live mode requires positive finite values,
 `sweep threshold + headroom <= hard maximum`, and non-empty valid evidence fields;
 `unapproved`, unknown modes or period schemes, a disabled signed expiry, malformed
 hashes, and inconsistent combinations fail closed. Changing any field invalidates
@@ -295,12 +296,14 @@ for staking deposit and delegation and rejects unknown fields. In particular,
 the exact validator address. Intent-supplied hashes are correlation identifiers,
 not proof that the referenced state or limits are genuine.
 
-For every initial request and retry, the signer authenticates the caller and
-independently queries authoritative order, fill, spot-balance, and staking state
-using the actual account address. It verifies that the canonical stable order/fill
-set, workflow ID, residual carve-out, and eligible amount exactly match the
+For every initial request, the signer authenticates the caller and independently
+queries authoritative order, fill, spot-balance, and staking state using the
+actual account address. It verifies that the canonical stable order/fill set,
+workflow ID, residual carve-out, and eligible amount exactly match the
 purchase-time mapping instead of trusting caller-supplied identifiers or aggregate
-balance. For `cDeposit`, it
+balance. A caller retry is status and reconciliation only: it supplies the opaque
+operation ID and cannot request another signature, nonce, action, or submission.
+For `cDeposit`, the signer
 requires every durable pre-purchase authorization and venue order binding to
 remain authentic, consistent, `order_bound` to this workflow, and unused by any
 other workflow. It verifies
@@ -322,27 +325,54 @@ validator state fails closed. Only the explicitly approved
 allowlisted, active, not jailed, and not undelegate-only. Missing, stale, consumed,
 ambiguous, or mismatched evidence is rejected into manual review without signing.
 
-Before producing a signature, one durable atomic transaction verifies every fill
-is already mapped to this workflow, performs the action-specific reservation, and
+`cDeposit` and `tokenDelegate` have no venue-enforced `expiresAfter` field. The
+only live staking mode is therefore `signer_submit_once`: the isolated signer owns
+the outbound exchange client and never exposes a sign-only endpoint. The caller
+receives only an opaque operation ID and sanitized status or terminal result,
+never a serialized action, nonce/signature pair, or other reusable submission
+payload.
+
+Using the same ledger-backed UTC clock, immediately before claiming the phase and
+again immediately before signing, the signer refreshes every balance, limit,
+validator, and evidence gate above and requires the checked strict inequality
+`intent_expiry_ms - now_ms > submission_min_remaining_ms`. The configured margin
+must be positive. The exact margin, an expired intent, insufficient remaining
+time, clock failure, arithmetic failure, or refresh failure rejects before
+signing. This is an in-signer dispatch guard, not a claim that the venue enforces
+staking acceptance expiry.
+
+One durable atomic transaction then performs the action-specific reservation and
 claims the unique `(account, workflow ID, action phase)` key with the immutable
-fill allocations, canonical intent digest, and nonce. The deposit phase must
-atomically move the full mapped eligible allocation from `eligible_spot` to
-`deposit_reserved`. The
-delegation phase must atomically verify its reconciled deposit predecessor and move
-the same mapped quantity from `deposited_undelegated` to
-`delegation_reserved`; it cannot reserve `eligible_spot`. The signer never creates
-or changes the fill-to-workflow mapping while processing an intent. All fills in
-an aggregate purchase succeed or fail as a unit. Deposit and delegation are
-separate, ordered phases, and each may be claimed only once. Authoritative success
-finalizes the reservation into `deposited_undelegated` or `delegated` respectively.
-A conflicting state, unmapped fill set, amount, digest, or nonce is rejected. A
-duplicate of a completed phase may return only the previously stored byte-identical
-result, never a fresh signature or nonce. A crash or write ambiguity between
-reservation, signing, and result persistence leaves the action-specific
-reservation and phase blocked for authoritative reconciliation and manual review.
-Neither may be cleared by caller retry, process restart, snapshot restore, or a
-later balance increase. The purchase-time mapping, lot lifecycle, and
-consumed-phase ledger are included in the hash chain and off-host restore checks.
+fill allocations, canonical intent digest, nonce, `signer_submit_once` mode, and
+minimum remaining-time policy. The deposit phase atomically moves the full mapped
+eligible allocation from `eligible_spot` to `deposit_reserved`. The delegation
+phase atomically verifies its reconciled deposit predecessor and moves the same
+mapped quantity from `deposited_undelegated` to `delegation_reserved`; it cannot
+reserve `eligible_spot`. The signer never creates or changes the
+fill-to-workflow mapping while processing an intent. All fills in an aggregate
+purchase succeed or fail as a unit. Deposit and delegation are separate, ordered
+phases, and each may be claimed only once.
+
+After that claim, the signer creates the signature only in protected memory and
+directly submits the exact action once. It never logs, persists, returns, or
+exports the signature or payload. If it cannot begin the network write before
+intent expiry, it destroys the in-memory payload without submitting and leaves
+the reservation and phase blocked for manual reconciliation. If any request bytes
+may have been sent but no authoritative result is available by expiry, the phase
+becomes ambiguous: no component may retry, and the signer reconciles by account,
+action, nonce, and movement history. A late authoritative success finalizes the
+reservation into `deposited_undelegated` or `delegated` respectively; a conclusive
+rejection or absence is stored as a terminal audited outcome under the consumed
+phase key. A conflicting state, unmapped fill set, amount, digest, or nonce is
+rejected. A duplicate or caller retry returns only the stored opaque status or
+terminal result, never a fresh signature, nonce, action, or submission.
+
+A crash or write ambiguity between reservation, signing, submission, and result
+persistence leaves the action-specific reservation and phase blocked for
+authoritative reconciliation and manual review. Neither may be cleared by caller
+retry, process restart, snapshot restore, or a later balance increase. The
+purchase-time mapping, lot lifecycle, submission state, and consumed-phase ledger
+are included in the hash chain and off-host restore checks.
 
 Until this boundary is implemented and rehearsed, automatic staking remains
 disabled. Storing a general-purpose master private key in the bot process is not
@@ -432,7 +462,13 @@ All gates are conjunctive and fail closed:
    Delegation requires the same mapped eligible quantity in
    `deposited_undelegated` after authoritative deposit reconciliation, plus an
    explicitly specified, allowlisted active validator that is neither jailed nor
-   undelegate-only.
+   undelegate-only. Because staking actions do not support `expiresAfter`, both
+   actions require `signer_submit_once`, a positive
+   `submission_min_remaining_ms`, and direct one-time submission by the isolated
+   signer without exposing a signature or action payload. Failure to begin the
+   network write before intent expiry blocks the phase without submission. A
+   possible write or unknown response blocks retry and requires authoritative
+   reconciliation.
 9. An ambiguous exposure-creating action response moves the workflow to
    reconciliation or manual review; it never causes a blind retry.
 10. Engaging manual halt atomically denies new order placement, staking deposit,
@@ -465,6 +501,8 @@ configuration must set all of these explicitly:
 - market/book, account-history, fee-schedule, and signal staleness limits;
 - purchase-fill registration deadline plus deterministic lot allocation and
   expiration policy;
+- signer-only staking submission mode and positive minimum remaining time before
+  intent expiry;
 - externally enforced hot-balance mode, limit, sweep threshold, and worst-case
   headroom evidence, or separately approved uncapped-authority acceptance;
 - mandatory cancel-only containment while halted;
@@ -481,6 +519,7 @@ configuration must set all of these explicitly:
 | Replay or nonce pruning | durable atomic nonce, unique signer per process, bounded expiry where supported, purchase-time one-fill-to-workflow mapping, lot consumption, signer-side one-time workflow/action-phase claims, never reuse deregistered/expired agent | reconcile by CLOID/history; block ambiguous lot and phase claims; rotate signer; never resend an unknown action blindly |
 | Unauthorized API-wallet order | signer-side durable pre-purchase decision and CLOID authorization before execution; exact order-envelope binding | unmatched or mismatched fills remain permanently ineligible for automatic staking; halt and reconcile the trading-account compromise |
 | Delayed or stale order | signed `expiresAfter = effective_expiry_ms - 1` plus IOC-only live policy; GTC/ALO and missing/changed expiry rejected; no process-local expiry credit | venue rejects delayed acceptance; any impossible post-expiry fill halts live action, remains charged, and is ineligible for automatic staking |
+| Withheld or delayed staking payload | no sign-only endpoint; signer-only direct one-time submission; in-memory-only signature; strict positive pre-dispatch margin | pre-write expiry blocks without submission; possible write or timeout blocks retry and requires authoritative history reconciliation |
 | Fee under-reservation | checked `C = N + ceil(N * aggregate fee bps / 10000)` reserves admitted, reserve, yearly, and cumulative cash room while daily notional separately reserves `N` | authoritative fee reconciliation retains full reservation while ambiguous and halts on an unknown, stale, differently denominated, or above-ceiling fee |
 | Malicious validator selection | exact-address allowlist, no yield-based auto-switch, active/not-jailed/not-undelegate-only checks | stop new delegation and require allowlist-owner review |
 | Dependency compromise | lockfile, checksums, minimal signing interface, CI audit/review gate | artifact provenance and rollback; rotate signer if signing material may have been exposed |
@@ -563,6 +602,12 @@ Before production secrets or funds are present, attach evidence for:
 - account-target tests proving automatic staking accepts only a dedicated master
   execution account that exactly matches the signer and rejects subaccount, vault,
   unknown, and master-account mismatch configurations;
+- staking-submission tests proving the caller, logs, and durable ledger can never
+  obtain a signature or action payload; exact remaining-time equality rejects
+  before signing; delaying dispatch beyond expiry destroys the payload without a
+  write; a possible partial write or unknown response blocks retry while a late
+  success is reconciled; crashes at claim, sign, write, and response persistence
+  preserve the consumed phase and submission state across restore;
 - adversarial pre-authorization tests proving a forged decision, unknown or reused
   CLOID, changed order envelope or limits, late authorization, unmatched fill, and
   residual reissue without a new authorization remain permanently ineligible for

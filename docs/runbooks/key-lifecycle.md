@@ -75,6 +75,17 @@ ciphertext, host alias, or production filesystem path.
 8. Fault-test the signer around claim, signature, and result persistence. A
    consumed or ambiguous `(account, workflow ID, action phase)` must remain
    blocked across caller retry, restart, restore, and a retry with a new nonce.
+   Confirm `cDeposit` and `tokenDelegate` use only `signer_submit_once`: the
+   signer owns the exchange client, and callers, logs, and the durable ledger
+   receive no signature or action payload. At the exact
+   `submission_min_remaining_ms` boundary, verify rejection occurs before
+   signing. Delay dispatch past intent expiry and verify the signer destroys the
+   in-memory payload, performs no write, and blocks the phase for manual
+   reconciliation. Inject a partial or unknown write and withhold the response
+   beyond expiry; verify no retry is possible, the caller sees only opaque status,
+   and a late authoritative success is reconciled. Crash at claim, sign, write,
+   and result persistence and verify the consumed phase and submission state
+   survive restore.
    Confirm purchase fills are mapped by the independent reconciler at first
    authoritative observation, not by the staking request. Sell or otherwise
    consume a registered lot, replenish aggregate balance, then repackage the old
