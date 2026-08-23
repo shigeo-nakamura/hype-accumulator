@@ -6,6 +6,12 @@ max_yearly_deployable_microusd = 0
 max_cumulative_deployable_microusd = 0
 reserve_microusd = 0
 
+[custody]
+# Service-side order limits do not constrain a leaked API wallet.
+api_wallet_authority = "full_assigned_account_trading"
+require_dedicated_execution_account = true
+max_hot_trading_balance_microusd = 0
+
 [execution]
 max_slippage_bps = 0
 book_stale_after_seconds = 0

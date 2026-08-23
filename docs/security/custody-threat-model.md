@@ -14,7 +14,7 @@ gain a capability from the presence of a private key.
 | Capability | Production principal | Allowed actions | Explicitly denied |
 | --- | --- | --- | --- |
 | Read/reconcile | unsigned account address | metadata, book, balances, orders, fills, movements, staking state | every exchange action |
-| Spot execution | dedicated, named API wallet used by one process | capped HYPE/USDC order and cancel | transfers, staking, withdrawals, agent approval |
+| Spot execution | dedicated, named API wallet used by one process | venue-authorized trading actions for its assigned account; service policy submits only capped HYPE/USDC orders and cancels | user-signed transfers, staking, withdrawals, agent approval |
 | Staking approval | separately controlled master-wallet signer, pending user approval | `cDeposit` and `tokenDelegate` only, for a reconciled workflow | `cWithdraw`, undelegation, transfers, orders, agent approval |
 | Recovery | offline master-wallet procedure | revoke/replace agent and recover funded account | unattended service access |
 
@@ -22,6 +22,18 @@ Hyperliquid account queries use the actual master or subaccount address, never
 the API-wallet address. Nonces belong to the signer, so every bot process uses a
 new, dedicated API wallet and a durable monotonic allocator. A deregistered or
 expired API-wallet address is never reused.
+
+An API wallet is modeled as having full trading authority over its assigned
+account. Service-side asset, notional, and slippage checks do not constrain a
+leaked key and are defense in depth only. Production therefore requires a
+dedicated execution master account, subaccount, or vault whose available trading
+balance is independently bounded by the approved hot-balance cap and contains no
+unrelated funds. Reconciliation halts before signing if that balance exceeds the
+cap. Any venue-enforced agent restrictions must be proven by capability tests
+before receiving credit; none are assumed by this design. If account isolation
+is incompatible with the approved staking flow, custody remains unapproved unless
+the user explicitly accepts full trading authority over the funded account and
+its stated maximum loss.
 
 `cDeposit` and `tokenDelegate` use the user-signed EIP-712 scheme, while spot
 orders use the L1 action scheme. The production design therefore treats staking
@@ -100,7 +112,7 @@ unlimited. Production configuration must set all of these explicitly:
 | Threat | Prevent | Detect / recover |
 | --- | --- | --- |
 | Co-host compromise | isolated Unix user, read-only config, no master key in trading process, least-privilege IAM, signer action allowlist | revoke API wallet from an offline master path; halt; reconcile from authoritative history |
-| Leaked API key | dedicated named agent per process, low action/notional limits, no reuse | alert on unknown signer/order; revoke and generate a new address |
+| Leaked API key | full trading authority assumed; dedicated balance-bounded execution account, one named agent per process, no unrelated funds or address reuse | alert on unknown signer/order or hot-balance breach; halt, revoke, reconcile, and generate a new address |
 | Replay or nonce pruning | durable atomic nonce, unique signer per process, bounded expiry where supported, never reuse deregistered/expired agent | reconcile by CLOID/history; rotate signer; never resend an unknown action blindly |
 | Malicious validator selection | exact-address allowlist, no yield-based auto-switch, active/not-jailed/not-undelegate-only checks | stop new delegation and require allowlist-owner review |
 | Dependency compromise | lockfile, checksums, minimal signing interface, CI audit/review gate | artifact provenance and rollback; rotate signer if signing material may have been exposed |
@@ -134,6 +146,8 @@ Before production secrets or funds are present, attach evidence for:
 - a dry-run key install/rotate/revoke rehearsal using non-production material;
 - ledger restore and stale/ambiguous-response fault tests;
 - IAM and filesystem permission review;
+- proof of venue-enforced agent restrictions or dedicated-account balance
+  isolation, including the maximum hot balance and breach behavior;
 - the user's explicit choice of custody option, host, validator, limits, and
   exact small-probe configuration.
 
@@ -143,4 +157,5 @@ Before production secrets or funds are present, attach evidence for:
 - Hyperliquid, [Signing](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/signing)
 - Hyperliquid, [Exchange endpoint](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/exchange-endpoint)
 - Hyperliquid, [Staking](https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/staking)
+- Hyperliquid, [Sub-accounts](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/sub-accounts)
 
