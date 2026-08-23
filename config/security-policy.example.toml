@@ -56,16 +56,24 @@ max_purchase_fee_bps = 0
 # Only IOC is approved. GTC, ALO, and unknown/resting values fail live validation.
 authorized_order_tif = "ioc"
 # Live mode rejects false. The exact Hyperliquid expiresAfter millisecond is part
-# of the signed request hash and is one millisecond before effective expiry.
+# of the signed request hash and equals effective expiry minus the verified
+# maximum venue-clock lag below, minus one millisecond.
 require_signed_request_expiry = true
+# Required positive in live mode and bound into the acknowledgement. Independent
+# fresh venue-clock evidence must prove a conservative lag no greater than this,
+# including measurement uncertainty and maximum drift through effective expiry.
+max_venue_clock_lag_ms = 0
+# Required positive in live mode. Missing, future, or age-at-limit clock evidence
+# fails closed; an unbounded or above-bound observation halts live authorization.
+venue_clock_evidence_stale_after_seconds = 0
 book_stale_after_seconds = 0
 account_history_stale_after_seconds = 0
 # Required positive in live mode; missing, future, or age-at-limit fee data fails.
 fee_schedule_stale_after_seconds = 0
 # Live mode rejects false. The independent signer-side authorizer must commit the
 # exact decision-chain quantity/notional caps and one active slot, CLOID, unsigned
-# request including nonce/expiresAfter, fee-capped cash debit, ledger limits, and
-# expiry before submission.
+# request including nonce/expiresAfter, fee-capped cash debit, ledger limits,
+# venue-clock evidence and lag bound, and expiry before submission.
 require_prepurchase_authorization = true
 # Required positive in live mode. Signal age must be non-negative and strictly
 # below this threshold; a missing, malformed, or future timestamp fails closed.

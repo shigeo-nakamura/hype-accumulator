@@ -35,7 +35,8 @@ ciphertext, host alias, or production filesystem path.
 7. Before order submission, verify the signer-side authorizer independently
    validates the decision and policy inputs and durably binds the exact account,
    decision, CLOID, unsigned request template, L1 nonce, signed `expiresAfter`,
-   fee ceiling, `N`/`F`/`C` values, ledger limits, and expiry. Submit an
+   fee ceiling, `N`/`F`/`C` values, ledger limits, venue-clock evidence and lag
+   bound, and expiry. Submit an
    unauthorized order with non-production material and confirm its fills remain
    permanently ineligible for automatic staking. Repeat with a forged decision,
    changed price or quantity, reused/unknown CLOID, expired or late authorization,
@@ -80,13 +81,19 @@ ciphertext, host alias, or production filesystem path.
    request is denied, the carried mirror must still commit. Repeat with concurrent
    instances, expiry, restart, and restore; expiry removes both the originating
    reservation and every mirror before releasing the active slot.
-   At claim, test every input freshness horizon and the exact effective-expiry
-   boundary; neither an expired `authorized` record nor an ambiguous claimed record
-   may return to a reusable state. Verify the exact
-   `expiresAfter_ms = effective_expiry_ms - 1` is in the authorization, canonical
-   unsigned request-template digest, L1 action hash, and submitted payload.
-   Omission or alteration must fail; hold a valid signed IOC request until the
-   horizon and prove the venue rejects it without a fill. Confirm GTC, ALO, and
+   Obtain independently authenticated venue-clock evidence and calculate a
+   conservative maximum lag `L` including measurement uncertainty and drift
+   through the horizon. Missing, stale, future, malformed, unbounded, and
+   above-policy observations must reject live authorization. At claim, test every
+   input freshness horizon, `now_ms = expiresAfter_ms`, and the exact effective
+   expiry boundary; neither an expired `authorized` record nor an ambiguous
+   claimed record may return to a reusable state. Verify the exact
+   `expiresAfter_ms = effective_expiry_ms - L - 1`, `L`, and evidence digest are
+   in the authorization, canonical unsigned request-template digest, L1 action
+   hash, and submitted payload. Omission or alteration must fail. Model the venue
+   clock at exactly the maximum permitted lag, hold a valid signed IOC request
+   until the ledger's effective horizon, and prove the venue rejects it without a
+   fill. Confirm GTC, ALO, and
    every resting TIF fail live validation and only the exact IOC-plus-expiry
    envelope can be claimed. Carry an ambiguous IOC claim across daily and yearly
    boundaries and verify `N` reduces each later daily ledger until terminal
@@ -115,10 +122,12 @@ ciphertext, host alias, or production filesystem path.
    reaches `submission_claimed` and confirm the service reports
    `halt_draining`, never `halted`. Submit it just before `expiresAfter_ms`;
    the cancel-only path must discover and bind it, cancel it if open, and reconcile
-   every fill. For a withheld request that never appears, require the ledger clock
-   to pass expiry plus a gap-free authoritative order/fill watermark later than
-   expiry. Only after every snapshotted claim is terminal and a fresh query shows
-   no open orders may the service report `halted`. Drop cancellation and query
+   every fill. For a withheld request that never appears, a lagging venue may
+   remain able to accept after the ledger passes the smaller signed expiry.
+   Require the ledger clock to pass `effective_expiry_ms` plus a gap-free
+   authoritative order/fill watermark later than that effective horizon. Only
+   after every snapshotted claim is terminal and a fresh query shows no open
+   orders may the service report `halted`. Drop cancellation and query
    responses, restart, restore, stale the history watermark, and remove the
    cancel-only signer; every case must remain visibly `halt_draining`, re-query
    when possible, alert, and escalate. Staking signatures remain unavailable in

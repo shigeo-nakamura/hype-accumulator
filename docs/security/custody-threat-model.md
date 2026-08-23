@@ -51,7 +51,8 @@ The effective-policy digest binds the enforcement mode, hard maximum, sweep
 threshold, worst-case outage headroom, lowercase SHA-256 evidence digest, opaque
 approved change-record reference, and the canonical daily/yearly limit-period
 schemes. It also binds the aggregate purchase-fee ceiling, mandatory
-venue-enforced signed-request-expiry mode, and the invariant
+venue-enforced signed-request-expiry mode, maximum verified venue-clock lag,
+venue-clock evidence freshness limit, and the invariant
 `staking.enabled = false`. A bounded live mode requires positive finite values,
 `sweep threshold + headroom <= hard maximum`, and non-empty valid evidence fields;
 `unapproved`, unknown modes or period schemes, a disabled signed expiry, malformed
@@ -79,7 +80,13 @@ account and strategy inputs, and either recomputes the deterministic approved
 decision or verifies an authenticated approval artifact issued outside the trading
 service. It checks admitted-uncommitted capital, reserve, daily room, signal
 freshness, the authoritative fee schedule, slippage, and hot-exposure enforcement
-against its own immutable policy anchor. The authenticated decision contains an
+against its own immutable policy anchor. It also obtains independently
+authenticated venue-clock evidence whose non-negative age is strictly below the
+positive acknowledged `venue_clock_evidence_stale_after_seconds` and verifies
+that the conservative venue lag, including sampling uncertainty and maximum
+drift through the authorization horizon, is no greater than the acknowledged
+`max_venue_clock_lag_ms`. Missing, stale, future, malformed, or above-bound
+evidence rejects live authorization. The authenticated decision contains an
 immutable canonical decision-chain ID and digest plus exact maximum base quantity
 `Q_D` and purchase notional `N_D` in checked integer units; missing, non-positive,
 or unrepresentable decision caps reject authorization. For the requested exact
@@ -130,22 +137,27 @@ The record contains:
   exact HYPE quantity reserved to fill the current `residual_hype_wei` deficit
   before staking eligibility is constructed; and
 - issue time, integer `effective_expiry_ms` no later than the earliest deadline for
-  the policy acknowledgement, decision, signal, book, account, or fee-schedule
-  data, exact `expiresAfter_ms = effective_expiry_ms - 1`, and the authorizer's
+  the policy acknowledgement, decision, signal, book, account, fee-schedule, or
+  venue-clock evidence, the evidence timestamp and digest, verified
+  `max_venue_clock_lag_ms = L`, exact
+  `expiresAfter_ms = effective_expiry_ms - L - 1`, and the authorizer's
   authenticated record digest.
 
 Live order placement requires Hyperliquid's venue-enforced `expiresAfter` field.
-The checked subtraction above must produce a positive representable integer
-millisecond. The authorizer binds that exact value into both its record and the
-canonical unsigned exchange-request-template digest. The executor passes the same
-value into the L1 action hash before signing and sends the byte-identical `action`,
-nonce, `vaultAddress`, `expiresAfter`, and signature payload. An omitted, changed,
-recomputed, or unsupported expiry fails envelope validation or signature
-verification. Because the venue rejects the request after `expiresAfter_ms`,
-choosing one millisecond before `effective_expiry_ms` prevents acceptance at or
-beyond the authorization horizon even if a valid signed request is delayed or
-withheld in transit. Local pre-submit checks remain defense in depth, not the
-expiry enforcement boundary.
+The checked subtraction above must not underflow and must produce a positive
+representable integer millisecond. The authorizer binds `L`, its evidence, and
+that exact value into both its record and the canonical unsigned
+exchange-request-template digest. The executor passes the same value into the L1
+action hash before signing and sends the byte-identical `action`, nonce,
+`vaultAddress`, `expiresAfter`, and signature payload. An omitted, changed,
+recomputed, or unsupported expiry or lag bound fails envelope validation or
+signature verification. Because the venue compares `expiresAfter_ms` with its own
+clock, a venue clock may lag the ledger clock by `L`. Subtracting both `L` and
+one millisecond guarantees that when the ledger reaches `effective_expiry_ms`,
+the slowest permitted venue clock is already past the signed expiry. If no
+positive evidence-backed bound covers uncertainty and drift through that horizon,
+live order authorization is unavailable. Local pre-submit checks remain defense
+in depth, not the expiry enforcement boundary.
 
 The only live period schemes are `utc_calendar_day_v1` and
 `utc_calendar_year_v1`. For a non-negative UTC POSIX second `t` obtained inside
@@ -181,9 +193,11 @@ exchange-request template. The executor must atomically move exactly one record
 from `authorized` to `submission_claimed` with that template digest before
 signing. It may append only the resulting signature before submitting the exact
 payload. The same transaction uses the ledger's authoritative UTC clock to require
-`now_ms < effective_expiry_ms`, rechecks that the effective expiry does not exceed
-any bound input's freshness horizon, validates the exact signed
-`expiresAfter_ms`, and performs the current-day carry-forward operation above.
+`now_ms < expiresAfter_ms < effective_expiry_ms`, rechecks that the effective
+expiry does not exceed any bound input's freshness horizon, independently
+revalidates fresh venue-clock evidence at or below the bound `L`, validates the
+exact signed `expiresAfter_ms`, and performs the current-day carry-forward
+operation above.
 If the claim day differs from the originating day, this record's full-`N` mirror
 must exist and fit before the state transition commits. Missing room or a failed
 claim leaves the record `authorized` and forbids signing. An expired record still
@@ -437,7 +451,13 @@ All gates are conjunctive and fail closed:
    remain fresh. Independently obtained fee-schedule data must likewise have a
    non-negative age strictly below the positive
    `fee_schedule_stale_after_seconds`; missing, malformed, future, or age-at-limit
-   data rejects the purchase. It also requires no unknown movement, no balance
+   data rejects the purchase. Independently authenticated venue-clock evidence
+   must have a non-negative age strictly below the positive
+   `venue_clock_evidence_stale_after_seconds` and prove, after measurement
+   uncertainty and horizon-drift headroom, a lag no greater than the positive
+   `max_venue_clock_lag_ms`. An unavailable, stale, future, malformed, unbounded,
+   or above-bound clock observation rejects live purchase. It also requires no
+   unknown movement, no balance
    mismatch, no halt, no active predecessor and sufficient remaining `Q_D` and
    `N_D` in the authenticated decision chain, enough admitted-uncommitted cash
    after the reserve, available daily purchase-notional room, available slippage
@@ -446,18 +466,20 @@ All gates are conjunctive and fail closed:
    submission, the signer-side
    authorizer must durably bind the independently verified decision, exact CLOID
    and canonical unsigned request template, policy version, fee ceiling, effective
-   expiry, exact signed
-   `expiresAfter`, and remaining limits while atomically moving `C` from the
+   expiry, clock evidence and lag bound `L`, exact signed
+   `expiresAfter = effective_expiry_ms - L - 1`, and remaining limits while
+   atomically moving `C` from the
    selected admitted allocations' `uncommitted` state to `committed` and
    reserving `N` against daily purchase-notional room. The executor must reject a
-   claim at or beyond that
-   expiry or beyond any input freshness horizon. Only IOC with the venue-enforced
+   claim at or beyond the earlier signed expiry or beyond any input freshness
+   horizon. Only IOC with the venue-enforced
    signed request expiry is authorized; every resting TIF, omitted or altered
    expiry, and delayed venue acceptance is rejected. No matching authorization
-   means no service order; any bypass or impossible post-expiry fill is permanently
-   ineligible for automatic staking and halts live action. Unresolved notional
-   reservations reduce new daily room until terminal settlement; unresolved `C`
-   stays committed inside its already charged admission allocations and never
+   means no service order; any bypass or fill at or beyond effective expiry is
+   permanently ineligible for automatic staking and halts live action. Unresolved
+   notional reservations reduce new daily room until terminal settlement;
+   unresolved `C` stays committed inside its already charged admission allocations
+   and never
    consumes a second yearly or lifetime allocation.
 8. Automatic staking is disabled. Because the signed staking actions lack a
    venue-enforced acceptance deadline, the service never creates a deposit or
@@ -475,10 +497,11 @@ All gates are conjunctive and fail closed:
     originating `reserved` counter and every mirror, releasing its other policy
     and decision reservations, and clearing its decision active slot. The same
     transaction snapshots every `submission_claimed` and `order_bound` record with
-    its CLOID and signed `expiresAfter_ms`. A claim is treated as possibly signed
-    even if local persistence says otherwise. The service must not report `halted`
-    or assert that service-originated placement has stopped while any snapshot
-    record is unresolved.
+    its CLOID, signed `expiresAfter_ms`, `effective_expiry_ms`, lag bound, and
+    evidence digest. A claim is treated as possibly signed even if local
+    persistence says otherwise. The service must not report `halted` or assert
+    that service-originated placement has stopped while any snapshot record is
+    unresolved.
 
     Unsigned reconciliation and a mandatory cancel-only execution path remain
     active in both `halt_draining` and `halted`. That path independently queries
@@ -491,12 +514,15 @@ All gates are conjunctive and fail closed:
     reconciler binds it, cancels it if open, and accounts for every fill before
     marking it terminal.
 
-    Only after the ledger clock has passed a snapshotted `expiresAfter_ms` and
-    authoritative order/fill histories have a gap-free watermark later than that
-    expiry may a still-invisible CLOID be atomically marked conclusively absent and
-    terminal unused, return its `C` slices to the same allocations'
-    `uncommitted` state, subtract its full `N` from the originating `reserved`
-    counter and every mirror, release its other policy and decision reservations,
+    A lagging venue may still accept after the ledger has passed the smaller signed
+    `expiresAfter_ms`. Only after the ledger clock has passed the snapshotted
+    `effective_expiry_ms`, where the lag-adjusted proof guarantees venue expiry,
+    and authoritative order/fill histories have a gap-free watermark later than
+    that effective expiry may a still-invisible CLOID be atomically marked
+    conclusively absent and terminal unused, return its `C` slices to the same
+    allocations' `uncommitted` state, subtract its full `N` from the
+    originating `reserved` counter and every mirror, release its other policy and
+    decision reservations,
     and clear its decision active slot. It remains unresolved before that point.
     After every claimed/bound record is terminal and a fresh account query
     returns no open order, one transaction may move `halt_draining` to `halted`.
@@ -519,7 +545,8 @@ configuration must set all of these explicitly:
 - maximum yearly and lifetime admission allocations of deployable capital;
 - exact `utc_calendar_day_v1` and `utc_calendar_year_v1` limit-period schemes;
 - maximum order slippage;
-- aggregate maximum purchase-fee rate and mandatory venue-enforced signed expiry;
+- aggregate maximum purchase-fee rate, mandatory venue-enforced signed expiry,
+  positive verified venue-clock lag bound, and clock-evidence freshness limit;
 - minimum reserve and residual HYPE buffer;
 - market/book, account-history, fee-schedule, and signal staleness limits;
 - purchase-fill registration deadline plus deterministic lot allocation and
@@ -541,7 +568,7 @@ configuration must set all of these explicitly:
 | Replay or nonce pruning | durable atomic nonce, unique signer per process, bounded expiry where supported, purchase-time one-fill-to-workflow mapping, lot consumption, one-time authorization/order claims, never reuse deregistered/expired agent | reconcile by CLOID/history; block ambiguous order claims; rotate signer; never resend an unknown action blindly |
 | Unauthorized API-wallet order | signer-side durable pre-purchase decision and CLOID authorization before execution; exact order-envelope binding | unmatched or mismatched fills remain permanently ineligible for automatic staking; halt and reconcile the trading-account compromise |
 | Concurrent decision reuse | unique decision-chain row; one active authorization; atomic `Q` and `N` decision reservations with global policy reservations | ambiguous predecessor retains the active slot; terminal reconciliation consumes fills and releases only proven remainder before reissue |
-| Delayed or stale order | signed `expiresAfter = effective_expiry_ms - 1` plus IOC-only live policy; GTC/ALO and missing/changed expiry rejected; no process-local expiry credit | venue rejects delayed acceptance; any impossible post-expiry fill halts live action, remains charged, and is ineligible for automatic staking |
+| Delayed or stale order | signed `expiresAfter = effective_expiry_ms - verified venue lag L - 1` plus IOC-only live policy; missing/stale/unbounded clock evidence, GTC/ALO, and changed expiry rejected | even the slowest permitted venue clock is past signed expiry at the effective horizon; any fill at or beyond that horizon halts live action, remains charged, and is ineligible for automatic staking |
 | Delayed staking acceptance | automatic staking disabled because user-signed staking actions lack a venue-enforced acceptance deadline; no runtime signer, endpoint, or client | configuration rejects any enabled value before live capability; HYPE remains in spot and staking is manual/offline |
 | Fee under-reservation | checked `C = N + ceil(N * aggregate fee bps / 10000)` moves admitted-uncommitted cash to `committed` while preserving the reserve; daily notional separately reserves `N` and admission ceilings are not charged twice | authoritative fee reconciliation retains the full commitment while ambiguous and halts on an unknown, stale, differently denominated, or above-ceiling fee |
 | Malicious validator selection | no runtime staking capability; validator data is advisory for offline manual review only | keep HYPE in spot and require a separately approved offline operation |
@@ -578,8 +605,10 @@ Before production secrets or funds are present, attach evidence for:
   authorizations/claims/signatures but remains visibly `halt_draining` while a
   pre-cutoff `submission_claimed` request is withheld. Inject its acceptance just
   before `expiresAfter_ms` and prove discovery, binding, cancellation, and fill
-  reconciliation occur before `halted`; absent claims require a gap-free
-  post-expiry history watermark. Lost responses, stale history, restart, restore,
+  reconciliation occur before `halted`; with the venue clock at maximum permitted
+  lag, absent claims require the ledger to pass `effective_expiry_ms` and a
+  gap-free history watermark later than that horizon. Merely passing the smaller
+  signed expiry is insufficient. Lost responses, stale history, restart, restore,
   and unavailable signer must preserve draining state and escalation;
 - IAM and filesystem permission review;
 - proof of venue-enforced agent restrictions or dedicated-account balance
@@ -656,11 +685,16 @@ Before production secrets or funds are present, attach evidence for:
   cases. A pre-boundary `authorized` record must be mirrored idempotently before
   either a later-day claim or new authorization can commit;
 - authorization-expiry tests proving effective expiry is capped by every input
-  freshness horizon, `expiresAfter_ms` is exactly one millisecond earlier and
-  included in the L1 action hash and canonical unsigned request-template digest,
-  and the claim rejects the exact boundary, stale inputs, and omitted or changed
-  expiry; delay a valid signed payload beyond the horizon and prove venue rejection
-  with no fill;
+  freshness horizon, independently authenticated venue-clock evidence is fresh,
+  and its conservative lag `L` covers measurement uncertainty and maximum drift
+  through that horizon. Missing, stale, future, malformed, unbounded, and
+  above-policy lag evidence must fail live operation. Prove
+  `expiresAfter_ms = effective_expiry_ms - L - 1` with checked arithmetic and bind
+  `L`, its evidence digest, and that exact expiry into the authorization, L1
+  action hash, and canonical unsigned request-template digest. Claims at the
+  signed-expiry boundary and omitted or altered fields must fail; with the venue
+  clock exactly `L` behind the ledger, delay a valid signed payload to the
+  effective horizon and prove venue rejection with no fill;
 - TIF and rollover tests proving GTC/ALO/resting envelopes are rejected, IOC fills
   cannot be accepted at or beyond effective expiry, and every unexpired
   `authorized`, `submission_claimed`, or `order_bound` record reduces each later
