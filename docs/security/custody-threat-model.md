@@ -48,10 +48,11 @@ claiming a cap requires a separate explicit policy mode and user approval; this
 document does not grant it.
 
 The effective-policy digest binds the enforcement mode, hard maximum, sweep
-threshold, worst-case outage headroom, lowercase SHA-256 evidence digest, and
-opaque approved change-record reference. A bounded live mode requires positive
-finite values, `sweep threshold + headroom <= hard maximum`, and non-empty valid
-evidence fields; `unapproved`, unknown modes, malformed hashes, and inconsistent
+threshold, worst-case outage headroom, lowercase SHA-256 evidence digest, opaque
+approved change-record reference, and the canonical daily/yearly limit-period
+schemes. A bounded live mode requires positive finite values,
+`sweep threshold + headroom <= hard maximum`, and non-empty valid evidence fields;
+`unapproved`, unknown modes or period schemes, malformed hashes, and inconsistent
 combinations fail closed. Changing any field invalidates the acknowledgement.
 
 `cDeposit` and `tokenDelegate` use the user-signed EIP-712 scheme, while spot
@@ -74,34 +75,53 @@ account and strategy inputs, and either recomputes the deterministic approved
 decision or verifies an authenticated approval artifact issued outside the trading
 service. It checks admitted capital, reserve, daily/yearly/cumulative room, signal
 freshness, slippage, and hot-exposure enforcement against its own immutable policy
-anchor. One durable atomic transaction both reserves the order's worst-case
-notional against its admitted-capital tranche and every daily, yearly, cumulative,
-and hot-exposure limit and commits the one-time pre-purchase authorization. If the
-complete reservation is unavailable, neither a partial reservation nor a record is
-created. Concurrent authorization requests serialize on the same limit ledger.
+anchor. One durable atomic transaction against a single strongly consistent
+ledger, using that ledger's authoritative UTC database clock, both reserves the
+order's worst-case notional against its admitted-capital tranche and every daily,
+yearly, cumulative, and hot-exposure limit and commits the one-time pre-purchase
+authorization. If the complete reservation is unavailable, neither a partial
+reservation nor a record is created. Concurrent authorizer instances serialize on
+the same limit-ledger rows; a process-local clock or ledger snapshot cannot
+authorize a purchase.
 The record contains:
 
 - an authorization ID and canonical daily-decision ID and digest;
 - the actual execution account, policy version, market, buy side, mandatory IOC
   TIF, exact client order ID (CLOID), quantity, and limit price;
 - the maximum notional and slippage, the amount reserved in each named ledger,
-  checked room before and after reservation, and any exact HYPE quantity reserved
-  to fill the current `residual_hype_wei` deficit before staking eligibility is
+  canonical daily/yearly period IDs and exact half-open UTC boundaries, checked
+  room before and after reservation, and any exact HYPE quantity reserved to fill
+  the current `residual_hype_wei` deficit before staking eligibility is
   constructed; and
 - issue time and an effective expiry no later than the earliest deadline for the
   policy acknowledgement, decision, signal, book, or account data, plus the
   authorizer's authenticated record digest.
 
+The only live period schemes are `utc_calendar_day_v1` and
+`utc_calendar_year_v1`. For a non-negative UTC POSIX second `t` obtained inside
+the ledger transaction, the day is the half-open interval
+`[floor(t / 86400) * 86400, (floor(t / 86400) + 1) * 86400)` with durable ID
+`utc-day-v1:<integer day index>`. The year is the proleptic-Gregorian UTC interval
+`[YYYY-01-01T00:00:00Z, (YYYY+1)-01-01T00:00:00Z)` with durable ID
+`utc-year-v1:<four-digit YYYY>`. Boundary equality belongs to the next period;
+process timezone, locale, daylight-saving rules, and host clock do not participate.
+Each ledger row has a uniqueness constraint on
+`(execution account, limit kind, period scheme, period ID)` and stores the exact
+start/end seconds. Period opening is an insert-or-lock operation in the same
+serializable reservation transaction. A conflicting boundary, overlapping or
+duplicate row, unsupported timestamp, or restore/replay mismatch fails closed.
+The same schemes assign authoritative fill timestamps to execution periods.
+
 The record is committed before the API wallet signs or submits the byte-identical
 order envelope. The executor must atomically move exactly one record from
 `authorized` to `submission_claimed` with that envelope digest before signing. The
-same transaction uses a trusted clock to require `now < effective expiry` and
-rechecks that the effective expiry does not exceed any bound input's freshness
-horizon; the equality boundary, a future/missing input timestamp, or a failed
-claim forbids submission. An expired record still in `authorized` moves atomically
-to a terminal unused state and releases its reservation. A transport-ambiguous
-submission stays claimed until authoritative CLOID reconciliation and never
-releases room or retries blindly.
+same transaction uses the ledger's authoritative UTC clock to require
+`now < effective expiry` and rechecks that the effective expiry does not exceed any
+bound input's freshness horizon; the equality boundary, a future/missing input
+timestamp, or a failed claim forbids submission. An expired record still in
+`authorized` moves atomically to a terminal unused state and releases its
+reservation. A transport-ambiguous submission stays claimed until authoritative
+CLOID reconciliation and never releases room or retries blindly.
 
 The approved live policy authorizes IOC only: the venue immediately cancels every
 unfilled remainder, so the order cannot rest across the authorization horizon.
@@ -128,13 +148,15 @@ reissue from the remaining decision and policy room. A caller-supplied decision,
 authorization record, or policy snapshot is correlation data only.
 
 An unresolved `submission_claimed` or `order_bound` reservation never disappears
-at a daily or yearly rollover. It remains charged to its originating period and is
-also deducted as a conservative cross-period encumbrance from each newly opened
-daily/yearly room until terminal reconciliation. Admitted-capital, cumulative, and
-hot-exposure reservations remain continuously charged. Terminal reconciliation
-atomically charges the actual fill to its authoritative execution period, releases
+at a daily or yearly boundary. It remains charged to its recorded originating
+period IDs and is also deducted as a conservative cross-period encumbrance from
+each canonical period row opened by a later reservation transaction until terminal
+reconciliation. There is no independent process-local rollover job.
+Admitted-capital, cumulative, and hot-exposure reservations remain continuously
+charged. Terminal reconciliation atomically charges the actual fill to the
+canonical execution-period IDs derived from its authoritative timestamp, releases
 only the proven unfilled remainder and mirrored encumbrances, and preserves a
-conserved audit trail; rollover alone cannot make room reusable.
+conserved audit trail; a boundary alone cannot make room reusable.
 
 An independent signer-side reconciler, not the intent caller, advances a durable
 monotonic cursor over authoritative fills. When a purchase workflow becomes
@@ -324,10 +346,10 @@ All gates are conjunctive and fail closed:
    parent-account environment name; every other combination is rejected.
 5. A deposit above the per-deposit limit remains visible but unallocated until a
    separately recorded operator admission. Capital beyond yearly room remains
-   unallocated until the approved period rolls over or a newly acknowledged policy
-   raises the ceiling; capital beyond the lifetime cumulative room requires such a
-   newly acknowledged policy. Operator admission alone never overrides either
-   ceiling.
+   unallocated until the next canonical `utc_calendar_year_v1` period begins or a
+   newly acknowledged policy raises the ceiling; capital beyond the lifetime
+   cumulative room requires such a newly acknowledged policy. Operator admission
+   alone never overrides either ceiling.
 6. Committed plus spent USDC cannot exceed admitted deposits minus reconciled
    withdrawals and reserves.
 7. A purchase requires fresh book/account data and a trusted decision-signal
@@ -382,6 +404,7 @@ unlimited. Production configuration must set all of these explicitly:
 - maximum automatically admitted deposit;
 - maximum daily purchase notional;
 - maximum yearly and cumulative deployable capital;
+- exact `utc_calendar_day_v1` and `utc_calendar_year_v1` limit-period schemes;
 - maximum order slippage;
 - minimum reserve and residual HYPE buffer;
 - market/book, account-history, and signal staleness limits;
@@ -492,6 +515,12 @@ Before production secrets or funds are present, attach evidence for:
 - concurrent-authorization tests proving worst-case notional is atomically reserved
   against admitted, daily, yearly, cumulative, and hot-exposure room and released
   only for conclusively unfilled or never-submitted terminal records;
+- canonical-period tests running multiple authorizers under different host
+  timezones across one second before, exactly at, and one second after UTC day and
+  Gregorian-year boundaries; all instances and clean-directory restores must
+  derive identical IDs and half-open bounds, reuse one unique row, preserve prior
+  spend and unresolved encumbrances, and reject host-clock, overlap, duplicate,
+  unsupported-schema, and boundary-tampering cases;
 - authorization-expiry tests proving effective expiry is capped by every input
   freshness horizon and the claim rejects the exact boundary, stale inputs, and
   post-expiry execution;

@@ -5,6 +5,10 @@ max_daily_notional_microusd = 0
 max_yearly_deployable_microusd = 0
 max_cumulative_deployable_microusd = 0
 reserve_microusd = 0
+# These exact v1 schemes are the only live values. They use half-open UTC periods,
+# are bound into the policy digest, and reject local-time or rolling alternatives.
+daily_limit_period = "utc_calendar_day_v1"
+yearly_limit_period = "utc_calendar_year_v1"
 
 [custody]
 # Service-side order limits do not constrain a leaked API wallet.

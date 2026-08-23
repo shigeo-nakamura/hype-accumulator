@@ -45,6 +45,12 @@ ciphertext, host alias, or production filesystem path.
    ensure terminal enrollment accepts that existing binding without transitioning
    it again. Race two authorizations whose combined worst-case notional exceeds
    each applicable room ledger and verify one fails without a partial record.
+   Run authorizer instances under different host timezones at one second before,
+   exactly at, and one second after UTC day and Gregorian-year boundaries. Verify
+   they use the shared ledger clock, derive identical half-open bounds and durable
+   period IDs, and insert or lock one unique row. A clean-directory restore must
+   reproduce those rows and reject a changed scheme, host-clock input, duplicate,
+   overlap, or altered boundary without restoring room.
    At claim, test every input freshness horizon and the exact effective-expiry
    boundary; neither an expired `authorized` record nor an ambiguous claimed record
    may return to a reusable state. Confirm GTC, ALO, and every resting TIF fail
@@ -99,10 +105,11 @@ ciphertext, host alias, or production filesystem path.
    Verify the sweep threshold plus worst-case headroom does not exceed the hard
    maximum, and verify the acknowledged evidence SHA-256 and private change-record
    reference before enabling live mode.
-11. At the exact yearly and lifetime cumulative capital boundaries, verify that
-    neither direct admission nor a separately recorded operator admission permits
-    another purchase. Year rollover may restore only yearly room; exceeding either
-    acknowledged ceiling requires a newly acknowledged policy.
+11. At the exact `utc_calendar_year_v1` and lifetime cumulative capital
+    boundaries, verify that neither direct admission nor a separately recorded
+    operator admission permits another purchase. Only the half-open UTC boundary
+    may restore yearly room; exceeding either acknowledged ceiling requires a
+    newly acknowledged policy.
 12. Keep book and account feeds fresh while supplying a missing, malformed, future,
     exactly-at-limit, and expired decision-signal timestamp. Confirm every case
     rejects purchase and that only a non-negative age strictly below the configured
