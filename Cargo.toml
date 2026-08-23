@@ -1,0 +1,19 @@
+[package]
+name = "hype-accumulator"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+chrono = { version = "=0.4.41", default-features = false, features = ["clock", "serde"] }
+dex-connector = { git = "https://github.com/shigeo-nakamura/dex-connector", tag = "v4.7.9", default-features = false, features = ["hyperliquid-sdk"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+thiserror = "=2.0.12"
+toml = "=0.8.23"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
