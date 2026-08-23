@@ -70,28 +70,25 @@ signal_stale_after_seconds = 0
 cancel_known_open_orders_while_halted = true
 
 [staking]
-# A subaccount or vault must keep this false; no automatic child-to-master transfer
-# is authorized by this policy.
+# The only accepted value in dry-run or live configuration. cDeposit and
+# tokenDelegate lack a venue-enforced acceptance deadline, so true, missing, or
+# unknown values fail startup and no runtime master signer is installed.
 enabled = false
-# cDeposit/tokenDelegate do not support expiresAfter. This is the only live mode:
-# the signer submits once itself and never returns a signature or action payload.
-submission_mode = "signer_submit_once"
-# Required positive for automatic staking. At the exact margin, do not sign.
-submission_min_remaining_ms = 0
+# Advisory inputs for unsigned eligibility research and offline manual review.
 validator_allowlist = []
-# Required positive for automatic staking. The authorizer reserves any deficit
-# from a purchase; only the exact remainder may become staking-eligible.
+# Dormant bookkeeping reserves any deficit from a purchase; it never authorizes
+# an automatic staking action.
 residual_hype_wei = 0
-# Zero disables automatic staking. Eligible fills must be registered by the
+# Zero disables dormant eligibility. Candidate fills must be registered by the
 # independent reconciler within this period after first authoritative observation.
 fill_registration_deadline_seconds = 0
 # Non-workflow sales and transfers consume lots in ascending
 # (authoritative fill time, order ID, fill ID, residual-before-eligible) order.
 # Unknown policies fail.
 lot_consumption_policy = "oldest_authoritative_fill_first"
-# Zero makes every lot ineligible for automatic staking; it is never unlimited.
+# Zero makes every lot ineligible in dormant bookkeeping; it is never unlimited.
 lot_eligibility_max_age_seconds = 0
-# Safe default; the staking-account alternative requires explicit approval.
+# The only accepted value. No continuation policy may authorize cDeposit.
 no_eligible_validator_policy = "hold_in_spot"
 
 [operator]

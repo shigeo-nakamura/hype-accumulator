@@ -15,7 +15,7 @@ gain a capability from the presence of a private key.
 | --- | --- | --- | --- |
 | Read/reconcile | unsigned account address | metadata, book, balances, orders, fills, movements, staking state | every exchange action |
 | Spot execution | dedicated, named API wallet used by one process | venue-authorized trading actions for its assigned account; service policy submits only capped HYPE/USDC orders and cancels | user-signed transfers, staking, withdrawals, agent approval |
-| Staking approval | separately controlled master-wallet signer, pending user approval | durable off-exchange purchase-authorization records plus `cDeposit` and `tokenDelegate`, for a reconciled workflow | `cWithdraw`, undelegation, transfers, orders, agent approval |
+| Staking automation (disabled) | no runtime principal or master key | unsigned eligibility and audit records only | `cDeposit`, `tokenDelegate`, `cWithdraw`, undelegation, transfers, orders, agent approval |
 | Recovery | offline master-wallet procedure | revoke/replace agent and recover funded account | unattended service access |
 
 Hyperliquid account queries use the actual master or subaccount address, never
@@ -50,26 +50,26 @@ document does not grant it.
 The effective-policy digest binds the enforcement mode, hard maximum, sweep
 threshold, worst-case outage headroom, lowercase SHA-256 evidence digest, opaque
 approved change-record reference, and the canonical daily/yearly limit-period
-schemes. It also binds the aggregate purchase-fee ceiling and mandatory
-venue-enforced signed-request-expiry mode. For staking it binds the signer-only
-submit-once mode and positive minimum time remaining before intent expiry. A
-bounded live mode requires positive finite values,
+schemes. It also binds the aggregate purchase-fee ceiling, mandatory
+venue-enforced signed-request-expiry mode, and the invariant
+`staking.enabled = false`. A bounded live mode requires positive finite values,
 `sweep threshold + headroom <= hard maximum`, and non-empty valid evidence fields;
 `unapproved`, unknown modes or period schemes, a disabled signed expiry, malformed
-hashes, and inconsistent combinations fail closed. Changing any field invalidates
-the acknowledgement.
+hashes, `staking.enabled = true`, and inconsistent combinations fail closed.
+Changing any field invalidates the acknowledgement.
 
-`cDeposit` and `tokenDelegate` use the user-signed EIP-712 scheme, while spot
-orders use the L1 action scheme. The production design therefore treats staking
-as master-authority until a testnet or explicitly approved probe demonstrates a
-narrower supported authority. An API wallet succeeding at order placement is
-not evidence that it can authorize staking. These approved staking actions contain
-no child-account target, so automatic staking is available only when
-`execution_account_kind = "dedicated_master"` and the execution account exactly
-matches the account recovered from the master signer. A subaccount or vault must
-keep `staking.enabled = false`; purchased HYPE remains in spot. A child-to-master
-transfer path would expand the signer capability and requires a separate design,
-threat model, and explicit approval; this service does not infer or perform one.
+`cDeposit` and `tokenDelegate` use the user-signed EIP-712 scheme and do not
+support a venue-enforced acceptance deadline such as `expiresAfter`, while spot
+orders use the L1 action scheme. A request can stall after a local pre-submit
+check and reach the venue after its balance, limit, or validator evidence expires.
+Direct signer submission and a local time margin do not bound that in-flight
+delay. Automatic staking is therefore unavailable for every execution-account
+kind: `staking.enabled` must remain `false`, no master signer is installed in the
+runtime service, and purchased HYPE remains in spot. A future staking path
+requires a venue-enforced deadline bound into the signed action, a revised threat
+model, fresh evidence, and explicit user approval. A child-to-master transfer path
+would likewise require a separate design and approval; this service does not
+infer or perform one.
 
 ## Required process isolation
 
@@ -198,10 +198,14 @@ actual notional separately from actual cash debit including fees, releases only
 the proven unfilled remainder, unused fee headroom, and mirrored encumbrances, and
 preserves a conserved audit trail; a boundary alone cannot make room reusable.
 
-An independent signer-side reconciler, not the intent caller, advances a durable
+The following lot bookkeeping is dormant, unsigned eligibility accounting. It
+does not authorize, sign, or submit a staking action and cannot override the
+mandatory disabled gate.
+
+An independent reconciler advances a durable
 monotonic cursor over authoritative fills. When a purchase workflow becomes
 terminal and its canonical order/fill set is final, and before it can become
-staking-eligible, the reconciler requires a distinct signer-side
+eligible in that dormant ledger, the reconciler requires a distinct signer-side
 `order_bound` authorization for every order in the set. Every account,
 decision, CLOID, canonical order envelope, limit, and expiry must match exactly,
 and all authorizations must belong to the same decision chain. It atomically binds
@@ -236,28 +240,22 @@ must satisfy exactly
 `purchased = residual_spot + eligible_spot`. A caller cannot choose or revise the
 split, and a residual allocation can never later become staking-eligible.
 
-Automatic staking is full eligible-allocation only: the intent amount must equal
+The dormant eligibility model is full eligible-allocation only: a candidate
+amount must equal
 the sum of every exact `eligible_spot` allocation for its mapped authoritative
-fills after the residual carve-out. The signer does not create further sub-lots,
-accept a partial eligible amount, or split one workflow across multiple deposit
-or delegation phase keys.
+fills after the residual carve-out. The bookkeeping does not create further
+sub-lots or accept a caller-chosen partial eligible amount.
 
 The reconciler maintains amount-conserving lot states: `residual_spot`,
-`eligible_spot`,
-`deposit_reserved`, `deposited_undelegated`, `delegation_reserved`, `delegated`,
-and terminal spent, moved, expired, or ineligible states. A deposit reservation
-moves the entire exact mapped eligible allocation from `eligible_spot` to
-`deposit_reserved` while leaving `residual_spot` in spot;
-authoritative `cDeposit` completion moves that same quantity to
-`deposited_undelegated`.
-A delegation reservation starts only from `deposited_undelegated`, moves it to
-`delegation_reserved`, and authoritative `tokenDelegate` completion moves it to
-`delegated`. Delegation never debits or reserves the original spot quantity again.
-Each transition is atomic. A terminal lot never becomes eligible again because
-fungible spot or undelegated balance later increases. Before any reservation, the
-authoritative fill and movement cursors must be caught up through a fresh common
-watermark; a gap or concurrent state that cannot be ordered against that watermark
-fails closed.
+`eligible_spot`, and terminal spent, moved, expired, or ineligible states. There
+is no deposit or delegation reservation state and no transition from an eligible
+lot into staking. A separately approved offline manual staking movement is
+observed as an external movement and makes the affected lot moved and ineligible;
+it is never attributed to an automatic workflow. A terminal lot never becomes
+eligible again because fungible spot later increases. Before any eligibility
+classification, the authoritative fill and movement cursors must be caught up
+through a fresh common watermark; a gap or concurrent state that cannot be ordered
+against that watermark fails closed.
 
 Non-workflow sales and transfers debit registered spot allocations
 deterministically in ascending
@@ -267,8 +265,7 @@ partial consumption of an eligible allocation makes the workflow
 ineligible for automatic staking: the consumed quantity enters its terminal state
 and the remainder cannot be enrolled as a sub-lot. Consumed `residual_spot`
 reopens a deficit but cannot promote any old allocation; only a new
-pre-authorized purchase may refill it. Staking reservations consume the entire
-exact mapped eligible allocation in their workflow.
+pre-authorized purchase may refill it. No staking reservation exists.
 `lot_eligibility_max_age_seconds` makes a remaining lot eligible only while
 `now < authoritative fill time + max age`; the boundary itself is expired. The
 only supported
@@ -276,107 +273,30 @@ only supported
 unknown policies, missing stable tie-breakers, and arithmetic remainder fail
 closed rather than selecting an implementation-dependent lot.
 
-The trading service emits a content-addressed staking intent after an
-authoritative fill and balance reconciliation. A separate signer accepts only a
-fully specified intent containing:
+The service stops at that unsigned bookkeeping boundary. It has no staking intent
+endpoint, staking signer, master-key material, or outbound `cDeposit` or
+`tokenDelegate` client. Configuration validation accepts only
+`staking.enabled = false` in dry-run and live configurations; `true`, a missing
+value, or an unknown value fails startup before any live capability is enabled.
+No account kind, validator policy, local expiry check, dispatch margin, retry
+rule, or direct-submission implementation may bypass this invariant.
 
-- workflow and daily decision IDs plus the stable authoritative order and fill
-  IDs and signer-side pre-purchase authorization IDs for the purchase;
-- account, action phase, asset, and exact integer `wei` amount; a delegation
-  intent also contains exactly one validator, while a deposit intent contains no
-  validator field;
-- hashes of the admitted-capital snapshot, order/fill evidence, and current
-  staking state;
-- an expiry and a fresh monotonic nonce;
-- the remaining approved daily, yearly, and cumulative limits.
+The reason is an uncloseable acceptance-time gap in the current venue protocol.
+Once a user-signed staking request has entered a proxy, TCP buffer, or adversarial
+network, the service cannot withdraw it or prove that the venue accepted it before
+the evidence horizon. Destroying a local payload, blocking retry, and reconciling
+an ambiguous result limit duplicates but cannot prevent a stale first acceptance.
+Those controls therefore receive no safety credit for automatic staking.
 
-The signer has no generic JSON/action endpoint. It uses separate strict schemas
-for staking deposit and delegation and rejects unknown fields. In particular,
-`cDeposit` neither accepts nor infers a validator, while `tokenDelegate` requires
-the exact validator address. Intent-supplied hashes are correlation identifiers,
-not proof that the referenced state or limits are genuine.
-
-For every initial request, the signer authenticates the caller and independently
-queries authoritative order, fill, spot-balance, and staking state using the
-actual account address. It verifies that the canonical stable order/fill set,
-workflow ID, residual carve-out, and eligible amount exactly match the
-purchase-time mapping instead of trusting caller-supplied identifiers or aggregate
-balance. A caller retry is status and reconciliation only: it supplies the opaque
-operation ID and cannot request another signature, nonce, action, or submission.
-For `cDeposit`, the signer
-requires every durable pre-purchase authorization and venue order binding to
-remain authentic, consistent, `order_bound` to this workflow, and unused by any
-other workflow. It verifies
-the intent amount equals the entire mapped eligible allocation, tracked unconsumed
-`residual_spot` is at least `residual_hype_wei`, and authoritative spot balance
-after subtracting the intent amount remains at least that same positive buffer.
-For `tokenDelegate`, it instead
-verifies a completed reconciled deposit predecessor and that the same full amount
-remains in `deposited_undelegated` with sufficient authoritative undelegated
-staking balance; it never requires or reserves `eligible_spot` again. It also
-verifies residual balance, intent expiry, and daily, yearly, and cumulative room
-against an independently loaded approved policy and immutable ledger anchor.
-For a deposit under the default `hold_in_spot` policy, it independently queries
-the complete allowlist and requires at least one currently eligible validator,
-without accepting or selecting a validator in the intent. Missing or stale
-validator state fails closed. Only the explicitly approved
-`hold_undelegated_in_staking` policy skips that availability requirement for
-`cDeposit`. For delegation, it queries the specified validator and verifies it is
-allowlisted, active, not jailed, and not undelegate-only. Missing, stale, consumed,
-ambiguous, or mismatched evidence is rejected into manual review without signing.
-
-`cDeposit` and `tokenDelegate` have no venue-enforced `expiresAfter` field. The
-only live staking mode is therefore `signer_submit_once`: the isolated signer owns
-the outbound exchange client and never exposes a sign-only endpoint. The caller
-receives only an opaque operation ID and sanitized status or terminal result,
-never a serialized action, nonce/signature pair, or other reusable submission
-payload.
-
-Using the same ledger-backed UTC clock, immediately before claiming the phase and
-again immediately before signing, the signer refreshes every balance, limit,
-validator, and evidence gate above and requires the checked strict inequality
-`intent_expiry_ms - now_ms > submission_min_remaining_ms`. The configured margin
-must be positive. The exact margin, an expired intent, insufficient remaining
-time, clock failure, arithmetic failure, or refresh failure rejects before
-signing. This is an in-signer dispatch guard, not a claim that the venue enforces
-staking acceptance expiry.
-
-One durable atomic transaction then performs the action-specific reservation and
-claims the unique `(account, workflow ID, action phase)` key with the immutable
-fill allocations, canonical intent digest, nonce, `signer_submit_once` mode, and
-minimum remaining-time policy. The deposit phase atomically moves the full mapped
-eligible allocation from `eligible_spot` to `deposit_reserved`. The delegation
-phase atomically verifies its reconciled deposit predecessor and moves the same
-mapped quantity from `deposited_undelegated` to `delegation_reserved`; it cannot
-reserve `eligible_spot`. The signer never creates or changes the
-fill-to-workflow mapping while processing an intent. All fills in an aggregate
-purchase succeed or fail as a unit. Deposit and delegation are separate, ordered
-phases, and each may be claimed only once.
-
-After that claim, the signer creates the signature only in protected memory and
-directly submits the exact action once. It never logs, persists, returns, or
-exports the signature or payload. If it cannot begin the network write before
-intent expiry, it destroys the in-memory payload without submitting and leaves
-the reservation and phase blocked for manual reconciliation. If any request bytes
-may have been sent but no authoritative result is available by expiry, the phase
-becomes ambiguous: no component may retry, and the signer reconciles by account,
-action, nonce, and movement history. A late authoritative success finalizes the
-reservation into `deposited_undelegated` or `delegated` respectively; a conclusive
-rejection or absence is stored as a terminal audited outcome under the consumed
-phase key. A conflicting state, unmapped fill set, amount, digest, or nonce is
-rejected. A duplicate or caller retry returns only the stored opaque status or
-terminal result, never a fresh signature, nonce, action, or submission.
-
-A crash or write ambiguity between reservation, signing, submission, and result
-persistence leaves the action-specific reservation and phase blocked for
-authoritative reconciliation and manual review. Neither may be cleared by caller
-retry, process restart, snapshot restore, or a later balance increase. The
-purchase-time mapping, lot lifecycle, submission state, and consumed-phase ledger
-are included in the hash chain and off-host restore checks.
-
-Until this boundary is implemented and rehearsed, automatic staking remains
-disabled. Storing a general-purpose master private key in the bot process is not
-an acceptable default.
+Re-enabling automatic staking requires evidence that the venue rejects acceptance
+at or beyond an expiry cryptographically bound into the signed staking action.
+That capability must cover both `cDeposit` and `tokenDelegate` and be tested by
+delaying an already signed request beyond the horizon. Any future design must
+also restore independent evidence validation, one-time phase consumption, and
+ambiguity reconciliation in a new reviewed threat model with explicit user
+approval. Until then, staking is an offline manual operation outside this
+service. Storing a general-purpose master private key in the bot process remains
+prohibited.
 
 ## Capital admission and action gates
 
@@ -388,10 +308,10 @@ All gates are conjunctive and fail closed:
    kind, signer mode, normalized validator set, expiry, and the normalized resolved
    parent-account value or an explicit null marker. Environment-variable names
    alone are not part of the approval boundary. Any resolved-value change or
-   resolution failure invalidates the acknowledgement and fails closed. Automatic
-   staking additionally requires the execution account to be the dedicated master
-   account recovered from the approved signer; subaccount, vault, unknown, and
-   mismatched combinations fail closed.
+   resolution failure invalidates the acknowledgement and fails closed.
+   `staking.enabled = false` is mandatory for every account kind and both dry-run
+   and live configuration; there is no automatic-staking acknowledgement or
+   signer mode.
 2. System-wide deployable capital originates from authoritative external USDC
    movement history with a stable event ID. Raw balance delta, order
    holds/releases, fills, fees, internal transfers, dust, and reconciliation
@@ -449,26 +369,12 @@ All gates are conjunctive and fail closed:
    means no service order; any bypass or impossible post-expiry fill is permanently
    ineligible for automatic staking and halts live action. Unresolved reservations
    carry into and reduce new daily/yearly room until terminal settlement.
-8. A staking deposit requires reconciled newly purchased HYPE in `eligible_spot`
-   after the authorizer-reserved residual deficit has been carved out into
-   `residual_spot`. On an initially empty account, serial terminal purchases must
-   first accumulate the configured positive `residual_hype_wei` in spot before
-   any remainder can become staking-eligible; a fill no larger than the current
-   deficit produces no staking intent. The signer independently requires the
-   tracked and post-deposit authoritative residual to meet the configured buffer.
-   When no validator is eligible, a deposit is permitted only by the separately
-   approved `hold_undelegated_in_staking` policy; the request has no validator
-   field.
-   Delegation requires the same mapped eligible quantity in
-   `deposited_undelegated` after authoritative deposit reconciliation, plus an
-   explicitly specified, allowlisted active validator that is neither jailed nor
-   undelegate-only. Because staking actions do not support `expiresAfter`, both
-   actions require `signer_submit_once`, a positive
-   `submission_min_remaining_ms`, and direct one-time submission by the isolated
-   signer without exposing a signature or action payload. Failure to begin the
-   network write before intent expiry blocks the phase without submission. A
-   possible write or unknown response blocks retry and requires authoritative
-   reconciliation.
+8. Automatic staking is disabled. Because the signed staking actions lack a
+   venue-enforced acceptance deadline, the service never creates a deposit or
+   delegation reservation, intent, signature, or outbound request. Dormant
+   `eligible_spot` accounting remains unsigned and purchased HYPE remains in spot;
+   no account type, validator state, continuation policy, local time margin, or
+   operator acknowledgement permits `cDeposit` or `tokenDelegate`.
 9. An ambiguous exposure-creating action response moves the workflow to
    reconciliation or manual review; it never causes a blind retry.
 10. Engaging manual halt atomically denies new order placement, staking deposit,
@@ -501,8 +407,7 @@ configuration must set all of these explicitly:
 - market/book, account-history, fee-schedule, and signal staleness limits;
 - purchase-fill registration deadline plus deterministic lot allocation and
   expiration policy;
-- signer-only staking submission mode and positive minimum remaining time before
-  intent expiry;
+- mandatory `staking.enabled = false` with no runtime staking signer or client;
 - externally enforced hot-balance mode, limit, sweep threshold, and worst-case
   headroom evidence, or separately approved uncapped-authority acceptance;
 - mandatory cancel-only containment while halted;
@@ -516,38 +421,28 @@ configuration must set all of these explicitly:
 | --- | --- | --- |
 | Co-host compromise | isolated Unix user, read-only config, no master key in trading process, least-privilege IAM, signer action allowlist | revoke API wallet from an offline master path; halt; reconcile from authoritative history |
 | Leaked API key | full trading authority assumed; dedicated execution account with no unrelated funds; no loss-cap credit without external enforcement proof; one named agent per process and no address reuse | alert on unknown signer/order or operational threshold breach; halt, cancel, revoke, reconcile, and generate a new address |
-| Replay or nonce pruning | durable atomic nonce, unique signer per process, bounded expiry where supported, purchase-time one-fill-to-workflow mapping, lot consumption, signer-side one-time workflow/action-phase claims, never reuse deregistered/expired agent | reconcile by CLOID/history; block ambiguous lot and phase claims; rotate signer; never resend an unknown action blindly |
+| Replay or nonce pruning | durable atomic nonce, unique signer per process, bounded expiry where supported, purchase-time one-fill-to-workflow mapping, lot consumption, one-time authorization/order claims, never reuse deregistered/expired agent | reconcile by CLOID/history; block ambiguous order claims; rotate signer; never resend an unknown action blindly |
 | Unauthorized API-wallet order | signer-side durable pre-purchase decision and CLOID authorization before execution; exact order-envelope binding | unmatched or mismatched fills remain permanently ineligible for automatic staking; halt and reconcile the trading-account compromise |
 | Delayed or stale order | signed `expiresAfter = effective_expiry_ms - 1` plus IOC-only live policy; GTC/ALO and missing/changed expiry rejected; no process-local expiry credit | venue rejects delayed acceptance; any impossible post-expiry fill halts live action, remains charged, and is ineligible for automatic staking |
-| Withheld or delayed staking payload | no sign-only endpoint; signer-only direct one-time submission; in-memory-only signature; strict positive pre-dispatch margin | pre-write expiry blocks without submission; possible write or timeout blocks retry and requires authoritative history reconciliation |
+| Delayed staking acceptance | automatic staking disabled because user-signed staking actions lack a venue-enforced acceptance deadline; no runtime signer, endpoint, or client | configuration rejects any enabled value before live capability; HYPE remains in spot and staking is manual/offline |
 | Fee under-reservation | checked `C = N + ceil(N * aggregate fee bps / 10000)` reserves admitted, reserve, yearly, and cumulative cash room while daily notional separately reserves `N` | authoritative fee reconciliation retains full reservation while ambiguous and halts on an unknown, stale, differently denominated, or above-ceiling fee |
-| Malicious validator selection | exact-address allowlist, no yield-based auto-switch, active/not-jailed/not-undelegate-only checks | stop new delegation and require allowlist-owner review |
+| Malicious validator selection | no runtime staking capability; validator data is advisory for offline manual review only | keep HYPE in spot and require a separately approved offline operation |
 | Dependency compromise | lockfile, checksums, minimal signing interface, CI audit/review gate | artifact provenance and rollback; rotate signer if signing material may have been exposed |
 | State rollback/truncation | hash-chained append-only ledger, atomic snapshot, versioned off-host backup | replay and checksum verification; fail closed on divergence |
 | Deposit spoofing or dust | authoritative external movement IDs plus confirmation/admission policy | expose observed vs confirmed vs admitted totals separately; manual classification correction |
 | Capital-event misclassification | typed movement categories; transfers inherit only from a traced admitted parent residual and never increase system-wide admission | invariant checks against parent/child account histories, idempotent transfer IDs, and the conserved capital equation |
-| Operator error | schema validation, effective-policy digest acknowledgement, two-step live/staking gates, exact validator/notional display | manual halt with authoritative cancel-only containment, immutable audit trail, rehearsed restore and key rotation |
+| Operator error | schema validation, effective-policy digest acknowledgement, live gate, mandatory disabled-staking invariant, exact notional display | manual halt with authoritative cancel-only containment, immutable audit trail, rehearsed restore and key rotation |
 
 ## Validator governance
 
-The allowlist owner is an operator independent from runtime policy. Changes are
-reviewed at least monthly and immediately after a jailed, inactive,
-undelegate-only, or commission-change alert. Runtime code may remove a validator
-from eligibility but may never add or switch one. When no approved validator is
-eligible, the typed
-`no_eligible_validator_policy` controls the next step and raises an alert. The
-default `hold_in_spot` value forbids `cDeposit`. The only alternative,
-`hold_undelegated_in_staking`, requires separate explicit approval and permits
-only a validator-free `cDeposit`, never delegation; the signer skips validator
-lookup and eligibility checks for that action while retaining every purchase,
-lot, balance, limit, expiry, and phase-consumption check. Operators must accept
-its seven-day return queue. Under `hold_in_spot`, a deposit remains validator-free
-but requires a fresh signer-side scan proving at least one allowlisted validator is
-eligible; no eligible validator or unavailable state rejects the deposit. Unknown
-policy values fail configuration validation. `hold_in_spot`
-does not provide a leaked-key balance cap: if retained or appreciated HYPE could
-exceed the independently enforced bound, no further purchase is authorized and
-production remains unapproved until an external containment design is proven.
+Validator metadata and the allowlist are advisory inputs for unsigned research
+and offline manual review only. Runtime code may remove a validator from that
+view but may never add or switch one. `no_eligible_validator_policy` accepts only
+`hold_in_spot`; every alternative and unknown value fails configuration
+validation and cannot authorize a deposit. Retained or appreciated HYPE in spot
+does not provide a leaked-key balance cap: if it could exceed the independently
+enforced bound, no further purchase is authorized and production remains
+unapproved until an external containment design is proven.
 
 Automatic `cWithdraw` and undelegation are absent from the service. Staking to
 spot has a seven-day queue and limited pending withdrawals; recovery procedures
@@ -557,7 +452,8 @@ must account for that delay rather than adding an emergency automatic action.
 
 Before production secrets or funds are present, attach evidence for:
 
-- deterministic signature vectors and signer-capability tests on testnet/replay;
+- deterministic L1 order-signature vectors and signer-capability tests on
+  testnet/replay;
 - a dry-run key install/rotate/revoke rehearsal using non-production material;
 - ledger restore and stale/ambiguous-response fault tests;
 - halt-transition tests proving new exposure is denied before exact authoritative
@@ -571,43 +467,32 @@ Before production secrets or funds are present, attach evidence for:
   evidence SHA-256, and approved change-record reference into the policy digest;
 - conservation, idempotency, source/destination, and excess-transfer tests when
   parent-admission inheritance is enabled;
-- signer crash/retry/restore tests proving each workflow action phase is consumed
-  before signing and cannot be reauthorized with a different nonce;
-- action-specific lot-state tests proving deposit and delegation reserve
-  `eligible_spot` and `deposited_undelegated` respectively, including ambiguous
-  responses, restore, and rejection of double reservation;
+- automatic-staking boundary tests proving every attempt to enable staking,
+  including `staking.enabled = true`, missing or unknown values, every account
+  kind, and every validator/continuation setting, fails before any live capability
+  is enabled; build and deployment artifacts must contain no runtime staking
+  signer, endpoint, master key, `cDeposit`, `tokenDelegate`, or direct-submission
+  client;
 - amount-conservation tests starting from zero HYPE and covering a fill below, at,
   and above the residual deficit, partial fills, concurrent residual reservations,
   deterministic multi-fill allocation, consumed residual, and restore; every case
   must prove exact `purchased = residual_spot + eligible_spot` accounting and
-  preserve the configured post-deposit residual, with later authorizations denied
-  while a residual top-up is unresolved;
-- full-eligible-allocation tests proving undersized, oversized, partially
-  consumed, and attempted caller-chosen sub-lot intents are rejected without
-  creating another phase key;
+  preserve the configured positive spot residual, with later authorizations
+  denied while a residual top-up is unresolved;
 - purchase-time registration and adversarial replay tests proving an unmapped or
   consumed historical fill cannot be enrolled under fresh workflow or daily
   decision IDs, including after a later purchase replenishes balances;
 - deterministic multi-lot partial-sale/transfer tests, including identical
   timestamps, stable-ID tie-breaking, expiry boundaries, and replay after restore;
-- action-schema tests proving deposit intents reject a validator field, delegation
-  intents require one, `hold_in_spot` deposits require fresh allowlist
-  availability, and approved deposit-only continuation succeeds without validator
-  availability while preserving every non-validator gate;
 - yearly and lifetime boundary tests proving an operator admission cannot bypass
   either acknowledged deployable-capital ceiling;
 - signal-freshness boundary tests proving a missing, malformed, future, or
   age-at-limit decision timestamp rejects a purchase while book/account data is
   otherwise fresh;
-- account-target tests proving automatic staking accepts only a dedicated master
-  execution account that exactly matches the signer and rejects subaccount, vault,
-  unknown, and master-account mismatch configurations;
-- staking-submission tests proving the caller, logs, and durable ledger can never
-  obtain a signature or action payload; exact remaining-time equality rejects
-  before signing; delaying dispatch beyond expiry destroys the payload without a
-  write; a possible partial write or unknown response blocks retry while a late
-  success is reconciled; crashes at claim, sign, write, and response persistence
-  preserve the consumed phase and submission state across restore;
+- delayed-acceptance tests documenting that local pre-submit checks, direct
+  submission, no-retry rules, and dispatch margins cannot prevent an already
+  signed staking request from stalling in flight; none may be accepted as a
+  substitute for a venue-enforced signed acceptance deadline;
 - adversarial pre-authorization tests proving a forged decision, unknown or reused
   CLOID, changed order envelope or limits, late authorization, unmatched fill, and
   residual reissue without a new authorization remain permanently ineligible for
@@ -640,8 +525,8 @@ Before production secrets or funds are present, attach evidence for:
   release;
 - acknowledgement tests proving a changed, missing, malformed, or differently
   normalized parent-account value invalidates the effective-policy digest;
-- the user's explicit choice of custody option, host, validator, limits, and
-  exact small-probe configuration.
+- the user's explicit choice of custody option, host, limits, and exact small-probe
+  configuration; no approval can enable automatic staking under this model.
 
 ## Sources
 

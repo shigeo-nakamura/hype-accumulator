@@ -7,8 +7,7 @@ ciphertext, host alias, or production filesystem path.
 
 - Live mode and automatic staking are disabled.
 - The selected custody option, typed execution-account kind, and host have explicit
-  user approval. Automatic staking uses only a dedicated master execution account
-  that exactly matches the separately controlled signer.
+  user approval. No approval enables automatic staking under this model.
 - The operator has recorded the expected account, fresh agent public address,
   canonical config, normalized validator allowlist, acknowledgement expiry, and
   every startup-resolved policy identity through the private change record. For
@@ -27,11 +26,12 @@ ciphertext, host alias, or production filesystem path.
    read-only validation mode.
 5. Verify the account query uses the actual account address and returns the
    expected read-only state. Do not submit an action. Confirm automatic staking is
-   rejected for subaccount, vault, unknown, and master-signer/account mismatch
-   configurations; the service has no implicit child-to-master transfer path.
+   rejected for every account kind and the service has no implicit child-to-master
+   transfer path.
 6. Confirm the service rejects live config without a current acknowledgement and
-   rejects a missing, malformed, or changed resolved policy identity. Confirm it
-   rejects staking when the separate signer is unavailable.
+   rejects a missing, malformed, or changed resolved policy identity. Confirm
+   `staking.enabled = true`, a missing value, and unknown values fail startup in
+   both dry-run and live configurations.
 7. Before order submission, verify the signer-side authorizer independently
    validates the decision and policy inputs and durably binds the exact account,
    decision, CLOID, unsigned request template, L1 nonce, signed `expiresAfter`,
@@ -72,54 +72,21 @@ ciphertext, host alias, or production filesystem path.
    new-period ledger until terminal settlement; an impossible fill at or beyond
    effective expiry must remain charged, halt live action, and be
    automatic-staking ineligible.
-8. Fault-test the signer around claim, signature, and result persistence. A
-   consumed or ambiguous `(account, workflow ID, action phase)` must remain
-   blocked across caller retry, restart, restore, and a retry with a new nonce.
-   Confirm `cDeposit` and `tokenDelegate` use only `signer_submit_once`: the
-   signer owns the exchange client, and callers, logs, and the durable ledger
-   receive no signature or action payload. At the exact
-   `submission_min_remaining_ms` boundary, verify rejection occurs before
-   signing. Delay dispatch past intent expiry and verify the signer destroys the
-   in-memory payload, performs no write, and blocks the phase for manual
-   reconciliation. Inject a partial or unknown write and withhold the response
-   beyond expiry; verify no retry is possible, the caller sees only opaque status,
-   and a late authoritative success is reconciled. Crash at claim, sign, write,
-   and result persistence and verify the consumed phase and submission state
-   survive restore.
-   Confirm purchase fills are mapped by the independent reconciler at first
-   authoritative observation, not by the staking request. Sell or otherwise
-   consume a registered lot, replenish aggregate balance, then repackage the old
-   fill under new workflow and daily decision IDs; the lot ledger must reject it.
-   An old fill missing the purchase-time mapping must also remain ineligible.
-   Delay sale/movement ingestion and confirm staking fails until both cursors
-   reach a fresh common watermark. Create multiple lots, partially consume them,
-   and verify replay selects the same oldest lot using fill time, order ID, then
-   fill ID; verify expired lots cannot be reserved. With no eligible validator,
-   verify `hold_in_spot` rejects `cDeposit`, while the separately approved
-   `hold_undelegated_in_staking` mode accepts a validator-free deposit intent and
-   still rejects delegation. Deposit intents containing a validator and delegation
-   intents missing one must fail schema validation. Under `hold_in_spot`, stale or
-   unavailable validator state must also reject the deposit. Complete a deposit
-   from a zero-HYPE account: a terminal total fill below or equal to the atomically
-   reserved residual deficit must produce only `residual_spot` and no staking
-   intent, while a total fill above the deficit, including a partial fill of a
-   larger requested order, must conserve the exact purchase as
-   `residual_spot + eligible_spot` using the canonical fill order. Race two
-   purchases and verify every later authorization fails while the first residual
-   top-up remains unresolved. Consume residual spot and confirm no old eligible
-   allocation is promoted and no deposit proceeds until a new authorized purchase
-   refills the deficit. Then
-   verify the full eligible allocation moves from `eligible_spot` through
-   `deposit_reserved` to `deposited_undelegated` while the configured positive
-   residual remains in authoritative spot; delegation must reserve only that
-   undelegated state, never debit `eligible_spot` again. Submit undersized,
-   oversized, and caller-chosen sub-lot amounts and partially consume an eligible
-   allocation; every case must reject automatic staking without creating another
-   phase key.
-   Exercise ambiguous responses, restart, and restore at both reservation
-   boundaries.
+8. Prove the automatic-staking boundary is absent, not merely guarded at runtime.
+   Build and deployment artifacts must contain no staking signer process,
+   master-key credential, staking intent endpoint, or outbound `cDeposit` or
+   `tokenDelegate` client. Attempts to enable staking for every account kind,
+   validator state, or continuation policy must fail before any live capability
+   starts. Confirm `hold_in_spot` is the only accepted continuation value and
+   never produces an action. Review a delayed-delivery fault model showing that a
+   locally valid signed request can stall in a proxy or TCP buffer until after its
+   evidence horizon; do not accept local margins, direct submission, payload
+   destruction, or no-retry reconciliation as substitutes for a venue-enforced
+   deadline in the signed staking action. Confirm purchase lots and residual
+   amounts remain unsigned bookkeeping and HYPE remains in spot across restart
+   and restore.
 9. Rehearse manual halt with a resting test order. Confirm new order and staking
-   signatures stop before the cancel-only path independently discovers and
+   signatures are already unavailable before the cancel-only path discovers and
    cancels the exact open order. Drop the cancellation response and verify it
    re-queries authoritative state before retrying; signer loss must alert and
    escalate without clearing the halt.
@@ -166,18 +133,18 @@ ciphertext, host alias, or production filesystem path.
 6. Resume only after the capital equation and spot/staking balances reconcile and
    the user approves a new config acknowledgement.
 
-## Contain suspected master-signer compromise
+## Contain suspected offline master-key compromise
 
 An exfiltrated master-wallet key cannot be revoked or rotated in place. API-wallet
 deregistration does not contain it. Treat the funded master account as compromised
 and execute this procedure only from a clean, independent recovery environment:
 
-1. Engage manual halt, disconnect the staking signer, and revoke its host, IAM,
-   KMS, and network access. Do not send another request through the suspected
-   signer or host.
-2. Establish a fresh master account and separately controlled signer under the
-   approved offline recovery process. Record its policy and account identifiers
-   in the private change record before moving value.
+1. Engage manual halt and verify no runtime staking signer or master credential is
+   deployed. Revoke any accidentally present host, IAM, KMS, and network access;
+   do not use the suspected key or environment again.
+2. Establish a fresh master account under the approved offline recovery process.
+   Record its policy and account identifiers in the private change record before
+   moving value.
 3. Query authoritative orders, fills, balances, movements, staking state, pending
    withdrawals, delegations, and rewards for the compromised account from the
    clean environment. Preserve an incident cutoff and continue monitoring for
