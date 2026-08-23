@@ -101,7 +101,7 @@ fully specified intent containing:
 - hashes of the admitted-capital snapshot, order/fill evidence, and current
   staking state;
 - an expiry and a fresh monotonic nonce;
-- the remaining approved daily and cumulative limits.
+- the remaining approved daily, yearly, and cumulative limits.
 
 The signer has no generic JSON/action endpoint. It uses separate strict schemas
 for staking deposit and delegation and rejects unknown fields. In particular,
@@ -114,12 +114,17 @@ independently queries authoritative order, fill, spot-balance, and staking state
 using the actual account address. It verifies that the canonical stable order/fill
 set, workflow ID, amount, and remaining eligible lot quantity exactly match the
 purchase-time mapping instead of trusting caller-supplied identifiers or aggregate
-balance. It also verifies residual balance, intent expiry, and daily and cumulative
-room against an independently loaded approved policy and immutable ledger anchor.
-For delegation only, it additionally queries validator state and verifies the
-specified validator is allowlisted, active, not jailed, and not undelegate-only.
-Missing, stale, consumed, ambiguous, or mismatched evidence is rejected into manual
-review without signing.
+balance. It also verifies residual balance, intent expiry, and daily, yearly, and
+cumulative room against an independently loaded approved policy and immutable
+ledger anchor.
+For a deposit under the default `hold_in_spot` policy, it independently queries
+the complete allowlist and requires at least one currently eligible validator,
+without accepting or selecting a validator in the intent. Missing or stale
+validator state fails closed. Only the explicitly approved
+`hold_undelegated_in_staking` policy skips that availability requirement for
+`cDeposit`. For delegation, it queries the specified validator and verifies it is
+allowlisted, active, not jailed, and not undelegate-only. Missing, stale, consumed,
+ambiguous, or mismatched evidence is rejected into manual review without signing.
 
 Before producing a signature, one durable atomic transaction verifies every fill
 is already mapped to this workflow with sufficient eligible quantity, reserves
@@ -174,12 +179,17 @@ All gates are conjunctive and fail closed:
    `external_deposit_only` with inheritance disabled and no parent, or
    `traced_parent_transfer` with inheritance enabled and a non-empty approved
    parent-account environment name; every other combination is rejected.
-5. A deposit above the per-deposit limit or beyond yearly/cumulative room remains
-   visible but unallocated until a separately recorded operator admission.
+5. A deposit above the per-deposit limit remains visible but unallocated until a
+   separately recorded operator admission. Capital beyond yearly room remains
+   unallocated until the approved period rolls over or a newly acknowledged policy
+   raises the ceiling; capital beyond the lifetime cumulative room requires such a
+   newly acknowledged policy. Operator admission alone never overrides either
+   ceiling.
 6. Committed plus spent USDC cannot exceed admitted deposits minus reconciled
    withdrawals and reserves.
 7. A purchase requires fresh book/account data, no unknown movement, no balance
-   mismatch, no halt, available daily/cumulative notional and slippage room, and
+   mismatch, no halt, available daily purchase-notional room, available yearly
+   and cumulative deployable-capital room, available slippage room, and
    independently enforced post-purchase hot-exposure room. A service-side
    threshold alone cannot satisfy the final condition.
 8. A staking deposit requires reconciled newly purchased HYPE and a configured
@@ -247,7 +257,10 @@ default `hold_in_spot` value forbids `cDeposit`. The only alternative,
 only a validator-free `cDeposit`, never delegation; the signer skips validator
 lookup and eligibility checks for that action while retaining every purchase,
 lot, balance, limit, expiry, and phase-consumption check. Operators must accept
-its seven-day return queue. Unknown policy values fail configuration validation. `hold_in_spot`
+its seven-day return queue. Under `hold_in_spot`, a deposit remains validator-free
+but requires a fresh signer-side scan proving at least one allowlisted validator is
+eligible; no eligible validator or unavailable state rejects the deposit. Unknown
+policy values fail configuration validation. `hold_in_spot`
 does not provide a leaked-key balance cap: if retained or appreciated HYPE could
 exceed the independently enforced bound, no further purchase is authorized and
 production remains unapproved until an external containment design is proven.
@@ -282,8 +295,11 @@ Before production secrets or funds are present, attach evidence for:
 - deterministic multi-lot partial-sale/transfer tests, including identical
   timestamps, stable-ID tie-breaking, expiry boundaries, and replay after restore;
 - action-schema tests proving deposit intents reject a validator field, delegation
-  intents require one, and approved deposit-only continuation succeeds when no
-  validator is eligible without weakening any non-validator gate;
+  intents require one, `hold_in_spot` deposits require fresh allowlist
+  availability, and approved deposit-only continuation succeeds without validator
+  availability while preserving every non-validator gate;
+- yearly and lifetime boundary tests proving an operator admission cannot bypass
+  either acknowledged deployable-capital ceiling;
 - acknowledgement tests proving a changed, missing, malformed, or differently
   normalized parent-account value invalidates the effective-policy digest;
 - the user's explicit choice of custody option, host, validator, limits, and

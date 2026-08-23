@@ -43,7 +43,8 @@ ciphertext, host alias, or production filesystem path.
    verify `hold_in_spot` rejects `cDeposit`, while the separately approved
    `hold_undelegated_in_staking` mode accepts a validator-free deposit intent and
    still rejects delegation. Deposit intents containing a validator and delegation
-   intents missing one must fail schema validation.
+   intents missing one must fail schema validation. Under `hold_in_spot`, stale or
+   unavailable validator state must also reject the deposit.
 8. Rehearse manual halt with a resting test order. Confirm new order and staking
    signatures stop before the cancel-only path independently discovers and
    cancels the exact open order. Drop the cancellation response and verify it
@@ -56,6 +57,10 @@ ciphertext, host alias, or production filesystem path.
    Verify the sweep threshold plus worst-case headroom does not exceed the hard
    maximum, and verify the acknowledged evidence SHA-256 and private change-record
    reference before enabling live mode.
+10. At the exact yearly and lifetime cumulative capital boundaries, verify that
+    neither direct admission nor a separately recorded operator admission permits
+    another purchase. Year rollover may restore only yearly room; exceeding either
+    acknowledged ceiling requires a newly acknowledged policy.
 
 ## Rotate
 
