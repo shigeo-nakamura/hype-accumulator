@@ -18,6 +18,13 @@ pub enum ExchangeError {
 }
 pub trait Exchange: Send {
     fn mode(&self) -> &'static str;
+
+    /// Submits an intent to the configured exchange boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError`] when the intent is rejected or the selected
+    /// exchange implementation cannot perform live actions.
     fn submit(&mut self, intent: &OrderIntent) -> Result<Submission, ExchangeError>;
 }
 #[derive(Default)]

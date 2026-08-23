@@ -11,6 +11,13 @@ impl<E: Exchange> Executor<E> {
     pub const fn new(exchange: E, limits: ExecutionConfig) -> Self {
         Self { exchange, limits }
     }
+
+    /// Validates notional limits and submits one order intent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::Rejected`] for a non-finite, non-positive, or
+    /// oversized notional, or propagates an error from the exchange boundary.
     pub fn execute(&mut self, notional_usdc: f64) -> Result<Submission, ExchangeError> {
         if !notional_usdc.is_finite()
             || notional_usdc <= 0.0

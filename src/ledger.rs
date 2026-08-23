@@ -6,6 +6,11 @@ pub struct LedgerEntry {
     pub deployed_usdc: f64,
 }
 pub trait Ledger: Send {
+    /// Appends one immutable event to the ledger.
+    ///
+    /// # Errors
+    ///
+    /// Returns an implementation-specific persistence error.
     fn append(&mut self, entry: LedgerEntry) -> Result<(), String>;
 }
 #[derive(Default)]

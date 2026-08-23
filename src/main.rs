@@ -14,7 +14,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "config.toml".to_owned());
     let config = Config::from_toml(&fs::read_to_string(path)?)?;
     let exchange = bootstrap(
-        config,
+        &config,
         &hype_accumulator::config::ProcessEnvironment,
         |_| Box::new(UnavailableLiveExchange),
     )?;

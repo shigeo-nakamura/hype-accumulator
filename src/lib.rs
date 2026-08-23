@@ -12,8 +12,13 @@ use config::{Config, ConfigError, Environment};
 use exchange::{DryRunExchange, Exchange};
 
 /// Validates every safety boundary before constructing a network-capable exchange.
+///
+/// # Errors
+///
+/// Returns [`ConfigError`] when configuration validation fails. The live
+/// factory is never called on an error or while `dry_run` is enabled.
 pub fn bootstrap<E, F>(
-    config: Config,
+    config: &Config,
     env: &E,
     live_factory: F,
 ) -> Result<Box<dyn Exchange>, ConfigError>
@@ -25,6 +30,6 @@ where
     if config.dry_run {
         Ok(Box::new(DryRunExchange::default()))
     } else {
-        Ok(live_factory(&config))
+        Ok(live_factory(config))
     }
 }

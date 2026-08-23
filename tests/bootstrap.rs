@@ -12,16 +12,20 @@ fn fixture() -> Config {
 
 #[test]
 fn safe_defaults_are_dry_run_and_halted() {
-    let config = fixture();
+    let input = include_str!("fixtures/safe.toml")
+        .replace("dry_run = true\n", "")
+        .replace("manual_halt = true\n", "");
+    let config = Config::from_toml(&input).expect("safe defaults must parse");
     assert!(config.dry_run);
     assert!(config.manual_halt);
+    assert!(!config.live_approved);
 }
 
 #[test]
 fn dry_run_never_constructs_live_exchange() {
     let called = Rc::new(Cell::new(false));
     let marker = Rc::clone(&called);
-    let mut exchange = bootstrap(fixture(), &HashMap::new(), move |_| {
+    let mut exchange = bootstrap(&fixture(), &HashMap::new(), move |_| {
         marker.set(true);
         panic!("live exchange must not be constructed")
     })
@@ -45,7 +49,7 @@ fn incomplete_live_config_fails_before_exchange_construction() {
     config.validator_allowlist.push("validator-a".into());
     let called = Rc::new(Cell::new(false));
     let marker = Rc::clone(&called);
-    let result = bootstrap(config, &HashMap::new(), move |_| {
+    let result = bootstrap(&config, &HashMap::new(), move |_| {
         marker.set(true);
         Box::new(DryRunExchange::default())
     });
@@ -62,10 +66,21 @@ fn capital_is_limited_by_admitted_not_observed_balance() {
         deployed_this_year_usdc: 20.0,
         deployed_cumulative_usdc: 50.0,
     };
-    assert_eq!(
-        automatically_deployable(&snapshot, &fixture().capital),
-        80.0
-    );
+    let deployable = automatically_deployable(&snapshot, &fixture().capital);
+    assert!((deployable - 30.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn fully_deployed_admitted_capital_cannot_be_reused() {
+    let snapshot = CapitalSnapshot {
+        observed_spot_usdc: 900.0,
+        confirmed_deposits_usdc: 80.0,
+        admitted_deposits_usdc: 80.0,
+        deployed_this_year_usdc: 80.0,
+        deployed_cumulative_usdc: 80.0,
+    };
+    let deployable = automatically_deployable(&snapshot, &fixture().capital);
+    assert!(deployable.abs() < f64::EPSILON);
 }
 
 #[test]

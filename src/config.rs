@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::{collections::HashMap, env};
+use std::{collections::HashMap, env, hash::BuildHasher};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -69,7 +69,7 @@ impl Environment for ProcessEnvironment {
         env::var(name).ok()
     }
 }
-impl Environment for HashMap<String, String> {
+impl<S: BuildHasher> Environment for HashMap<String, String, S> {
     fn get(&self, name: &str) -> Option<String> {
         HashMap::get(self, name).cloned()
     }
@@ -86,9 +86,23 @@ pub enum ConfigError {
 }
 
 impl Config {
+    /// Parses a complete configuration from TOML.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Parse`] when the input is not valid TOML or does
+    /// not match the fail-closed configuration schema.
     pub fn from_toml(input: &str) -> Result<Self, ConfigError> {
         toml::from_str(input).map_err(|error| ConfigError::Parse(error.to_string()))
     }
+
+    /// Validates configuration invariants before any exchange is constructed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Invalid`] for inconsistent safety limits or live
+    /// gates, and [`ConfigError::MissingLiveSecret`] when required live-only
+    /// environment values are absent.
     pub fn validate<E: Environment>(&self, env: &E) -> Result<(), ConfigError> {
         positive(
             "max_automatically_deployable_usdc",
@@ -157,7 +171,7 @@ impl Config {
             &self.hyperliquid.account_env,
             &self.hyperliquid.signing_key_env,
         ] {
-            if name.is_empty() || env.get(name).map_or(true, |value| value.trim().is_empty()) {
+            if name.is_empty() || env.get(name).is_none_or(|value| value.trim().is_empty()) {
                 return Err(ConfigError::MissingLiveSecret(name.clone()));
             }
         }
