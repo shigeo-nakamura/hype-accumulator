@@ -6,6 +6,7 @@
 
 use crate::pacing::UsdcMicros;
 use chrono::{DateTime, NaiveDate, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -22,6 +23,7 @@ pub const LEDGER_SCHEMA_VERSION: u8 = 1;
 pub const SNAPSHOT_SCHEMA_VERSION: u8 = 1;
 pub const LEDGER_FILE_NAME: &str = "ledger.jsonl";
 pub const SNAPSHOT_FILE_NAME: &str = "snapshot.json";
+const LOCK_FILE_NAME: &str = ".ledger.lock";
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Legacy in-memory observation retained for callers that have not migrated
@@ -287,6 +289,11 @@ impl DurableLedger {
     /// snapshot-inconsistent state.
     pub fn open(directory: impl AsRef<Path>) -> Result<Self, LedgerError> {
         let directory = directory.as_ref().to_path_buf();
+        let _lock = LedgerLock::acquire(&directory)?;
+        Self::open_unlocked(directory)
+    }
+
+    fn open_unlocked(directory: PathBuf) -> Result<Self, LedgerError> {
         let payload = read_optional(&directory.join(LEDGER_FILE_NAME))?;
         let records = load_records(&payload)?;
         let events = records
@@ -294,9 +301,7 @@ impl DurableLedger {
             .map(|record| record.event.clone())
             .collect::<Vec<_>>();
         let state = replay(&events)?;
-        if let Some(snapshot) = load_snapshot(&directory.join(SNAPSHOT_FILE_NAME))? {
-            validate_snapshot_anchor(&snapshot, &records)?;
-        }
+        validate_current_snapshot(&directory, &records)?;
         let mut events_by_id = BTreeMap::new();
         for event in events {
             if events_by_id.insert(event.event_id.clone(), event).is_some() {
@@ -343,6 +348,8 @@ impl DurableLedger {
     /// concurrent file changes, serialization, or durable-write failures.
     pub fn append(&mut self, event: LedgerEvent) -> Result<AppendOutcome, LedgerError> {
         validate_event(&event)?;
+        let _lock = LedgerLock::acquire(&self.directory)?;
+        self.ensure_current()?;
         if let Some(existing) = self.events_by_id.get(&event.event_id) {
             return if existing == &event {
                 Ok(AppendOutcome::Duplicate)
@@ -368,11 +375,21 @@ impl DurableLedger {
             event,
             record_hash,
         };
-        self.write_record(&record)?;
+        let snapshot = LedgerSnapshot {
+            ledger_schema_version: LEDGER_SCHEMA_VERSION,
+            record_count: sequence
+                .checked_add(1)
+                .ok_or_else(|| LedgerError::CorruptLedger("record count overflowed".into()))?,
+            head_hash: record.record_hash.clone(),
+            state: next_state.clone(),
+        };
+        let next_file_len = self.write_record(&record)?;
+        write_snapshot(&self.directory, &snapshot)?;
         self.events_by_id
             .insert(record.event.event_id.clone(), record.event.clone());
         self.records.push(record);
         self.state = next_state;
+        self.file_len = next_file_len;
         Ok(AppendOutcome::Appended)
     }
 
@@ -386,7 +403,8 @@ impl DurableLedger {
     /// Returns [`LedgerError`] if the journal changed concurrently or the
     /// snapshot cannot be serialized or durably replaced.
     pub fn checkpoint(&self) -> Result<LedgerSnapshot, LedgerError> {
-        self.ensure_file_len()?;
+        let _lock = LedgerLock::acquire(&self.directory)?;
+        self.ensure_current()?;
         let snapshot = LedgerSnapshot {
             ledger_schema_version: LEDGER_SCHEMA_VERSION,
             record_count: u64::try_from(self.records.len())
@@ -394,14 +412,7 @@ impl DurableLedger {
             head_hash: self.head_hash().to_owned(),
             state: self.state.clone(),
         };
-        let envelope = SnapshotEnvelope {
-            schema_version: SNAPSHOT_SCHEMA_VERSION,
-            checksum: snapshot_checksum(&snapshot)?,
-            snapshot: snapshot.clone(),
-        };
-        let mut payload = serde_json::to_vec(&envelope).map_err(LedgerError::json)?;
-        payload.push(b'\n');
-        write_atomic(&self.directory.join(SNAPSHOT_FILE_NAME), &payload)?;
+        write_snapshot(&self.directory, &snapshot)?;
         Ok(snapshot)
     }
 
@@ -416,7 +427,12 @@ impl DurableLedger {
         destination: impl AsRef<Path>,
     ) -> Result<Self, LedgerError> {
         let source = source.as_ref();
-        let verified = Self::open(source)?;
+        let destination = destination.as_ref();
+        if source == destination {
+            return Err(LedgerError::RestoreDestinationNotEmpty);
+        }
+        let _source_lock = LedgerLock::acquire(source)?;
+        let verified = Self::open_unlocked(source.to_path_buf())?;
         let snapshot_payload = read_optional(&source.join(SNAPSHOT_FILE_NAME))?;
         if snapshot_payload.is_empty() {
             return Err(LedgerError::MissingSnapshot);
@@ -435,24 +451,31 @@ impl DurableLedger {
         if source_records != verified.records {
             return Err(LedgerError::ConcurrentModification);
         }
-        let destination = destination.as_ref();
+        ensure_clean_directory(destination)?;
+        let _destination_lock = LedgerLock::acquire(destination)?;
         ensure_clean_directory(destination)?;
         write_atomic(&destination.join(LEDGER_FILE_NAME), &ledger_payload)?;
         write_atomic(&destination.join(SNAPSHOT_FILE_NAME), &snapshot_payload)?;
-        let restored = Self::open(destination)?;
+        let restored = Self::open_unlocked(destination.to_path_buf())?;
         if restored.records != verified.records || restored.state != verified.state {
             return Err(LedgerError::SnapshotMismatch);
         }
         Ok(restored)
     }
 
-    fn write_record(&mut self, record: &LedgerEnvelope) -> Result<(), LedgerError> {
+    fn write_record(&self, record: &LedgerEnvelope) -> Result<u64, LedgerError> {
         fs::create_dir_all(&self.directory).map_err(LedgerError::io)?;
-        self.ensure_file_len()?;
         let path = self.directory.join(LEDGER_FILE_NAME);
         let created = !path.exists();
         let mut line = serde_json::to_vec(record).map_err(LedgerError::json)?;
         line.push(b'\n');
+        let next_file_len = self
+            .file_len
+            .checked_add(
+                u64::try_from(line.len())
+                    .map_err(|_| LedgerError::CorruptLedger("file length overflowed".into()))?,
+            )
+            .ok_or_else(|| LedgerError::CorruptLedger("file length overflowed".into()))?;
         let mut options = OpenOptions::new();
         options.create(true).append(true);
         #[cfg(unix)]
@@ -466,31 +489,18 @@ impl DurableLedger {
         if created {
             sync_directory(&self.directory)?;
         }
-        self.file_len = self
-            .file_len
-            .checked_add(
-                u64::try_from(line.len())
-                    .map_err(|_| LedgerError::CorruptLedger("file length overflowed".into()))?,
-            )
-            .ok_or_else(|| LedgerError::CorruptLedger("file length overflowed".into()))?;
-        Ok(())
+        Ok(next_file_len)
     }
 
-    fn ensure_file_len(&self) -> Result<(), LedgerError> {
-        let current_len = fs::metadata(self.directory.join(LEDGER_FILE_NAME))
-            .map(|metadata| metadata.len())
-            .or_else(|error| {
-                if error.kind() == io::ErrorKind::NotFound {
-                    Ok(0)
-                } else {
-                    Err(error)
-                }
-            })
-            .map_err(LedgerError::io)?;
-        if current_len == self.file_len {
-            Ok(())
-        } else {
+    fn ensure_current(&self) -> Result<(), LedgerError> {
+        let payload = read_optional(&self.directory.join(LEDGER_FILE_NAME))?;
+        let current_len = u64::try_from(payload.len())
+            .map_err(|_| LedgerError::CorruptLedger("file length overflowed".into()))?;
+        let records = load_records(&payload)?;
+        if current_len != self.file_len || records != self.records {
             Err(LedgerError::ConcurrentModification)
+        } else {
+            validate_current_snapshot(&self.directory, &records)
         }
     }
 }
@@ -706,6 +716,17 @@ fn validate_event(event: &LedgerEvent) -> Result<(), LedgerError> {
     Ok(())
 }
 
+fn validate_current_snapshot(
+    directory: &Path,
+    records: &[LedgerEnvelope],
+) -> Result<(), LedgerError> {
+    match load_snapshot(&directory.join(SNAPSHOT_FILE_NAME))? {
+        Some(snapshot) => validate_snapshot_anchor(&snapshot, records),
+        None if records.is_empty() => Ok(()),
+        None => Err(LedgerError::MissingSnapshot),
+    }
+}
+
 fn validate_snapshot_anchor(
     snapshot: &LedgerSnapshot,
     records: &[LedgerEnvelope],
@@ -718,6 +739,9 @@ fn validate_snapshot_anchor(
     if count > records.len() {
         return Err(LedgerError::TruncatedLedger);
     }
+    if count < records.len() {
+        return Err(LedgerError::StaleSnapshot);
+    }
     let expected_head = if count == 0 {
         GENESIS_HASH
     } else {
@@ -726,7 +750,7 @@ fn validate_snapshot_anchor(
     if snapshot.head_hash != expected_head {
         return Err(LedgerError::SnapshotMismatch);
     }
-    let events = records[..count]
+    let events = records
         .iter()
         .map(|record| record.event.clone())
         .collect::<Vec<_>>();
@@ -810,6 +834,17 @@ fn snapshot_checksum(snapshot: &LedgerSnapshot) -> Result<String, LedgerError> {
     })
     .map_err(LedgerError::json)?;
     Ok(digest_hex(&payload))
+}
+
+fn write_snapshot(directory: &Path, snapshot: &LedgerSnapshot) -> Result<(), LedgerError> {
+    let envelope = SnapshotEnvelope {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        checksum: snapshot_checksum(snapshot)?,
+        snapshot: snapshot.clone(),
+    };
+    let mut payload = serde_json::to_vec(&envelope).map_err(LedgerError::json)?;
+    payload.push(b'\n');
+    write_atomic(&directory.join(SNAPSHOT_FILE_NAME), &payload)
 }
 
 fn digest_hex(payload: &[u8]) -> String {
@@ -928,16 +963,35 @@ fn write_atomic(path: &Path, payload: &[u8]) -> Result<(), LedgerError> {
     result
 }
 
+struct LedgerLock {
+    _file: File,
+}
+
+impl LedgerLock {
+    fn acquire(directory: &Path) -> Result<Self, LedgerError> {
+        fs::create_dir_all(directory).map_err(LedgerError::io)?;
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o640);
+        }
+        let file = options
+            .open(directory.join(LOCK_FILE_NAME))
+            .map_err(LedgerError::io)?;
+        file.lock_exclusive().map_err(LedgerError::io)?;
+        Ok(Self { _file: file })
+    }
+}
+
 fn ensure_clean_directory(path: &Path) -> Result<(), LedgerError> {
     if path.exists() {
-        let mut entries = fs::read_dir(path).map_err(LedgerError::io)?;
-        if entries
-            .next()
-            .transpose()
-            .map_err(LedgerError::io)?
-            .is_some()
-        {
-            return Err(LedgerError::RestoreDestinationNotEmpty);
+        for entry in fs::read_dir(path).map_err(LedgerError::io)? {
+            let entry = entry.map_err(LedgerError::io)?;
+            if entry.file_name() != LOCK_FILE_NAME {
+                return Err(LedgerError::RestoreDestinationNotEmpty);
+            }
         }
     } else {
         fs::create_dir_all(path).map_err(LedgerError::io)?;

@@ -95,6 +95,68 @@ fn duplicate_event_is_idempotent_and_id_collision_fails_closed() {
 }
 
 #[test]
+fn duplicate_retry_verifies_that_the_event_is_still_durable() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let mut ledger = DurableLedger::open(directory.path()).expect("open ledger");
+    let durable_event = deposit("deposit-durable-retry", 1, 100);
+    ledger
+        .append(durable_event.clone())
+        .expect("append deposit");
+    fs::remove_file(ledger_path(directory.path())).expect("delete journal fixture");
+
+    assert!(matches!(
+        ledger.append(durable_event),
+        Err(LedgerError::ConcurrentModification)
+    ));
+}
+
+#[test]
+fn concurrent_writers_cannot_both_append_from_the_same_head() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let first = DurableLedger::open(directory.path()).expect("open first writer");
+    let second = DurableLedger::open(directory.path()).expect("open second writer");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let first_barrier = std::sync::Arc::clone(&barrier);
+    let second_barrier = std::sync::Arc::clone(&barrier);
+
+    let first_thread = std::thread::spawn(move || {
+        let mut first = first;
+        first_barrier.wait();
+        first.append(deposit("deposit-concurrent-a", 1, 100))
+    });
+    let second_thread = std::thread::spawn(move || {
+        let mut second = second;
+        second_barrier.wait();
+        second.append(deposit("deposit-concurrent-b", 1, 100))
+    });
+    let outcomes = [
+        first_thread.join().expect("first writer joined"),
+        second_thread.join().expect("second writer joined"),
+    ];
+
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, Ok(AppendOutcome::Appended)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, Err(LedgerError::ConcurrentModification)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        DurableLedger::open(directory.path())
+            .expect("journal remains replayable")
+            .record_count(),
+        1
+    );
+}
+
+#[test]
 fn only_admitted_authoritative_deposits_increase_deployable_capital() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let mut ledger = DurableLedger::open(directory.path()).expect("open ledger");
@@ -286,10 +348,10 @@ fn checkpoint_anchor_detects_complete_tail_loss() {
     ledger
         .append(deposit("deposit-tail", 1, 100))
         .expect("append deposit");
+    ledger.checkpoint().expect("write earlier checkpoint");
     ledger
         .append(observed("balance-tail", 2, 100, 1))
-        .expect("append balance");
-    ledger.checkpoint().expect("write checkpoint");
+        .expect("append and advance latest-head snapshot");
     drop(ledger);
 
     let path = ledger_path(directory.path());
@@ -381,10 +443,10 @@ fn clean_directory_restore_round_trips_exact_checkpoint() {
                 .into_owned()
         })
         .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(
-        file_names,
-        [LEDGER_FILE_NAME.into(), SNAPSHOT_FILE_NAME.into()].into()
-    );
+    assert_eq!(file_names.len(), 3);
+    assert!(file_names.contains(LEDGER_FILE_NAME));
+    assert!(file_names.contains(SNAPSHOT_FILE_NAME));
+    assert!(file_names.contains(".ledger.lock"));
     assert_eq!(
         DurableLedger::open(&destination)
             .expect("reopen restored ledger")
@@ -402,27 +464,32 @@ fn restore_rejects_stale_or_missing_snapshot_and_nonempty_destination() {
         .append(deposit("deposit-restore-guard", 1, 100))
         .expect("append deposit");
 
+    let first_snapshot = fs::read(snapshot_path(source.path())).expect("read exact snapshot");
+    fs::remove_file(snapshot_path(source.path())).expect("remove snapshot fixture");
+
     assert!(matches!(
         DurableLedger::restore_clean(source.path(), destination.path()),
         Err(LedgerError::MissingSnapshot)
     ));
 
-    ledger.checkpoint().expect("write checkpoint");
+    fs::write(snapshot_path(source.path()), &first_snapshot)
+        .expect("restore exact snapshot fixture");
     ledger
         .append(observed("balance-after-checkpoint", 2, 100, 1))
         .expect("append event after checkpoint");
+    let current_snapshot = fs::read(snapshot_path(source.path())).expect("read current snapshot");
+    fs::write(snapshot_path(source.path()), first_snapshot)
+        .expect("restore stale snapshot fixture");
     assert!(matches!(
         DurableLedger::restore_clean(source.path(), destination.path()),
         Err(LedgerError::StaleSnapshot)
     ));
-    assert_eq!(
-        DurableLedger::open(source.path())
-            .expect("stale prefix checkpoint remains valid for normal open")
-            .record_count(),
-        2
-    );
+    assert!(matches!(
+        DurableLedger::open(source.path()),
+        Err(LedgerError::StaleSnapshot)
+    ));
 
-    ledger.checkpoint().expect("refresh checkpoint");
+    fs::write(snapshot_path(source.path()), current_snapshot).expect("restore current snapshot");
     fs::write(destination.path().join("occupied"), b"data").expect("occupy destination");
     assert!(matches!(
         DurableLedger::restore_clean(source.path(), destination.path()),

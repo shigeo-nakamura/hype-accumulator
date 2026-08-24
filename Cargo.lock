@@ -1808,6 +1808,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "dex-connector",
+ "fs2",
  "proptest",
  "reqwest",
  "rust_decimal",
