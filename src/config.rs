@@ -118,6 +118,10 @@ pub enum ConfigError {
     MissingObservationAccount(String),
     #[error("live mode requires an attached effective security policy")]
     MissingSecurityPolicy,
+    #[error(
+        "live execution is unavailable until durable reservation and authenticated authorization are implemented"
+    )]
+    LiveExecutionUnavailable,
     #[error(transparent)]
     SecurityPolicy(#[from] SecurityPolicyError),
 }
@@ -330,6 +334,9 @@ impl Config {
         now: DateTime<Utc>,
     ) -> Result<RuntimeActionPolicy, ConfigError> {
         self.validate_at(env, now)?;
+        if !self.dry_run {
+            return Err(ConfigError::LiveExecutionUnavailable);
+        }
         let max_purchase_fee_bps = self
             .security_policy
             .as_ref()

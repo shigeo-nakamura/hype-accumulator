@@ -1,21 +1,16 @@
 use chrono::{DateTime, TimeZone, Utc};
 use hype_accumulator::{
     bootstrap_with_clock,
-    clock::Clock,
+    clock::FixedClock,
     config::{Config, ConfigError, SecurityPolicyError},
-    exchange::{
-        DryRunExchange, Exchange, ExchangeError, OrderIntent, OrderTimeInForce, Submission,
-    },
+    exchange::DryRunExchange,
     execution::Executor,
     pacing::{
         CapitalEvent, DecisionInput, DecisionReason, DepositEvent, PacingError, PacingLimits,
         PacingState, UsdcMicros,
     },
 };
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::{cell::Cell, collections::HashMap, rc::Rc};
 
 const EXECUTION_ACCOUNT: &str = "0x11111111111111111111111111111111111111aa";
 const OTHER_EXECUTION_ACCOUNT: &str = "0x2222222222222222222222222222222222222222";
@@ -340,130 +335,35 @@ fn acknowledged_caps_and_reserve_drive_effective_pacing() {
     );
 }
 
-#[derive(Clone)]
-struct MutableClock(Arc<Mutex<DateTime<Utc>>>);
-
-impl MutableClock {
-    fn new(now: DateTime<Utc>) -> Self {
-        Self(Arc::new(Mutex::new(now)))
-    }
-
-    fn set(&self, now: DateTime<Utc>) {
-        *self.0.lock().expect("clock lock") = now;
-    }
-}
-
-impl Clock for MutableClock {
-    fn now(&self) -> DateTime<Utc> {
-        *self.0.lock().expect("clock lock")
-    }
-}
-
-#[derive(Clone, Default)]
-struct RecordingExchange(Arc<Mutex<Vec<OrderIntent>>>);
-
-impl Exchange for RecordingExchange {
-    fn mode(&self) -> &'static str {
-        "recording"
-    }
-
-    fn submit(&mut self, intent: &OrderIntent) -> Result<Submission, ExchangeError> {
-        self.0.lock().expect("intent lock").push(intent.clone());
-        Ok(Submission::Simulated)
-    }
-}
-
 #[test]
-fn fee_ceiling_and_acknowledgement_expiry_are_enforced_per_action() {
+fn live_action_construction_requires_durable_authorization() {
     let env = live_environment();
     let policy = live_policy_template();
     let acknowledged = acknowledged_policy(&policy, &env);
     let config = config_with_policy(&acknowledged);
-    let clock = MutableClock::new(at("2026-08-31T23:59:59Z"));
-
-    let recording = RecordingExchange::default();
-    let mut executor =
-        Executor::from_config_with_clock(recording.clone(), &config, &env, clock.clone())
-            .expect("live policy authorizes the action boundary");
-    assert_eq!(executor.execute(10.0), Ok(Submission::Simulated));
-    assert_eq!(
-        recording.0.lock().expect("intent lock")[0].max_purchase_fee_bps,
-        5
-    );
-    assert_eq!(
-        recording.0.lock().expect("intent lock")[0].time_in_force,
-        OrderTimeInForce::ImmediateOrCancel
-    );
+    let before_expiry = at("2026-08-31T23:59:59Z");
+    config
+        .validate_at(&env, before_expiry)
+        .expect("effective live policy validates");
     assert!(matches!(
-        executor.execute(16.0),
-        Err(ExchangeError::Rejected(message)) if message.contains("daily notional")
+        Executor::from_config_with_clock(
+            DryRunExchange::default(),
+            &config,
+            &env,
+            FixedClock(before_expiry),
+        ),
+        Err(ConfigError::LiveExecutionUnavailable)
     ));
-    clock.set(at(EXPIRY));
+    let factory_called = Rc::new(Cell::new(false));
+    let marker = Rc::clone(&factory_called);
     assert!(matches!(
-        executor.execute(10.0),
-        Err(ExchangeError::Rejected(message)) if message.contains("expired")
+        bootstrap_with_clock(&config, &env, FixedClock(before_expiry), move |_| {
+            marker.set(true);
+            Box::new(DryRunExchange::default())
+        }),
+        Err(ConfigError::LiveExecutionUnavailable)
     ));
-
-    clock.set(at("2026-08-31T23:59:59Z"));
-    let mut guarded = bootstrap_with_clock(&config, &env, clock.clone(), |_| {
-        Box::new(DryRunExchange::default())
-    })
-    .expect("live exchange is policy wrapped");
-    assert_eq!(
-        guarded.submit(&OrderIntent {
-            notional_usdc: 10.0,
-            max_slippage_bps: 20,
-            max_purchase_fee_bps: 5,
-            time_in_force: OrderTimeInForce::ImmediateOrCancel,
-        }),
-        Ok(Submission::Simulated)
-    );
-    assert!(matches!(
-        guarded.submit(&OrderIntent {
-            notional_usdc: 10.0,
-            max_slippage_bps: 20,
-            max_purchase_fee_bps: 6,
-            time_in_force: OrderTimeInForce::ImmediateOrCancel,
-        }),
-        Err(ExchangeError::Rejected(message)) if message.contains("fee")
-    ));
-    assert!(matches!(
-        guarded.submit(&OrderIntent {
-            notional_usdc: 10.0,
-            max_slippage_bps: 20,
-            max_purchase_fee_bps: 5,
-            time_in_force: OrderTimeInForce::GoodTilCanceled,
-        }),
-        Err(ExchangeError::Rejected(message)) if message.contains("immediate-or-cancel")
-    ));
-    assert_eq!(
-        guarded.submit(&OrderIntent {
-            notional_usdc: 15.0,
-            max_slippage_bps: 20,
-            max_purchase_fee_bps: 5,
-            time_in_force: OrderTimeInForce::ImmediateOrCancel,
-        }),
-        Ok(Submission::Simulated)
-    );
-    assert!(matches!(
-        guarded.submit(&OrderIntent {
-            notional_usdc: 0.000_001,
-            max_slippage_bps: 20,
-            max_purchase_fee_bps: 5,
-            time_in_force: OrderTimeInForce::ImmediateOrCancel,
-        }),
-        Err(ExchangeError::Rejected(message)) if message.contains("daily notional")
-    ));
-    clock.set(at(EXPIRY));
-    assert!(matches!(
-        guarded.submit(&OrderIntent {
-            notional_usdc: 10.0,
-            max_slippage_bps: 20,
-            max_purchase_fee_bps: 5,
-            time_in_force: OrderTimeInForce::ImmediateOrCancel,
-        }),
-        Err(ExchangeError::Rejected(message)) if message.contains("expired")
-    ));
+    assert!(!factory_called.get());
 }
 
 #[test]
