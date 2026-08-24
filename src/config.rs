@@ -240,22 +240,6 @@ impl Config {
         {
             return Err(ConfigError::Invalid("order limits are inconsistent".into()));
         }
-        let scheduled_weekdays = u32::try_from(
-            self.schedule
-                .weekdays
-                .iter()
-                .copied()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
-        )
-        .map_err(|_| ConfigError::Invalid("too many UTC weekdays".into()))?;
-        let regular_days = self
-            .pacing
-            .target_horizon_days
-            .saturating_sub(self.pacing.final_catch_up_days);
-        let regular_slots = (f64::from(regular_days) * f64::from(scheduled_weekdays) / 7.0).ceil();
-        let optimistic_slots = regular_slots + f64::from(self.pacing.final_catch_up_days);
-        let schedule_capacity = optimistic_slots * self.pacing.max_order_usdc;
         let automatic_cap_microusd = usdc_to_microusd(
             self.capital.max_automatically_deployable_usdc,
             "runtime automatic capital cap",
@@ -273,8 +257,7 @@ impl Config {
         // only by cumulative capacity remaining after that global reserve.
         let schedulable_cap_microusd = automatic_cap_microusd
             .min(cumulative_cap_microusd.saturating_sub(fixed_reserve_microusd));
-        let schedule_capacity_microusd =
-            usdc_to_microusd(schedule_capacity, "runtime schedule capacity")?;
+        let schedule_capacity_microusd = self.schedule_capacity_microusd()?;
         if schedulable_cap_microusd > schedule_capacity_microusd {
             return Err(ConfigError::Invalid(
                 "automatic capital cap cannot fit the configured schedule and daily order cap"
@@ -339,6 +322,35 @@ impl Config {
         self.pacing
             .max_order_usdc
             .min(self.execution.max_order_usdc)
+    }
+
+    fn schedule_capacity_microusd(&self) -> Result<u64, ConfigError> {
+        let scheduled_weekdays = u64::try_from(
+            self.schedule
+                .weekdays
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len(),
+        )
+        .map_err(|_| ConfigError::Invalid("too many UTC weekdays".into()))?;
+        let regular_days = self
+            .pacing
+            .target_horizon_days
+            .saturating_sub(self.pacing.final_catch_up_days);
+        let regular_slot_numerator = u64::from(regular_days)
+            .checked_mul(scheduled_weekdays)
+            .ok_or_else(|| ConfigError::Invalid("runtime schedule capacity overflow".into()))?;
+        let regular_slots = regular_slot_numerator
+            .checked_add(6)
+            .ok_or_else(|| ConfigError::Invalid("runtime schedule capacity overflow".into()))?
+            / 7;
+        let optimistic_slots = regular_slots
+            .checked_add(u64::from(self.pacing.final_catch_up_days))
+            .ok_or_else(|| ConfigError::Invalid("runtime schedule capacity overflow".into()))?;
+        usdc_to_microusd(self.pacing.max_order_usdc, "runtime maximum order")?
+            .checked_mul(optimistic_slots)
+            .ok_or_else(|| ConfigError::Invalid("runtime schedule capacity overflow".into()))
     }
 
     pub(crate) fn effective_security_reserve_microusd(&self) -> Option<u64> {

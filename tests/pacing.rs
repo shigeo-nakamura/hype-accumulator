@@ -997,6 +997,21 @@ fn unsafe_caps_and_impossible_schedule_are_rejected_by_config() {
     ));
 }
 
+#[test]
+fn exact_microunit_schedule_capacity_avoids_float_drift() {
+    let mut config = Config::from_toml(include_str!("fixtures/safe.toml")).expect("fixture");
+    config.capital.max_automatically_deployable_usdc = 8_199.571_2;
+    config.capital.yearly_deployment_cap_usdc = 8_199.571_2;
+    config.capital.cumulative_deployment_cap_usdc = 8_199.571_2;
+    config.pacing.max_order_usdc = 22.403_2;
+    config.execution.max_order_usdc = 22.403_2;
+    config.pacing.target_horizon_days = 366;
+    config.schedule.weekdays = vec![1, 2, 3, 4, 5, 6, 7];
+    config
+        .validate(&HashMap::new())
+        .expect("366 slots exactly fit an integer-microunit capital cap");
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
