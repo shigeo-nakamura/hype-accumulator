@@ -360,9 +360,18 @@ pub struct AuxiliarySignal {
 }
 
 /// A fully specified lookup that cannot silently forward-fill another date.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RevisionQuery {
+    source: String,
+    source_version: String,
+    series: String,
+    observation_date: NaiveDate,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevisionQueryWire {
     source: String,
     source_version: String,
     series: String,
@@ -427,6 +436,22 @@ impl RevisionQuery {
             && identity.source_version == self.source_version
             && identity.series == self.series
             && identity.observation_date == self.observation_date
+    }
+}
+
+impl<'de> Deserialize<'de> for RevisionQuery {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = RevisionQueryWire::deserialize(deserializer)?;
+        Self::new(
+            wire.source,
+            wire.source_version,
+            wire.series,
+            wire.observation_date,
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 

@@ -78,6 +78,24 @@ fn raw_contract_rejects_bad_time_order_zero_prices_and_crossed_books() {
         LiveSignalNormalizer::normalize_json(&zero.to_string()),
         Err(SignalError::Json(_))
     ));
+
+    for invalid in [
+        serde_json::json!({
+            "source": "",
+            "source_version": "v1",
+            "series": "hype_market",
+            "observation_date": "2026-07-01"
+        }),
+        serde_json::json!({
+            "source": "fixture-core",
+            "source_version": "v1",
+            "series": " hype_market ",
+            "observation_date": "2026-07-01"
+        }),
+    ] {
+        let error = serde_json::from_value::<RevisionQuery>(invalid).unwrap_err();
+        assert!(error.to_string().contains("non-empty and trimmed"));
+    }
 }
 
 #[test]
