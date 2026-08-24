@@ -1569,12 +1569,15 @@ pub trait ExchangeOrderOwnerStore: Send + Sync {
     /// Returns an implementation-specific availability or persistence error.
     fn claim(&self, owner: &ExchangeOrderOwner) -> Result<bool, String>;
 
-    /// Claims a venue fill identity for exactly one authorization and order.
+    /// Atomically claims a venue fill bundle for exactly one authorization and order.
+    ///
+    /// A conflict anywhere in the bundle must return `false` without inserting
+    /// any missing owner from that bundle.
     ///
     /// # Errors
     ///
     /// Returns an implementation-specific availability or persistence error.
-    fn claim_fill(&self, owner: &ExchangeFillOwner) -> Result<bool, String>;
+    fn claim_fills(&self, owners: &[ExchangeFillOwner]) -> Result<bool, String>;
 }
 
 #[derive(Serialize)]
@@ -1757,17 +1760,14 @@ impl DurableWorkflow {
         &self,
         evidence: &OrderBoundEligibilityEvidence,
     ) -> Result<bool, WorkflowError> {
-        for fill in &evidence.fills {
-            let owner = self.exchange_fill_owner(evidence, fill);
-            if !self
-                .exchange_order_owner_store
-                .claim_fill(&owner)
-                .map_err(WorkflowError::exchange_fill_owner)?
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        let owners = evidence
+            .fills
+            .iter()
+            .map(|fill| self.exchange_fill_owner(evidence, fill))
+            .collect::<Vec<_>>();
+        self.exchange_order_owner_store
+            .claim_fills(&owners)
+            .map_err(WorkflowError::exchange_fill_owner)
     }
 
     fn reconcile_exchange_order_owner(&mut self) -> Result<(), WorkflowError> {
@@ -1840,14 +1840,22 @@ impl DurableWorkflow {
         at: DateTime<Utc>,
     ) -> Result<AppendOutcome, WorkflowError> {
         let exchange_order_id = exchange_order_id.into().trim().to_owned();
-        if !exchange_order_id.is_empty()
-            && at >= self.state.binding.order_envelope.effective_expiry_at
-        {
-            let reason = "order acceptance reached its effective expiry horizon";
-            if self.state.stage != WorkflowStage::ManualReview {
-                self.mark_manual_review(reason, at.max(self.state.last_transition_at))?;
-            }
-            return Err(WorkflowError::ContradictoryObservation(reason.into()));
+        let action_id = action_id_for(self.state.workflow_id(), ActionKind::SubmitOrder);
+        let event_id = stable_id(
+            "event/order_submission/v1",
+            &[self.state.workflow_id(), &action_id],
+        );
+        let transition = WorkflowTransition::OrderSubmissionObserved {
+            action_id,
+            exchange_order_id: exchange_order_id.clone(),
+        };
+        let candidate = WorkflowEvent {
+            event_id: event_id.clone(),
+            at,
+            transition: transition.clone(),
+        };
+        if self.validate_append(&candidate).is_err() {
+            return self.append_observation(event_id, at, transition);
         }
         if !exchange_order_id.is_empty() && !self.claim_exchange_order(&exchange_order_id)? {
             if self.state.stage != WorkflowStage::ManualReview {
@@ -1860,18 +1868,7 @@ impl DurableWorkflow {
                 EXCHANGE_ORDER_OWNER_CONFLICT_REASON.into(),
             ));
         }
-        let action_id = action_id_for(self.state.workflow_id(), ActionKind::SubmitOrder);
-        self.append_observation(
-            stable_id(
-                "event/order_submission/v1",
-                &[self.state.workflow_id(), &action_id],
-            ),
-            at,
-            WorkflowTransition::OrderSubmissionObserved {
-                action_id,
-                exchange_order_id,
-            },
-        )
+        self.append_observation(event_id, at, transition)
     }
 
     /// Records that authoritative post-expiry CLOID reconciliation found no
@@ -2316,6 +2313,18 @@ impl DurableWorkflow {
             }
         }
         result
+    }
+
+    fn validate_append(&self, event: &WorkflowEvent) -> Result<(), WorkflowError> {
+        if let Some(existing) = self.events_by_id.get(&event.event_id) {
+            return if existing.transition == event.transition {
+                Ok(())
+            } else {
+                Err(WorkflowError::EventCollision(event.event_id.clone()))
+            };
+        }
+        let mut next_state = self.state.clone();
+        next_state.apply(event)
     }
 
     fn append(&mut self, event: WorkflowEvent) -> Result<AppendOutcome, WorkflowError> {

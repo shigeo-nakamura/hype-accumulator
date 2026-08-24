@@ -50,15 +50,37 @@ impl ExchangeOrderOwnerStore for MemoryExchangeOrderOwnerStore {
         }
     }
 
-    fn claim_fill(&self, owner: &ExchangeFillOwner) -> Result<bool, String> {
-        let key = (owner.execution_identity_hash.clone(), owner.fill_id.clone());
-        let mut owners = self.fill_owners.lock().map_err(|error| error.to_string())?;
-        if let Some(existing) = owners.get(&key) {
-            Ok(existing == owner)
-        } else {
-            owners.insert(key, owner.clone());
-            Ok(true)
+    fn claim_fills(&self, owners: &[ExchangeFillOwner]) -> Result<bool, String> {
+        let mut claims = BTreeMap::new();
+        for owner in owners {
+            let key = (owner.execution_identity_hash.clone(), owner.fill_id.clone());
+            if claims
+                .insert(key, owner.clone())
+                .is_some_and(|existing| existing != *owner)
+            {
+                return Ok(false);
+            }
         }
+        let mut owners = self.fill_owners.lock().map_err(|error| error.to_string())?;
+        if claims
+            .iter()
+            .any(|(key, owner)| owners.get(key).is_some_and(|existing| existing != owner))
+        {
+            return Ok(false);
+        }
+        for (key, owner) in claims {
+            owners.entry(key).or_insert(owner);
+        }
+        Ok(true)
+    }
+}
+
+impl MemoryExchangeOrderOwnerStore {
+    fn has_fill_owner(&self, execution_identity_hash: &str, fill_id: &str) -> bool {
+        self.fill_owners
+            .lock()
+            .expect("fill owners lock")
+            .contains_key(&(execution_identity_hash.to_owned(), fill_id.to_owned()))
     }
 }
 
@@ -572,6 +594,59 @@ fn one_exchange_order_cannot_be_owned_by_two_decision_workflows() {
 }
 
 #[test]
+fn invalid_submission_does_not_claim_the_correct_workflows_order() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let invalid_path = temp.path().join("invalid-order-owner.jsonl");
+    let correct_path = temp.path().join("correct-order-owner.jsonl");
+    let invalid_binding = binding();
+    let mut correct_binding = invalid_binding.clone();
+    correct_binding.decision_id = "decision-2026-08-24-correct-owner".to_owned();
+    let owner_store = Arc::new(MemoryExchangeOrderOwnerStore::default());
+    let mut invalid = DurableWorkflow::open_or_create(
+        &invalid_path,
+        &invalid_binding,
+        Arc::new(MemoryProtectedHeadStore::default()),
+        owner_store.clone(),
+    )
+    .expect("invalid workflow opens");
+    let mut correct = DurableWorkflow::open_or_create(
+        &correct_path,
+        &correct_binding,
+        Arc::new(MemoryProtectedHeadStore::default()),
+        owner_store.clone(),
+    )
+    .expect("correct workflow opens");
+
+    assert!(matches!(
+        invalid.observe_order_submission("correct-exchange-order", at(2)),
+        Err(WorkflowError::InvalidTransition(_))
+    ));
+    assert!(owner_store
+        .order_owners
+        .lock()
+        .expect("order owners lock")
+        .is_empty());
+
+    ready(
+        correct
+            .prepare_order(at(1))
+            .expect("correct order prepared"),
+    );
+    correct
+        .observe_order_submission("correct-exchange-order", at(2))
+        .expect("correct workflow claims order after validation");
+    assert_eq!(correct.state().stage(), WorkflowStage::OrderSubmitted);
+    assert_eq!(
+        owner_store
+            .order_owners
+            .lock()
+            .expect("order owners lock")
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn acceptance_at_effective_expiry_halts_before_claiming_the_order() {
     let temp = tempfile::tempdir().expect("temp directory");
     let path = temp.path().join("acceptance-at-expiry.jsonl");
@@ -656,7 +731,14 @@ fn one_exchange_fill_cannot_be_owned_by_two_decision_workflows() {
     }
 
     let first_evidence = bound_evidence(&first, &[("shared-venue-fill", 250, 3)], at(6));
-    let second_evidence = bound_evidence(&second, &[("shared-venue-fill", 250, 3)], at(6));
+    let second_evidence = bound_evidence(
+        &second,
+        &[
+            ("fresh-before-conflict", 100, 3),
+            ("shared-venue-fill", 150, 3),
+        ],
+        at(6),
+    );
     first
         .record_staking_eligibility(Some(first_evidence), at(6))
         .expect("first workflow claims fill");
@@ -669,6 +751,10 @@ fn one_exchange_fill_cannot_be_owned_by_two_decision_workflows() {
         .state()
         .manual_review_reason()
         .is_some_and(|reason| reason.contains("fill ID is already owned")));
+    assert!(!owner_store.has_fill_owner(
+        &second_binding.inventory_before.execution_identity_hash,
+        "fresh-before-conflict",
+    ));
     drop(first);
     drop(second);
 
