@@ -10,7 +10,11 @@ use hype_accumulator::{
         PacingState, UsdcMicros,
     },
 };
-use std::{cell::Cell, collections::HashMap, rc::Rc};
+use std::{
+    cell::Cell,
+    collections::{BTreeSet, HashMap},
+    rc::Rc,
+};
 
 const EXECUTION_ACCOUNT: &str = "0x11111111111111111111111111111111111111aa";
 const OTHER_EXECUTION_ACCOUNT: &str = "0x2222222222222222222222222222222222222222";
@@ -158,6 +162,23 @@ fn example_policy_is_typed_and_safe_for_dry_run() {
     config
         .validate_at(&HashMap::new(), at("2026-08-24T00:00:00Z"))
         .expect("safe dry-run policy");
+}
+
+#[test]
+fn dry_run_policy_reserve_must_fit_the_runtime_admission_cap() {
+    let policy = include_str!("../config/security-policy.example.toml")
+        .replace("reserve_microusd = 0", "reserve_microusd = 100000000");
+    let config =
+        Config::from_toml_with_security_policy(include_str!("fixtures/safe.toml"), &policy)
+            .expect("typed dry-run documents");
+    assert!(matches!(
+        config.validate_at(&HashMap::new(), at("2026-08-24T00:00:00Z")),
+        Err(ConfigError::Invalid(message)) if message.contains("reserve")
+    ));
+    assert_eq!(
+        PacingLimits::from_config(&config),
+        Err(PacingError::InvalidLimits)
+    );
 }
 
 #[test]
@@ -503,14 +524,34 @@ fn resolved_parent_identity_is_digest_bound_when_inheritance_is_enabled() {
 }
 
 #[test]
+fn supported_isolated_account_kinds_are_acknowledged_and_digest_bound() {
+    let env = live_environment();
+    let acknowledgements = ["dedicated_master", "subaccount", "vault"]
+        .into_iter()
+        .map(|kind| {
+            let policy = live_policy_template().replace(
+                "execution_account_kind = \"dedicated_master\"",
+                &format!("execution_account_kind = \"{kind}\""),
+            );
+            let acknowledgement = acknowledged_policy(&policy, &env);
+            config_with_policy(&acknowledgement)
+                .validate_at(&env, at("2026-08-31T23:59:59Z"))
+                .expect("supported isolated account kind validates");
+            acknowledgement
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(acknowledgements.len(), 3);
+}
+
+#[test]
 fn unsafe_custody_and_staking_modes_fail_before_live() {
     let env = live_environment();
-    let subaccount = live_policy_template().replace(
+    let unapproved = live_policy_template().replace(
         "execution_account_kind = \"dedicated_master\"",
-        "execution_account_kind = \"subaccount\"",
+        "execution_account_kind = \"unapproved\"",
     );
     assert!(matches!(
-        config_with_policy(&subaccount).expected_live_acknowledgement(&env),
+        config_with_policy(&unapproved).expected_live_acknowledgement(&env),
         Err(ConfigError::SecurityPolicy(SecurityPolicyError::Invalid(_)))
     ));
 

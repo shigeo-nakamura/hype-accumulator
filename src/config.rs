@@ -251,6 +251,11 @@ impl Config {
         let fixed_reserve_microusd = self
             .effective_security_reserve_microusd()
             .unwrap_or_default();
+        if fixed_reserve_microusd >= automatic_cap_microusd {
+            return Err(ConfigError::Invalid(
+                "security-policy reserve must be below the automatic capital cap".into(),
+            ));
+        }
         // The reserve reduces the first admitted tranche, but an expired
         // tranche may later hold it for the account as a whole. A subsequent
         // active tranche can therefore spend up to the automatic cap, bounded
@@ -852,7 +857,12 @@ impl SecurityPolicy {
                 api_wallet_authority: "full_assigned_account_trading",
                 signer_mode: "dedicated_api_wallet_spot_only",
                 require_dedicated_execution_account: custody.require_dedicated_execution_account,
-                execution_account_kind: "dedicated_master",
+                execution_account_kind: match custody.execution_account_kind {
+                    ExecutionAccountKind::Unapproved => "unapproved",
+                    ExecutionAccountKind::DedicatedMaster => "dedicated_master",
+                    ExecutionAccountKind::Subaccount => "subaccount",
+                    ExecutionAccountKind::Vault => "vault",
+                },
                 max_hot_trading_balance_microusd: custody.max_hot_trading_balance_microusd,
                 hot_balance_enforcement: "externally_enforced_bounded",
                 hot_balance_sweep_threshold_microusd: custody.hot_balance_sweep_threshold_microusd,
@@ -1047,10 +1057,10 @@ impl SecurityPolicy {
         if custody.api_wallet_authority != ApiWalletAuthority::FullAssignedAccountTrading
             || custody.signer_mode != SignerMode::DedicatedApiWalletSpotOnly
             || !custody.require_dedicated_execution_account
-            || custody.execution_account_kind != ExecutionAccountKind::DedicatedMaster
+            || custody.execution_account_kind == ExecutionAccountKind::Unapproved
         {
             return invalid_policy(
-                "live custody requires a dedicated main account and spot-only API wallet",
+                "live custody requires an approved isolated account and spot-only API wallet",
             );
         }
         if custody.hot_balance_enforcement != HotBalanceEnforcement::ExternallyEnforcedBounded {
