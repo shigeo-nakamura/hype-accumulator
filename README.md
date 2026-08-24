@@ -49,6 +49,10 @@ Plans respect exchange minimum and daily caps and hold an infeasible horizon
 residual for explicit approval. The configured final catch-up window adds daily
 eligible slots but never relaxes the daily cap.
 
+Terminal settlement records both filled notional and the authoritative total
+cash debit. Charged fees consume the reserved commitment permanently; only
+unused headroom returns to tranche residual capital.
+
 This fallback deliberately has no market-signal multiplier, signer, exchange
 submission, state-file backend, or live configuration. The caller must durably
 persist a new decision before any separately approved execution integration.

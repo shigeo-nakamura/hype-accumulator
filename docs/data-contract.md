@@ -2,7 +2,7 @@
 
 Every run is anchored by an immutable manifest `as_of` timestamp and SHA-256 hashes. All timestamps are UTC. A market observation is usable only when `available_at <= decision_at`; if revisions exist, the latest revision visible at that decision wins. Future revisions never rewrite an earlier decision. A provider-specific publication lag is applied in addition to `available_at` (the ETF-flow feature uses one full observation-day lag).
 
-Capital events require an authoritative, unique `event_id`, `occurred_at`, `confirmed_at`, and `first_usable_at`. Only `first_usable_at <= decision_at` admits a deposit or withdrawal. Thus a deposit confirmed after the UTC decision participates on the next eligible decision. Withdrawals consume admitted, uninvested cohorts FIFO and cannot consume invested or future capital.
+Capital events require an authoritative, unique `event_id`, `occurred_at`, `confirmed_at`, and `first_usable_at`. Only `first_usable_at <= decision_at` admits a deposit or withdrawal. Thus a deposit confirmed after the UTC decision participates on the next eligible decision. Withdrawals consume admitted, unspent cohorts FIFO and cannot consume unsettled commitments, filled notional, charged execution costs, or future capital.
 
 ## Source registry
 

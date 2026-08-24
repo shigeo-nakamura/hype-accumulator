@@ -98,7 +98,7 @@ fn arbitrary_time_events_repace_only_future_decisions() {
         .expect("first decision");
     assert_eq!(first.decision().planned_usdc, usd(1));
     state
-        .settle_decision(&first.decision().decision_id, usd(1))
+        .settle_decision(&first.decision().decision_id, usd(1), usd(1))
         .expect("first fill");
 
     let after = at(2026, 1, 1, 18);
@@ -237,6 +237,7 @@ fn retroactive_withdrawal_never_reuses_committed_or_invested_capital() {
         .settle_decision(
             &decision.decision().decision_id,
             decision.decision().planned_usdc,
+            decision.decision().planned_usdc,
         )
         .expect("commitment invested");
     let invested_result = invested_state.reconcile_capital(
@@ -271,7 +272,7 @@ fn late_earlier_deposit_cannot_displace_existing_fill_backing() {
         .expect("decision from later tranche");
     let filled = decision.decision().planned_usdc;
     state
-        .settle_decision(&decision.decision().decision_id, filled)
+        .settle_decision(&decision.decision().decision_id, filled, filled)
         .expect("later tranche filled");
 
     state
@@ -563,25 +564,57 @@ fn unsettled_commitment_encumbers_fee_spread_reserve() {
     assert_eq!(state.deposits()["reserved"].committed_usdc, usd(100));
 
     let before = state.clone();
-    let withdrawal = CapitalEvent::Withdrawal(WithdrawalEvent {
+    let blocked_withdrawal = CapitalEvent::Withdrawal(WithdrawalEvent {
         event_id: "blocked-withdrawal".to_owned(),
         amount_usdc: usd(1),
         occurred_at: at(2026, 12, 31, 13),
         reconciled_at: at(2026, 12, 31, 14),
     });
     assert!(matches!(
-        state.reconcile_capital(&[withdrawal], at(2026, 12, 31, 14), &limits),
+        state.reconcile_capital(&[blocked_withdrawal], at(2026, 12, 31, 14), &limits),
         Err(hype_accumulator::pacing::PacingError::WithdrawalExceedsFreeCapital(id))
             if id == "blocked-withdrawal"
     ));
     assert_eq!(state, before);
 
+    assert!(matches!(
+        state.settle_decision(&decision.decision().decision_id, usd(90), usd(89)),
+        Err(hype_accumulator::pacing::PacingError::DebitBelowFill)
+    ));
+    assert!(matches!(
+        state.settle_decision(&decision.decision().decision_id, usd(90), usd(101)),
+        Err(hype_accumulator::pacing::PacingError::DebitExceedsCommitment)
+    ));
+    assert_eq!(state, before);
+
     state
-        .settle_decision(&decision.decision().decision_id, usd(90))
-        .expect("settlement releases unused reserve headroom");
-    assert_eq!(state.deposits()["reserved"].invested_usdc, usd(90));
+        .settle_decision(&decision.decision().decision_id, usd(90), usd(95))
+        .expect("settlement retains the actual fee debit");
+    assert_eq!(state.deposits()["reserved"].invested_usdc, usd(95));
     assert_eq!(state.deposits()["reserved"].committed_usdc, usd(0));
-    assert_eq!(state.deposits()["reserved"].residual_usdc(), usd(10));
+    assert_eq!(state.deposits()["reserved"].residual_usdc(), usd(5));
+    assert_eq!(
+        state.decisions()[&at(2026, 12, 31, 12).date_naive()].debited_usdc,
+        usd(95)
+    );
+    state
+        .settle_decision(&decision.decision().decision_id, usd(90), usd(95))
+        .expect("the exact fill and debit replay is idempotent");
+    assert!(matches!(
+        state.settle_decision(&decision.decision().decision_id, usd(90), usd(96)),
+        Err(hype_accumulator::pacing::PacingError::ConflictingSettlement)
+    ));
+    let settled = state.clone();
+    assert!(matches!(
+        state.reconcile_capital(
+            &[withdrawal("fee-not-reusable", 6, at(2026, 12, 31, 15))],
+            at(2026, 12, 31, 16),
+            &limits,
+        ),
+        Err(hype_accumulator::pacing::PacingError::WithdrawalExceedsFreeCapital(id))
+            if id == "fee-not-reusable"
+    ));
+    assert_eq!(state, settled);
 }
 
 #[test]
@@ -614,10 +647,10 @@ fn reserve_commitment_can_span_tranches_without_changing_fill_attribution() {
         ));
 
     state
-        .settle_decision(&decision.decision().decision_id, usd(50))
+        .settle_decision(&decision.decision().decision_id, usd(50), usd(55))
         .expect("settlement releases reserve-only tranche slice");
     assert_eq!(state.deposits()["first"].invested_usdc, usd(50));
-    assert_eq!(state.deposits()["second"].invested_usdc, usd(0));
+    assert_eq!(state.deposits()["second"].invested_usdc, usd(5));
     assert_eq!(state.deposits()["second"].committed_usdc, usd(0));
 }
 
@@ -645,7 +678,7 @@ fn late_year_infeasibility_holds_residual_across_rollover() {
         } if *residual_usdc == usd(100) && *remaining_capacity_usdc == usd(25)
     )));
     state
-        .settle_decision(&final_day.decision().decision_id, usd(25))
+        .settle_decision(&final_day.decision().decision_id, usd(25), usd(25))
         .expect("settle final-day fill");
 
     let rollover = state
@@ -688,7 +721,7 @@ fn long_outage_repaces_remaining_days_without_breaking_the_daily_cap() {
         } if *residual_usdc == usd(100) && *remaining_capacity_usdc == usd(50)
     )));
     state
-        .settle_decision(&resumed.decision().decision_id, usd(25))
+        .settle_decision(&resumed.decision().decision_id, usd(25), usd(25))
         .expect("settle resumed purchase");
     let final_day = state
         .decide(&input(at(2026, 12, 31, 12), 75), &limits)
@@ -808,14 +841,14 @@ fn partial_fill_releases_commitment_without_losing_attribution() {
         .decide(&input(at(2026, 12, 31, 12), 100), &limits)
         .expect("planned decision");
     state
-        .settle_decision(&decision.decision().decision_id, usd(7))
+        .settle_decision(&decision.decision().decision_id, usd(7), usd(7))
         .expect("partial fill");
     let tranche = &state.deposits()["fill"];
     assert_eq!(tranche.invested_usdc, usd(7));
     assert_eq!(tranche.committed_usdc, usd(0));
     assert_eq!(tranche.residual_usdc(), usd(93));
     state
-        .settle_decision(&decision.decision().decision_id, usd(7))
+        .settle_decision(&decision.decision().decision_id, usd(7), usd(7))
         .expect("idempotent settlement");
 }
 
@@ -894,6 +927,7 @@ proptest! {
                 state
                     .settle_decision(
                         &first.decision().decision_id,
+                        UsdcMicros::from_micros(fill),
                         UsdcMicros::from_micros(fill),
                     )
                     .expect("bounded settlement");

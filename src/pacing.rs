@@ -274,6 +274,7 @@ pub struct DecisionAllocation {
     pub planned_usdc: UsdcMicros,
     pub committed_usdc: UsdcMicros,
     pub filled_usdc: UsdcMicros,
+    pub debited_usdc: UsdcMicros,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -286,6 +287,7 @@ pub struct DailyDecision {
     pub planned_usdc: UsdcMicros,
     pub committed_usdc: UsdcMicros,
     pub filled_usdc: UsdcMicros,
+    pub debited_usdc: UsdcMicros,
     pub settled: bool,
     pub reason: DecisionReason,
     pub allocations: Vec<DecisionAllocation>,
@@ -458,9 +460,10 @@ impl PacingState {
         Ok(DecisionResult::New(decision))
     }
 
-    /// Finalizes a planned offline decision with its cumulative economic fill.
-    /// Unfilled commitment is released to the original tranches. Repeating the
-    /// exact settlement is idempotent; a conflicting replay fails closed.
+    /// Finalizes a planned offline decision with its cumulative economic fill
+    /// and authoritative total cash debit. Only unused commitment is released
+    /// to the original tranches. Repeating the exact settlement is idempotent;
+    /// a conflicting replay fails closed.
     ///
     /// # Errors
     ///
@@ -470,6 +473,7 @@ impl PacingState {
         &mut self,
         decision_id: &str,
         final_filled_usdc: UsdcMicros,
+        final_debited_usdc: UsdcMicros,
     ) -> Result<(), PacingError> {
         self.validate_invariants()?;
         let date = self
@@ -485,7 +489,9 @@ impl PacingState {
             return Err(PacingError::NotEconomicDecision);
         }
         if existing.settled {
-            return if existing.filled_usdc == final_filled_usdc {
+            return if existing.filled_usdc == final_filled_usdc
+                && existing.debited_usdc == final_debited_usdc
+            {
                 Ok(())
             } else {
                 Err(PacingError::ConflictingSettlement)
@@ -493,6 +499,12 @@ impl PacingState {
         }
         if final_filled_usdc > existing.planned_usdc {
             return Err(PacingError::FillExceedsCommitment);
+        }
+        if final_debited_usdc < final_filled_usdc {
+            return Err(PacingError::DebitBelowFill);
+        }
+        if final_debited_usdc > existing.committed_usdc {
+            return Err(PacingError::DebitExceedsCommitment);
         }
 
         let mut next = self.clone();
@@ -508,25 +520,50 @@ impl PacingState {
             let filled = allocation.planned_usdc.0.min(fill_remaining);
             fill_remaining -= filled;
             filled_by_tranche.push(filled);
+        }
+        if fill_remaining != 0 {
+            return Err(PacingError::CorruptState);
+        }
+        let mut debit_remaining = final_debited_usdc
+            .0
+            .checked_sub(final_filled_usdc.0)
+            .ok_or(PacingError::ArithmeticOverflow)?;
+        let mut debited_by_tranche = filled_by_tranche.clone();
+        for (allocation, debited) in allocations.iter().zip(&mut debited_by_tranche) {
+            let headroom = allocation.committed_usdc.0.saturating_sub(*debited);
+            let extra = headroom.min(debit_remaining);
+            *debited = debited
+                .checked_add(extra)
+                .ok_or(PacingError::ArithmeticOverflow)?;
+            debit_remaining -= extra;
+        }
+        if debit_remaining != 0 {
+            return Err(PacingError::CorruptState);
+        }
+        for (allocation, debited) in allocations.iter().zip(&debited_by_tranche) {
             let tranche = next
                 .deposits
                 .get_mut(&allocation.tranche_id)
                 .ok_or(PacingError::CorruptState)?;
             tranche.committed_usdc =
                 checked_sub(tranche.committed_usdc, allocation.committed_usdc)?;
-            tranche.invested_usdc = checked_add(tranche.invested_usdc, UsdcMicros(filled))?;
-        }
-        if fill_remaining != 0 {
-            return Err(PacingError::CorruptState);
+            tranche.invested_usdc = checked_add(tranche.invested_usdc, UsdcMicros(*debited))?;
         }
         let decision = next
             .decisions
             .get_mut(&date)
             .ok_or(PacingError::UnknownDecision)?;
-        for (allocation, filled) in decision.allocations.iter_mut().zip(filled_by_tranche) {
+        for ((allocation, filled), debited) in decision
+            .allocations
+            .iter_mut()
+            .zip(filled_by_tranche)
+            .zip(debited_by_tranche)
+        {
             allocation.filled_usdc = UsdcMicros(filled);
+            allocation.debited_usdc = UsdcMicros(debited);
         }
         decision.filled_usdc = final_filled_usdc;
+        decision.debited_usdc = final_debited_usdc;
         decision.settled = true;
         next.validate_invariants()?;
         *self = next;
@@ -683,24 +720,7 @@ impl PacingState {
         let mut expected_committed = BTreeMap::<&str, UsdcMicros>::new();
         let mut expected_invested = BTreeMap::<&str, UsdcMicros>::new();
         for (date, decision) in &self.decisions {
-            let planned = checked_sum(
-                decision
-                    .allocations
-                    .iter()
-                    .map(|allocation| allocation.planned_usdc),
-            )?;
-            let committed = checked_sum(
-                decision
-                    .allocations
-                    .iter()
-                    .map(|allocation| allocation.committed_usdc),
-            )?;
-            let filled = checked_sum(
-                decision
-                    .allocations
-                    .iter()
-                    .map(|allocation| allocation.filled_usdc),
-            )?;
+            let (planned, committed, filled, debited) = decision_allocation_totals(decision)?;
             if date != &decision.decision_date
                 || decision.decision_id != format!("fixed-dca:{date}")
                 || !decision_ids.insert(&decision.decision_id)
@@ -708,8 +728,11 @@ impl PacingState {
                 || committed != decision.committed_usdc
                 || decision.committed_usdc < decision.planned_usdc
                 || filled != decision.filled_usdc
+                || debited != decision.debited_usdc
                 || filled > planned
-                || (!decision.settled && !filled.is_zero())
+                || debited < filled
+                || debited > committed
+                || (!decision.settled && (!filled.is_zero() || !debited.is_zero()))
                 || (decision.planned_usdc.is_zero()
                     && (!decision.committed_usdc.is_zero() || !decision.allocations.is_empty()))
             {
@@ -719,6 +742,8 @@ impl PacingState {
                 if !self.deposits.contains_key(&allocation.tranche_id)
                     || allocation.filled_usdc > allocation.planned_usdc
                     || allocation.planned_usdc > allocation.committed_usdc
+                    || allocation.debited_usdc < allocation.filled_usdc
+                    || allocation.debited_usdc > allocation.committed_usdc
                 {
                     return Err(PacingError::CorruptState);
                 }
@@ -728,7 +753,7 @@ impl PacingState {
                     &mut expected_committed
                 };
                 let amount = if decision.settled {
-                    allocation.filled_usdc
+                    allocation.debited_usdc
                 } else {
                     allocation.committed_usdc
                 };
@@ -1114,7 +1139,6 @@ impl PacingState {
         }
 
         let allocations = self.commit_plan(planned, &due_rows, limits.fee_spread_reserve_bps)?;
-        let committed = allocation_commitment_total(&allocations)?;
         let explanation = PacingExplanation {
             admitted_unspent_usdc: admitted_unspent,
             unadmitted_usdc: unadmitted,
@@ -1137,8 +1161,9 @@ impl PacingState {
             capital_snapshot_hash,
             input_snapshot_hash,
             planned_usdc: planned,
-            committed_usdc: committed,
+            committed_usdc: allocation_commitment_total(&allocations)?,
             filled_usdc: UsdcMicros::default(),
+            debited_usdc: UsdcMicros::default(),
             settled: false,
             reason,
             allocations,
@@ -1283,6 +1308,7 @@ impl PacingState {
                 planned_usdc: UsdcMicros(planned_amount),
                 committed_usdc: UsdcMicros(committed_amount),
                 filled_usdc: UsdcMicros::default(),
+                debited_usdc: UsdcMicros::default(),
             });
         }
         if !planned_amounts.is_empty() || reserve_remaining != 0 {
@@ -1312,6 +1338,10 @@ pub enum PacingError {
     NotEconomicDecision,
     #[error("fill exceeds decision commitment")]
     FillExceedsCommitment,
+    #[error("settlement debit is below the filled notional")]
+    DebitBelowFill,
+    #[error("settlement debit exceeds the maximum cash commitment")]
+    DebitExceedsCommitment,
     #[error("settlement conflicts with durable state")]
     ConflictingSettlement,
     #[error("persisted pacing state violates an invariant")]
@@ -1478,6 +1508,32 @@ fn allocation_commitment_total(
             .iter()
             .map(|allocation| allocation.committed_usdc),
     )
+}
+
+fn decision_allocation_totals(
+    decision: &DailyDecision,
+) -> Result<(UsdcMicros, UsdcMicros, UsdcMicros, UsdcMicros), PacingError> {
+    Ok((
+        checked_sum(
+            decision
+                .allocations
+                .iter()
+                .map(|allocation| allocation.planned_usdc),
+        )?,
+        allocation_commitment_total(&decision.allocations)?,
+        checked_sum(
+            decision
+                .allocations
+                .iter()
+                .map(|allocation| allocation.filled_usdc),
+        )?,
+        checked_sum(
+            decision
+                .allocations
+                .iter()
+                .map(|allocation| allocation.debited_usdc),
+        )?,
+    ))
 }
 
 fn div_ceil(value: u64, divisor: u64) -> u64 {
