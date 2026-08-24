@@ -464,6 +464,29 @@ fn deterministic_identity_is_independent_of_allocation_input_order() {
 }
 
 #[test]
+fn execution_identity_hash_must_be_canonical() {
+    for invalid_identity in [
+        "",
+        " ",
+        " signer-identity-hash-a",
+        "signer-identity-hash-a ",
+    ] {
+        let valid = binding();
+        let mut inventory = valid.inventory_before;
+        inventory.execution_identity_hash = invalid_identity.to_owned();
+        assert!(matches!(
+            DecisionBinding::from_pacing_decision(
+                &decision(),
+                inventory,
+                valid.order_envelope,
+                valid.eligibility_policy,
+            ),
+            Err(WorkflowError::InvalidBinding(_))
+        ));
+    }
+}
+
+#[test]
 fn expiry_binding_requires_exact_verified_clock_lag_gap() {
     for invalid in [
         "wrong-gap",
@@ -663,6 +686,36 @@ fn acceptance_at_effective_expiry_halts_before_claiming_the_order() {
     ));
     assert_eq!(workflow.state().stage(), WorkflowStage::ManualReview);
     assert!(workflow.state().exchange_order_id().is_none());
+    assert!(workflow
+        .state()
+        .manual_review_reason()
+        .is_some_and(|reason| reason.contains("effective expiry horizon")));
+    drop(workflow);
+    assert_eq!(
+        reopen(&path, &binding).state().stage(),
+        WorkflowStage::ManualReview
+    );
+}
+
+#[test]
+fn duplicate_acceptance_at_effective_expiry_durably_halts() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("duplicate-acceptance-at-expiry.jsonl");
+    let binding = binding();
+    let mut workflow = reopen(&path, &binding);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    workflow
+        .observe_order_submission("exchange-order-1", at(2))
+        .expect("timely acceptance recorded");
+
+    assert!(matches!(
+        workflow.observe_order_submission(
+            "exchange-order-1",
+            binding.order_envelope.effective_expiry_at,
+        ),
+        Err(WorkflowError::ContradictoryObservation(_))
+    ));
+    assert_eq!(workflow.state().stage(), WorkflowStage::ManualReview);
     assert!(workflow
         .state()
         .manual_review_reason()

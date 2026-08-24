@@ -219,6 +219,8 @@ impl DecisionBinding {
                 .execution_identity_hash
                 .trim()
                 .is_empty()
+            || self.inventory_before.execution_identity_hash
+                != self.inventory_before.execution_identity_hash.trim()
             || self.inventory_before.unconsumed_residual_spot_hype_atoms
                 > self.inventory_before.spot_hype_atoms
             || self.inventory_before.unconsumed_residual_spot_hype_atoms
@@ -1840,6 +1842,15 @@ impl DurableWorkflow {
         at: DateTime<Utc>,
     ) -> Result<AppendOutcome, WorkflowError> {
         let exchange_order_id = exchange_order_id.into().trim().to_owned();
+        if !exchange_order_id.is_empty()
+            && at >= self.state.binding.order_envelope.effective_expiry_at
+        {
+            let reason = "order acceptance reached its effective expiry horizon";
+            if self.state.stage != WorkflowStage::ManualReview {
+                self.mark_manual_review(reason, at.max(self.state.last_transition_at))?;
+            }
+            return Err(WorkflowError::ContradictoryObservation(reason.into()));
+        }
         let action_id = action_id_for(self.state.workflow_id(), ActionKind::SubmitOrder);
         let event_id = stable_id(
             "event/order_submission/v1",
