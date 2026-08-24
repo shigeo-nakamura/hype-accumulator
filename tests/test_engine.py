@@ -210,6 +210,35 @@ class EngineInvariantTests(unittest.TestCase):
         self.assertEqual(result["trade_count"], 3)
         self.assertEqual(result["max_inventory_drawdown"], 0.5)
 
+    def test_missing_future_price_day_does_not_change_current_pace(self) -> None:
+        utc = timezone.utc
+        first = datetime(2025, 1, 1, 12, tzinfo=utc)
+        third = datetime(2025, 1, 3, 12, tzinfo=utc)
+        deposit = CapitalEvent("deposit", "deposit", 90.0, first, first, first)
+        result = run_backtest(
+            [PriceBar(first, 100.0), PriceBar(third, 100.0)],
+            [deposit],
+            PointInTimeView([], third),
+            {
+                "name": "daily",
+                "kind": "fixed",
+                "cadence": "daily",
+                "horizon": "2025-01-03",
+                "features": [],
+            },
+            {
+                "min_trade_usd": 1.0,
+                "max_trade_usd": 100.0,
+                "fee_bps": 0.0,
+                "half_spread_bps": 0.0,
+                "slippage_bps": 0.0,
+            },
+            third,
+        )
+
+        self.assertEqual(result["trades"][0]["spend_usd"], 30.0)
+        self.assertEqual(result["trades"][1]["spend_usd"], 60.0)
+
     def test_stale_fixed_fallback_disables_adaptive_multiplier(self) -> None:
         utc = timezone.utc
         revisions = [

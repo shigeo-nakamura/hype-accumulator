@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from math import sqrt
 from typing import Any
 
@@ -44,11 +44,13 @@ class Ledger:
                 return
 
 
-def remaining_dates(bars: list[PriceBar], index: int, horizon: date, cadence: str) -> int:
-    dates = sorted({bar.decision_at.date() for bar in bars[index:] if bar.decision_at.date() <= horizon})
-    if cadence == "weekly":
-        dates = [day for day in dates if day.weekday() == 0]
-    return max(len(dates), 1)
+def remaining_dates(decision_date: date, horizon: date, cadence: str) -> int:
+    if cadence != "weekly":
+        return max((horizon - decision_date).days + 1, 1)
+    first_monday = decision_date + timedelta(days=(7 - decision_date.weekday()) % 7)
+    if first_monday > horizon:
+        return 1
+    return 1 + (horizon - first_monday).days // 7
 
 
 def feature_score(view: PointInTimeView, decision_at: datetime, enabled: set[str], stale_after_days: int) -> tuple[float, bool]:
@@ -90,7 +92,7 @@ def run_backtest(
     horizon = date.fromisoformat(policy["horizon"])
     cost_rate = (execution["fee_bps"] + execution["half_spread_bps"] + execution["slippage_bps"]) / 10_000
     cadence = policy.get("cadence", "daily")
-    for index, bar in enumerate(bars):
+    for bar in bars:
         if bar.decision_at > as_of or bar.decision_at.date() > horizon:
             break
         final_price = bar.price_usd
@@ -113,7 +115,7 @@ def run_backtest(
         if ledger.cash <= 1e-8:
             skipped["no_cash"] = skipped.get("no_cash", 0) + 1
             continue
-        slots = remaining_dates(bars, index, horizon, cadence)
+        slots = remaining_dates(bar.decision_at.date(), horizon, cadence)
         base = ledger.cash / slots
         multiplier = 1.0
         score, stale = feature_score(view, bar.decision_at, set(policy.get("features", [])), policy.get("stale_after_days", 3))
