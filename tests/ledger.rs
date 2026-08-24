@@ -106,12 +106,12 @@ fn duplicate_retry_verifies_that_the_event_is_still_durable() {
 
     assert!(matches!(
         ledger.append(durable_event),
-        Err(LedgerError::ConcurrentModification)
+        Err(LedgerError::TruncatedLedger)
     ));
 }
 
 #[test]
-fn concurrent_writers_cannot_both_append_from_the_same_head() {
+fn concurrent_writers_serialize_and_rebase_from_the_durable_head() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let first = DurableLedger::open(directory.path()).expect("open first writer");
     let second = DurableLedger::open(directory.path()).expect("open second writer");
@@ -139,20 +139,13 @@ fn concurrent_writers_cannot_both_append_from_the_same_head() {
             .iter()
             .filter(|outcome| matches!(outcome, Ok(AppendOutcome::Appended)))
             .count(),
-        1
-    );
-    assert_eq!(
-        outcomes
-            .iter()
-            .filter(|outcome| matches!(outcome, Err(LedgerError::ConcurrentModification)))
-            .count(),
-        1
+        2
     );
     assert_eq!(
         DurableLedger::open(directory.path())
             .expect("journal remains replayable")
             .record_count(),
-        1
+        2
     );
 }
 
