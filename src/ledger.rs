@@ -537,7 +537,7 @@ impl DurableLedger {
     ) -> Result<Self, LedgerError> {
         let source = canonical_directory(source.as_ref())?;
         let destination = canonical_directory(destination.as_ref())?;
-        if source == destination {
+        if source == destination || same_directory_identity(&source, &destination)? {
             return Err(LedgerError::RestoreDestinationNotEmpty);
         }
         let (_first_lock, _second_lock) = if source < destination {
@@ -1477,6 +1477,20 @@ fn canonical_directory(path: &Path) -> Result<PathBuf, LedgerError> {
     fs::canonicalize(absolute).map_err(LedgerError::io)
 }
 
+#[cfg(unix)]
+fn same_directory_identity(left: &Path, right: &Path) -> Result<bool, LedgerError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let left = fs::metadata(left).map_err(LedgerError::io)?;
+    let right = fs::metadata(right).map_err(LedgerError::io)?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(not(unix))]
+fn same_directory_identity(left: &Path, right: &Path) -> Result<bool, LedgerError> {
+    Ok(left == right)
+}
+
 fn create_directory_all_durable<F>(path: &Path, sync_parent: &mut F) -> Result<(), LedgerError>
 where
     F: FnMut(&Path) -> Result<(), LedgerError>,
@@ -1871,6 +1885,20 @@ mod transaction_tests {
 
         assert!(LedgerLock::acquire(&missing).is_err());
         assert!(!missing.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_identity_detects_distinct_alias_paths() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("directory");
+        let container = tempfile::tempdir().expect("alias container");
+        let alias = container.path().join("alias");
+        symlink(directory.path(), &alias).expect("create directory alias");
+
+        assert_ne!(directory.path(), alias);
+        assert!(same_directory_identity(directory.path(), &alias).expect("compare identities"));
     }
 
     #[test]
