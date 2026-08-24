@@ -2799,7 +2799,10 @@ fn max_fill_notional_usdc(
 }
 
 fn policy_time_delta(seconds: u64) -> Option<TimeDelta> {
-    i64::try_from(seconds).ok().and_then(TimeDelta::try_seconds)
+    (seconds != 0)
+        .then_some(seconds)
+        .and_then(|seconds| i64::try_from(seconds).ok())
+        .and_then(TimeDelta::try_seconds)
 }
 
 fn eligibility_policy_windows(
@@ -2808,13 +2811,13 @@ fn eligibility_policy_windows(
     let registration_window = policy_time_delta(policy.fill_registration_deadline_seconds)
         .ok_or_else(|| {
             WorkflowError::ContradictoryObservation(
-                "fill registration deadline cannot be represented".into(),
+                "fill registration deadline must be positive and representable".into(),
             )
         })?;
     let lot_max_age =
         policy_time_delta(policy.lot_eligibility_max_age_seconds).ok_or_else(|| {
             WorkflowError::ContradictoryObservation(
-                "lot eligibility maximum age cannot be represented".into(),
+                "lot eligibility maximum age must be positive and representable".into(),
             )
         })?;
     Ok((registration_window, lot_max_age))

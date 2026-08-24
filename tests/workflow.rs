@@ -1537,16 +1537,40 @@ fn residual_lot_inventory_cannot_exceed_spot_or_its_configured_target() {
 }
 
 #[test]
-fn eligibility_policy_durations_must_be_representable() {
-    for invalid in ["version", "registration", "age"] {
+fn eligibility_policy_durations_must_be_positive_and_representable() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    for invalid in [
+        "version",
+        "zero-registration",
+        "overflowing-registration",
+        "zero-age",
+        "overflowing-age",
+    ] {
         let valid = binding();
         let mut policy = valid.eligibility_policy;
         match invalid {
             "version" => policy.policy_version.clear(),
-            "registration" => policy.fill_registration_deadline_seconds = u64::MAX,
-            "age" => policy.lot_eligibility_max_age_seconds = u64::MAX,
+            "zero-registration" => policy.fill_registration_deadline_seconds = 0,
+            "overflowing-registration" => {
+                policy.fill_registration_deadline_seconds = u64::MAX;
+            }
+            "zero-age" => policy.lot_eligibility_max_age_seconds = 0,
+            "overflowing-age" => policy.lot_eligibility_max_age_seconds = u64::MAX,
             _ => unreachable!("complete fixture set"),
         }
+        let mut direct_binding = binding();
+        direct_binding.eligibility_policy = policy.clone();
+        let path = temp.path().join(format!("invalid-policy-{invalid}.jsonl"));
+        assert!(matches!(
+            DurableWorkflow::open_or_create(
+                &path,
+                &direct_binding,
+                Arc::new(MemoryProtectedHeadStore::default()),
+                Arc::new(MemoryExchangeOrderOwnerStore::default()),
+            ),
+            Err(WorkflowError::InvalidBinding(_))
+        ));
+        assert!(!path.exists());
         assert!(matches!(
             DecisionBinding::from_pacing_decision(
                 &decision(),
@@ -2693,19 +2717,13 @@ fn eligibility_requires_durable_timely_fill_registration() {
         "cursor-beyond-watermark",
         "registered-at-deadline",
         "wrong-deadline",
-        "zero-window",
         "wrong-authorization",
         "wrong-authorization-hash",
         "wrong-execution-identity",
         "wrong-cloid",
         "wrong-order",
     ] {
-        let mut binding = binding();
-        if invalid == "zero-window" {
-            binding
-                .eligibility_policy
-                .fill_registration_deadline_seconds = 0;
-        }
+        let binding = binding();
         let path = temp
             .path()
             .join(format!("invalid-registration-{invalid}.jsonl"));
@@ -2743,7 +2761,6 @@ fn eligibility_requires_durable_timely_fill_registration() {
             }
             "registered-at-deadline" => fill.registered_at = fill.registration_deadline_at,
             "wrong-deadline" => fill.registration_deadline_at = at(5),
-            "zero-window" => fill.registration_deadline_at = fill.first_observed_at,
             "wrong-authorization" => fill.authorization_id = "authorization-b".to_owned(),
             "wrong-authorization-hash" => {
                 fill.authorization_record_hash = "authorization-record-hash-b".to_owned();
@@ -2822,11 +2839,8 @@ fn order_binding_at_effective_expiry_halts_before_claiming_fills() {
 #[test]
 fn eligibility_expires_at_configured_max_age_boundary() {
     let temp = tempfile::tempdir().expect("temp directory");
-    for case in ["just-before", "boundary", "zero-age"] {
-        let mut binding = binding();
-        if case == "zero-age" {
-            binding.eligibility_policy.lot_eligibility_max_age_seconds = 0;
-        }
+    for case in ["just-before", "boundary"] {
+        let binding = binding();
         let path = temp.path().join(format!("eligibility-age-{case}.jsonl"));
         let mut workflow = reopen(&path, &binding);
         ready(workflow.prepare_order(at(1)).expect("order prepared"));
@@ -2854,7 +2868,6 @@ fn eligibility_expires_at_configured_max_age_boundary() {
         let recorded_at = match case {
             "just-before" => expiry_boundary - TimeDelta::milliseconds(1),
             "boundary" => expiry_boundary,
-            "zero-age" => at(5),
             _ => unreachable!("complete fixture set"),
         };
         let evidence = bound_evidence(&workflow, &[("fill-1", 250, 3)], recorded_at);
