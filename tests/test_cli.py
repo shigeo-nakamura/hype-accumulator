@@ -131,7 +131,7 @@ class ExperimentContractTests(unittest.TestCase):
 
     def test_experiment_cannot_advance_past_dataset_snapshot(self) -> None:
         experiment = json.loads((FIXTURES / "experiment.json").read_text(encoding="utf-8"))
-        experiment["as_of"] = "2026-01-01T00:00:00Z"
+        experiment["as_of"] = "2026-01-02T00:00:00Z"
         self.make_paths_absolute(experiment)
 
         with tempfile.TemporaryDirectory() as directory:

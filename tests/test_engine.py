@@ -152,12 +152,12 @@ class EngineInvariantTests(unittest.TestCase):
     def test_usable_capital_after_final_price_is_reported(self) -> None:
         utc = timezone.utc
         first = datetime(2025, 1, 1, 12, tzinfo=utc)
-        horizon = datetime(2025, 1, 2, 23, tzinfo=utc)
+        after_horizon = datetime(2025, 1, 3, tzinfo=utc)
         late = datetime(2025, 1, 2, 18, tzinfo=utc)
         result = run_backtest(
             [PriceBar(first, 10.0)],
             [CapitalEvent("late", "deposit", 50.0, late, late, late)],
-            PointInTimeView([], horizon),
+            PointInTimeView([], after_horizon),
             {
                 "name": "daily",
                 "kind": "fixed",
@@ -172,7 +172,7 @@ class EngineInvariantTests(unittest.TestCase):
                 "half_spread_bps": 0.0,
                 "slippage_bps": 0.0,
             },
-            horizon,
+            after_horizon,
         )
 
         self.assertEqual(result["remaining_cash_usd"], 50.0)
@@ -269,6 +269,35 @@ class EngineInvariantTests(unittest.TestCase):
         self.assertFalse(result["horizon_complete"])
         self.assertFalse(result["horizon_infeasible"])
         self.assertEqual(result["capital_cohorts"], [])
+
+    def test_horizon_day_price_outage_does_not_close_before_utc_cutoff(self) -> None:
+        utc = timezone.utc
+        prior = datetime(2025, 1, 1, 16, tzinfo=utc)
+        during_outage = datetime(2025, 1, 2, 17, tzinfo=utc)
+        result = run_backtest(
+            [PriceBar(prior, 10.0)],
+            [CapitalEvent("deposit", "deposit", 100.0, prior, prior, prior)],
+            PointInTimeView([], during_outage),
+            {
+                "name": "daily",
+                "kind": "fixed",
+                "cadence": "daily",
+                "horizon": "2025-01-02",
+                "features": [],
+            },
+            {
+                "min_trade_usd": 1.0,
+                "max_trade_usd": 25.0,
+                "fee_bps": 0.0,
+                "half_spread_bps": 0.0,
+                "slippage_bps": 0.0,
+            },
+            during_outage,
+        )
+
+        self.assertEqual(result["horizon_status"], "in_progress")
+        self.assertFalse(result["horizon_complete"])
+        self.assertFalse(result["horizon_infeasible"])
 
     def test_simultaneous_deposit_precedes_withdrawal_regardless_of_id(self) -> None:
         utc = timezone.utc

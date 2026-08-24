@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from math import sqrt
 from typing import Any
 
@@ -152,21 +152,8 @@ def run_backtest(
         apply_capital_event(ledger, pending[event_index])
         event_index += 1
     cohort_rows = [{"event_id": c.event_id, "admitted_usd": round(c.admitted_usd, 8), "invested_usd": round(c.invested_usd, 8), "withdrawn_usd": round(c.withdrawn_usd, 8), "remaining_usd": round(c.cash_usd, 8), "utilization": round(c.invested_usd / c.admitted_usd, 8)} for c in ledger.cohorts]
-    future_horizon_decision = any(
-        bar.decision_at.date() == horizon
-        and bar.decision_at > as_of
-        and (cadence != "weekly" or bar.decision_at.weekday() == 0)
-        for bar in bars
-    )
-    future_horizon_capital = any(
-        event.first_usable_at.date() == horizon and event.first_usable_at > as_of
-        for event in events
-    )
-    horizon_reached = as_of.date() > horizon or (
-        as_of.date() == horizon
-        and not future_horizon_decision
-        and not future_horizon_capital
-    )
+    horizon_cutoff = datetime.combine(horizon + timedelta(days=1), time.min, tzinfo=timezone.utc)
+    horizon_reached = as_of >= horizon_cutoff
     infeasible = horizon_reached and ledger.cash > 1e-8
     horizon_status = "infeasible" if infeasible else "complete" if horizon_reached else "in_progress"
     valuation_date = min(horizon, as_of.date())
