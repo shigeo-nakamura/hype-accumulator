@@ -1,23 +1,1020 @@
-use chrono::{DateTime, Utc};
+//! Durable, tamper-evident audit ledger and local restore boundary.
+//!
+//! This module is deliberately transport-agnostic. It writes only to caller-
+//! supplied local directories and never submits, signs, uploads, or deploys
+//! anything.
+
+use crate::pacing::UsdcMicros;
+use chrono::{DateTime, NaiveDate, Utc};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
+    fs::{self, File, OpenOptions},
+    io::{self, Write},
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
+use thiserror::Error;
+
+pub const LEDGER_SCHEMA_VERSION: u8 = 1;
+pub const SNAPSHOT_SCHEMA_VERSION: u8 = 1;
+pub const LEDGER_FILE_NAME: &str = "ledger.jsonl";
+pub const SNAPSHOT_FILE_NAME: &str = "snapshot.json";
+const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Legacy in-memory observation retained for callers that have not migrated
+/// to [`DurableLedger`]. It is not part of the durable replay contract.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LedgerEntry {
     pub at: DateTime<Utc>,
     pub admitted_deposit_usdc: f64,
     pub deployed_usdc: f64,
 }
+
 pub trait Ledger: Send {
-    /// Appends one immutable event to the ledger.
+    /// Appends one immutable observation.
     ///
     /// # Errors
     ///
     /// Returns an implementation-specific persistence error.
     fn append(&mut self, entry: LedgerEntry) -> Result<(), String>;
 }
+
 #[derive(Default)]
 pub struct MemoryLedger(pub Vec<LedgerEntry>);
+
 impl Ledger for MemoryLedger {
     fn append(&mut self, entry: LedgerEntry) -> Result<(), String> {
         self.0.push(entry);
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LedgerEvent {
+    pub event_id: String,
+    pub occurred_at: DateTime<Utc>,
+    pub kind: LedgerEventKind,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LedgerEventKind {
+    AuthoritativeDeposit {
+        amount_usdc: UsdcMicros,
+    },
+    DepositAdmission {
+        deposit_event_id: String,
+        amount_usdc: UsdcMicros,
+    },
+    AuthoritativeWithdrawal {
+        amount_usdc: UsdcMicros,
+    },
+    CapitalCommitted {
+        commitment_id: String,
+        amount_usdc: UsdcMicros,
+    },
+    CapitalSettled {
+        commitment_id: String,
+        debited_usdc: UsdcMicros,
+    },
+    BalanceObserved {
+        observed_usdc: UsdcMicros,
+        observed_hype_atoms: u64,
+    },
+    DailyDecision {
+        decision_id: String,
+        decision_date: NaiveDate,
+        planned_usdc: UsdcMicros,
+        committed_usdc: UsdcMicros,
+    },
+    DailySkip {
+        decision_id: String,
+        decision_date: NaiveDate,
+        reason: String,
+    },
+    OrderRecorded {
+        order_id: String,
+        decision_id: String,
+    },
+    FillRecorded {
+        order_id: String,
+        filled_usdc: UsdcMicros,
+        received_hype_atoms: u64,
+    },
+    FeeRecorded {
+        order_id: String,
+        fee_usdc: UsdcMicros,
+    },
+    StakingDepositRecorded {
+        action_id: String,
+        hype_atoms: u64,
+    },
+    DelegationRecorded {
+        action_id: String,
+        validator_id: String,
+        hype_atoms: u64,
+    },
+    RewardRecorded {
+        reward_id: String,
+        hype_atoms: u64,
+    },
+    ReconciliationCorrection {
+        correction_id: String,
+        observed_usdc: UsdcMicros,
+        observed_hype_atoms: u64,
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LedgerEnvelope {
+    pub schema_version: u8,
+    pub sequence: u64,
+    pub previous_hash: String,
+    pub event: LedgerEvent,
+    pub record_hash: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AppendOutcome {
+    Appended,
+    Duplicate,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DepositReplay {
+    authoritative_usdc: UsdcMicros,
+    admitted_usdc: UsdcMicros,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CommitmentReplay {
+    committed_usdc: UsdcMicros,
+    debited_usdc: UsdcMicros,
+    settled: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayState {
+    deposits: BTreeMap<String, DepositReplay>,
+    commitments: BTreeMap<String, CommitmentReplay>,
+    admitted_usdc: UsdcMicros,
+    withdrawn_usdc: UsdcMicros,
+    committed_usdc: UsdcMicros,
+    spent_usdc: UsdcMicros,
+    observed_usdc: UsdcMicros,
+    observed_hype_atoms: u64,
+    last_event_at: Option<DateTime<Utc>>,
+}
+
+impl ReplayState {
+    #[must_use]
+    pub const fn admitted_usdc(&self) -> UsdcMicros {
+        self.admitted_usdc
+    }
+
+    #[must_use]
+    pub const fn withdrawn_usdc(&self) -> UsdcMicros {
+        self.withdrawn_usdc
+    }
+
+    #[must_use]
+    pub const fn committed_usdc(&self) -> UsdcMicros {
+        self.committed_usdc
+    }
+
+    #[must_use]
+    pub const fn spent_usdc(&self) -> UsdcMicros {
+        self.spent_usdc
+    }
+
+    #[must_use]
+    pub const fn observed_usdc(&self) -> UsdcMicros {
+        self.observed_usdc
+    }
+
+    #[must_use]
+    pub const fn observed_hype_atoms(&self) -> u64 {
+        self.observed_hype_atoms
+    }
+
+    #[must_use]
+    pub const fn last_event_at(&self) -> Option<&DateTime<Utc>> {
+        self.last_event_at.as_ref()
+    }
+
+    #[must_use]
+    pub fn deployable_usdc(&self) -> UsdcMicros {
+        let used = self
+            .withdrawn_usdc
+            .as_micros()
+            .saturating_add(self.committed_usdc.as_micros())
+            .saturating_add(self.spent_usdc.as_micros());
+        UsdcMicros::from_micros(self.admitted_usdc.as_micros().saturating_sub(used))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LedgerSnapshot {
+    ledger_schema_version: u8,
+    record_count: u64,
+    head_hash: String,
+    state: ReplayState,
+}
+
+impl LedgerSnapshot {
+    #[must_use]
+    pub const fn record_count(&self) -> u64 {
+        self.record_count
+    }
+
+    #[must_use]
+    pub fn head_hash(&self) -> &str {
+        &self.head_hash
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> &ReplayState {
+        &self.state
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotEnvelope {
+    schema_version: u8,
+    snapshot: LedgerSnapshot,
+    checksum: String,
+}
+
+#[derive(Serialize)]
+struct RecordHashInput<'a> {
+    schema_version: u8,
+    sequence: u64,
+    previous_hash: &'a str,
+    event: &'a LedgerEvent,
+}
+
+#[derive(Serialize)]
+struct SnapshotHashInput<'a> {
+    schema_version: u8,
+    snapshot: &'a LedgerSnapshot,
+}
+
+pub struct DurableLedger {
+    directory: PathBuf,
+    records: Vec<LedgerEnvelope>,
+    events_by_id: BTreeMap<String, LedgerEvent>,
+    state: ReplayState,
+    file_len: u64,
+}
+
+impl DurableLedger {
+    /// Opens a ledger and verifies its journal, hash chain, and snapshot anchor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] for malformed, truncated, hash-invalid, or
+    /// snapshot-inconsistent state.
+    pub fn open(directory: impl AsRef<Path>) -> Result<Self, LedgerError> {
+        let directory = directory.as_ref().to_path_buf();
+        let payload = read_optional(&directory.join(LEDGER_FILE_NAME))?;
+        let records = load_records(&payload)?;
+        let events = records
+            .iter()
+            .map(|record| record.event.clone())
+            .collect::<Vec<_>>();
+        let state = replay(&events)?;
+        if let Some(snapshot) = load_snapshot(&directory.join(SNAPSHOT_FILE_NAME))? {
+            validate_snapshot_anchor(&snapshot, &records)?;
+        }
+        let mut events_by_id = BTreeMap::new();
+        for event in events {
+            if events_by_id.insert(event.event_id.clone(), event).is_some() {
+                return Err(LedgerError::CorruptLedger(
+                    "duplicate event ID in journal".into(),
+                ));
+            }
+        }
+        Ok(Self {
+            directory,
+            records,
+            events_by_id,
+            state,
+            file_len: u64::try_from(payload.len())
+                .map_err(|_| LedgerError::CorruptLedger("file length overflowed".into()))?,
+        })
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> &ReplayState {
+        &self.state
+    }
+
+    #[must_use]
+    pub fn head_hash(&self) -> &str {
+        self.records
+            .last()
+            .map_or(GENESIS_HASH, |record| record.record_hash.as_str())
+    }
+
+    #[must_use]
+    pub fn record_count(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Appends one validated event and fsyncs it before returning.
+    ///
+    /// Replaying the exact same event ID and payload is idempotent. Reusing an
+    /// ID for different content fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] for invalid transitions, ID collisions,
+    /// concurrent file changes, serialization, or durable-write failures.
+    pub fn append(&mut self, event: LedgerEvent) -> Result<AppendOutcome, LedgerError> {
+        validate_event(&event)?;
+        if let Some(existing) = self.events_by_id.get(&event.event_id) {
+            return if existing == &event {
+                Ok(AppendOutcome::Duplicate)
+            } else {
+                Err(LedgerError::EventCollision(event.event_id))
+            };
+        }
+        let mut events = self
+            .records
+            .iter()
+            .map(|record| record.event.clone())
+            .collect::<Vec<_>>();
+        events.push(event.clone());
+        let next_state = replay(&events)?;
+        let sequence = u64::try_from(self.records.len())
+            .map_err(|_| LedgerError::CorruptLedger("sequence overflowed".into()))?;
+        let previous_hash = self.head_hash().to_owned();
+        let record_hash = record_hash(sequence, &previous_hash, &event)?;
+        let record = LedgerEnvelope {
+            schema_version: LEDGER_SCHEMA_VERSION,
+            sequence,
+            previous_hash,
+            event,
+            record_hash,
+        };
+        self.write_record(&record)?;
+        self.events_by_id
+            .insert(record.event.event_id.clone(), record.event.clone());
+        self.records.push(record);
+        self.state = next_state;
+        Ok(AppendOutcome::Appended)
+    }
+
+    /// Atomically writes a checksummed replay snapshot.
+    ///
+    /// The checksum and snapshot share one atomically-renamed envelope, so a
+    /// crash cannot publish one without the other.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] if the journal changed concurrently or the
+    /// snapshot cannot be serialized or durably replaced.
+    pub fn checkpoint(&self) -> Result<LedgerSnapshot, LedgerError> {
+        self.ensure_file_len()?;
+        let snapshot = LedgerSnapshot {
+            ledger_schema_version: LEDGER_SCHEMA_VERSION,
+            record_count: u64::try_from(self.records.len())
+                .map_err(|_| LedgerError::CorruptLedger("record count overflowed".into()))?,
+            head_hash: self.head_hash().to_owned(),
+            state: self.state.clone(),
+        };
+        let envelope = SnapshotEnvelope {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            checksum: snapshot_checksum(&snapshot)?,
+            snapshot: snapshot.clone(),
+        };
+        let mut payload = serde_json::to_vec(&envelope).map_err(LedgerError::json)?;
+        payload.push(b'\n');
+        write_atomic(&self.directory.join(SNAPSHOT_FILE_NAME), &payload)?;
+        Ok(snapshot)
+    }
+
+    /// Restores a fully checkpointed ledger into a missing or empty directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] for a non-clean destination, missing/stale
+    /// snapshot, source mutation, verification failure, or local I/O failure.
+    pub fn restore_clean(
+        source: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+    ) -> Result<Self, LedgerError> {
+        let source = source.as_ref();
+        let verified = Self::open(source)?;
+        let snapshot_payload = read_optional(&source.join(SNAPSHOT_FILE_NAME))?;
+        if snapshot_payload.is_empty() {
+            return Err(LedgerError::MissingSnapshot);
+        }
+        let snapshot = decode_snapshot(&snapshot_payload)?;
+        if snapshot.record_count
+            != u64::try_from(verified.records.len())
+                .map_err(|_| LedgerError::CorruptLedger("record count overflowed".into()))?
+            || snapshot.head_hash != verified.head_hash()
+            || snapshot.state != verified.state
+        {
+            return Err(LedgerError::StaleSnapshot);
+        }
+        let ledger_payload = read_optional(&source.join(LEDGER_FILE_NAME))?;
+        let source_records = load_records(&ledger_payload)?;
+        if source_records != verified.records {
+            return Err(LedgerError::ConcurrentModification);
+        }
+        let destination = destination.as_ref();
+        ensure_clean_directory(destination)?;
+        write_atomic(&destination.join(LEDGER_FILE_NAME), &ledger_payload)?;
+        write_atomic(&destination.join(SNAPSHOT_FILE_NAME), &snapshot_payload)?;
+        let restored = Self::open(destination)?;
+        if restored.records != verified.records || restored.state != verified.state {
+            return Err(LedgerError::SnapshotMismatch);
+        }
+        Ok(restored)
+    }
+
+    fn write_record(&mut self, record: &LedgerEnvelope) -> Result<(), LedgerError> {
+        fs::create_dir_all(&self.directory).map_err(LedgerError::io)?;
+        self.ensure_file_len()?;
+        let path = self.directory.join(LEDGER_FILE_NAME);
+        let created = !path.exists();
+        let mut line = serde_json::to_vec(record).map_err(LedgerError::json)?;
+        line.push(b'\n');
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o640);
+        }
+        let mut file = options.open(&path).map_err(LedgerError::io)?;
+        file.write_all(&line).map_err(LedgerError::io)?;
+        file.sync_all().map_err(LedgerError::io)?;
+        if created {
+            sync_directory(&self.directory)?;
+        }
+        self.file_len = self
+            .file_len
+            .checked_add(
+                u64::try_from(line.len())
+                    .map_err(|_| LedgerError::CorruptLedger("file length overflowed".into()))?,
+            )
+            .ok_or_else(|| LedgerError::CorruptLedger("file length overflowed".into()))?;
+        Ok(())
+    }
+
+    fn ensure_file_len(&self) -> Result<(), LedgerError> {
+        let current_len = fs::metadata(self.directory.join(LEDGER_FILE_NAME))
+            .map(|metadata| metadata.len())
+            .or_else(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    Ok(0)
+                } else {
+                    Err(error)
+                }
+            })
+            .map_err(LedgerError::io)?;
+        if current_len == self.file_len {
+            Ok(())
+        } else {
+            Err(LedgerError::ConcurrentModification)
+        }
+    }
+}
+
+fn replay(events: &[LedgerEvent]) -> Result<ReplayState, LedgerError> {
+    let mut state = ReplayState::default();
+    let mut event_ids = BTreeSet::new();
+    for event in events {
+        validate_event(event)?;
+        if !event_ids.insert(event.event_id.as_str()) {
+            return Err(LedgerError::CorruptLedger(
+                "duplicate event ID in journal".into(),
+            ));
+        }
+        apply_event(&mut state, event)?;
+        state.last_event_at = Some(event.occurred_at);
+    }
+    Ok(state)
+}
+
+fn apply_event(state: &mut ReplayState, event: &LedgerEvent) -> Result<(), LedgerError> {
+    match &event.kind {
+        LedgerEventKind::AuthoritativeDeposit { amount_usdc } => {
+            state.deposits.insert(
+                event.event_id.clone(),
+                DepositReplay {
+                    authoritative_usdc: *amount_usdc,
+                    admitted_usdc: UsdcMicros::default(),
+                },
+            );
+        }
+        LedgerEventKind::DepositAdmission {
+            deposit_event_id,
+            amount_usdc,
+        } => {
+            let deposit = state
+                .deposits
+                .get_mut(deposit_event_id)
+                .ok_or_else(|| LedgerError::UnknownDeposit(deposit_event_id.clone()))?;
+            let next_admitted = checked_add(deposit.admitted_usdc, *amount_usdc)?;
+            if next_admitted > deposit.authoritative_usdc {
+                return Err(LedgerError::AdmissionExceedsDeposit(
+                    deposit_event_id.clone(),
+                ));
+            }
+            deposit.admitted_usdc = next_admitted;
+            state.admitted_usdc = checked_add(state.admitted_usdc, *amount_usdc)?;
+        }
+        LedgerEventKind::AuthoritativeWithdrawal { amount_usdc } => {
+            require_deployable(state, *amount_usdc)?;
+            state.withdrawn_usdc = checked_add(state.withdrawn_usdc, *amount_usdc)?;
+        }
+        LedgerEventKind::CapitalCommitted {
+            commitment_id,
+            amount_usdc,
+        } => {
+            if state.commitments.contains_key(commitment_id) {
+                return Err(LedgerError::CommitmentCollision(commitment_id.clone()));
+            }
+            require_deployable(state, *amount_usdc)?;
+            state.committed_usdc = checked_add(state.committed_usdc, *amount_usdc)?;
+            state.commitments.insert(
+                commitment_id.clone(),
+                CommitmentReplay {
+                    committed_usdc: *amount_usdc,
+                    debited_usdc: UsdcMicros::default(),
+                    settled: false,
+                },
+            );
+        }
+        LedgerEventKind::CapitalSettled {
+            commitment_id,
+            debited_usdc,
+        } => {
+            let commitment = state
+                .commitments
+                .get_mut(commitment_id)
+                .ok_or_else(|| LedgerError::UnknownCommitment(commitment_id.clone()))?;
+            if commitment.settled {
+                return Err(LedgerError::CommitmentAlreadySettled(commitment_id.clone()));
+            }
+            if *debited_usdc > commitment.committed_usdc {
+                return Err(LedgerError::DebitExceedsCommitment(commitment_id.clone()));
+            }
+            state.committed_usdc = checked_sub(state.committed_usdc, commitment.committed_usdc)?;
+            state.spent_usdc = checked_add(state.spent_usdc, *debited_usdc)?;
+            commitment.debited_usdc = *debited_usdc;
+            commitment.settled = true;
+        }
+        LedgerEventKind::BalanceObserved {
+            observed_usdc,
+            observed_hype_atoms,
+        }
+        | LedgerEventKind::ReconciliationCorrection {
+            observed_usdc,
+            observed_hype_atoms,
+            ..
+        } => {
+            state.observed_usdc = *observed_usdc;
+            state.observed_hype_atoms = *observed_hype_atoms;
+        }
+        LedgerEventKind::DailyDecision { .. }
+        | LedgerEventKind::DailySkip { .. }
+        | LedgerEventKind::OrderRecorded { .. }
+        | LedgerEventKind::FillRecorded { .. }
+        | LedgerEventKind::FeeRecorded { .. }
+        | LedgerEventKind::StakingDepositRecorded { .. }
+        | LedgerEventKind::DelegationRecorded { .. }
+        | LedgerEventKind::RewardRecorded { .. } => {}
+    }
+    Ok(())
+}
+
+fn validate_event(event: &LedgerEvent) -> Result<(), LedgerError> {
+    validate_id("event_id", &event.event_id)?;
+    match &event.kind {
+        LedgerEventKind::AuthoritativeDeposit { amount_usdc }
+        | LedgerEventKind::AuthoritativeWithdrawal { amount_usdc } => {
+            require_nonzero(*amount_usdc)?;
+        }
+        LedgerEventKind::DepositAdmission {
+            deposit_event_id,
+            amount_usdc,
+        } => {
+            validate_id("deposit_event_id", deposit_event_id)?;
+            require_nonzero(*amount_usdc)?;
+        }
+        LedgerEventKind::CapitalCommitted {
+            commitment_id,
+            amount_usdc,
+        } => {
+            validate_id("commitment_id", commitment_id)?;
+            require_nonzero(*amount_usdc)?;
+        }
+        LedgerEventKind::CapitalSettled { commitment_id, .. } => {
+            validate_id("commitment_id", commitment_id)?;
+        }
+        LedgerEventKind::BalanceObserved { .. } => {}
+        LedgerEventKind::DailyDecision {
+            decision_id,
+            planned_usdc,
+            committed_usdc,
+            ..
+        } => {
+            validate_id("decision_id", decision_id)?;
+            require_nonzero(*planned_usdc)?;
+            if *committed_usdc < *planned_usdc {
+                return Err(LedgerError::InvalidEvent(
+                    "decision commitment is below planned notional".into(),
+                ));
+            }
+        }
+        LedgerEventKind::DailySkip {
+            decision_id,
+            reason,
+            ..
+        } => {
+            validate_id("decision_id", decision_id)?;
+            validate_text("reason", reason)?;
+        }
+        LedgerEventKind::OrderRecorded {
+            order_id,
+            decision_id,
+        } => {
+            validate_id("order_id", order_id)?;
+            validate_id("decision_id", decision_id)?;
+        }
+        LedgerEventKind::FillRecorded {
+            order_id,
+            filled_usdc,
+            received_hype_atoms,
+        } => {
+            validate_id("order_id", order_id)?;
+            require_nonzero(*filled_usdc)?;
+            require_hype(*received_hype_atoms)?;
+        }
+        LedgerEventKind::FeeRecorded { order_id, fee_usdc } => {
+            validate_id("order_id", order_id)?;
+            require_nonzero(*fee_usdc)?;
+        }
+        LedgerEventKind::StakingDepositRecorded {
+            action_id,
+            hype_atoms,
+        } => {
+            validate_id("action_id", action_id)?;
+            require_hype(*hype_atoms)?;
+        }
+        LedgerEventKind::DelegationRecorded {
+            action_id,
+            validator_id,
+            hype_atoms,
+        } => {
+            validate_id("action_id", action_id)?;
+            validate_id("validator_id", validator_id)?;
+            require_hype(*hype_atoms)?;
+        }
+        LedgerEventKind::RewardRecorded {
+            reward_id,
+            hype_atoms,
+        } => {
+            validate_id("reward_id", reward_id)?;
+            require_hype(*hype_atoms)?;
+        }
+        LedgerEventKind::ReconciliationCorrection {
+            correction_id,
+            reason,
+            ..
+        } => {
+            validate_id("correction_id", correction_id)?;
+            validate_text("reason", reason)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_snapshot_anchor(
+    snapshot: &LedgerSnapshot,
+    records: &[LedgerEnvelope],
+) -> Result<(), LedgerError> {
+    if snapshot.ledger_schema_version != LEDGER_SCHEMA_VERSION {
+        return Err(LedgerError::SnapshotMismatch);
+    }
+    let count =
+        usize::try_from(snapshot.record_count).map_err(|_| LedgerError::SnapshotMismatch)?;
+    if count > records.len() {
+        return Err(LedgerError::TruncatedLedger);
+    }
+    let expected_head = if count == 0 {
+        GENESIS_HASH
+    } else {
+        &records[count - 1].record_hash
+    };
+    if snapshot.head_hash != expected_head {
+        return Err(LedgerError::SnapshotMismatch);
+    }
+    let events = records[..count]
+        .iter()
+        .map(|record| record.event.clone())
+        .collect::<Vec<_>>();
+    if replay(&events)? != snapshot.state {
+        return Err(LedgerError::SnapshotMismatch);
+    }
+    Ok(())
+}
+
+fn load_records(payload: &[u8]) -> Result<Vec<LedgerEnvelope>, LedgerError> {
+    if payload.is_empty() {
+        return Ok(Vec::new());
+    }
+    if payload.last() != Some(&b'\n') {
+        return Err(LedgerError::TruncatedLedger);
+    }
+    let mut records = Vec::new();
+    let mut expected_previous_hash = GENESIS_HASH.to_owned();
+    for line in payload
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let record: LedgerEnvelope = serde_json::from_slice(line).map_err(LedgerError::json)?;
+        let expected_sequence = u64::try_from(records.len())
+            .map_err(|_| LedgerError::CorruptLedger("sequence overflowed".into()))?;
+        if record.schema_version != LEDGER_SCHEMA_VERSION
+            || record.sequence != expected_sequence
+            || record.previous_hash != expected_previous_hash
+            || record.record_hash
+                != record_hash(record.sequence, &record.previous_hash, &record.event)?
+        {
+            return Err(LedgerError::CorruptLedger(
+                "record sequence or hash chain is invalid".into(),
+            ));
+        }
+        expected_previous_hash.clone_from(&record.record_hash);
+        records.push(record);
+    }
+    Ok(records)
+}
+
+fn load_snapshot(path: &Path) -> Result<Option<LedgerSnapshot>, LedgerError> {
+    match fs::read(path) {
+        Ok(payload) if payload.is_empty() => Err(LedgerError::CorruptSnapshot),
+        Ok(payload) => decode_snapshot(&payload).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(LedgerError::io(error)),
+    }
+}
+
+fn decode_snapshot(payload: &[u8]) -> Result<LedgerSnapshot, LedgerError> {
+    let envelope: SnapshotEnvelope =
+        serde_json::from_slice(payload).map_err(|_| LedgerError::CorruptSnapshot)?;
+    if envelope.schema_version != SNAPSHOT_SCHEMA_VERSION
+        || envelope.checksum != snapshot_checksum(&envelope.snapshot)?
+    {
+        return Err(LedgerError::CorruptSnapshot);
+    }
+    Ok(envelope.snapshot)
+}
+
+fn record_hash(
+    sequence: u64,
+    previous_hash: &str,
+    event: &LedgerEvent,
+) -> Result<String, LedgerError> {
+    let payload = serde_json::to_vec(&RecordHashInput {
+        schema_version: LEDGER_SCHEMA_VERSION,
+        sequence,
+        previous_hash,
+        event,
+    })
+    .map_err(LedgerError::json)?;
+    Ok(digest_hex(&payload))
+}
+
+fn snapshot_checksum(snapshot: &LedgerSnapshot) -> Result<String, LedgerError> {
+    let payload = serde_json::to_vec(&SnapshotHashInput {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        snapshot,
+    })
+    .map_err(LedgerError::json)?;
+    Ok(digest_hex(&payload))
+}
+
+fn digest_hex(payload: &[u8]) -> String {
+    let digest = Sha256::digest(payload);
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    output
+}
+
+fn checked_add(left: UsdcMicros, right: UsdcMicros) -> Result<UsdcMicros, LedgerError> {
+    left.as_micros()
+        .checked_add(right.as_micros())
+        .map(UsdcMicros::from_micros)
+        .ok_or(LedgerError::ArithmeticOverflow)
+}
+
+fn checked_sub(left: UsdcMicros, right: UsdcMicros) -> Result<UsdcMicros, LedgerError> {
+    left.as_micros()
+        .checked_sub(right.as_micros())
+        .map(UsdcMicros::from_micros)
+        .ok_or(LedgerError::CorruptLedger(
+            "capital conservation underflowed".into(),
+        ))
+}
+
+fn require_deployable(state: &ReplayState, requested: UsdcMicros) -> Result<(), LedgerError> {
+    if requested <= state.deployable_usdc() {
+        Ok(())
+    } else {
+        Err(LedgerError::InsufficientDeployableCapital)
+    }
+}
+
+fn require_nonzero(value: UsdcMicros) -> Result<(), LedgerError> {
+    if value.is_zero() {
+        Err(LedgerError::InvalidEvent(
+            "USDC amount must be positive".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn require_hype(value: u64) -> Result<(), LedgerError> {
+    if value == 0 {
+        Err(LedgerError::InvalidEvent(
+            "HYPE amount must be positive".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_id(name: &str, value: &str) -> Result<(), LedgerError> {
+    if value.trim().is_empty() || value.trim() != value {
+        Err(LedgerError::InvalidEvent(format!(
+            "{name} must be non-empty and trimmed"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_text(name: &str, value: &str) -> Result<(), LedgerError> {
+    if value.trim().is_empty() {
+        Err(LedgerError::InvalidEvent(format!(
+            "{name} must be non-empty"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn read_optional(path: &Path) -> Result<Vec<u8>, LedgerError> {
+    fs::read(path)
+        .or_else(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                Ok(Vec::new())
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(LedgerError::io)
+}
+
+fn write_atomic(path: &Path, payload: &[u8]) -> Result<(), LedgerError> {
+    let parent = path.parent().ok_or(LedgerError::InvalidPath)?;
+    let file_name = path.file_name().ok_or(LedgerError::InvalidPath)?;
+    fs::create_dir_all(parent).map_err(LedgerError::io)?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| LedgerError::Io(error.to_string()))?
+        .as_nanos();
+    let mut temporary_name = file_name.to_os_string();
+    temporary_name.push(format!(".{}.{}.tmp", std::process::id(), nonce));
+    let temporary = parent.join(temporary_name);
+    let result = (|| -> Result<(), LedgerError> {
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o640);
+        }
+        let mut file = options.open(&temporary).map_err(LedgerError::io)?;
+        file.write_all(payload).map_err(LedgerError::io)?;
+        file.sync_all().map_err(LedgerError::io)?;
+        fs::rename(&temporary, path).map_err(LedgerError::io)?;
+        sync_directory(parent)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn ensure_clean_directory(path: &Path) -> Result<(), LedgerError> {
+    if path.exists() {
+        let mut entries = fs::read_dir(path).map_err(LedgerError::io)?;
+        if entries
+            .next()
+            .transpose()
+            .map_err(LedgerError::io)?
+            .is_some()
+        {
+            return Err(LedgerError::RestoreDestinationNotEmpty);
+        }
+    } else {
+        fs::create_dir_all(path).map_err(LedgerError::io)?;
+    }
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<(), LedgerError> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(LedgerError::io)
+}
+
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum LedgerError {
+    #[error("invalid ledger event: {0}")]
+    InvalidEvent(String),
+    #[error("event ID collision: {0}")]
+    EventCollision(String),
+    #[error("unknown authoritative deposit: {0}")]
+    UnknownDeposit(String),
+    #[error("admission exceeds authoritative deposit: {0}")]
+    AdmissionExceedsDeposit(String),
+    #[error("insufficient deployable capital")]
+    InsufficientDeployableCapital,
+    #[error("commitment ID collision: {0}")]
+    CommitmentCollision(String),
+    #[error("unknown commitment: {0}")]
+    UnknownCommitment(String),
+    #[error("commitment already settled: {0}")]
+    CommitmentAlreadySettled(String),
+    #[error("cash debit exceeds commitment: {0}")]
+    DebitExceedsCommitment(String),
+    #[error("ledger is truncated")]
+    TruncatedLedger,
+    #[error("ledger is corrupt: {0}")]
+    CorruptLedger(String),
+    #[error("snapshot is missing")]
+    MissingSnapshot,
+    #[error("snapshot checksum or encoding is corrupt")]
+    CorruptSnapshot,
+    #[error("snapshot does not match its journal prefix")]
+    SnapshotMismatch,
+    #[error("snapshot does not cover the current journal head")]
+    StaleSnapshot,
+    #[error("restore destination is not empty")]
+    RestoreDestinationNotEmpty,
+    #[error("ledger changed since it was opened")]
+    ConcurrentModification,
+    #[error("ledger path is invalid")]
+    InvalidPath,
+    #[error("ledger arithmetic overflow")]
+    ArithmeticOverflow,
+    #[error("ledger I/O failed: {0}")]
+    Io(String),
+    #[error("ledger serialization failed: {0}")]
+    Json(String),
+}
+
+impl LedgerError {
+    fn io(error: io::Error) -> Self {
+        error.into()
+    }
+
+    fn json(error: serde_json::Error) -> Self {
+        error.into()
+    }
+}
+
+impl From<io::Error> for LedgerError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error.to_string())
+    }
+}
+
+impl From<serde_json::Error> for LedgerError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error.to_string())
     }
 }
