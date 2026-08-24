@@ -350,6 +350,37 @@ fn reconciliation_correction_ids_cannot_be_reused() {
 }
 
 #[test]
+fn late_observations_remain_auditable_without_replacing_fresher_state() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let anchor = anchor_store();
+    let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+    ledger
+        .append(observed("newer-observation", 3, 50, 500))
+        .expect("append newer observation");
+    ledger
+        .append(event(
+            "late-correction",
+            2,
+            LedgerEventKind::ReconciliationCorrection {
+                correction_id: "late-correction-id".into(),
+                observed_usdc: usd(10),
+                observed_hype_atoms: 100,
+                reason: "delayed authoritative correction".into(),
+            },
+        ))
+        .expect("append late correction for audit");
+
+    assert_eq!(ledger.state().observed_usdc(), usd(50));
+    assert_eq!(ledger.state().observed_hype_atoms(), 500);
+    assert_eq!(ledger.state().last_event_at(), Some(&at(3)));
+    let replayed_state = ledger.state().clone();
+    drop(ledger);
+
+    let reopened = open(directory.path(), &anchor).expect("reopen ledger");
+    assert_eq!(reopened.state(), &replayed_state);
+}
+
+#[test]
 fn stable_order_ids_are_idempotent_and_cannot_change_ownership() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let anchor = anchor_store();

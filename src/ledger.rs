@@ -203,6 +203,8 @@ pub struct ReplayState {
     spent_usdc: UsdcMicros,
     observed_usdc: UsdcMicros,
     observed_hype_atoms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_observation_at: Option<DateTime<Utc>>,
     last_event_at: Option<DateTime<Utc>>,
 }
 
@@ -899,7 +901,10 @@ fn replay(events: &[LedgerEvent]) -> Result<ReplayState, LedgerError> {
             _ => {}
         }
         apply_event(&mut state, event)?;
-        state.last_event_at = Some(event.occurred_at);
+        state.last_event_at = Some(match state.last_event_at.as_ref() {
+            Some(last) => event.occurred_at.max(*last),
+            None => event.occurred_at,
+        });
     }
     Ok(state)
 }
@@ -939,7 +944,12 @@ fn apply_event(state: &mut ReplayState, event: &LedgerEvent) -> Result<(), Ledge
             observed_usdc,
             observed_hype_atoms,
             ..
-        } => record_observed_balance(state, *observed_usdc, *observed_hype_atoms),
+        } => record_observed_balance(
+            state,
+            event.occurred_at,
+            *observed_usdc,
+            *observed_hype_atoms,
+        ),
         LedgerEventKind::DailyDecision {
             decision_id,
             decision_date,
@@ -1076,11 +1086,19 @@ fn record_capital_settlement(
 
 fn record_observed_balance(
     state: &mut ReplayState,
+    occurred_at: DateTime<Utc>,
     observed_usdc: UsdcMicros,
     observed_hype_atoms: u64,
 ) {
-    state.observed_usdc = observed_usdc;
-    state.observed_hype_atoms = observed_hype_atoms;
+    let is_freshest = match state.last_observation_at.as_ref() {
+        Some(last) => occurred_at >= *last,
+        None => true,
+    };
+    if is_freshest {
+        state.observed_usdc = observed_usdc;
+        state.observed_hype_atoms = observed_hype_atoms;
+        state.last_observation_at = Some(occurred_at);
+    }
 }
 
 fn record_daily_outcome(
@@ -2460,9 +2478,24 @@ fn restore_is_complete(
     }
 }
 
-fn sync_directory(path: &Path) -> Result<(), LedgerError> {
+#[cfg(windows)]
+fn open_directory_for_sync(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    options.open(path)
+}
+
+#[cfg(not(windows))]
+fn open_directory_for_sync(path: &Path) -> io::Result<File> {
     File::open(path)
-        .and_then(|directory| directory.sync_all())
+}
+
+fn sync_directory(path: &Path) -> Result<(), LedgerError> {
+    open_directory_for_sync(path)?
+        .sync_all()
         .map_err(LedgerError::io)
 }
 
