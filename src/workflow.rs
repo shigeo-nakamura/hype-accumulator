@@ -1332,6 +1332,9 @@ impl WorkflowState {
         at: DateTime<Utc>,
     ) -> Option<String> {
         match transition {
+            WorkflowTransition::OrderSubmissionObserved { .. } if at < self.last_transition_at => {
+                Some("accepted order predates the durable order preparation".into())
+            }
             WorkflowTransition::OrderSubmissionObserved { .. } if self.order_is_terminal() => {
                 Some("accepted order appeared after terminal reconciliation".into())
             }

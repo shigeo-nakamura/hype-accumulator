@@ -1207,6 +1207,30 @@ fn consumed_residual_inventory_is_replenished_before_eligible_spot() {
 }
 
 #[test]
+fn acceptance_predating_the_prepared_action_durably_halts() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("acceptance-before-preparation.jsonl");
+    let binding = binding();
+    let mut workflow = reopen(&path, &binding);
+    ready(workflow.prepare_order(at(2)).expect("order prepared"));
+
+    assert!(matches!(
+        workflow.observe_order_submission("exchange-order-1", at(1)),
+        Err(WorkflowError::InvalidTransition(_))
+    ));
+    assert_eq!(workflow.state().stage(), WorkflowStage::ManualReview);
+    assert!(workflow
+        .state()
+        .manual_review_reason()
+        .is_some_and(|reason| reason.contains("predates the durable order preparation")));
+    drop(workflow);
+    assert_eq!(
+        reopen(&path, &binding).state().stage(),
+        WorkflowStage::ManualReview
+    );
+}
+
+#[test]
 fn late_event_collision_persists_manual_review_at_a_monotonic_time() {
     let temp = tempfile::tempdir().expect("temp directory");
     let path = temp.path().join("late-collision.jsonl");
