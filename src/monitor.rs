@@ -21,7 +21,6 @@ pub struct BalanceObservation {
     pub spot_usdc: f64,
     pub spot_hype: f64,
     pub hype_price_usdc: f64,
-    pub last_trade_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -30,6 +29,19 @@ pub struct StakingObservation {
     pub undelegated_hype: f64,
     pub pending_withdrawal_hype: f64,
     pub delegation_rows_hype: f64,
+}
+
+/// Authoritative accumulator-ledger attribution for account-level observations.
+///
+/// Account balances and fills alone cannot distinguish accumulator activity
+/// from direct transfers, pre-existing holdings, or manual staking actions.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HypeAttribution {
+    Unavailable,
+    Reconciled {
+        hype: f64,
+        last_trade_at: Option<DateTime<Utc>>,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -107,14 +119,15 @@ impl HyperliquidObserver {
         })
     }
 
-    /// Reads spot balances, current HYPE mark, fills, staking summary, and
-    /// staking delegations, then produces the dashboard-safe status block.
+    /// Reads spot balances, current HYPE mark, staking summary, and staking
+    /// delegations, then produces a fail-closed dashboard status block.
     ///
     /// # Errors
     ///
     /// Returns [`MonitorError`] when any required read or reconciliation fails.
     pub async fn observe(
         &self,
+        attribution: &HypeAttribution,
         trade_cadence: impl Into<String>,
     ) -> Result<AccumulatorStatus, MonitorError> {
         let combined = self
@@ -127,11 +140,6 @@ impl HyperliquidObserver {
             .get_ticker(HYPE_SPOT_SYMBOL, None)
             .await
             .map_err(|error| MonitorError::Connector(error.to_string()))?;
-        let fills = self
-            .connector
-            .get_filled_orders(HYPE_SPOT_SYMBOL)
-            .await
-            .map_err(|error| MonitorError::Connector(error.to_string()))?;
         let summary: DelegatorSummaryWire = self
             .post_info(json!({"type": "delegatorSummary", "user": self.account}))
             .await?;
@@ -139,23 +147,10 @@ impl HyperliquidObserver {
             .post_info(json!({"type": "delegations", "user": self.account}))
             .await?;
 
-        let last_trade_at = fills
-            .orders
-            .iter()
-            .filter(|fill| !fill.is_rejected)
-            .filter_map(|fill| fill.filled_ts_ms)
-            .max()
-            .map(|timestamp| {
-                DateTime::from_timestamp_millis(timestamp).ok_or_else(|| {
-                    MonitorError::InvalidResponse("fill timestamp is out of range".to_owned())
-                })
-            })
-            .transpose()?;
         let balances = BalanceObservation {
             spot_usdc: spot_total(&combined.spot_assets, "USDC")?,
             spot_hype: spot_total(&combined.spot_assets, "HYPE")?,
             hype_price_usdc: decimal_to_f64(ticker.price, "HYPE mark")?,
-            last_trade_at,
         };
         let staking = StakingObservation {
             delegated_hype: parse_amount(&summary.delegated, "delegated HYPE")?,
@@ -171,7 +166,7 @@ impl HyperliquidObserver {
                 },
             )?,
         };
-        reconcile_status(&balances, &staking, Utc::now(), trade_cadence)
+        reconcile_status(&balances, &staking, attribution, Utc::now(), trade_cadence)
     }
 
     async fn post_info<T: DeserializeOwned>(&self, body: Value) -> Result<T, MonitorError> {
@@ -189,8 +184,10 @@ impl HyperliquidObserver {
     }
 }
 
-/// Reconciles spot and staking observations into one dashboard balance.
-/// Delegation row mismatches remain visible as a fresh degraded status.
+/// Reconciles account observations with authoritative accumulator attribution.
+/// Unattributed account HYPE is excluded, and unavailable attribution produces
+/// a fresh degraded status with zero reported HYPE instead of silently claiming
+/// pre-existing, transferred, or manually staked holdings.
 ///
 /// # Errors
 ///
@@ -199,6 +196,7 @@ impl HyperliquidObserver {
 pub fn reconcile_status(
     balances: &BalanceObservation,
     staking: &StakingObservation,
+    attribution: &HypeAttribution,
     observed_at: DateTime<Utc>,
     trade_cadence: impl Into<String>,
 ) -> Result<AccumulatorStatus, MonitorError> {
@@ -212,20 +210,45 @@ pub fn reconcile_status(
     ] {
         finite_nonnegative(label, value)?;
     }
-    let mismatch = (staking.delegated_hype - staking.delegation_rows_hype).abs();
-    let tolerance = 1e-8_f64.max(staking.delegated_hype.abs() * 1e-10);
-    let health_reason = (mismatch > tolerance)
-        .then(|| "staking delegation total does not match delegator summary".to_owned());
-    let total_hype = balances.spot_hype
+    let observed_hype = balances.spot_hype
         + staking.delegated_hype
         + staking.undelegated_hype
         + staking.pending_withdrawal_hype;
+    let attribution_tolerance = 1e-8_f64.max(observed_hype.abs() * 1e-10);
+    let delegation_tolerance = 1e-8_f64.max(staking.delegated_hype.abs() * 1e-10);
+    let mismatch = (staking.delegated_hype - staking.delegation_rows_hype).abs();
+    let mut health_reasons = Vec::new();
+    if mismatch > delegation_tolerance {
+        health_reasons.push("staking delegation total does not match delegator summary");
+    }
+    let (attributed_hype, last_trade_at) = match attribution {
+        HypeAttribution::Unavailable => {
+            health_reasons.push("HYPE attribution unavailable; account holdings excluded");
+            (0.0, None)
+        }
+        HypeAttribution::Reconciled {
+            hype,
+            last_trade_at,
+        } => {
+            finite_nonnegative("attributed HYPE", *hype)?;
+            if *hype > observed_hype + attribution_tolerance {
+                return Err(MonitorError::InvalidResponse(
+                    "attributed HYPE exceeds observed account holdings".to_owned(),
+                ));
+            }
+            if observed_hype - *hype > attribution_tolerance {
+                health_reasons.push("unattributed HYPE account holdings excluded");
+            }
+            (*hype, *last_trade_at)
+        }
+    };
+    let health_reason = (!health_reasons.is_empty()).then(|| health_reasons.join("; "));
     AccumulatorStatus::new(
         balances.spot_usdc,
-        total_hype,
+        attributed_hype,
         balances.hype_price_usdc,
         observed_at,
-        balances.last_trade_at,
+        last_trade_at,
         trade_cadence,
         health_reason,
     )

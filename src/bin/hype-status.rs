@@ -1,7 +1,7 @@
 use chrono::Utc;
 use hype_accumulator::{
     config::{Config, ProcessEnvironment},
-    monitor::{trade_cadence_label, HyperliquidObserver},
+    monitor::{trade_cadence_label, HypeAttribution, HyperliquidObserver},
     status::DashboardStatus,
     status_io::write_status_atomic,
 };
@@ -29,7 +29,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let process_started_at = Utc::now();
     let observer = HyperliquidObserver::new(&config.hyperliquid.endpoint, &account)?;
     let accumulator = observer
-        .observe(trade_cadence_label(&config.schedule))
+        .observe(
+            &HypeAttribution::Unavailable,
+            trade_cadence_label(&config.schedule),
+        )
         .await?;
     let updated_at = Utc::now();
     let status = DashboardStatus::new(updated_at, process_started_at, config.dry_run, accumulator);

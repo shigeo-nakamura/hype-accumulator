@@ -28,6 +28,11 @@ paths. `config/example.toml` is safe and non-routable.
 The live adapter and persistent ledger backend are intentionally outside this
 bootstrap. The crate pins tagged `dex-connector` with `hyperliquid-sdk` only.
 
+The read-only status observer therefore treats HYPE attribution as unavailable:
+it reports zero HYPE with degraded health until an authoritative accumulator
+ledger supplies reconciled holdings and last-trade identity. Raw account HYPE
+and account-wide fills are never presented as accumulator activity.
+
 ## Dashboard status contract
 
 The accumulator publishes a nested `accumulator` status block for

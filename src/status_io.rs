@@ -28,7 +28,7 @@ pub fn write_status_atomic(
     status: &DashboardStatus,
 ) -> Result<(), StatusIoError> {
     let path = path.as_ref();
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = normalized_parent(path);
     let file_name = path.file_name().ok_or(StatusIoError::InvalidPath)?;
     fs::create_dir_all(parent)?;
     let nonce = SystemTime::now()
@@ -60,8 +60,25 @@ pub fn write_status_atomic(
     result.map_err(StatusIoError::from)
 }
 
+fn normalized_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
 fn temporary_path(parent: &Path, file_name: &std::ffi::OsStr, nonce: u128) -> PathBuf {
     let mut name = file_name.to_os_string();
     name.push(format!(".{}.{}.tmp", std::process::id(), nonce));
     parent.join(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalized_parent;
+    use std::path::Path;
+
+    #[test]
+    fn bare_file_name_uses_current_directory() {
+        assert_eq!(normalized_parent(Path::new("status.json")), Path::new("."));
+    }
 }
