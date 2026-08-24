@@ -379,7 +379,7 @@ impl PacingState {
         ordered.sort_by_key(|event| match event {
             CapitalEvent::Deposit(deposit) => (deposit.received_at, 0_u8, &deposit.event_id),
             CapitalEvent::Withdrawal(withdrawal) => {
-                (withdrawal.reconciled_at, 1_u8, &withdrawal.event_id)
+                (withdrawal.occurred_at, 1_u8, &withdrawal.event_id)
             }
         });
         for event in ordered {
@@ -738,7 +738,7 @@ impl PacingState {
             self.withdrawals
                 .values()
                 .filter(|record| !record.applied && record.event.reconciled_at <= at)
-                .map(|record| (record.event.reconciled_at, 1, record.event.event_id.clone())),
+                .map(|record| (record.event.occurred_at, 1, record.event.event_id.clone())),
         );
         timeline.sort();
         for (_, kind, id) in timeline {

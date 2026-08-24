@@ -139,12 +139,18 @@ fn future_deposit_cannot_retroactively_fund_an_earlier_withdrawal() {
     let mut state = PacingState::default();
     let withdrawn_at = at(2026, 1, 1, 8);
     let deposited_at = at(2026, 1, 1, 9);
+    let reconciled_at = at(2026, 1, 1, 10);
     let result = state.reconcile_capital(
         &[
-            withdrawal("earlier-withdrawal", 10, withdrawn_at),
+            CapitalEvent::Withdrawal(WithdrawalEvent {
+                event_id: "earlier-withdrawal".to_owned(),
+                amount_usdc: usd(10),
+                occurred_at: withdrawn_at,
+                reconciled_at,
+            }),
             deposit("later-deposit", 100, deposited_at),
         ],
-        at(2026, 1, 1, 10),
+        at(2026, 1, 1, 11),
         &limits,
     );
     assert!(matches!(
