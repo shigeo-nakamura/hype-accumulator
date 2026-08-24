@@ -114,6 +114,32 @@ class PointInTimeContractTests(unittest.TestCase):
             ):
                 load_capital_events(manifest)
 
+    def test_empty_or_whitespace_capital_event_ids_are_rejected(self) -> None:
+        original = json.loads(
+            (FIXTURES / "capital-one-manifest.json").read_text(encoding="utf-8")
+        )
+        for event_id in ("", "   ", " event "):
+            with self.subTest(event_id=event_id):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    events = root / "events.csv"
+                    events.write_text(
+                        "event_id,kind,amount_usd,occurred_at,confirmed_at,first_usable_at\n"
+                        f"{event_id},deposit,60,2025-01-01T08:00:00Z,2025-01-01T09:00:00Z,2025-01-01T09:01:00Z\n",
+                        encoding="utf-8",
+                    )
+                    manifest_body = dict(original)
+                    manifest_body["files"] = dict(original["files"])
+                    manifest_body["files"]["events"] = {
+                        "path": events.name,
+                        "sha256": digest(events),
+                    }
+                    manifest = root / "manifest.json"
+                    manifest.write_text(json.dumps(manifest_body), encoding="utf-8")
+
+                    with self.assertRaisesRegex(ValueError, "capital event IDs must be nonempty"):
+                        load_capital_events(manifest)
+
     def test_nonfinite_observation_is_rejected(self) -> None:
         original = json.loads((FIXTURES / "dataset-manifest.json").read_text(encoding="utf-8"))
         with tempfile.TemporaryDirectory() as directory:

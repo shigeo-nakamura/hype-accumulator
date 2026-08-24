@@ -118,6 +118,8 @@ def load_capital_events(manifest_path: Path) -> tuple[list[CapitalEvent], dict[s
             if not event.occurred_at <= event.confirmed_at <= event.first_usable_at:
                 raise ValueError(f"invalid capital event timing: {event.event_id}")
             events.append(event)
+    if any(not event.event_id or event.event_id != event.event_id.strip() for event in events):
+        raise ValueError("capital event IDs must be nonempty without surrounding whitespace")
     if len({e.event_id for e in events}) != len(events):
         raise ValueError("capital event IDs must be unique and authoritative")
     deposit_slots = [event.first_usable_at for event in events if event.kind == "deposit"]
