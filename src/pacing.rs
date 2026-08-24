@@ -728,9 +728,39 @@ impl PacingState {
         // a withdrawal that is reconciled late: a deposit admitted by an
         // earlier call must not remain available before its actual usable time.
         for tranche in self.deposits.values_mut() {
-            tranche.admitted_usdc = UsdcMicros::default();
+            let durable_backing = checked_add(tranche.invested_usdc, tranche.committed_usdc)?;
+            if durable_backing > tranche.source_amount_usdc
+                || (!durable_backing.is_zero()
+                    && tranche
+                        .first_usable_at
+                        .is_none_or(|usable_at| usable_at > at))
+            {
+                return Err(PacingError::CorruptState);
+            }
+            // Immutable commitments and fills keep first claim on admission
+            // capacity. A newly learned earlier event may redistribute only
+            // the unused admission around that durable economic history.
+            tranche.admitted_usdc = durable_backing;
             tranche.withdrawn_usdc = UsdcMicros::default();
             tranche.status = status_before_admission(tranche, limits, at);
+        }
+        let reserved_total =
+            checked_sum(self.deposits.values().map(|tranche| tranche.admitted_usdc))?;
+        let reserved_years = self
+            .deposits
+            .values()
+            .map(|tranche| tranche.received_at.year())
+            .collect::<BTreeSet<_>>();
+        if reserved_total > limits.max_automatically_admitted_usdc
+            || reserved_total > limits.cumulative_admission_cap_usdc
+        {
+            return Err(PacingError::CorruptState);
+        }
+        for year in reserved_years {
+            let (_, reserved_year) = self.admitted_totals(year)?;
+            if reserved_year > limits.yearly_admission_cap_usdc {
+                return Err(PacingError::CorruptState);
+            }
         }
         for record in self.withdrawals.values_mut() {
             record.applied = false;

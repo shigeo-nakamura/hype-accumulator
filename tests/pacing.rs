@@ -253,6 +253,53 @@ fn retroactive_withdrawal_never_reuses_committed_or_invested_capital() {
 }
 
 #[test]
+fn late_earlier_deposit_cannot_displace_existing_fill_backing() {
+    let mut limits = limits();
+    limits.max_automatically_admitted_usdc = usd(100);
+    limits.yearly_admission_cap_usdc = usd(100);
+    limits.cumulative_admission_cap_usdc = usd(100);
+    let mut state = PacingState::default();
+    state
+        .reconcile_capital(
+            &[deposit("later-filled", 100, at(2026, 1, 1, 9))],
+            at(2026, 1, 1, 10),
+            &limits,
+        )
+        .expect("later tranche initially consumes the cap");
+    let decision = state
+        .decide(&input(at(2026, 1, 1, 12), 1_000), &limits)
+        .expect("decision from later tranche");
+    let filled = decision.decision().planned_usdc;
+    state
+        .settle_decision(&decision.decision().decision_id, filled)
+        .expect("later tranche filled");
+
+    state
+        .reconcile_capital(
+            &[deposit("delayed-earlier", 100, at(2026, 1, 1, 8))],
+            at(2026, 1, 1, 13),
+            &limits,
+        )
+        .expect("delayed event uses only uncommitted admission capacity");
+
+    let earlier = &state.deposits()["delayed-earlier"];
+    let later = &state.deposits()["later-filled"];
+    assert_eq!(later.invested_usdc, filled);
+    assert_eq!(later.admitted_usdc, filled);
+    assert_eq!(
+        earlier.admitted_usdc,
+        UsdcMicros::from_micros(usd(100).as_micros() - filled.as_micros())
+    );
+    assert_eq!(
+        earlier.admitted_usdc.as_micros() + later.admitted_usdc.as_micros(),
+        usd(100).as_micros()
+    );
+    state
+        .validate_invariants()
+        .expect("fill remains fully backed");
+}
+
+#[test]
 fn unadmitted_or_balance_only_capital_fails_closed() {
     let limits = limits();
     let mut balance_only = PacingState::default();
