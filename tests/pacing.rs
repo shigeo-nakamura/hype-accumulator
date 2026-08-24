@@ -557,6 +557,51 @@ fn fixed_reserve_is_deducted_before_proportional_reserve() {
 }
 
 #[test]
+fn fixed_reserve_is_unavailable_to_withdrawals() {
+    let mut reserved = limits();
+    reserved.max_daily_notional_usdc = usd(100);
+    reserved.fixed_reserve_usdc = usd(10);
+    let received = at(2026, 12, 31, 8);
+    let mut state = PacingState::default();
+    state
+        .reconcile_capital(
+            &[deposit("withdrawal-reserve", 100, received)],
+            at(2026, 12, 31, 10),
+            &reserved,
+        )
+        .expect("reserve deposit");
+    let decision = state
+        .decide(&input(at(2026, 12, 31, 12), 100), &reserved)
+        .expect("reserve-aware decision");
+    assert_eq!(decision.decision().planned_usdc, usd(90));
+    state
+        .settle_decision(&decision.decision().decision_id, usd(90), usd(90))
+        .expect("purchase settles above reserve");
+
+    let before = state.clone();
+    assert!(matches!(
+        state.reconcile_capital(
+            &[withdrawal("reserve-withdrawal", 10, at(2026, 12, 31, 15))],
+            at(2026, 12, 31, 16),
+            &reserved,
+        ),
+        Err(hype_accumulator::pacing::PacingError::WithdrawalExceedsFreeCapital(id))
+            if id == "reserve-withdrawal"
+    ));
+    assert_eq!(state, before);
+    assert_eq!(
+        state.deposits()["withdrawal-reserve"].residual_usdc(),
+        usd(10)
+    );
+
+    reserved.fixed_reserve_usdc = reserved.max_automatically_admitted_usdc;
+    assert_eq!(
+        reserved.validate(),
+        Err(hype_accumulator::pacing::PacingError::InvalidLimits)
+    );
+}
+
+#[test]
 fn fixed_reserve_is_global_across_expired_and_active_horizons() {
     let mut reserved = limits();
     reserved.max_daily_notional_usdc = usd(100);

@@ -129,6 +129,7 @@ impl PacingLimits {
             || self.cumulative_admission_cap_usdc.is_zero()
             || self.max_automatically_admitted_usdc > self.yearly_admission_cap_usdc
             || self.yearly_admission_cap_usdc > self.cumulative_admission_cap_usdc
+            || self.fixed_reserve_usdc >= self.max_automatically_admitted_usdc
             || self.fee_spread_reserve_bps >= 10_000
             || self.final_catch_up_days == 0
             || self.utc_hour > 23
@@ -385,8 +386,8 @@ impl PacingState {
     ///
     /// Deposit admission requires confirmations, cooldown, explicit approval,
     /// and available automatic/yearly/cumulative capacity. A reconciled
-    /// withdrawal consumes only free tranche residual and never creates a HYPE
-    /// sale intent.
+    /// withdrawal consumes only free tranche residual above the global fixed
+    /// reserve and never creates a HYPE sale intent.
     ///
     /// # Errors
     ///
@@ -686,6 +687,21 @@ impl PacingState {
                 return Err(PacingError::CorruptState);
             }
         }
+        let free_before_withdrawals = checked_sum(self.deposits.values().map(|tranche| {
+            UsdcMicros(
+                tranche
+                    .admitted_usdc
+                    .0
+                    .saturating_sub(tranche.invested_usdc.0)
+                    .saturating_sub(tranche.committed_usdc.0),
+            )
+        }))?;
+        let residual = checked_sum(self.deposits.values().map(DepositTranche::residual_usdc))?;
+        let required_reserve =
+            UsdcMicros(free_before_withdrawals.0.min(limits.fixed_reserve_usdc.0));
+        if residual < required_reserve {
+            return Err(PacingError::CorruptState);
+        }
         Ok(())
     }
 
@@ -958,7 +974,7 @@ impl PacingState {
             if kind == 0 {
                 self.admit_ready_deposit(&id, limits)?;
             } else {
-                self.apply_ready_withdrawal(&id)?;
+                self.apply_ready_withdrawal(&id, limits)?;
             }
         }
         Ok(())
@@ -1009,10 +1025,15 @@ impl PacingState {
         Ok((admitted_total, admitted_year))
     }
 
-    fn apply_ready_withdrawal(&mut self, id: &str) -> Result<(), PacingError> {
+    fn apply_ready_withdrawal(
+        &mut self,
+        id: &str,
+        limits: &PacingLimits,
+    ) -> Result<(), PacingError> {
         let record = self.withdrawals.get(id).ok_or(PacingError::CorruptState)?;
         let free = checked_sum(self.deposits.values().map(DepositTranche::residual_usdc))?;
-        if record.event.amount_usdc > free {
+        let withdrawable = checked_sub_floor(free, limits.fixed_reserve_usdc);
+        if record.event.amount_usdc > withdrawable {
             return Err(PacingError::WithdrawalExceedsFreeCapital(id.to_owned()));
         }
         let target = record.event.amount_usdc;
