@@ -1178,14 +1178,13 @@ impl WorkflowState {
             self.binding.decided_at,
             recorded_at,
         ) || !independent_history_watermarks(&evidence.fill_history, &evidence.movement_history)
-            || !evidence.movements.is_empty()
         {
             return Err(WorkflowError::ContradictoryObservation(
-                "eligibility lacks a fresh common fill/movement watermark or a workflow lot moved"
-                    .into(),
+                "eligibility lacks a fresh common fill/movement watermark".into(),
             ));
         }
-        self.validate_bound_fills(evidence, accepted_at, recorded_at)
+        self.validate_bound_fills(evidence, accepted_at, recorded_at)?;
+        Self::validate_bound_movements(evidence, recorded_at)
     }
 
     fn validate_bound_fills(
@@ -1281,6 +1280,49 @@ impl WorkflowState {
                 "authorized fill set does not equal the terminal quantity and execution notional"
                     .into(),
             ));
+        }
+        Ok(())
+    }
+
+    fn validate_bound_movements(
+        evidence: &OrderBoundEligibilityEvidence,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<(), WorkflowError> {
+        let mut movement_ids = BTreeSet::new();
+        let mut consumed = 0_u64;
+        let mut previous: Option<(DateTime<Utc>, &str)> = None;
+        for movement in &evidence.movements {
+            let key = (movement.occurred_at, movement.movement_id.as_str());
+            consumed = consumed
+                .checked_add(movement.consumed_hype.as_atoms())
+                .ok_or_else(|| {
+                    WorkflowError::ContradictoryObservation(
+                        "movement consumption overflowed".into(),
+                    )
+                })?;
+            let residual_available = residual_hype_available_before(
+                &evidence.fills,
+                evidence.residual_reservation_hype,
+                movement.occurred_at,
+            )
+            .ok_or_else(|| {
+                WorkflowError::ContradictoryObservation(
+                    "residual movement availability overflowed".into(),
+                )
+            })?;
+            if !canonical_nonempty(&movement.movement_id)
+                || movement.consumed_hype.is_zero()
+                || !movement_ids.insert(movement.movement_id.as_str())
+                || previous.is_some_and(|previous| previous >= key)
+                || movement.occurred_at > recorded_at
+                || movement.occurred_at > evidence.movement_history.through_at
+                || consumed > residual_available
+            {
+                return Err(WorkflowError::ContradictoryObservation(
+                    "movement evidence is invalid or consumes an eligible allocation".into(),
+                ));
+            }
+            previous = Some(key);
         }
         Ok(())
     }
@@ -2839,6 +2881,24 @@ fn checked_fill_totals(
             WorkflowError::ContradictoryObservation("authorized fill notional overflowed".into())
         })?;
     Ok((purchased, executed_notional))
+}
+
+fn residual_hype_available_before(
+    fills: &[BoundFillEvidence],
+    residual_reservation: HypeAtoms,
+    occurred_at: DateTime<Utc>,
+) -> Option<u64> {
+    let mut residual_remaining = residual_reservation.as_atoms();
+    let mut available = 0_u64;
+    for fill in fills {
+        if fill.executed_at >= occurred_at {
+            break;
+        }
+        let residual_for_fill = residual_remaining.min(fill.purchased_hype.as_atoms());
+        available = available.checked_add(residual_for_fill)?;
+        residual_remaining = residual_remaining.checked_sub(residual_for_fill)?;
+    }
+    Some(available)
 }
 
 fn valid_eligibility_history_watermark(

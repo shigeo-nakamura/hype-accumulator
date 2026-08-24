@@ -2899,6 +2899,70 @@ fn eligibility_expires_at_configured_max_age_boundary() {
 }
 
 #[test]
+fn movements_preserve_eligibility_only_within_the_residual_carve_out() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    for (case, consumed_hype) in [("residual-only", 5), ("eligible-touched", 11)] {
+        let path = temp.path().join(format!("movement-{case}.jsonl"));
+        let mut binding = binding();
+        binding.inventory_before.unconsumed_residual_spot_hype_atoms = hype(0);
+        let mut workflow = reopen(&path, &binding);
+        ready(workflow.prepare_order(at(1)).expect("order prepared"));
+        observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
+        workflow
+            .observe_order_fill(
+                "mixed-fill",
+                hype(20),
+                usdc(4_000_000),
+                usdc(4_040_000),
+                false,
+                at(3),
+            )
+            .expect("mixed fill observed");
+        workflow
+            .finalize_order(
+                hype(20),
+                usdc(4_000_000),
+                usdc(4_040_000),
+                OrderFinality::Canceled,
+                at(4),
+            )
+            .expect("mixed order finalized");
+        let mut evidence = bound_evidence(&workflow, &[("mixed-fill", 20, 3)], at(6));
+        evidence.movements.push(BoundMovementEvidence {
+            movement_id: format!("external-sale-{case}"),
+            consumed_hype: hype(consumed_hype),
+            occurred_at: at(5),
+        });
+
+        let result = workflow.record_staking_eligibility(Some(evidence), at(6));
+        if case == "residual-only" {
+            let eligibility = result.expect("residual-only movement remains eligible");
+            assert_eq!(eligibility.residual_hype, hype(10));
+            assert_eq!(eligibility.eligible_hype, hype(10));
+            assert_eq!(
+                workflow.state().stage(),
+                WorkflowStage::StakingEligibilityRecorded
+            );
+        } else {
+            assert!(matches!(
+                result,
+                Err(WorkflowError::ContradictoryObservation(_))
+            ));
+            assert_eq!(workflow.state().stage(), WorkflowStage::ManualReview);
+        }
+        drop(workflow);
+        assert_eq!(
+            reopen(&path, &binding).state().stage(),
+            if case == "residual-only" {
+                WorkflowStage::StakingEligibilityRecorded
+            } else {
+                WorkflowStage::ManualReview
+            }
+        );
+    }
+}
+
+#[test]
 fn eligibility_requires_fresh_gap_free_movement_coverage() {
     let temp = tempfile::tempdir().expect("temp directory");
     let binding = binding();
