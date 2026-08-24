@@ -179,6 +179,7 @@ struct PurchaseDecisionReplay {
     planned_usdc: UsdcMicros,
     committed_usdc: UsdcMicros,
     filled_usdc: UsdcMicros,
+    fee_usdc: UsdcMicros,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -587,7 +588,6 @@ impl DurableLedger {
             return Err(LedgerError::RestoreDestinationNotEmpty);
         }
         let (_first_lock, _second_lock) = acquire_restore_locks(&source, &destination)?;
-        cleanup_restore_temporaries(&destination)?;
         recover_pending(&source, source_anchor_store.as_ref())?;
         let verified = Self::open_unlocked(source.clone(), source_anchor_store)?;
         let snapshot_payload = read_optional(&source.join(SNAPSHOT_FILE_NAME))?;
@@ -830,7 +830,9 @@ fn apply_event(state: &mut ReplayState, event: &LedgerEvent) -> Result<(), Ledge
             filled_usdc,
             ..
         } => record_fill(state, order_id, *filled_usdc)?,
-        LedgerEventKind::FeeRecorded { order_id, .. } => require_order(state, order_id)?,
+        LedgerEventKind::FeeRecorded { order_id, fee_usdc } => {
+            record_fee(state, order_id, *fee_usdc)?;
+        }
         LedgerEventKind::StakingDepositRecorded { .. }
         | LedgerEventKind::DelegationRecorded { .. }
         | LedgerEventKind::RewardRecorded { .. } => {}
@@ -964,6 +966,7 @@ fn record_purchase_decision(
             planned_usdc,
             committed_usdc,
             filled_usdc: UsdcMicros::default(),
+            fee_usdc: UsdcMicros::default(),
         },
     );
     Ok(())
@@ -1000,28 +1003,68 @@ fn record_fill(
     order_id: &str,
     filled_usdc: UsdcMicros,
 ) -> Result<(), LedgerError> {
-    let decision_id = state
-        .orders
-        .get(order_id)
-        .ok_or_else(|| LedgerError::UnknownOrder(order_id.to_owned()))?
-        .clone();
+    let decision_id = decision_id_for_order(state, order_id)?;
+    require_unsettled_decision_backing(state, &decision_id)?;
     let decision = state
         .purchase_decisions
         .get_mut(&decision_id)
         .ok_or_else(|| LedgerError::UnknownDecision(decision_id.clone()))?;
     let next_filled = checked_add(decision.filled_usdc, filled_usdc)?;
     if next_filled > decision.planned_usdc {
-        return Err(LedgerError::FillExceedsDecisionPlan(decision_id));
+        return Err(LedgerError::FillExceedsDecisionPlan(decision_id.clone()));
+    }
+    if checked_add(next_filled, decision.fee_usdc)? > decision.committed_usdc {
+        return Err(LedgerError::DecisionCostsExceedCommitment(decision_id));
     }
     decision.filled_usdc = next_filled;
     Ok(())
 }
 
-fn require_order(state: &ReplayState, order_id: &str) -> Result<(), LedgerError> {
-    if state.orders.contains_key(order_id) {
+fn record_fee(
+    state: &mut ReplayState,
+    order_id: &str,
+    fee_usdc: UsdcMicros,
+) -> Result<(), LedgerError> {
+    let decision_id = decision_id_for_order(state, order_id)?;
+    require_unsettled_decision_backing(state, &decision_id)?;
+    let decision = state
+        .purchase_decisions
+        .get_mut(&decision_id)
+        .ok_or_else(|| LedgerError::UnknownDecision(decision_id.clone()))?;
+    let next_fee = checked_add(decision.fee_usdc, fee_usdc)?;
+    if checked_add(decision.filled_usdc, next_fee)? > decision.committed_usdc {
+        return Err(LedgerError::DecisionCostsExceedCommitment(decision_id));
+    }
+    decision.fee_usdc = next_fee;
+    Ok(())
+}
+
+fn decision_id_for_order(state: &ReplayState, order_id: &str) -> Result<String, LedgerError> {
+    state
+        .orders
+        .get(order_id)
+        .cloned()
+        .ok_or_else(|| LedgerError::UnknownOrder(order_id.to_owned()))
+}
+
+fn require_unsettled_decision_backing(
+    state: &ReplayState,
+    decision_id: &str,
+) -> Result<(), LedgerError> {
+    let decision = state
+        .purchase_decisions
+        .get(decision_id)
+        .ok_or_else(|| LedgerError::UnknownDecision(decision_id.to_owned()))?;
+    if state
+        .commitments
+        .get(&decision.commitment_id)
+        .is_some_and(|commitment| !commitment.settled)
+    {
         Ok(())
     } else {
-        Err(LedgerError::UnknownOrder(order_id.to_owned()))
+        Err(LedgerError::InsufficientDecisionBacking(
+            decision_id.to_owned(),
+        ))
     }
 }
 
@@ -2024,59 +2067,6 @@ fn remove_durable(directory: &Path, file_name: &str) -> Result<(), LedgerError> 
     }
 }
 
-fn cleanup_restore_temporaries(directory: &Path) -> Result<(), LedgerError> {
-    let mut removed = false;
-    for entry in fs::read_dir(directory).map_err(LedgerError::io)? {
-        let entry = entry.map_err(LedgerError::io)?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if !is_restore_atomic_temporary(name) {
-            continue;
-        }
-        if !entry.file_type().map_err(LedgerError::io)?.is_file() {
-            continue;
-        }
-        fs::remove_file(entry.path()).map_err(LedgerError::io)?;
-        removed = true;
-    }
-    if removed {
-        sync_directory(directory)?;
-    }
-    Ok(())
-}
-
-fn is_restore_atomic_temporary(name: &str) -> bool {
-    [
-        RESTORE_PENDING_FILE_NAME,
-        LEDGER_FILE_NAME,
-        SNAPSHOT_FILE_NAME,
-    ]
-    .iter()
-    .any(|target| {
-        let Some(suffix) = name
-            .strip_prefix(target)
-            .and_then(|suffix| suffix.strip_prefix('.'))
-            .and_then(|suffix| suffix.strip_suffix(".tmp"))
-        else {
-            return false;
-        };
-        let mut parts = suffix.split('.');
-        let Some(process_id) = parts.next() else {
-            return false;
-        };
-        let Some(nonce) = parts.next() else {
-            return false;
-        };
-        parts.next().is_none()
-            && !process_id.is_empty()
-            && process_id.bytes().all(|byte| byte.is_ascii_digit())
-            && !nonce.is_empty()
-            && nonce.bytes().all(|byte| byte.is_ascii_digit())
-    })
-}
-
 fn has_only_restore_entries(directory: &Path, pending: bool) -> Result<bool, LedgerError> {
     for entry in fs::read_dir(directory).map_err(LedgerError::io)? {
         let name = entry.map_err(LedgerError::io)?.file_name();
@@ -2162,6 +2152,8 @@ pub enum LedgerError {
     UnknownOrder(String),
     #[error("fills exceed the purchase decision plan: {0}")]
     FillExceedsDecisionPlan(String),
+    #[error("fills and fees exceed the purchase decision commitment: {0}")]
+    DecisionCostsExceedCommitment(String),
     #[error("unknown commitment: {0}")]
     UnknownCommitment(String),
     #[error("commitment already settled: {0}")]
@@ -2598,11 +2590,6 @@ mod transaction_tests {
             write_pending_restore(&destination, &pending).expect("persist restore intent");
             write_atomic(&destination.join(LEDGER_FILE_NAME), &ledger_payload)
                 .expect("publish journal before interruption");
-            fs::write(
-                destination.join(format!("{SNAPSHOT_FILE_NAME}.123.456.tmp")),
-                b"partial snapshot",
-            )
-            .expect("leave orphaned snapshot temporary");
         }
 
         let restored = DurableLedger::restore_clean(
@@ -2615,9 +2602,6 @@ mod transaction_tests {
         assert_eq!(restored.records, verified.records);
         assert_eq!(restored.state, verified.state);
         assert!(!destination.join(RESTORE_PENDING_FILE_NAME).exists());
-        assert!(!destination
-            .join(format!("{SNAPSHOT_FILE_NAME}.123.456.tmp"))
-            .exists());
 
         let retried = DurableLedger::restore_clean(
             source.path(),

@@ -595,6 +595,140 @@ fn fills_are_capped_across_all_orders_for_one_decision() {
 }
 
 #[test]
+fn fills_and_fees_share_the_decision_commitment_cap() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let anchor = anchor_store();
+    let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+    let date = at(0).date_naive();
+    ledger
+        .append(dated_event(
+            "daily-cost-cap",
+            date,
+            1,
+            LedgerEventKind::DailyDecision {
+                decision_id: "decision-cost-cap".into(),
+                decision_date: date,
+                commitment_id: "commitment-decision-cost-cap".into(),
+                planned_usdc: usd(10),
+                committed_usdc: usd(12),
+            },
+        ))
+        .expect("append cost-capped decision");
+    append_decision_backing(&mut ledger, "decision-cost-cap", date, 12);
+    ledger
+        .append(dated_event(
+            "order-cost-cap",
+            date,
+            5,
+            LedgerEventKind::OrderRecorded {
+                order_id: "order-cost-cap".into(),
+                decision_id: "decision-cost-cap".into(),
+            },
+        ))
+        .expect("append backed order");
+    ledger
+        .append(dated_event(
+            "fill-cost-cap",
+            date,
+            6,
+            LedgerEventKind::FillRecorded {
+                order_id: "order-cost-cap".into(),
+                filled_usdc: usd(10),
+                received_hype_atoms: 1,
+            },
+        ))
+        .expect("append planned fill");
+    ledger
+        .append(dated_event(
+            "fee-cost-cap",
+            date,
+            7,
+            LedgerEventKind::FeeRecorded {
+                order_id: "order-cost-cap".into(),
+                fee_usdc: usd(2),
+            },
+        ))
+        .expect("append fee within commitment");
+    assert_eq!(
+        ledger.append(dated_event(
+            "fee-over-cost-cap",
+            date,
+            8,
+            LedgerEventKind::FeeRecorded {
+                order_id: "order-cost-cap".into(),
+                fee_usdc: usd(1),
+            },
+        )),
+        Err(LedgerError::DecisionCostsExceedCommitment(
+            "decision-cost-cap".into()
+        ))
+    );
+}
+
+#[test]
+fn fills_and_fees_are_rejected_after_backing_settles() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let anchor = anchor_store();
+    let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+    let date = at(0).date_naive();
+    ledger
+        .append(daily_outcome(
+            "daily-settled-costs",
+            "decision-settled-costs",
+            date,
+            "decision",
+        ))
+        .expect("append decision");
+    append_decision_backing(&mut ledger, "decision-settled-costs", date, 10);
+    ledger
+        .append(dated_event(
+            "order-settled-costs",
+            date,
+            5,
+            LedgerEventKind::OrderRecorded {
+                order_id: "order-settled-costs".into(),
+                decision_id: "decision-settled-costs".into(),
+            },
+        ))
+        .expect("append backed order");
+    ledger
+        .append(dated_event(
+            "settle-before-costs",
+            date,
+            6,
+            LedgerEventKind::CapitalSettled {
+                commitment_id: "commitment-decision-settled-costs".into(),
+                debited_usdc: usd(0),
+            },
+        ))
+        .expect("settle backing");
+    for (event_id, kind) in [
+        (
+            "fill-after-settle",
+            LedgerEventKind::FillRecorded {
+                order_id: "order-settled-costs".into(),
+                filled_usdc: usd(1),
+                received_hype_atoms: 1,
+            },
+        ),
+        (
+            "fee-after-settle",
+            LedgerEventKind::FeeRecorded {
+                order_id: "order-settled-costs".into(),
+                fee_usdc: usd(1),
+            },
+        ),
+    ] {
+        assert_eq!(
+            ledger.append(dated_event(event_id, date, 10, kind)),
+            Err(LedgerError::InsufficientDecisionBacking(
+                "decision-settled-costs".into()
+            ))
+        );
+    }
+}
+
+#[test]
 fn purchase_order_requires_sufficient_unsettled_backing() {
     for (case, backing, settle) in [("insufficient", 9, false), ("settled", 10, true)] {
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -1095,7 +1229,7 @@ fn clean_directory_restore_round_trips_exact_checkpoint() {
 }
 
 #[test]
-fn restore_recovers_orphaned_atomic_intent_temporary() {
+fn restore_preserves_unverified_atomic_temporary_and_fails_closed() {
     let source = tempfile::tempdir().expect("source directory");
     let container = tempfile::tempdir().expect("destination container");
     let destination = container.path().join("restored");
@@ -1111,15 +1245,19 @@ fn restore_recovers_orphaned_atomic_intent_temporary() {
     let orphan = destination.join(".pending-restore.json.123.456.tmp");
     fs::write(&orphan, b"partial restore intent").expect("write orphaned intent temporary");
 
-    let restored = restore(
-        source.path(),
-        &destination,
-        &source_anchor,
-        &destination_anchor,
-    )
-    .expect("restore after interrupted intent publication");
-    assert_eq!(restored.record_count(), 1);
-    assert!(!orphan.exists());
+    assert!(matches!(
+        restore(
+            source.path(),
+            &destination,
+            &source_anchor,
+            &destination_anchor,
+        ),
+        Err(LedgerError::RestoreDestinationNotEmpty)
+    ));
+    assert_eq!(
+        fs::read(&orphan).expect("unverified temporary remains"),
+        b"partial restore intent"
+    );
 }
 
 #[test]
