@@ -4,9 +4,9 @@ use hype_accumulator::{
     workflow::{
         ActionKind, AppendOutcome, BoundFillEvidence, BoundMovementEvidence,
         ConclusiveAbsenceEvidence, DecisionBinding, DurableWorkflow, EligibilityPolicyBinding,
-        ExternalAction, ExternalReceipt, GapFreeHistoryWatermark, HypeAtoms, InventoryBaseline,
-        OrderBoundEligibilityEvidence, OrderEnvelopeBinding, OrderFinality, PrepareOutcome,
-        WorkflowError, WorkflowStage,
+        ExternalAction, ExternalReceipt, GapFreeHistoryWatermark, HistoryDomain, HypeAtoms,
+        InventoryBaseline, OrderBoundEligibilityEvidence, OrderEnvelopeBinding, OrderFinality,
+        PrepareOutcome, WorkflowError, WorkflowStage,
     },
 };
 use std::{
@@ -150,6 +150,7 @@ fn bound_evidence(
         residual_reservation_hype: hype(residual_reservation),
         policy_version: binding.eligibility_policy.policy_version.clone(),
         fill_history: GapFreeHistoryWatermark {
+            domain: HistoryDomain::Fill,
             watermark_id: "eligibility-fill-watermark-a".to_owned(),
             cursor: 303,
             gap_free_from_at: binding.decided_at,
@@ -157,6 +158,7 @@ fn bound_evidence(
             evidence_hash: "eligibility-fill-history-a".to_owned(),
         },
         movement_history: GapFreeHistoryWatermark {
+            domain: HistoryDomain::Movement,
             watermark_id: "eligibility-movement-watermark-a".to_owned(),
             cursor: 404,
             gap_free_from_at: binding.decided_at,
@@ -169,6 +171,14 @@ fn bound_evidence(
             .enumerate()
             .map(|(index, (fill_id, atoms, minute))| BoundFillEvidence {
                 fill_id: (*fill_id).to_owned(),
+                authorization_id: "order-bound-authorization-a".to_owned(),
+                authorization_record_hash: "authorization-record-hash-a".to_owned(),
+                execution_identity_hash: binding.inventory_before.execution_identity_hash.clone(),
+                client_order_id: state.client_order_id(),
+                order_id: state
+                    .exchange_order_id()
+                    .expect("accepted order identity")
+                    .to_owned(),
                 purchased_hype: hype(*atoms),
                 executed_at: at(*minute),
                 first_observed_at: at(*minute),
@@ -195,6 +205,7 @@ fn absence_evidence(workflow: &DurableWorkflow, observation_id: &str) -> Conclus
         client_order_id: state.client_order_id(),
         effective_expiry_at: state.binding().order_envelope.effective_expiry_at,
         order_history: GapFreeHistoryWatermark {
+            domain: HistoryDomain::Order,
             watermark_id: "order-history-watermark-a".to_owned(),
             cursor: 101,
             gap_free_from_at,
@@ -202,6 +213,7 @@ fn absence_evidence(workflow: &DurableWorkflow, observation_id: &str) -> Conclus
             evidence_hash: "order-history-evidence-hash-a".to_owned(),
         },
         fill_history: GapFreeHistoryWatermark {
+            domain: HistoryDomain::Fill,
             watermark_id: "fill-history-watermark-a".to_owned(),
             cursor: 202,
             gap_free_from_at,
@@ -653,7 +665,14 @@ fn conclusively_absent_submission_releases_pending_intent_and_completes() {
 fn absence_requires_effective_expiry_and_both_gap_free_watermarks() {
     let temp = tempfile::tempdir().expect("temp directory");
     let binding = binding();
-    for invalid in ["before-expiry", "order-gap", "fill-gap"] {
+    for invalid in [
+        "before-expiry",
+        "order-gap",
+        "fill-gap",
+        "order-domain",
+        "fill-domain",
+        "same-proof",
+    ] {
         let path = temp.path().join(format!("invalid-absence-{invalid}.jsonl"));
         let mut workflow = reopen(&path, &binding);
         ready(workflow.prepare_order(at(1)).expect("order prepared"));
@@ -666,6 +685,19 @@ fn absence_requires_effective_expiry_and_both_gap_free_watermarks() {
             }
             "fill-gap" => {
                 evidence.fill_history.gap_free_from_at = at(1);
+                at(31)
+            }
+            "order-domain" => {
+                evidence.order_history.domain = HistoryDomain::Fill;
+                at(31)
+            }
+            "fill-domain" => {
+                evidence.fill_history.domain = HistoryDomain::Order;
+                at(31)
+            }
+            "same-proof" => {
+                evidence.fill_history.watermark_id = evidence.order_history.watermark_id.clone();
+                evidence.fill_history.evidence_hash = evidence.order_history.evidence_hash.clone();
                 at(31)
             }
             _ => unreachable!("complete fixture set"),
@@ -682,6 +714,75 @@ fn absence_requires_effective_expiry_and_both_gap_free_watermarks() {
             WorkflowStage::ManualReview
         );
     }
+}
+
+#[test]
+fn fully_filled_observation_requires_the_full_signed_quantity() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("partial-fully-filled-observation.jsonl");
+    let binding = binding();
+    let mut workflow = reopen(&path, &binding);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    workflow
+        .observe_order_submission("exchange-order-1", at(2))
+        .expect("submission observed");
+
+    assert!(matches!(
+        workflow.observe_order_fill(
+            "partial-fill",
+            hype(100),
+            usdc(20_000_000),
+            usdc(20_200_000),
+            true,
+            at(3),
+        ),
+        Err(WorkflowError::ContradictoryObservation(_))
+    ));
+    assert_eq!(workflow.state().stage(), WorkflowStage::ManualReview);
+    drop(workflow);
+    assert_eq!(
+        reopen(&path, &binding).state().stage(),
+        WorkflowStage::ManualReview
+    );
+}
+
+#[test]
+fn filled_finality_requires_the_full_signed_quantity() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("partial-filled-finality.jsonl");
+    let binding = binding();
+    let mut workflow = reopen(&path, &binding);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    workflow
+        .observe_order_submission("exchange-order-1", at(2))
+        .expect("submission observed");
+    workflow
+        .observe_order_fill(
+            "partial-fill",
+            hype(100),
+            usdc(20_000_000),
+            usdc(20_200_000),
+            false,
+            at(3),
+        )
+        .expect("partial fill observed");
+
+    assert!(matches!(
+        workflow.finalize_order(
+            hype(100),
+            usdc(20_000_000),
+            usdc(20_200_000),
+            OrderFinality::Filled,
+            at(4),
+        ),
+        Err(WorkflowError::ContradictoryObservation(_))
+    ));
+    assert_eq!(workflow.state().stage(), WorkflowStage::ManualReview);
+    drop(workflow);
+    assert_eq!(
+        reopen(&path, &binding).state().stage(),
+        WorkflowStage::ManualReview
+    );
 }
 
 #[test]
@@ -1310,6 +1411,11 @@ fn eligibility_requires_durable_timely_fill_registration() {
         "registered-at-deadline",
         "wrong-deadline",
         "zero-window",
+        "wrong-authorization",
+        "wrong-authorization-hash",
+        "wrong-execution-identity",
+        "wrong-cloid",
+        "wrong-order",
     ] {
         let mut binding = binding();
         if invalid == "zero-window" {
@@ -1356,6 +1462,15 @@ fn eligibility_requires_durable_timely_fill_registration() {
             "registered-at-deadline" => fill.registered_at = fill.registration_deadline_at,
             "wrong-deadline" => fill.registration_deadline_at = at(5),
             "zero-window" => fill.registration_deadline_at = fill.first_observed_at,
+            "wrong-authorization" => fill.authorization_id = "authorization-b".to_owned(),
+            "wrong-authorization-hash" => {
+                fill.authorization_record_hash = "authorization-record-hash-b".to_owned();
+            }
+            "wrong-execution-identity" => {
+                fill.execution_identity_hash = "signer-identity-hash-b".to_owned();
+            }
+            "wrong-cloid" => fill.client_order_id = "0xother-cloid".to_owned(),
+            "wrong-order" => fill.order_id = "exchange-order-2".to_owned(),
             _ => unreachable!("complete fixture set"),
         }
 
@@ -1449,6 +1564,9 @@ fn eligibility_requires_fresh_gap_free_movement_coverage() {
         "fill-watermark-stale",
         "movement-gap",
         "movement-zero-cursor",
+        "fill-domain",
+        "movement-domain",
+        "same-proof",
     ] {
         let path = temp
             .path()
@@ -1487,6 +1605,13 @@ fn eligibility_requires_fresh_gap_free_movement_coverage() {
             "fill-watermark-stale" => evidence.fill_history.through_at = at(5),
             "movement-gap" => evidence.movement_history.gap_free_from_at = at(1),
             "movement-zero-cursor" => evidence.movement_history.cursor = 0,
+            "fill-domain" => evidence.fill_history.domain = HistoryDomain::Order,
+            "movement-domain" => evidence.movement_history.domain = HistoryDomain::Fill,
+            "same-proof" => {
+                evidence.movement_history.watermark_id = evidence.fill_history.watermark_id.clone();
+                evidence.movement_history.evidence_hash =
+                    evidence.fill_history.evidence_hash.clone();
+            }
             _ => unreachable!("complete fixture set"),
         }
 
@@ -1514,13 +1639,20 @@ fn accepted_order_without_bound_authorization_is_permanently_ineligible() {
         .observe_order_submission("exchange-order-1", at(2))
         .expect("submission observed");
     workflow
-        .observe_order_fill("fill-1", hype(1), usdc(100_000), usdc(101_000), true, at(3))
+        .observe_order_fill(
+            "fill-1",
+            hype(250),
+            usdc(50_000_000),
+            usdc(50_500_000),
+            true,
+            at(3),
+        )
         .expect("fill observed");
     workflow
         .finalize_order(
-            hype(1),
-            usdc(100_000),
-            usdc(101_000),
+            hype(250),
+            usdc(50_000_000),
+            usdc(50_500_000),
             OrderFinality::Filled,
             at(4),
         )
@@ -1531,7 +1663,7 @@ fn accepted_order_without_bound_authorization_is_permanently_ineligible() {
         Err(WorkflowError::ContradictoryObservation(_))
     ));
     assert_eq!(workflow.state().stage(), WorkflowStage::ManualReview);
-    let valid_evidence = bound_evidence(&workflow, &[("fill-1", 1, 3)], at(6));
+    let valid_evidence = bound_evidence(&workflow, &[("fill-1", 250, 3)], at(6));
     assert!(matches!(
         workflow.record_staking_eligibility(Some(valid_evidence), at(6)),
         Err(WorkflowError::InvalidTransition(_))

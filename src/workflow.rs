@@ -333,6 +333,11 @@ pub struct StakingEligibility {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BoundFillEvidence {
     pub fill_id: String,
+    pub authorization_id: String,
+    pub authorization_record_hash: String,
+    pub execution_identity_hash: String,
+    pub client_order_id: String,
+    pub order_id: String,
     pub purchased_hype: HypeAtoms,
     pub executed_at: DateTime<Utc>,
     pub first_observed_at: DateTime<Utc>,
@@ -384,9 +389,18 @@ pub struct OrderBoundEligibilityEvidence {
     pub fills: Vec<BoundFillEvidence>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryDomain {
+    Order,
+    Fill,
+    Movement,
+}
+
 /// Gap-free authoritative history coverage used for conclusive absence.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GapFreeHistoryWatermark {
+    pub domain: HistoryDomain,
     pub watermark_id: String,
     pub cursor: u64,
     pub gap_free_from_at: DateTime<Utc>,
@@ -728,11 +742,11 @@ impl WorkflowState {
                         "fill is invalid for current state".into(),
                     ));
                 }
-                self.validate_cumulative_fill(
+                self.validate_observed_fill(
                     *cumulative_hype,
                     *cumulative_filled_usdc,
                     *cumulative_debited_usdc,
-                    false,
+                    *fully_filled,
                 )?;
                 if self.stage == WorkflowStage::Filled && !fully_filled {
                     return Err(WorkflowError::ContradictoryObservation(
@@ -767,11 +781,11 @@ impl WorkflowState {
                         "order finalization is invalid for current state".into(),
                     ));
                 }
-                self.validate_cumulative_fill(
+                self.validate_order_finalization(
                     *cumulative_hype,
                     *cumulative_filled_usdc,
                     *cumulative_debited_usdc,
-                    matches!(finality, OrderFinality::Canceled | OrderFinality::Expired),
+                    *finality,
                 )?;
                 self.purchased_hype = *cumulative_hype;
                 self.filled_usdc = *cumulative_filled_usdc;
@@ -967,14 +981,17 @@ impl WorkflowState {
             || evidence.client_order_id != client_order_id_for(&self.workflow_id)
             || evidence.effective_expiry_at != effective_expiry_at
             || recorded_at <= effective_expiry_at
+            || !independent_history_watermarks(&evidence.order_history, &evidence.fill_history)
             || !valid_gap_free_watermark(
                 &evidence.order_history,
+                HistoryDomain::Order,
                 self.binding.decided_at,
                 effective_expiry_at,
                 recorded_at,
             )
             || !valid_gap_free_watermark(
                 &evidence.fill_history,
+                HistoryDomain::Fill,
                 self.binding.decided_at,
                 effective_expiry_at,
                 recorded_at,
@@ -1045,13 +1062,16 @@ impl WorkflowState {
         }
         if !valid_eligibility_history_watermark(
             &evidence.fill_history,
+            HistoryDomain::Fill,
             self.binding.decided_at,
             recorded_at,
         ) || !valid_eligibility_history_watermark(
             &evidence.movement_history,
+            HistoryDomain::Movement,
             self.binding.decided_at,
             recorded_at,
-        ) || !evidence.movements.is_empty()
+        ) || !independent_history_watermarks(&evidence.fill_history, &evidence.movement_history)
+            || !evidence.movements.is_empty()
         {
             return Err(WorkflowError::ContradictoryObservation(
                 "eligibility lacks a fresh common fill/movement watermark or a workflow lot moved"
@@ -1111,6 +1131,11 @@ impl WorkflowState {
                     )
                 })?;
             if fill.fill_id.trim().is_empty()
+                || fill.authorization_id != evidence.authorization_id
+                || fill.authorization_record_hash != evidence.authorization_record_hash
+                || fill.execution_identity_hash != evidence.execution_identity_hash
+                || fill.client_order_id != evidence.client_order_id
+                || fill.order_id != evidence.order_id
                 || fill.purchased_hype.is_zero()
                 || !fill_ids.insert(fill.fill_id.as_str())
                 || previous.is_some_and(|previous| previous >= key)
@@ -1148,6 +1173,50 @@ impl WorkflowState {
         if purchased != self.purchased_hype.as_atoms() {
             return Err(WorkflowError::ContradictoryObservation(
                 "authorized fill set does not equal the terminal purchased quantity".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_observed_fill(
+        &self,
+        cumulative_hype: HypeAtoms,
+        cumulative_filled_usdc: UsdcMicros,
+        cumulative_debited_usdc: UsdcMicros,
+        fully_filled: bool,
+    ) -> Result<(), WorkflowError> {
+        self.validate_cumulative_fill(
+            cumulative_hype,
+            cumulative_filled_usdc,
+            cumulative_debited_usdc,
+            false,
+        )?;
+        if fully_filled && cumulative_hype != self.binding.order_envelope.original_quantity_hype {
+            return Err(WorkflowError::ContradictoryObservation(
+                "fully-filled observation did not reconcile the full signed quantity".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_order_finalization(
+        &self,
+        cumulative_hype: HypeAtoms,
+        cumulative_filled_usdc: UsdcMicros,
+        cumulative_debited_usdc: UsdcMicros,
+        finality: OrderFinality,
+    ) -> Result<(), WorkflowError> {
+        self.validate_cumulative_fill(
+            cumulative_hype,
+            cumulative_filled_usdc,
+            cumulative_debited_usdc,
+            matches!(finality, OrderFinality::Canceled | OrderFinality::Expired),
+        )?;
+        if finality == OrderFinality::Filled
+            && cumulative_hype != self.binding.order_envelope.original_quantity_hype
+        {
+            return Err(WorkflowError::ContradictoryObservation(
+                "filled finality did not reconcile the full signed quantity".into(),
             ));
         }
         Ok(())
@@ -1244,11 +1313,11 @@ impl WorkflowState {
             ) =>
             {
                 if let Err(WorkflowError::ContradictoryObservation(reason)) = self
-                    .validate_cumulative_fill(
+                    .validate_observed_fill(
                         *cumulative_hype,
                         *cumulative_filled_usdc,
                         *cumulative_debited_usdc,
-                        false,
+                        *fully_filled,
                     )
                 {
                     return Some(reason);
@@ -1269,11 +1338,11 @@ impl WorkflowState {
                     | WorkflowStage::Filled
             ) =>
             {
-                match self.validate_cumulative_fill(
+                match self.validate_order_finalization(
                     *cumulative_hype,
                     *cumulative_filled_usdc,
                     *cumulative_debited_usdc,
-                    matches!(finality, OrderFinality::Canceled | OrderFinality::Expired),
+                    *finality,
                 ) {
                     Err(WorkflowError::ContradictoryObservation(reason)) => Some(reason),
                     _ => None,
@@ -2017,16 +2086,27 @@ fn validate_receipt(receipt: &ExternalReceipt) -> Result<(), WorkflowError> {
 
 fn valid_gap_free_watermark(
     watermark: &GapFreeHistoryWatermark,
+    expected_domain: HistoryDomain,
     required_from_at: DateTime<Utc>,
     effective_expiry_at: DateTime<Utc>,
     recorded_at: DateTime<Utc>,
 ) -> bool {
-    !watermark.watermark_id.trim().is_empty()
+    watermark.domain == expected_domain
+        && !watermark.watermark_id.trim().is_empty()
         && watermark.cursor > 0
         && !watermark.evidence_hash.trim().is_empty()
         && watermark.gap_free_from_at <= required_from_at
         && watermark.through_at > effective_expiry_at
         && watermark.through_at <= recorded_at
+}
+
+fn independent_history_watermarks(
+    left: &GapFreeHistoryWatermark,
+    right: &GapFreeHistoryWatermark,
+) -> bool {
+    left.domain != right.domain
+        && left.watermark_id != right.watermark_id
+        && left.evidence_hash != right.evidence_hash
 }
 
 fn max_order_notional_usdc(envelope: &OrderEnvelopeBinding) -> Option<UsdcMicros> {
@@ -2045,10 +2125,12 @@ fn policy_time_delta(seconds: u64) -> Option<TimeDelta> {
 
 fn valid_eligibility_history_watermark(
     watermark: &GapFreeHistoryWatermark,
+    expected_domain: HistoryDomain,
     required_from_at: DateTime<Utc>,
     recorded_at: DateTime<Utc>,
 ) -> bool {
-    !watermark.watermark_id.trim().is_empty()
+    watermark.domain == expected_domain
+        && !watermark.watermark_id.trim().is_empty()
         && watermark.cursor > 0
         && !watermark.evidence_hash.trim().is_empty()
         && watermark.gap_free_from_at <= required_from_at
