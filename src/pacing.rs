@@ -20,7 +20,7 @@ use std::{
 };
 use thiserror::Error;
 
-const STATE_SCHEMA_VERSION: u8 = 1;
+const STATE_SCHEMA_VERSION: u8 = 2;
 const BPS_DENOMINATOR: u64 = 10_000;
 const USDC_MICROS_PER_UNIT: u64 = 1_000_000;
 type DueRow = (NaiveDate, DateTime<Utc>, String, UsdcMicros, UsdcMicros);
@@ -322,6 +322,7 @@ impl DecisionResult {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PacingState {
     schema_version: u8,
+    capital_reconciled_through: Option<DateTime<Utc>>,
     deposits: BTreeMap<String, DepositTranche>,
     withdrawals: BTreeMap<String, WithdrawalRecord>,
     decisions: BTreeMap<NaiveDate, DailyDecision>,
@@ -331,6 +332,7 @@ impl Default for PacingState {
     fn default() -> Self {
         Self {
             schema_version: STATE_SCHEMA_VERSION,
+            capital_reconciled_through: None,
             deposits: BTreeMap::new(),
             withdrawals: BTreeMap::new(),
             decisions: BTreeMap::new(),
@@ -339,6 +341,11 @@ impl Default for PacingState {
 }
 
 impl PacingState {
+    #[must_use]
+    pub const fn capital_reconciled_through(&self) -> Option<DateTime<Utc>> {
+        self.capital_reconciled_through
+    }
+
     #[must_use]
     pub const fn deposits(&self) -> &BTreeMap<String, DepositTranche> {
         &self.deposits
@@ -374,6 +381,13 @@ impl PacingState {
     ) -> Result<(), PacingError> {
         limits.validate()?;
         self.validate_invariants()?;
+        self.validate_for_limits(limits)?;
+        if self
+            .capital_reconciled_through
+            .is_some_and(|watermark| at < watermark)
+        {
+            return Err(PacingError::ReconciliationTimeRegressed);
+        }
         let mut next = self.clone();
         let mut ordered = events.iter().collect::<Vec<_>>();
         ordered.sort_by_key(|event| match event {
@@ -389,7 +403,9 @@ impl PacingState {
             }
         }
         next.replay_ready_capital(at, limits)?;
+        next.capital_reconciled_through = Some(at);
         next.validate_invariants()?;
+        next.validate_for_limits(limits)?;
         *self = next;
         Ok(())
     }
@@ -411,18 +427,31 @@ impl PacingState {
     ) -> Result<DecisionResult, PacingError> {
         limits.validate()?;
         self.validate_invariants()?;
-        let date = input.at.date_naive();
-        if let Some(existing) = self.decisions.get(&date) {
-            return Ok(DecisionResult::Existing(existing.clone()));
+        self.validate_for_limits(limits)?;
+        if self
+            .capital_reconciled_through
+            .is_some_and(|watermark| input.at < watermark)
+        {
+            return Err(PacingError::ReconciliationTimeRegressed);
         }
-        if !self.is_decision_due(input.at, limits) {
+        let mut next = self.clone();
+        next.replay_ready_capital(input.at, limits)?;
+        next.capital_reconciled_through = Some(input.at);
+        next.validate_invariants()?;
+        next.validate_for_limits(limits)?;
+        let date = input.at.date_naive();
+        if let Some(existing) = next.decisions.get(&date).cloned() {
+            *self = next;
+            return Ok(DecisionResult::Existing(existing));
+        }
+        if !next.is_decision_due(input.at, limits) {
             return Err(PacingError::DecisionNotDue);
         }
 
-        let mut next = self.clone();
         let decision = next.build_decision(input, limits)?;
         next.decisions.insert(date, decision.clone());
         next.validate_invariants()?;
+        next.validate_for_limits(limits)?;
         *self = next;
         Ok(DecisionResult::New(decision))
     }
@@ -514,6 +543,91 @@ impl PacingState {
         }
         self.validate_capital_records()?;
         self.validate_decision_attribution()
+    }
+
+    /// Recomputes admission gates from authoritative tranche fields and the
+    /// active limits. This must pass before restored state can plan capital.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PacingError`] when structural invariants, derived admission
+    /// fields, readiness, or configured admission caps do not match.
+    pub fn validate_for_limits(&self, limits: &PacingLimits) -> Result<(), PacingError> {
+        limits.validate()?;
+        self.validate_invariants()?;
+        if (!self.deposits.is_empty() || !self.withdrawals.is_empty())
+            && self.capital_reconciled_through.is_none()
+        {
+            return Err(PacingError::CorruptState);
+        }
+
+        for tranche in self.deposits.values() {
+            let event = DepositEvent {
+                event_id: tranche.event_id.clone(),
+                amount_usdc: tranche.source_amount_usdc,
+                received_at: tranche.received_at,
+                confirmed_at: tranche.confirmed_at,
+                confirmation_count: tranche.confirmation_count,
+                admission_approved_at: tranche.admission_approved_at,
+            };
+            validate_deposit(&event)?;
+            let expected_first_usable_at = first_usable_at(&event, limits)?;
+            if tranche.first_usable_at != expected_first_usable_at {
+                return Err(PacingError::CorruptState);
+            }
+            let admission_ready = expected_first_usable_at.is_some_and(|usable_at| {
+                self.capital_reconciled_through
+                    .is_some_and(|watermark| usable_at <= watermark)
+            });
+            if !admission_ready && !tranche.admitted_usdc.is_zero() {
+                return Err(PacingError::CorruptState);
+            }
+            let expected_status = if expected_first_usable_at.is_none() {
+                initial_status(&event, limits)
+            } else if !admission_ready {
+                AdmissionStatus::CoolingDown
+            } else if tranche.admitted_usdc == tranche.source_amount_usdc {
+                AdmissionStatus::Admitted
+            } else if tranche.admitted_usdc.is_zero() {
+                AdmissionStatus::HeldByAdmissionCap
+            } else {
+                AdmissionStatus::PartiallyAdmitted
+            };
+            let expected_horizon = NaiveDate::from_ymd_opt(tranche.received_at.year(), 12, 31)
+                .ok_or(PacingError::CorruptState)?;
+            if tranche.status != expected_status || tranche.target_horizon != expected_horizon {
+                return Err(PacingError::CorruptState);
+            }
+        }
+
+        let admitted_total =
+            checked_sum(self.deposits.values().map(|tranche| tranche.admitted_usdc))?;
+        if admitted_total > limits.max_automatically_admitted_usdc
+            || admitted_total > limits.cumulative_admission_cap_usdc
+        {
+            return Err(PacingError::CorruptState);
+        }
+        for year in self
+            .deposits
+            .values()
+            .map(|tranche| tranche.received_at.year())
+            .collect::<BTreeSet<_>>()
+        {
+            let (_, admitted_year) = self.admitted_totals(year)?;
+            if admitted_year > limits.yearly_admission_cap_usdc {
+                return Err(PacingError::CorruptState);
+            }
+        }
+        for record in self.withdrawals.values() {
+            validate_withdrawal(&record.event)?;
+            let should_be_applied = self
+                .capital_reconciled_through
+                .is_some_and(|watermark| record.event.reconciled_at <= watermark);
+            if record.applied != should_be_applied {
+                return Err(PacingError::CorruptState);
+            }
+        }
+        Ok(())
     }
 
     fn validate_capital_records(&self) -> Result<(), PacingError> {
@@ -1145,6 +1259,8 @@ pub enum PacingError {
     ConflictingCapitalEvent(String),
     #[error("withdrawal exceeds admitted uncommitted capital: {0}")]
     WithdrawalExceedsFreeCapital(String),
+    #[error("capital reconciliation time regressed")]
+    ReconciliationTimeRegressed,
     #[error("daily decision is not due")]
     DecisionNotDue,
     #[error("unknown decision")]

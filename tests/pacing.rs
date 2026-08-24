@@ -300,6 +300,110 @@ fn late_earlier_deposit_cannot_displace_existing_fill_backing() {
 }
 
 #[test]
+fn stale_reconciliation_time_cannot_restore_applied_withdrawal_capital() {
+    let limits = limits();
+    let mut state = PacingState::default();
+    state
+        .reconcile_capital(
+            &[
+                deposit("deposit", 100, at(2026, 1, 1, 8)),
+                CapitalEvent::Withdrawal(WithdrawalEvent {
+                    event_id: "withdrawal".to_owned(),
+                    amount_usdc: usd(20),
+                    occurred_at: at(2026, 1, 1, 9),
+                    reconciled_at: at(2026, 1, 1, 10),
+                }),
+            ],
+            at(2026, 1, 1, 10),
+            &limits,
+        )
+        .expect("withdrawal applied");
+    let before = state.clone();
+
+    let result = state.reconcile_capital(&[], at(2026, 1, 1, 9), &limits);
+    assert!(matches!(
+        result,
+        Err(hype_accumulator::pacing::PacingError::ReconciliationTimeRegressed)
+    ));
+    assert_eq!(state, before);
+    assert!(state.withdrawals()["withdrawal"].applied);
+    assert_eq!(state.deposits()["deposit"].residual_usdc(), usd(80));
+
+    state
+        .decide(&input(at(2026, 1, 1, 12), 1_000), &limits)
+        .expect("later planning retains the withdrawal");
+    assert!(state.withdrawals()["withdrawal"].applied);
+    assert_eq!(state.capital_reconciled_through(), Some(at(2026, 1, 1, 12)));
+}
+
+#[test]
+fn decision_replays_withdrawals_that_became_ready_after_last_reconciliation() {
+    let limits = limits();
+    let mut state = PacingState::default();
+    state
+        .reconcile_capital(
+            &[
+                deposit("deposit", 100, at(2026, 1, 1, 8)),
+                CapitalEvent::Withdrawal(WithdrawalEvent {
+                    event_id: "future-ready".to_owned(),
+                    amount_usdc: usd(20),
+                    occurred_at: at(2026, 1, 1, 9),
+                    reconciled_at: at(2026, 1, 1, 11),
+                }),
+            ],
+            at(2026, 1, 1, 10),
+            &limits,
+        )
+        .expect("future-ready withdrawal retained but not applied");
+    assert!(!state.withdrawals()["future-ready"].applied);
+
+    state
+        .decide(&input(at(2026, 1, 1, 12), 1_000), &limits)
+        .expect("decision advances capital replay");
+    assert!(state.withdrawals()["future-ready"].applied);
+    assert_eq!(state.deposits()["deposit"].withdrawn_usdc, usd(20));
+}
+
+#[test]
+fn restored_state_revalidates_authoritative_admission_fields() {
+    let limits = limits();
+    let mut state = PacingState::default();
+    state
+        .reconcile_capital(
+            &[unapproved_deposit("unapproved", 100, at(2026, 1, 1, 8))],
+            at(2026, 1, 1, 10),
+            &limits,
+        )
+        .expect("unapproved event retained without admission");
+    let original = serde_json::to_value(&state).expect("serialize state");
+
+    let mut admitted = original.clone();
+    admitted["deposits"]["unapproved"]["admitted_usdc"] = serde_json::json!(1_000_000);
+    let admitted: PacingState = serde_json::from_value(admitted).expect("restore tampered state");
+    assert!(admitted.validate_invariants().is_ok());
+    assert!(matches!(
+        admitted.validate_for_limits(&limits),
+        Err(hype_accumulator::pacing::PacingError::CorruptState)
+    ));
+
+    let mut usable = original.clone();
+    usable["deposits"]["unapproved"]["first_usable_at"] = serde_json::json!("2026-01-01T08:00:01Z");
+    let usable: PacingState = serde_json::from_value(usable).expect("restore tampered state");
+    assert!(matches!(
+        usable.validate_for_limits(&limits),
+        Err(hype_accumulator::pacing::PacingError::CorruptState)
+    ));
+
+    let mut status = original;
+    status["deposits"]["unapproved"]["status"] = serde_json::json!("admitted");
+    let mut status: PacingState = serde_json::from_value(status).expect("restore tampered state");
+    assert!(matches!(
+        status.decide(&input(at(2026, 1, 1, 12), 1_000), &limits),
+        Err(hype_accumulator::pacing::PacingError::CorruptState)
+    ));
+}
+
+#[test]
 fn unadmitted_or_balance_only_capital_fails_closed() {
     let limits = limits();
     let mut balance_only = PacingState::default();
