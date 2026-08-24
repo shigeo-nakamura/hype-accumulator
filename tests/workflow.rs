@@ -89,6 +89,9 @@ fn binding() -> DecisionBinding {
             l1_nonce: 7,
             signed_expiry_at: at(29),
             effective_expiry_at: at(30),
+            venue_clock_evidence_at: at(0),
+            venue_clock_evidence_digest: "venue-clock-evidence-a".to_owned(),
+            max_venue_clock_lag_ms: 59_999,
         },
     )
     .expect("valid workflow binding")
@@ -234,6 +237,32 @@ fn deterministic_identity_is_independent_of_allocation_input_order() {
             && l1_nonce == 7
             && signed_expiry_at == at(29)
     ));
+}
+
+#[test]
+fn expiry_binding_requires_exact_verified_clock_lag_gap() {
+    for invalid in [
+        "wrong-gap",
+        "zero-lag",
+        "overflow",
+        "missing-evidence",
+        "future-evidence",
+    ] {
+        let valid = binding();
+        let mut envelope = valid.order_envelope;
+        match invalid {
+            "wrong-gap" => envelope.max_venue_clock_lag_ms -= 1,
+            "zero-lag" => envelope.max_venue_clock_lag_ms = 0,
+            "overflow" => envelope.max_venue_clock_lag_ms = u64::MAX,
+            "missing-evidence" => envelope.venue_clock_evidence_digest.clear(),
+            "future-evidence" => envelope.venue_clock_evidence_at = at(1),
+            _ => unreachable!("complete fixture set"),
+        }
+        assert!(matches!(
+            DecisionBinding::from_pacing_decision(&decision(), valid.inventory_before, envelope,),
+            Err(WorkflowError::InvalidBinding(_))
+        ));
+    }
 }
 
 #[test]
@@ -600,6 +629,42 @@ fn partial_fill_cancel_race_uses_one_final_cumulative_fill_and_never_rebuys() {
         .expect("unsigned eligibility recorded from final cumulative fill");
     assert_eq!(eligibility.residual_hype, hype(0));
     assert_eq!(eligibility.eligible_hype, hype(150));
+}
+
+#[test]
+fn timely_fill_evidence_can_reconcile_after_effective_expiry() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("post-expiry-reconciliation.jsonl");
+    let binding = binding();
+    let mut workflow = reopen(&path, &binding);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    workflow
+        .observe_order_submission("exchange-order-1", at(2))
+        .expect("submission observed");
+    workflow
+        .observe_order_fill(
+            "timely-fill",
+            hype(250),
+            usdc(50_000_000),
+            usdc(50_500_000),
+            true,
+            at(3),
+        )
+        .expect("fill observed before expiry");
+    workflow
+        .finalize_order(
+            hype(250),
+            usdc(50_000_000),
+            usdc(50_500_000),
+            OrderFinality::Filled,
+            at(31),
+        )
+        .expect("terminal reconciliation may finish after expiry");
+    let evidence = bound_evidence(&workflow, &[("timely-fill", 250, 3)]);
+    let eligibility = workflow
+        .record_staking_eligibility(Some(evidence), at(32))
+        .expect("timely fill remains eligible after delayed reconciliation");
+    assert_eq!(eligibility.eligible_hype, hype(250));
 }
 
 #[test]

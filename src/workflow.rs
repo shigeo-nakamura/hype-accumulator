@@ -7,7 +7,7 @@
 //! reconciliation-only and is never returned as a new submission.
 
 use crate::pacing::{DailyDecision, DecisionReason, UsdcMicros};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -73,6 +73,9 @@ pub struct OrderEnvelopeBinding {
     pub l1_nonce: u64,
     pub signed_expiry_at: DateTime<Utc>,
     pub effective_expiry_at: DateTime<Utc>,
+    pub venue_clock_evidence_at: DateTime<Utc>,
+    pub venue_clock_evidence_digest: String,
+    pub max_venue_clock_lag_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -163,8 +166,7 @@ impl DecisionBinding {
             || self.committed_usdc < self.planned_usdc
             || self.order_envelope.original_quantity_hype.is_zero()
             || self.order_envelope.limit_price_usdc_per_hype.is_zero()
-            || self.order_envelope.signed_expiry_at <= self.decided_at
-            || self.order_envelope.effective_expiry_at <= self.order_envelope.signed_expiry_at
+            || !valid_expiry_binding(&self.order_envelope, self.decided_at)
             || self.capital_commitments.is_empty()
             || self.decided_at.date_naive() != self.decision_date
         {
@@ -983,7 +985,6 @@ impl WorkflowState {
             || evidence.order_bound_at > recorded_at
             || evidence.effective_expiry_at <= accepted_at
             || evidence.effective_expiry_at <= evidence.signed_expiry_at
-            || recorded_at >= evidence.effective_expiry_at
             || evidence.residual_reservation_hype
                 != self.binding.inventory_before.residual_hype_deficit()
         {
@@ -1006,7 +1007,6 @@ impl WorkflowState {
                 || fill.first_observed_at < fill.executed_at
                 || fill.registration_deadline_at < fill.first_observed_at
                 || recorded_at < fill.first_observed_at
-                || recorded_at > fill.registration_deadline_at
             {
                 return Err(WorkflowError::ContradictoryObservation(
                     "fill evidence is late, duplicated, unsorted, or outside the authorized order window"
@@ -1904,6 +1904,31 @@ fn valid_gap_free_watermark(
         && watermark.through_at <= recorded_at
 }
 
+fn valid_expiry_binding(envelope: &OrderEnvelopeBinding, decided_at: DateTime<Utc>) -> bool {
+    let Ok(lag_ms) = i64::try_from(envelope.max_venue_clock_lag_ms) else {
+        return false;
+    };
+    let Some(offset_ms) = lag_ms.checked_add(1) else {
+        return false;
+    };
+    let Some(offset) = TimeDelta::try_milliseconds(offset_ms) else {
+        return false;
+    };
+    let Some(expected_signed_expiry_at) = envelope.effective_expiry_at.checked_sub_signed(offset)
+    else {
+        return false;
+    };
+
+    envelope.max_venue_clock_lag_ms > 0
+        && !envelope.venue_clock_evidence_digest.trim().is_empty()
+        && envelope.venue_clock_evidence_at <= decided_at
+        && envelope.signed_expiry_at.timestamp_subsec_nanos() % 1_000_000 == 0
+        && envelope.effective_expiry_at.timestamp_subsec_nanos() % 1_000_000 == 0
+        && expected_signed_expiry_at.timestamp_millis() > 0
+        && envelope.signed_expiry_at == expected_signed_expiry_at
+        && envelope.signed_expiry_at > decided_at
+}
+
 fn workflow_id_for(binding: &DecisionBinding) -> Result<String, WorkflowError> {
     let encoded = serde_json::to_vec(binding).map_err(WorkflowError::json)?;
     Ok(format!("wf_{}", digest_hex(&encoded)))
@@ -1921,6 +1946,9 @@ struct CanonicalOrderEnvelope<'a> {
     l1_nonce: u64,
     signed_expiry_at: DateTime<Utc>,
     effective_expiry_at: DateTime<Utc>,
+    venue_clock_evidence_at: DateTime<Utc>,
+    venue_clock_evidence_digest: &'a str,
+    max_venue_clock_lag_ms: u64,
     market: &'static str,
     side: &'static str,
     time_in_force: &'static str,
@@ -1938,6 +1966,9 @@ fn canonical_order_envelope_hash(state: &WorkflowState) -> Result<String, Workfl
         l1_nonce: state.binding.order_envelope.l1_nonce,
         signed_expiry_at: state.binding.order_envelope.signed_expiry_at,
         effective_expiry_at: state.binding.order_envelope.effective_expiry_at,
+        venue_clock_evidence_at: state.binding.order_envelope.venue_clock_evidence_at,
+        venue_clock_evidence_digest: &state.binding.order_envelope.venue_clock_evidence_digest,
+        max_venue_clock_lag_ms: state.binding.order_envelope.max_venue_clock_lag_ms,
         market: "HYPE/USDC",
         side: "buy",
         time_in_force: "IOC",
