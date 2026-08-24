@@ -1,4 +1,8 @@
 use chrono::{DateTime, SecondsFormat, Utc};
+use rust_decimal::{
+    prelude::{FromPrimitive, ToPrimitive},
+    Decimal,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -1236,14 +1240,17 @@ fn usdc_to_microusd(value: f64, field: &str) -> Result<u64, SecurityPolicyError>
     if !value.is_finite() || value <= 0.0 {
         return invalid_policy(&format!("{field} must be finite and positive"));
     }
-    let scaled = value * 1_000_000.0;
-    let rounded = scaled.round();
-    if (scaled - rounded).abs() > 0.000_001 {
+    let decimal = Decimal::from_f64(value)
+        .ok_or_else(|| SecurityPolicyError::Invalid(format!("{field} is out of range")))?;
+    let scaled = decimal
+        .checked_mul(Decimal::from(1_000_000_u64))
+        .ok_or_else(|| SecurityPolicyError::Invalid(format!("{field} is out of range")))?;
+    if !scaled.fract().is_zero() {
         return invalid_policy(&format!("{field} must use exact microunits"));
     }
-    format!("{rounded:.0}")
-        .parse::<u64>()
-        .map_err(|_| SecurityPolicyError::Invalid(format!("{field} is out of range")))
+    scaled
+        .to_u64()
+        .ok_or_else(|| SecurityPolicyError::Invalid(format!("{field} is out of range")))
 }
 
 fn positive(name: &str, value: f64) -> Result<(), ConfigError> {

@@ -1012,6 +1012,25 @@ fn exact_microunit_schedule_capacity_avoids_float_drift() {
         .expect("366 slots exactly fit an integer-microunit capital cap");
 }
 
+#[test]
+fn six_decimal_monetary_values_use_decimal_conversion() {
+    let mut config = Config::from_toml(include_str!("fixtures/safe.toml")).expect("fixture");
+    config.capital.max_automatically_deployable_usdc = 16_890.122_169;
+    config.capital.yearly_deployment_cap_usdc = 16_890.122_169;
+    config.capital.cumulative_deployment_cap_usdc = 16_890.122_169;
+    config.pacing.max_order_usdc = 200.0;
+    config.execution.max_order_usdc = 200.0;
+    config
+        .validate(&HashMap::new())
+        .expect("valid six-decimal microunit value is accepted");
+
+    config.capital.max_automatically_deployable_usdc = 100.000_000_1;
+    assert!(matches!(
+        config.validate(&HashMap::new()),
+        Err(ConfigError::SecurityPolicy(_))
+    ));
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
