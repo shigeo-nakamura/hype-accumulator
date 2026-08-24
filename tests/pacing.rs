@@ -163,6 +163,96 @@ fn future_deposit_cannot_retroactively_fund_an_earlier_withdrawal() {
 }
 
 #[test]
+fn late_reconciliation_replays_prior_admissions_before_allocating_withdrawal() {
+    let limits = limits();
+    let mut state = PacingState::default();
+    let withdrawn_at = at(2026, 1, 1, 8);
+    let deposited_at = at(2026, 1, 1, 9);
+    state
+        .reconcile_capital(
+            &[deposit("later-deposit", 100, deposited_at)],
+            at(2026, 1, 1, 10),
+            &limits,
+        )
+        .expect("later deposit admitted by the first call");
+    assert_eq!(state.deposits()["later-deposit"].admitted_usdc, usd(100));
+
+    let result = state.reconcile_capital(
+        &[CapitalEvent::Withdrawal(WithdrawalEvent {
+            event_id: "late-earlier-withdrawal".to_owned(),
+            amount_usdc: usd(10),
+            occurred_at: withdrawn_at,
+            reconciled_at: at(2026, 1, 1, 11),
+        })],
+        at(2026, 1, 1, 12),
+        &limits,
+    );
+    assert!(matches!(
+        result,
+        Err(hype_accumulator::pacing::PacingError::WithdrawalExceedsFreeCapital(id))
+            if id == "late-earlier-withdrawal"
+    ));
+    assert_eq!(state.deposits()["later-deposit"].admitted_usdc, usd(100));
+    assert!(state.withdrawals().is_empty());
+}
+
+#[test]
+fn retroactive_withdrawal_never_reuses_committed_or_invested_capital() {
+    let limits = limits();
+    let mut committed_state = PacingState::default();
+    committed_state
+        .reconcile_capital(
+            &[deposit("deposit", 100, at(2026, 1, 1, 7))],
+            at(2026, 1, 1, 10),
+            &limits,
+        )
+        .expect("deposit admitted");
+    let decision = committed_state
+        .decide(&input(at(2026, 1, 1, 12), 1_000), &limits)
+        .expect("capital committed");
+    assert!(!decision.decision().planned_usdc.is_zero());
+
+    let late_withdrawal = |id: &str| {
+        CapitalEvent::Withdrawal(WithdrawalEvent {
+            event_id: id.to_owned(),
+            amount_usdc: usd(100),
+            occurred_at: at(2026, 1, 1, 11),
+            reconciled_at: at(2026, 1, 1, 13),
+        })
+    };
+    let committed_result = committed_state.reconcile_capital(
+        &[late_withdrawal("withdraw-committed")],
+        at(2026, 1, 1, 14),
+        &limits,
+    );
+    assert!(matches!(
+        committed_result,
+        Err(hype_accumulator::pacing::PacingError::WithdrawalExceedsFreeCapital(id))
+            if id == "withdraw-committed"
+    ));
+    assert!(committed_state.withdrawals().is_empty());
+
+    let mut invested_state = committed_state;
+    invested_state
+        .settle_decision(
+            &decision.decision().decision_id,
+            decision.decision().planned_usdc,
+        )
+        .expect("commitment invested");
+    let invested_result = invested_state.reconcile_capital(
+        &[late_withdrawal("withdraw-invested")],
+        at(2026, 1, 1, 14),
+        &limits,
+    );
+    assert!(matches!(
+        invested_result,
+        Err(hype_accumulator::pacing::PacingError::WithdrawalExceedsFreeCapital(id))
+            if id == "withdraw-invested"
+    ));
+    assert!(invested_state.withdrawals().is_empty());
+}
+
+#[test]
 fn unadmitted_or_balance_only_capital_fails_closed() {
     let limits = limits();
     let mut balance_only = PacingState::default();

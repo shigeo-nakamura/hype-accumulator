@@ -388,7 +388,7 @@ impl PacingState {
                 CapitalEvent::Withdrawal(withdrawal) => next.upsert_withdrawal(withdrawal)?,
             }
         }
-        next.apply_ready_capital(at, limits)?;
+        next.replay_ready_capital(at, limits)?;
         next.validate_invariants()?;
         *self = next;
         Ok(())
@@ -719,25 +719,34 @@ impl PacingState {
         Ok(())
     }
 
-    fn apply_ready_capital(
+    fn replay_ready_capital(
         &mut self,
         at: DateTime<Utc>,
         limits: &PacingLimits,
     ) -> Result<(), PacingError> {
-        let mut timeline = Vec::<(DateTime<Utc>, u8, String)>::new();
+        // Rebuild from every durable event on each call. This is necessary for
+        // a withdrawal that is reconciled late: a deposit admitted by an
+        // earlier call must not remain available before its actual usable time.
         for tranche in self.deposits.values_mut() {
+            tranche.admitted_usdc = UsdcMicros::default();
+            tranche.withdrawn_usdc = UsdcMicros::default();
+            tranche.status = status_before_admission(tranche, limits, at);
+        }
+        for record in self.withdrawals.values_mut() {
+            record.applied = false;
+            record.allocations.clear();
+        }
+
+        let mut timeline = Vec::<(DateTime<Utc>, u8, String)>::new();
+        for tranche in self.deposits.values() {
             if let Some(usable_at) = tranche.first_usable_at.filter(|value| *value <= at) {
-                if !tranche.unadmitted_usdc().is_zero() {
-                    timeline.push((usable_at, 0, tranche.event_id.clone()));
-                }
-            } else {
-                tranche.status = status_before_admission(tranche, limits, at);
+                timeline.push((usable_at, 0, tranche.event_id.clone()));
             }
         }
         timeline.extend(
             self.withdrawals
                 .values()
-                .filter(|record| !record.applied && record.event.reconciled_at <= at)
+                .filter(|record| record.event.reconciled_at <= at)
                 .map(|record| (record.event.occurred_at, 1, record.event.event_id.clone())),
         );
         timeline.sort();
