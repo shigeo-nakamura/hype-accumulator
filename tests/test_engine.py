@@ -149,6 +149,65 @@ class EngineInvariantTests(unittest.TestCase):
         self.assertEqual([row["event_id"] for row in result["capital_cohorts"]], ["initial"])
         self.assertEqual(result["ending_inventory_usd"], 100.0)
 
+    def test_usable_capital_after_final_price_is_reported(self) -> None:
+        utc = timezone.utc
+        first = datetime(2025, 1, 1, 12, tzinfo=utc)
+        horizon = datetime(2025, 1, 2, 23, tzinfo=utc)
+        late = datetime(2025, 1, 2, 18, tzinfo=utc)
+        result = run_backtest(
+            [PriceBar(first, 10.0)],
+            [CapitalEvent("late", "deposit", 50.0, late, late, late)],
+            PointInTimeView([], horizon),
+            {
+                "name": "daily",
+                "kind": "fixed",
+                "cadence": "daily",
+                "horizon": "2025-01-02",
+                "features": [],
+            },
+            {
+                "min_trade_usd": 1.0,
+                "max_trade_usd": 100.0,
+                "fee_bps": 0.0,
+                "half_spread_bps": 0.0,
+                "slippage_bps": 0.0,
+            },
+            horizon,
+        )
+
+        self.assertEqual(result["remaining_cash_usd"], 50.0)
+        self.assertEqual([row["event_id"] for row in result["capital_cohorts"]], ["late"])
+        self.assertEqual(result["horizon_status"], "infeasible")
+
+    def test_future_horizon_is_reported_in_progress(self) -> None:
+        utc = timezone.utc
+        first = datetime(2025, 1, 1, 12, tzinfo=utc)
+        deposit = CapitalEvent("deposit", "deposit", 100.0, first, first, first)
+        result = run_backtest(
+            [PriceBar(first, 10.0)],
+            [deposit],
+            PointInTimeView([], first),
+            {
+                "name": "daily",
+                "kind": "fixed",
+                "cadence": "daily",
+                "horizon": "2025-01-02",
+                "features": [],
+            },
+            {
+                "min_trade_usd": 1.0,
+                "max_trade_usd": 100.0,
+                "fee_bps": 0.0,
+                "half_spread_bps": 0.0,
+                "slippage_bps": 0.0,
+            },
+            first,
+        )
+
+        self.assertEqual(result["horizon_status"], "in_progress")
+        self.assertFalse(result["horizon_complete"])
+        self.assertFalse(result["horizon_infeasible"])
+
     def test_simultaneous_deposit_precedes_withdrawal_regardless_of_id(self) -> None:
         utc = timezone.utc
         at = datetime(2025, 1, 1, 12, tzinfo=utc)

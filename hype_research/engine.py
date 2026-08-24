@@ -44,6 +44,13 @@ class Ledger:
                 return
 
 
+def apply_capital_event(ledger: Ledger, event: CapitalEvent) -> None:
+    if event.kind == "deposit":
+        ledger.deposit(event)
+    else:
+        ledger.take(event.amount_usd, "withdrawal")
+
+
 def remaining_dates(decision_date: date, horizon: date, cadence: str) -> int:
     if cadence != "weekly":
         return max((horizon - decision_date).days + 1, 1)
@@ -99,11 +106,7 @@ def run_backtest(
         final_price = bar.price_usd
         final_price_at = bar.decision_at
         while event_index < len(pending) and pending[event_index].first_usable_at <= bar.decision_at:
-            event = pending[event_index]
-            if event.kind == "deposit":
-                ledger.deposit(event)
-            else:
-                ledger.take(event.amount_usd, "withdrawal")
+            apply_capital_event(ledger, pending[event_index])
             event_index += 1
         inventory_value = units * bar.price_usd
         peak_value = max(peak_value, inventory_value)
@@ -145,8 +148,13 @@ def run_backtest(
         turnover += order
         trades.append({"decision_at": bar.decision_at.isoformat().replace("+00:00", "Z"), "spend_usd": round(order, 8), "price_usd": bar.price_usd, "units": round(acquired, 10), "multiplier": round(multiplier, 6), "feature_score": round(score, 6)})
         last_trade_date = bar.decision_at.date()
+    while event_index < len(pending) and pending[event_index].first_usable_at.date() <= horizon:
+        apply_capital_event(ledger, pending[event_index])
+        event_index += 1
     cohort_rows = [{"event_id": c.event_id, "admitted_usd": round(c.admitted_usd, 8), "invested_usd": round(c.invested_usd, 8), "withdrawn_usd": round(c.withdrawn_usd, 8), "remaining_usd": round(c.cash_usd, 8), "utilization": round(c.invested_usd / c.admitted_usd, 8)} for c in ledger.cohorts]
-    infeasible = ledger.cash > 1e-8 and any(e.kind == "deposit" for e in events if e.first_usable_at.date() <= horizon)
+    horizon_reached = as_of.date() >= horizon
+    infeasible = horizon_reached and ledger.cash > 1e-8
+    horizon_status = "infeasible" if infeasible else "complete" if horizon_reached else "in_progress"
     valuation_date = min(horizon, as_of.date())
     ending_inventory_usd = (
         round(units * final_price, 8)
@@ -157,6 +165,7 @@ def run_backtest(
         "policy": policy["name"], "trade_count": len(trades), "acquisition_vwap_usd": round(spend / units, 8) if units else None,
         "invested_usd": round(spend, 8), "remaining_cash_usd": round(ledger.cash, 8), "units": round(units, 10),
         "ending_inventory_usd": ending_inventory_usd, "max_inventory_drawdown": round(max_drawdown, 8),
-        "turnover_usd": round(turnover, 8), "cost_usd": round(fees, 8), "horizon_complete": not infeasible,
+        "turnover_usd": round(turnover, 8), "cost_usd": round(fees, 8),
+        "horizon_status": horizon_status, "horizon_complete": horizon_status == "complete",
         "horizon_infeasible": infeasible, "skipped_days": skipped, "capital_cohorts": cohort_rows, "trades": trades,
     }
