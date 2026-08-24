@@ -590,6 +590,105 @@ fn clean_directory_restore_round_trips_exact_checkpoint() {
     );
 }
 
+#[test]
+fn restore_recovers_orphaned_atomic_intent_temporary() {
+    let source = tempfile::tempdir().expect("source directory");
+    let container = tempfile::tempdir().expect("destination container");
+    let destination = container.path().join("restored");
+    let source_anchor = anchor_store();
+    let destination_anchor = anchor_store();
+    let mut ledger = open(source.path(), &source_anchor).expect("open source ledger");
+    ledger
+        .append(deposit("deposit-before-orphan", 1, 100))
+        .expect("append deposit");
+    drop(ledger);
+
+    fs::create_dir_all(&destination).expect("create destination");
+    let orphan = destination.join(".pending-restore.json.123.456.tmp");
+    fs::write(&orphan, b"partial restore intent").expect("write orphaned intent temporary");
+
+    let restored = restore(
+        source.path(),
+        &destination,
+        &source_anchor,
+        &destination_anchor,
+    )
+    .expect("restore after interrupted intent publication");
+    assert_eq!(restored.record_count(), 1);
+    assert!(!orphan.exists());
+}
+
+#[test]
+fn restore_preserves_lookalike_temporary_and_fails_closed() {
+    let source = tempfile::tempdir().expect("source directory");
+    let destination = tempfile::tempdir().expect("destination directory");
+    let source_anchor = anchor_store();
+    let destination_anchor = anchor_store();
+    let mut ledger = open(source.path(), &source_anchor).expect("open source ledger");
+    ledger
+        .append(deposit("deposit-before-lookalike", 1, 100))
+        .expect("append deposit");
+    drop(ledger);
+
+    let lookalike = destination.path().join("snapshot.json.pid.456.tmp");
+    fs::write(&lookalike, b"foreign data").expect("write lookalike temporary");
+
+    assert!(matches!(
+        restore(
+            source.path(),
+            destination.path(),
+            &source_anchor,
+            &destination_anchor,
+        ),
+        Err(LedgerError::RestoreDestinationNotEmpty)
+    ));
+    assert_eq!(
+        fs::read(&lookalike).expect("lookalike remains"),
+        b"foreign data"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn restore_preserves_symlink_with_atomic_temporary_name_and_fails_closed() {
+    use std::os::unix::fs::symlink;
+
+    let source = tempfile::tempdir().expect("source directory");
+    let container = tempfile::tempdir().expect("destination container");
+    let destination = container.path().join("restored");
+    let target = container.path().join("foreign-target");
+    let source_anchor = anchor_store();
+    let destination_anchor = anchor_store();
+    let mut ledger = open(source.path(), &source_anchor).expect("open source ledger");
+    ledger
+        .append(deposit("deposit-before-symlink", 1, 100))
+        .expect("append deposit");
+    drop(ledger);
+
+    fs::create_dir_all(&destination).expect("create destination");
+    fs::write(&target, b"foreign data").expect("write symlink target");
+    let link = destination.join("snapshot.json.123.456.tmp");
+    symlink(&target, &link).expect("create temporary-name symlink");
+
+    assert!(matches!(
+        restore(
+            source.path(),
+            &destination,
+            &source_anchor,
+            &destination_anchor,
+        ),
+        Err(LedgerError::RestoreDestinationNotEmpty)
+    ));
+    assert!(fs::symlink_metadata(&link)
+        .expect("symlink remains")
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        fs::read(&target).expect("symlink target remains"),
+        b"foreign data"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn restore_rejects_a_source_directory_alias() {

@@ -550,6 +550,7 @@ impl DurableLedger {
                 LedgerLock::acquire(&source)?,
             )
         };
+        cleanup_restore_temporaries(&destination)?;
         recover_pending(&source, source_anchor_store.as_ref())?;
         let verified = Self::open_unlocked(source.clone(), source_anchor_store)?;
         let snapshot_payload = read_optional(&source.join(SNAPSHOT_FILE_NAME))?;
@@ -1496,6 +1497,59 @@ fn remove_durable(directory: &Path, file_name: &str) -> Result<(), LedgerError> 
     }
 }
 
+fn cleanup_restore_temporaries(directory: &Path) -> Result<(), LedgerError> {
+    let mut removed = false;
+    for entry in fs::read_dir(directory).map_err(LedgerError::io)? {
+        let entry = entry.map_err(LedgerError::io)?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_restore_atomic_temporary(name) {
+            continue;
+        }
+        if !entry.file_type().map_err(LedgerError::io)?.is_file() {
+            continue;
+        }
+        fs::remove_file(entry.path()).map_err(LedgerError::io)?;
+        removed = true;
+    }
+    if removed {
+        sync_directory(directory)?;
+    }
+    Ok(())
+}
+
+fn is_restore_atomic_temporary(name: &str) -> bool {
+    [
+        RESTORE_PENDING_FILE_NAME,
+        LEDGER_FILE_NAME,
+        SNAPSHOT_FILE_NAME,
+    ]
+    .iter()
+    .any(|target| {
+        let Some(suffix) = name
+            .strip_prefix(target)
+            .and_then(|suffix| suffix.strip_prefix('.'))
+            .and_then(|suffix| suffix.strip_suffix(".tmp"))
+        else {
+            return false;
+        };
+        let mut parts = suffix.split('.');
+        let Some(process_id) = parts.next() else {
+            return false;
+        };
+        let Some(nonce) = parts.next() else {
+            return false;
+        };
+        parts.next().is_none()
+            && !process_id.is_empty()
+            && process_id.bytes().all(|byte| byte.is_ascii_digit())
+            && !nonce.is_empty()
+            && nonce.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
 fn has_only_restore_entries(directory: &Path, pending: bool) -> Result<bool, LedgerError> {
     for entry in fs::read_dir(directory).map_err(LedgerError::io)? {
         let name = entry.map_err(LedgerError::io)?.file_name();
@@ -1867,6 +1921,11 @@ mod transaction_tests {
             write_pending_restore(&destination, &pending).expect("persist restore intent");
             write_atomic(&destination.join(LEDGER_FILE_NAME), &ledger_payload)
                 .expect("publish journal before interruption");
+            fs::write(
+                destination.join(format!("{SNAPSHOT_FILE_NAME}.123.456.tmp")),
+                b"partial snapshot",
+            )
+            .expect("leave orphaned snapshot temporary");
         }
 
         let restored = DurableLedger::restore_clean(
@@ -1879,6 +1938,9 @@ mod transaction_tests {
         assert_eq!(restored.records, verified.records);
         assert_eq!(restored.state, verified.state);
         assert!(!destination.join(RESTORE_PENDING_FILE_NAME).exists());
+        assert!(!destination
+            .join(format!("{SNAPSHOT_FILE_NAME}.123.456.tmp"))
+            .exists());
 
         let retried = DurableLedger::restore_clean(
             source.path(),
