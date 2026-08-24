@@ -168,6 +168,7 @@ struct DepositReplay {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CommitmentReplay {
+    occurred_at: DateTime<Utc>,
     committed_usdc: UsdcMicros,
     debited_usdc: UsdcMicros,
     settled: bool,
@@ -182,6 +183,7 @@ struct PurchaseDecisionReplay {
     committed_usdc: UsdcMicros,
     filled_usdc: UsdcMicros,
     fee_usdc: UsdcMicros,
+    latest_cost_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -943,11 +945,11 @@ fn apply_event(state: &mut ReplayState, event: &LedgerEvent) -> Result<(), Ledge
         LedgerEventKind::CapitalCommitted {
             commitment_id,
             amount_usdc,
-        } => record_capital_commitment(state, commitment_id, *amount_usdc)?,
+        } => record_capital_commitment(state, event.occurred_at, commitment_id, *amount_usdc)?,
         LedgerEventKind::CapitalSettled {
             commitment_id,
             debited_usdc,
-        } => record_capital_settlement(state, commitment_id, *debited_usdc)?,
+        } => record_capital_settlement(state, event.occurred_at, commitment_id, *debited_usdc)?,
         LedgerEventKind::BalanceObserved {
             observed_usdc,
             observed_hype_atoms,
@@ -1033,6 +1035,7 @@ fn record_deposit_admission(
 
 fn record_capital_commitment(
     state: &mut ReplayState,
+    occurred_at: DateTime<Utc>,
     commitment_id: &str,
     amount_usdc: UsdcMicros,
 ) -> Result<(), LedgerError> {
@@ -1044,6 +1047,7 @@ fn record_capital_commitment(
     state.commitments.insert(
         commitment_id.to_owned(),
         CommitmentReplay {
+            occurred_at,
             committed_usdc: amount_usdc,
             debited_usdc: UsdcMicros::default(),
             settled: false,
@@ -1054,10 +1058,11 @@ fn record_capital_commitment(
 
 fn record_capital_settlement(
     state: &mut ReplayState,
+    occurred_at: DateTime<Utc>,
     commitment_id: &str,
     debited_usdc: UsdcMicros,
 ) -> Result<(), LedgerError> {
-    let (recorded_costs, decision_commitment) = match state
+    let (recorded_costs, decision_commitment, latest_cost_at) = match state
         .purchase_decisions
         .values()
         .find(|decision| decision.commitment_id == commitment_id)
@@ -1065,8 +1070,9 @@ fn record_capital_settlement(
         Some(decision) => (
             checked_add(decision.filled_usdc, decision.fee_usdc)?,
             Some(decision.committed_usdc),
+            decision.latest_cost_at,
         ),
-        None => (UsdcMicros::default(), None),
+        None => (UsdcMicros::default(), None, None),
     };
     let commitment = state
         .commitments
@@ -1075,6 +1081,13 @@ fn record_capital_settlement(
     if commitment.settled {
         return Err(LedgerError::CommitmentAlreadySettled(
             commitment_id.to_owned(),
+        ));
+    }
+    if occurred_at < commitment.occurred_at
+        || latest_cost_at.is_some_and(|latest| occurred_at < latest)
+    {
+        return Err(LedgerError::InvalidEvent(
+            "settlement predates its commitment or recorded execution costs".into(),
         ));
     }
     if debited_usdc > commitment.committed_usdc
@@ -1165,6 +1178,7 @@ fn record_purchase_decision(
             committed_usdc,
             filled_usdc: UsdcMicros::default(),
             fee_usdc: UsdcMicros::default(),
+            latest_cost_at: None,
         },
     );
     Ok(())
@@ -1191,6 +1205,11 @@ fn record_order(
     }) {
         return Err(LedgerError::InsufficientDecisionBacking(
             decision_id.to_owned(),
+        ));
+    }
+    if commitment.is_some_and(|commitment| occurred_at < commitment.occurred_at) {
+        return Err(LedgerError::InvalidEvent(
+            "order predates its backing commitment".into(),
         ));
     }
     if state.orders.contains_key(order_id) {
@@ -1240,6 +1259,11 @@ fn record_fill(
         return Err(LedgerError::DecisionCostsExceedCommitment(decision_id));
     }
     decision.filled_usdc = next_filled;
+    decision.latest_cost_at = Some(
+        decision
+            .latest_cost_at
+            .map_or(occurred_at, |latest| latest.max(occurred_at)),
+    );
     state.fills.insert(fill_id.to_owned(), order_id.to_owned());
     Ok(())
 }
@@ -1275,6 +1299,11 @@ fn record_fee(
         return Err(LedgerError::DecisionCostsExceedCommitment(decision_id));
     }
     decision.fee_usdc = next_fee;
+    decision.latest_cost_at = Some(
+        decision
+            .latest_cost_at
+            .map_or(occurred_at, |latest| latest.max(occurred_at)),
+    );
     state.fees.insert(fee_id.to_owned(), order_id.to_owned());
     Ok(())
 }
@@ -2064,17 +2093,19 @@ fn read_journal(file: &mut File) -> Result<Vec<u8>, LedgerError> {
 }
 
 fn validate_journal_handle(directory: &Path, file: &File) -> Result<(), LedgerError> {
-    let path_metadata =
-        fs::symlink_metadata(directory.join(LEDGER_FILE_NAME)).map_err(LedgerError::io)?;
+    let path = directory.join(LEDGER_FILE_NAME);
+    let path_metadata = fs::symlink_metadata(&path).map_err(LedgerError::io)?;
     let file_metadata = file.metadata().map_err(LedgerError::io)?;
     if !path_metadata.file_type().is_file() || !file_metadata.file_type().is_file() {
         return Err(LedgerError::UnsafeJournalFile);
     }
-    validate_journal_identity(&path_metadata, &file_metadata)
+    validate_journal_identity(&path, file, &path_metadata, &file_metadata)
 }
 
 #[cfg(unix)]
 fn validate_journal_identity(
+    _path: &Path,
+    _file: &File,
     path_metadata: &fs::Metadata,
     file_metadata: &fs::Metadata,
 ) -> Result<(), LedgerError> {
@@ -2090,8 +2121,33 @@ fn validate_journal_identity(
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn validate_journal_identity(
+    path: &Path,
+    file: &File,
+    _path_metadata: &fs::Metadata,
+    _file_metadata: &fs::Metadata,
+) -> Result<(), LedgerError> {
+    let mut options = OpenOptions::new();
+    configure_journal_options(&mut options);
+    let path_file = options.open(path).map_err(LedgerError::io)?;
+    let path_information =
+        winx::winapi_util::file::information(&path_file).map_err(LedgerError::io)?;
+    let file_information = winx::winapi_util::file::information(file).map_err(LedgerError::io)?;
+    if path_information.volume_serial_number() != file_information.volume_serial_number()
+        || path_information.file_index() != file_information.file_index()
+        || path_information.number_of_links() != 1
+        || file_information.number_of_links() != 1
+    {
+        return Err(LedgerError::UnsafeJournalFile);
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn validate_journal_identity(
+    _path: &Path,
+    _file: &File,
     _path_metadata: &fs::Metadata,
     _file_metadata: &fs::Metadata,
 ) -> Result<(), LedgerError> {

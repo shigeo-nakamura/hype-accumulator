@@ -540,6 +540,21 @@ fn order_linked_costs_respect_event_time_causality() {
         ))
     );
 
+    assert_eq!(
+        ledger.append(dated_event(
+            "order-before-commitment",
+            date,
+            3,
+            LedgerEventKind::OrderRecorded {
+                order_id: "order-before-commitment".into(),
+                decision_id: "decision-causal-order".into(),
+            },
+        )),
+        Err(LedgerError::InvalidEvent(
+            "order predates its backing commitment".into()
+        ))
+    );
+
     ledger
         .append(dated_event(
             "causal-order",
@@ -582,6 +597,67 @@ fn order_linked_costs_respect_event_time_causality() {
         )),
         Err(LedgerError::InvalidEvent(
             "fee predates its owning order or decision".into()
+        ))
+    );
+    assert_eq!(
+        fs::read(ledger_path(directory.path())).expect("read unchanged ledger"),
+        durable_before
+    );
+}
+
+#[test]
+fn settlement_cannot_predate_recorded_execution_costs() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let anchor = anchor_store();
+    let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+    let date = at(0).date_naive();
+    ledger
+        .append(daily_outcome(
+            "daily-causal-settlement",
+            "decision-causal-settlement",
+            date,
+            "decision",
+        ))
+        .expect("append decision");
+    append_decision_backing(&mut ledger, "decision-causal-settlement", date, 10);
+    ledger
+        .append(dated_event(
+            "causal-settlement-order",
+            date,
+            5,
+            LedgerEventKind::OrderRecorded {
+                order_id: "causal-settlement-order".into(),
+                decision_id: "decision-causal-settlement".into(),
+            },
+        ))
+        .expect("append causal order");
+    ledger
+        .append(dated_event(
+            "causal-settlement-fill",
+            date,
+            6,
+            LedgerEventKind::FillRecorded {
+                fill_id: "causal-settlement-fill".into(),
+                order_id: "causal-settlement-order".into(),
+                filled_usdc: usd(5),
+                received_hype_atoms: 1,
+            },
+        ))
+        .expect("append causal fill");
+    let durable_before = fs::read(ledger_path(directory.path())).expect("read ledger");
+
+    assert_eq!(
+        ledger.append(dated_event(
+            "settlement-before-fill",
+            date,
+            5,
+            LedgerEventKind::CapitalSettled {
+                commitment_id: "commitment-decision-causal-settlement".into(),
+                debited_usdc: usd(5),
+            },
+        )),
+        Err(LedgerError::InvalidEvent(
+            "settlement predates its commitment or recorded execution costs".into()
         ))
     );
     assert_eq!(
@@ -2017,7 +2093,7 @@ fn opening_a_symlinked_journal_fails_without_modifying_its_target() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn appending_rejects_a_multiply_linked_journal() {
     let directory = tempfile::tempdir().expect("ledger directory");
