@@ -571,17 +571,7 @@ impl DurableLedger {
         if source == destination || same_directory_identity(&source, &destination)? {
             return Err(LedgerError::RestoreDestinationNotEmpty);
         }
-        let (_first_lock, _second_lock) = if source < destination {
-            (
-                LedgerLock::acquire(&source)?,
-                LedgerLock::acquire(&destination)?,
-            )
-        } else {
-            (
-                LedgerLock::acquire(&destination)?,
-                LedgerLock::acquire(&source)?,
-            )
-        };
+        let (_first_lock, _second_lock) = acquire_restore_locks(&source, &destination)?;
         cleanup_restore_temporaries(&destination)?;
         recover_pending(&source, source_anchor_store.as_ref())?;
         let verified = Self::open_unlocked(source.clone(), source_anchor_store)?;
@@ -620,7 +610,8 @@ impl DurableLedger {
                 // exact prefix. The current protected source head and its
                 // verified hash chain separately prove the prefix ancestry.
                 if target.anchor != verified.anchor
-                    && destination_anchor.as_ref() != target.anchor.as_ref()
+                    && (target.anchor.is_none()
+                        || destination_anchor.as_ref() != target.anchor.as_ref())
                 {
                     return Err(LedgerError::ProtectedAnchorMismatch);
                 }
@@ -1627,7 +1618,8 @@ fn write_atomic(path: &Path, payload: &[u8]) -> Result<(), LedgerError> {
 }
 
 struct LedgerLock {
-    _file: File,
+    directory: PathBuf,
+    file: File,
 }
 
 fn canonical_directory(path: &Path) -> Result<PathBuf, LedgerError> {
@@ -1701,20 +1693,121 @@ where
 }
 
 impl LedgerLock {
-    fn acquire(directory: &Path) -> Result<Self, LedgerError> {
+    fn open(directory: &Path) -> Result<Self, LedgerError> {
+        let path = directory.join(LOCK_FILE_NAME);
         let mut options = OpenOptions::new();
-        options.create(true).read(true).write(true);
+        options.read(true).write(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o640);
+
+            options.custom_flags(libc::O_NOFOLLOW).mode(0o640);
         }
-        let file = options
-            .open(directory.join(LOCK_FILE_NAME))
-            .map_err(LedgerError::io)?;
-        file.lock_exclusive().map_err(LedgerError::io)?;
-        Ok(Self { _file: file })
+        let file = match options.open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let mut create_options = OpenOptions::new();
+                create_options.read(true).write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+
+                    create_options.custom_flags(libc::O_NOFOLLOW).mode(0o640);
+                }
+                match create_options.open(&path) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        options.open(&path).map_err(LedgerError::io)?
+                    }
+                    Err(error) => return Err(LedgerError::io(error)),
+                }
+            }
+            Err(error) => return Err(LedgerError::io(error)),
+        };
+        let lock = Self {
+            directory: directory.to_path_buf(),
+            file,
+        };
+        lock.validate()?;
+        Ok(lock)
     }
+
+    fn lock(self) -> Result<Self, LedgerError> {
+        self.validate()?;
+        self.file.lock_exclusive().map_err(LedgerError::io)?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    fn acquire(directory: &Path) -> Result<Self, LedgerError> {
+        Self::open(directory)?.lock()
+    }
+
+    fn validate(&self) -> Result<(), LedgerError> {
+        let path_metadata =
+            fs::symlink_metadata(self.directory.join(LOCK_FILE_NAME)).map_err(LedgerError::io)?;
+        let file_metadata = self.file.metadata().map_err(LedgerError::io)?;
+        if !path_metadata.file_type().is_file() || !file_metadata.file_type().is_file() {
+            return Err(LedgerError::UnsafeLockFile);
+        }
+        validate_lock_identity(&path_metadata, &file_metadata)
+    }
+}
+
+fn acquire_restore_locks(
+    source: &Path,
+    destination: &Path,
+) -> Result<(LedgerLock, LedgerLock), LedgerError> {
+    let source_lock = LedgerLock::open(source)?;
+    let destination_lock = LedgerLock::open(destination)?;
+    if same_lock_identity(&source_lock.file, &destination_lock.file)? {
+        return Err(LedgerError::UnsafeLockFile);
+    }
+    let (first, second) = if source < destination {
+        (source_lock, destination_lock)
+    } else {
+        (destination_lock, source_lock)
+    };
+    Ok((first.lock()?, second.lock()?))
+}
+
+#[cfg(unix)]
+fn validate_lock_identity(
+    path_metadata: &fs::Metadata,
+    file_metadata: &fs::Metadata,
+) -> Result<(), LedgerError> {
+    use std::os::unix::fs::MetadataExt;
+
+    if path_metadata.dev() != file_metadata.dev()
+        || path_metadata.ino() != file_metadata.ino()
+        || path_metadata.nlink() != 1
+        || file_metadata.nlink() != 1
+    {
+        return Err(LedgerError::UnsafeLockFile);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_lock_identity(
+    _path_metadata: &fs::Metadata,
+    _file_metadata: &fs::Metadata,
+) -> Result<(), LedgerError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn same_lock_identity(left: &File, right: &File) -> Result<bool, LedgerError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let left = left.metadata().map_err(LedgerError::io)?;
+    let right = right.metadata().map_err(LedgerError::io)?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(not(unix))]
+fn same_lock_identity(_left: &File, _right: &File) -> Result<bool, LedgerError> {
+    Ok(false)
 }
 
 fn remove_durable(directory: &Path, file_name: &str) -> Result<(), LedgerError> {
@@ -1872,6 +1965,8 @@ pub enum LedgerError {
     CorruptRestorePending,
     #[error("journal must be a single-linked regular file at its locked path")]
     UnsafeJournalFile,
+    #[error("ledger lock must be a distinct single-linked regular file")]
+    UnsafeLockFile,
     #[error("restore destination is not empty")]
     RestoreDestinationNotEmpty,
     #[error("ledger changed since it was opened")]
@@ -2340,6 +2435,47 @@ mod transaction_tests {
         advanced
             .append(observation("observation-after-unanchored-intent", 2))
             .expect("advance source after unanchored intent");
+        drop(advanced);
+
+        assert!(matches!(
+            DurableLedger::restore_clean(
+                source.path(),
+                &destination,
+                source_anchor,
+                destination_anchor,
+            ),
+            Err(LedgerError::ProtectedAnchorMismatch)
+        ));
+        assert!(destination.join(RESTORE_PENDING_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn stale_empty_restore_intent_cannot_be_independently_authorized() {
+        let source = tempfile::tempdir().expect("source directory");
+        let container = tempfile::tempdir().expect("destination container");
+        let destination = container.path().join("restored");
+        let source_anchor = anchor_store();
+        let destination_anchor = anchor_store();
+        let empty = open(source.path(), &source_anchor).expect("open empty source ledger");
+        empty.checkpoint().expect("checkpoint empty source");
+        let ledger_payload =
+            fs::read(source.path().join(LEDGER_FILE_NAME)).expect("read empty journal");
+        let snapshot_payload =
+            fs::read(source.path().join(SNAPSHOT_FILE_NAME)).expect("read empty snapshot");
+        let pending = build_pending_restore(&ledger_payload, &snapshot_payload, &empty)
+            .expect("build empty restore intent");
+        drop(empty);
+
+        canonical_directory(&destination).expect("durably create destination directory");
+        {
+            let _lock = LedgerLock::acquire(&destination).expect("acquire destination lock");
+            write_pending_restore(&destination, &pending).expect("persist empty restore intent");
+        }
+
+        let mut advanced = open(source.path(), &source_anchor).expect("reopen source ledger");
+        advanced
+            .append(deposit("deposit-after-empty-restore-intent", 1))
+            .expect("advance source");
         drop(advanced);
 
         assert!(matches!(

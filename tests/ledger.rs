@@ -859,6 +859,55 @@ fn appending_rejects_a_multiply_linked_journal() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn opening_a_symlinked_lock_file_fails_without_modifying_its_target() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().expect("ledger directory");
+    let foreign_directory = tempfile::tempdir().expect("foreign directory");
+    let foreign_lock = foreign_directory.path().join("foreign.lock");
+    fs::write(&foreign_lock, b"foreign lock contents").expect("write foreign lock");
+    symlink(&foreign_lock, directory.path().join(".ledger.lock")).expect("symlink lock");
+
+    assert!(open(directory.path(), &anchor_store()).is_err());
+    assert_eq!(
+        fs::read(&foreign_lock).expect("foreign lock remains"),
+        b"foreign lock contents"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn restore_rejects_shared_hard_linked_locks_without_blocking() {
+    let source = tempfile::tempdir().expect("source directory");
+    let destination = tempfile::tempdir().expect("destination directory");
+    let source_anchor = anchor_store();
+    let destination_anchor = anchor_store();
+    let mut ledger = open(source.path(), &source_anchor).expect("open source ledger");
+    ledger
+        .append(deposit("deposit-before-shared-lock", 1, 100))
+        .expect("append deposit");
+    ledger.checkpoint().expect("checkpoint source");
+    drop(ledger);
+
+    fs::hard_link(
+        source.path().join(".ledger.lock"),
+        destination.path().join(".ledger.lock"),
+    )
+    .expect("share lock inode");
+
+    assert!(matches!(
+        restore(
+            source.path(),
+            destination.path(),
+            &source_anchor,
+            &destination_anchor,
+        ),
+        Err(LedgerError::UnsafeLockFile)
+    ));
+}
+
 #[test]
 fn protected_anchor_rejects_complete_local_ledger_and_snapshot_loss() {
     let directory = tempfile::tempdir().expect("temporary directory");
