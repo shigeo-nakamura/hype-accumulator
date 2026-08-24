@@ -132,7 +132,7 @@ fn blank_live_validator_is_rejected() {
 }
 
 #[test]
-fn automatic_cap_is_cumulative_not_reusable() {
+fn admitted_capital_uses_yearly_and_cumulative_room() {
     let mut snapshot = CapitalSnapshot {
         observed_spot_usdc: 500.0,
         confirmed_deposits_usdc: 500.0,
@@ -142,12 +142,12 @@ fn automatic_cap_is_cumulative_not_reusable() {
     };
     let limits = fixture().capital;
     let initial = automatically_deployable(&snapshot, &limits);
-    assert!((initial - 100.0).abs() < f64::EPSILON);
+    assert!((initial - 500.0).abs() < f64::EPSILON);
 
     snapshot.observed_spot_usdc = 400.0;
     snapshot.deployed_this_year_usdc = 100.0;
     snapshot.deployed_cumulative_usdc = 100.0;
-    assert!(automatically_deployable(&snapshot, &limits).abs() < f64::EPSILON);
+    assert!((automatically_deployable(&snapshot, &limits) - 400.0).abs() < f64::EPSILON);
 }
 
 #[test]

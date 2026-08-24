@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, env, hash::BuildHasher};
 use thiserror::Error;
 
@@ -34,6 +34,18 @@ pub struct PacingConfig {
     pub max_order_usdc: f64,
     pub deposit_cooldown_seconds: u64,
     pub target_horizon_days: u32,
+    #[serde(default = "default_fee_spread_reserve_bps")]
+    pub fee_spread_reserve_bps: u16,
+    #[serde(default = "default_final_catch_up_days")]
+    pub final_catch_up_days: u32,
+    #[serde(default)]
+    pub carry_over_policy: CarryOverPolicy,
+}
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CarryOverPolicy {
+    #[default]
+    HoldForApproval,
 }
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,6 +70,14 @@ pub struct ExecutionConfig {
 }
 const fn default_true() -> bool {
     true
+}
+
+const fn default_fee_spread_reserve_bps() -> u16 {
+    25
+}
+
+const fn default_final_catch_up_days() -> u32 {
+    7
 }
 
 const MAX_SLIPPAGE_BPS_HARD_CAP: u16 = 100;
@@ -138,10 +158,51 @@ impl Config {
                 "pacing horizon and cooldown must be positive".into(),
             ));
         }
+        if self.pacing.fee_spread_reserve_bps >= 10_000 {
+            return Err(ConfigError::Invalid(
+                "pacing.fee_spread_reserve_bps must be below 10000".into(),
+            ));
+        }
+        if self.pacing.final_catch_up_days == 0
+            || self.pacing.final_catch_up_days > self.pacing.target_horizon_days
+        {
+            return Err(ConfigError::Invalid(
+                "pacing final catch-up window is inconsistent with the target horizon".into(),
+            ));
+        }
+        if self.capital.max_automatically_deployable_usdc > self.capital.yearly_deployment_cap_usdc
+            || self.capital.yearly_deployment_cap_usdc > self.capital.cumulative_deployment_cap_usdc
+        {
+            return Err(ConfigError::Invalid(
+                "capital admission caps must be ordered automatic <= yearly <= cumulative".into(),
+            ));
+        }
         if self.pacing.min_order_usdc > self.pacing.max_order_usdc
             || self.pacing.max_order_usdc > self.execution.max_order_usdc
         {
             return Err(ConfigError::Invalid("order limits are inconsistent".into()));
+        }
+        let scheduled_weekdays = u32::try_from(
+            self.schedule
+                .weekdays
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+        )
+        .map_err(|_| ConfigError::Invalid("too many UTC weekdays".into()))?;
+        let regular_days = self
+            .pacing
+            .target_horizon_days
+            .saturating_sub(self.pacing.final_catch_up_days);
+        let regular_slots = (f64::from(regular_days) * f64::from(scheduled_weekdays) / 7.0).ceil();
+        let optimistic_slots = regular_slots + f64::from(self.pacing.final_catch_up_days);
+        let schedule_capacity = optimistic_slots * self.pacing.max_order_usdc;
+        if self.capital.max_automatically_deployable_usdc > schedule_capacity {
+            return Err(ConfigError::Invalid(
+                "automatic capital cap cannot fit the configured schedule and daily order cap"
+                    .into(),
+            ));
         }
         self.validate_observation_inputs()?;
         if !self.dry_run {

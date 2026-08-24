@@ -7,6 +7,7 @@ pub mod execution;
 pub mod ledger;
 pub mod metrics;
 pub mod monitor;
+pub mod pacing;
 pub mod signal;
 pub mod status;
 pub mod status_io;
