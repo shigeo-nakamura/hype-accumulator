@@ -745,8 +745,8 @@ dependencies = [
 
 [[package]]
 name = "dex-connector"
-version = "4.7.9"
-source = "git+https://github.com/shigeo-nakamura/dex-connector?tag=v4.7.9#9db3d4081d79e1dcb94b68028b078951236cd23d"
+version = "4.7.12"
+source = "git+https://github.com/shigeo-nakamura/dex-connector?tag=v4.7.12#753387e8f848f2917f6a657864c696eac04e83d7"
 dependencies = [
  "async-trait",
  "base64 0.21.7",
@@ -759,6 +759,7 @@ dependencies = [
  "ed25519-dalek",
  "env_logger",
  "ethers",
+ "fs2",
  "futures",
  "generic-array",
  "hex",
