@@ -225,8 +225,8 @@ fn every_transition_survives_a_restart_without_double_counting() {
     let eligibility = workflow
         .record_staking_eligibility(at(6))
         .expect("unsigned eligibility recorded");
-    assert_eq!(eligibility.residual_hype, hype(10));
-    assert_eq!(eligibility.eligible_hype, hype(240));
+    assert_eq!(eligibility.residual_hype, hype(0));
+    assert_eq!(eligibility.eligible_hype, hype(250));
     drop(workflow);
     workflow = reopen(&path, &binding);
     assert_eq!(
@@ -305,6 +305,66 @@ fn duplicate_responses_are_idempotent_even_when_redelivered_later() {
 }
 
 #[test]
+fn conclusively_absent_submission_releases_pending_intent_and_completes() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("absent-order.jsonl");
+    let binding = binding();
+    let mut workflow = reopen(&path, &binding);
+    let prepared = ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    drop(workflow);
+
+    workflow = reopen(&path, &binding);
+    assert_eq!(workflow.state().pending_action(), Some(&prepared));
+    assert!(matches!(
+        workflow.prepare_order(at(2)),
+        Ok(PrepareOutcome::ReconcileOnly {
+            kind: ActionKind::SubmitOrder,
+            ..
+        })
+    ));
+    assert_eq!(
+        workflow
+            .record_order_submission_absent("post-expiry-cloid-not-found", at(3))
+            .expect("authoritative absence recorded"),
+        AppendOutcome::Appended
+    );
+    let terminal_count = workflow.record_count();
+    assert_eq!(
+        workflow
+            .record_order_submission_absent("post-expiry-cloid-not-found", at(4))
+            .expect("absence replay is idempotent"),
+        AppendOutcome::Duplicate
+    );
+    assert_eq!(workflow.record_count(), terminal_count);
+    assert_eq!(workflow.state().stage(), WorkflowStage::OrderFinalized);
+    assert!(workflow.state().pending_action().is_none());
+    assert!(matches!(
+        workflow.prepare_order(at(4)),
+        Err(WorkflowError::InvalidTransition(_))
+    ));
+    drop(workflow);
+
+    workflow = reopen(&path, &binding);
+    assert_eq!(workflow.state().stage(), WorkflowStage::OrderFinalized);
+    assert!(workflow.state().pending_action().is_none());
+    assert_eq!(
+        workflow
+            .record_staking_eligibility(at(5))
+            .expect("zero-fill eligibility recorded"),
+        hype_accumulator::workflow::StakingEligibility {
+            residual_hype: hype(0),
+            eligible_hype: hype(0),
+        }
+    );
+    workflow.complete(at(6)).expect("workflow completed");
+    drop(workflow);
+    assert_eq!(
+        reopen(&path, &binding).state().stage(),
+        WorkflowStage::Complete
+    );
+}
+
+#[test]
 fn partial_fill_cancel_race_uses_one_final_cumulative_fill_and_never_rebuys() {
     let temp = tempfile::tempdir().expect("temp directory");
     let path = temp.path().join("workflow.jsonl");
@@ -349,8 +409,8 @@ fn partial_fill_cancel_race_uses_one_final_cumulative_fill_and_never_rebuys() {
     let eligibility = workflow
         .record_staking_eligibility(at(7))
         .expect("unsigned eligibility recorded from final cumulative fill");
-    assert_eq!(eligibility.residual_hype, hype(10));
-    assert_eq!(eligibility.eligible_hype, hype(140));
+    assert_eq!(eligibility.residual_hype, hype(0));
+    assert_eq!(eligibility.eligible_hype, hype(150));
 }
 
 #[test]
@@ -390,7 +450,8 @@ fn zero_fill_terminal_orders_complete_without_staking_intent() {
 fn residual_only_fill_records_zero_eligibility_and_completes() {
     let temp = tempfile::tempdir().expect("temp directory");
     let path = temp.path().join("residual-only.jsonl");
-    let binding = binding();
+    let mut binding = binding();
+    binding.inventory_before.spot_hype_atoms = hype(5);
     let mut workflow = reopen(&path, &binding);
     ready(workflow.prepare_order(at(1)).expect("order prepared"));
     workflow
@@ -469,6 +530,40 @@ fn late_event_collision_persists_manual_review_at_a_monotonic_time() {
         Err(WorkflowError::EventCollision(_))
     ));
     assert_eq!(workflow.state().stage(), WorkflowStage::ManualReview);
+    drop(workflow);
+    assert_eq!(
+        reopen(&path, &binding).state().stage(),
+        WorkflowStage::ManualReview
+    );
+}
+
+#[test]
+fn event_collision_after_completion_durably_invalidates_the_result() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("completed-collision.jsonl");
+    let binding = binding();
+    let mut workflow = reopen(&path, &binding);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    workflow
+        .observe_order_submission("exchange-order-1", at(2))
+        .expect("submission observed");
+    workflow
+        .finalize_order(hype(0), usdc(0), usdc(0), OrderFinality::Expired, at(3))
+        .expect("order finalized");
+    workflow
+        .record_staking_eligibility(at(4))
+        .expect("eligibility recorded");
+    workflow.complete(at(5)).expect("workflow completed");
+
+    assert!(matches!(
+        workflow.observe_order_submission("conflicting-order", at(2)),
+        Err(WorkflowError::EventCollision(_))
+    ));
+    assert_eq!(workflow.state().stage(), WorkflowStage::ManualReview);
+    assert!(workflow
+        .state()
+        .manual_review_reason()
+        .is_some_and(|reason| reason.contains("conflicting replay")));
     drop(workflow);
     assert_eq!(
         reopen(&path, &binding).state().stage(),
@@ -594,7 +689,7 @@ fn staking_and_delegation_actions_remain_hard_disabled() {
     let eligibility = workflow
         .record_staking_eligibility(at(7))
         .expect("unsigned eligibility recorded");
-    assert_eq!(eligibility.eligible_hype, hype(240));
+    assert_eq!(eligibility.eligible_hype, hype(250));
 }
 
 #[test]

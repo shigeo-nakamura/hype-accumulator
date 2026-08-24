@@ -53,6 +53,14 @@ pub struct InventoryBaseline {
     pub configured_residual_hype_atoms: HypeAtoms,
 }
 
+impl InventoryBaseline {
+    fn residual_hype_deficit(&self) -> HypeAtoms {
+        self.configured_residual_hype_atoms
+            .checked_sub(self.spot_hype_atoms)
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CapitalCommitment {
     pub event_id: String,
@@ -278,6 +286,10 @@ pub enum WorkflowTransition {
         action_id: String,
         exchange_order_id: String,
     },
+    OrderSubmissionAbsent {
+        action_id: String,
+        observation_id: String,
+    },
     OrderFillObserved {
         observation_id: String,
         cumulative_hype: HypeAtoms,
@@ -496,6 +508,19 @@ impl WorkflowState {
                 self.pending_action = None;
                 self.stage = WorkflowStage::OrderSubmitted;
             }
+            WorkflowTransition::OrderSubmissionAbsent {
+                action_id,
+                observation_id,
+            } => {
+                self.require_pending(ActionKind::SubmitOrder, action_id)?;
+                if self.stage != WorkflowStage::Decided || observation_id.trim().is_empty() {
+                    return Err(WorkflowError::InvalidTransition(
+                        "absent order submission evidence is invalid for current state".into(),
+                    ));
+                }
+                self.pending_action = None;
+                self.stage = WorkflowStage::OrderFinalized;
+            }
             WorkflowTransition::OrderFillObserved {
                 cumulative_hype,
                 cumulative_filled_usdc,
@@ -574,7 +599,7 @@ impl WorkflowState {
                 }
                 let expected_residual = self
                     .purchased_hype
-                    .min(self.binding.inventory_before.configured_residual_hype_atoms);
+                    .min(self.binding.inventory_before.residual_hype_deficit());
                 let expected_eligible = self
                     .purchased_hype
                     .checked_sub(expected_residual)
@@ -653,7 +678,7 @@ impl WorkflowState {
                 self.stage = WorkflowStage::Complete;
             }
             WorkflowTransition::ManualReview { reason } => {
-                if self.stage == WorkflowStage::Complete || reason.trim().is_empty() {
+                if reason.trim().is_empty() {
                     return Err(WorkflowError::InvalidTransition(
                         "manual review transition is invalid".into(),
                     ));
@@ -691,9 +716,9 @@ impl WorkflowState {
                 if self.stage == WorkflowStage::OrderFinalized
                     && !amount_hype.is_zero()
                     && Some(*amount_hype)
-                        == self.purchased_hype.checked_sub(
-                            self.binding.inventory_before.configured_residual_hype_atoms,
-                        ) =>
+                        == self
+                            .purchased_hype
+                            .checked_sub(self.binding.inventory_before.residual_hype_deficit()) =>
             {
                 Ok(())
             }
@@ -883,6 +908,34 @@ impl DurableWorkflow {
         )
     }
 
+    /// Records that authoritative post-expiry CLOID reconciliation found no
+    /// accepted order, releasing the prepared intent as a zero-fill terminal
+    /// outcome without allowing another submission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty evidence, an invalid stage, replay conflict,
+    /// or write failure.
+    pub fn record_order_submission_absent(
+        &mut self,
+        observation_id: impl Into<String>,
+        at: DateTime<Utc>,
+    ) -> Result<AppendOutcome, WorkflowError> {
+        let action_id = action_id_for(self.state.workflow_id(), ActionKind::SubmitOrder);
+        let observation_id = observation_id.into();
+        self.append_observation(
+            stable_id(
+                "event/order_submission_absent/v1",
+                &[self.state.workflow_id(), &action_id, &observation_id],
+            ),
+            at,
+            WorkflowTransition::OrderSubmissionAbsent {
+                action_id,
+                observation_id,
+            },
+        )
+    }
+
     /// Records cumulative fill and authoritative debit observations.
     ///
     /// # Errors
@@ -966,12 +1019,10 @@ impl DurableWorkflow {
                 "staking eligibility requires a terminal order".into(),
             ));
         }
-        let residual_hype = self.state.purchased_hype.min(
-            self.state
-                .binding
-                .inventory_before
-                .configured_residual_hype_atoms,
-        );
+        let residual_hype = self
+            .state
+            .purchased_hype
+            .min(self.state.binding.inventory_before.residual_hype_deficit());
         let eligible_hype = self
             .state
             .purchased_hype
@@ -1153,8 +1204,7 @@ impl DurableWorkflow {
     ///
     /// # Errors
     ///
-    /// Returns an error for an empty reason, a completed workflow, replay
-    /// conflict, or write failure.
+    /// Returns an error for an empty reason, replay conflict, or write failure.
     pub fn mark_manual_review(
         &mut self,
         reason: impl Into<String>,
@@ -1230,10 +1280,7 @@ impl DurableWorkflow {
             _ => None,
         };
         if let Some(reason) = reason {
-            if !matches!(
-                self.state.stage,
-                WorkflowStage::Complete | WorkflowStage::ManualReview
-            ) {
+            if self.state.stage != WorkflowStage::ManualReview {
                 let detected_at = at.max(self.state.last_transition_at);
                 self.mark_manual_review(reason, detected_at)?;
             }
@@ -1403,6 +1450,13 @@ fn validate_event_id(workflow_id: &str, event: &WorkflowEvent) -> Result<(), Wor
         WorkflowTransition::OrderSubmissionObserved { action_id, .. } => {
             stable_id("event/order_submission/v1", &[workflow_id, action_id])
         }
+        WorkflowTransition::OrderSubmissionAbsent {
+            action_id,
+            observation_id,
+        } => stable_id(
+            "event/order_submission_absent/v1",
+            &[workflow_id, action_id, observation_id],
+        ),
         WorkflowTransition::OrderFillObserved { observation_id, .. } => {
             stable_id("event/order_fill/v1", &[workflow_id, observation_id])
         }
