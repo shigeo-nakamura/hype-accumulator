@@ -756,12 +756,28 @@ impl DurableLedger {
 fn replay(events: &[LedgerEvent]) -> Result<ReplayState, LedgerError> {
     let mut state = ReplayState::default();
     let mut event_ids = BTreeSet::new();
+    let mut action_ids = BTreeSet::new();
+    let mut reward_ids = BTreeSet::new();
     for event in events {
         validate_event(event)?;
         if !event_ids.insert(event.event_id.as_str()) {
             return Err(LedgerError::CorruptLedger(
                 "duplicate event ID in journal".into(),
             ));
+        }
+        match &event.kind {
+            LedgerEventKind::StakingDepositRecorded { action_id, .. }
+            | LedgerEventKind::DelegationRecorded { action_id, .. } => {
+                if !action_ids.insert(action_id.as_str()) {
+                    return Err(LedgerError::ActionIdCollision(action_id.clone()));
+                }
+            }
+            LedgerEventKind::RewardRecorded { reward_id, .. } => {
+                if !reward_ids.insert(reward_id.as_str()) {
+                    return Err(LedgerError::RewardIdCollision(reward_id.clone()));
+                }
+            }
+            _ => {}
         }
         apply_event(&mut state, event)?;
         state.last_event_at = Some(event.occurred_at);
@@ -2304,6 +2320,10 @@ pub enum LedgerError {
     InsufficientDeployableCapital,
     #[error("commitment ID collision: {0}")]
     CommitmentCollision(String),
+    #[error("staking or delegation action ID collision: {0}")]
+    ActionIdCollision(String),
+    #[error("reward ID collision: {0}")]
+    RewardIdCollision(String),
     #[error("daily decision outcome already exists for {0}")]
     DecisionDateCollision(NaiveDate),
     #[error("daily decision ID already exists: {0}")]

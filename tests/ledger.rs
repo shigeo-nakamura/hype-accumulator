@@ -246,6 +246,68 @@ fn duplicate_event_is_idempotent_and_id_collision_fails_closed() {
 }
 
 #[test]
+fn staking_action_and_reward_ids_cannot_be_reused() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let anchor = anchor_store();
+    let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+    ledger
+        .append(event(
+            "staking-deposit-first",
+            1,
+            LedgerEventKind::StakingDepositRecorded {
+                action_id: "shared-action".into(),
+                hype_atoms: 10,
+            },
+        ))
+        .expect("append staking action");
+    let durable_before_action = fs::read(ledger_path(directory.path())).expect("read ledger");
+
+    assert_eq!(
+        ledger.append(event(
+            "delegation-second",
+            2,
+            LedgerEventKind::DelegationRecorded {
+                action_id: "shared-action".into(),
+                validator_id: "validator-1".into(),
+                hype_atoms: 10,
+            },
+        )),
+        Err(LedgerError::ActionIdCollision("shared-action".into()))
+    );
+    assert_eq!(
+        fs::read(ledger_path(directory.path())).expect("read unchanged action ledger"),
+        durable_before_action
+    );
+
+    ledger
+        .append(event(
+            "reward-first",
+            3,
+            LedgerEventKind::RewardRecorded {
+                reward_id: "shared-reward".into(),
+                hype_atoms: 2,
+            },
+        ))
+        .expect("append reward");
+    let durable_before_reward = fs::read(ledger_path(directory.path())).expect("read ledger");
+    assert_eq!(
+        ledger.append(event(
+            "reward-second",
+            4,
+            LedgerEventKind::RewardRecorded {
+                reward_id: "shared-reward".into(),
+                hype_atoms: 2,
+            },
+        )),
+        Err(LedgerError::RewardIdCollision("shared-reward".into()))
+    );
+    assert_eq!(
+        fs::read(ledger_path(directory.path())).expect("read unchanged reward ledger"),
+        durable_before_reward
+    );
+}
+
+#[test]
 fn one_daily_decision_or_skip_outcome_is_allowed_per_date() {
     for (first, second) in [
         ("decision", "decision"),
