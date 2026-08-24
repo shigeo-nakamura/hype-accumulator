@@ -758,6 +758,7 @@ fn replay(events: &[LedgerEvent]) -> Result<ReplayState, LedgerError> {
     let mut event_ids = BTreeSet::new();
     let mut action_ids = BTreeSet::new();
     let mut reward_ids = BTreeSet::new();
+    let mut correction_ids = BTreeSet::new();
     for event in events {
         validate_event(event)?;
         if !event_ids.insert(event.event_id.as_str()) {
@@ -775,6 +776,11 @@ fn replay(events: &[LedgerEvent]) -> Result<ReplayState, LedgerError> {
             LedgerEventKind::RewardRecorded { reward_id, .. } => {
                 if !reward_ids.insert(reward_id.as_str()) {
                     return Err(LedgerError::RewardIdCollision(reward_id.clone()));
+                }
+            }
+            LedgerEventKind::ReconciliationCorrection { correction_id, .. } => {
+                if !correction_ids.insert(correction_id.as_str()) {
+                    return Err(LedgerError::CorrectionIdCollision(correction_id.clone()));
                 }
             }
             _ => {}
@@ -2324,6 +2330,8 @@ pub enum LedgerError {
     ActionIdCollision(String),
     #[error("reward ID collision: {0}")]
     RewardIdCollision(String),
+    #[error("reconciliation correction ID collision: {0}")]
+    CorrectionIdCollision(String),
     #[error("daily decision outcome already exists for {0}")]
     DecisionDateCollision(NaiveDate),
     #[error("daily decision ID already exists: {0}")]

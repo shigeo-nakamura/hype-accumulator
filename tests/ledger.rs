@@ -308,6 +308,48 @@ fn staking_action_and_reward_ids_cannot_be_reused() {
 }
 
 #[test]
+fn reconciliation_correction_ids_cannot_be_reused() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let anchor = anchor_store();
+    let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+    ledger
+        .append(event(
+            "correction-first",
+            1,
+            LedgerEventKind::ReconciliationCorrection {
+                correction_id: "shared-correction".into(),
+                observed_usdc: usd(10),
+                observed_hype_atoms: 20,
+                reason: "authoritative correction".into(),
+            },
+        ))
+        .expect("append correction");
+    let durable_before = fs::read(ledger_path(directory.path())).expect("read ledger");
+
+    assert_eq!(
+        ledger.append(event(
+            "correction-second",
+            2,
+            LedgerEventKind::ReconciliationCorrection {
+                correction_id: "shared-correction".into(),
+                observed_usdc: usd(11),
+                observed_hype_atoms: 21,
+                reason: "conflicting retry".into(),
+            },
+        )),
+        Err(LedgerError::CorrectionIdCollision(
+            "shared-correction".into()
+        ))
+    );
+    assert_eq!(
+        fs::read(ledger_path(directory.path())).expect("read unchanged ledger"),
+        durable_before
+    );
+    assert_eq!(ledger.state().observed_usdc(), usd(10));
+    assert_eq!(ledger.state().observed_hype_atoms(), 20);
+}
+
+#[test]
 fn one_daily_decision_or_skip_outcome_is_allowed_per_date() {
     for (first, second) in [
         ("decision", "decision"),
