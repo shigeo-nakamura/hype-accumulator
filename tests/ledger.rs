@@ -158,6 +158,27 @@ fn duplicate_event_is_idempotent_and_id_collision_fails_closed() {
 }
 
 #[test]
+fn open_durably_creates_a_missing_nested_ledger_directory() {
+    let container = tempfile::tempdir().expect("ledger container");
+    let directory = container.path().join("first/second/ledger");
+    let anchor = anchor_store();
+
+    let mut ledger = open(&directory, &anchor).expect("open missing nested ledger directory");
+    ledger
+        .append(deposit("deposit-after-directory-create", 1, 100))
+        .expect("append after directory creation");
+    drop(ledger);
+
+    assert!(directory.is_dir());
+    assert_eq!(
+        open(&directory, &anchor)
+            .expect("reopen durably created ledger")
+            .record_count(),
+        1
+    );
+}
+
+#[test]
 fn duplicate_retry_verifies_that_the_event_is_still_durable() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let anchor = anchor_store();

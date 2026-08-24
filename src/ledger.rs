@@ -391,7 +391,7 @@ impl DurableLedger {
         directory: impl AsRef<Path>,
         anchor_store: Arc<dyn ProtectedAnchorStore>,
     ) -> Result<Self, LedgerError> {
-        let directory = directory.as_ref().to_path_buf();
+        let directory = canonical_directory(directory.as_ref())?;
         let _lock = LedgerLock::acquire(&directory)?;
         recover_pending(&directory, anchor_store.as_ref())?;
         Self::open_unlocked(directory, anchor_store)
@@ -536,7 +536,7 @@ impl DurableLedger {
         destination_anchor_store: Arc<dyn ProtectedAnchorStore>,
     ) -> Result<Self, LedgerError> {
         let source = canonical_directory(source.as_ref())?;
-        let destination = canonical_restore_directory(destination.as_ref())?;
+        let destination = canonical_directory(destination.as_ref())?;
         if source == destination {
             return Err(LedgerError::RestoreDestinationNotEmpty);
         }
@@ -1468,21 +1468,16 @@ struct LedgerLock {
 }
 
 fn canonical_directory(path: &Path) -> Result<PathBuf, LedgerError> {
-    fs::create_dir_all(path).map_err(LedgerError::io)?;
-    fs::canonicalize(path).map_err(LedgerError::io)
-}
-
-fn canonical_restore_directory(path: &Path) -> Result<PathBuf, LedgerError> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         env::current_dir().map_err(LedgerError::io)?.join(path)
     };
-    create_restore_directory_all(&absolute, &mut sync_directory)?;
+    create_directory_all_durable(&absolute, &mut sync_directory)?;
     fs::canonicalize(absolute).map_err(LedgerError::io)
 }
 
-fn create_restore_directory_all<F>(path: &Path, sync_parent: &mut F) -> Result<(), LedgerError>
+fn create_directory_all_durable<F>(path: &Path, sync_parent: &mut F) -> Result<(), LedgerError>
 where
     F: FnMut(&Path) -> Result<(), LedgerError>,
 {
@@ -1530,7 +1525,6 @@ where
 
 impl LedgerLock {
     fn acquire(directory: &Path) -> Result<Self, LedgerError> {
-        fs::create_dir_all(directory).map_err(LedgerError::io)?;
         let mut options = OpenOptions::new();
         options.create(true).read(true).write(true);
         #[cfg(unix)]
@@ -1838,14 +1832,14 @@ mod transaction_tests {
     }
 
     #[test]
-    fn restore_directory_creation_syncs_each_new_parent_entry() {
+    fn directory_creation_syncs_each_new_parent_entry() {
         let container = tempfile::tempdir().expect("destination container");
         let first = container.path().join("first");
         let second = first.join("second");
         let destination = second.join("restored");
         let mut synced = Vec::new();
 
-        create_restore_directory_all(&destination, &mut |parent| {
+        create_directory_all_durable(&destination, &mut |parent| {
             synced.push(parent.to_path_buf());
             Ok(())
         })
@@ -1862,12 +1856,21 @@ mod transaction_tests {
         );
 
         synced.clear();
-        create_restore_directory_all(&destination, &mut |parent| {
+        create_directory_all_durable(&destination, &mut |parent| {
             synced.push(parent.to_path_buf());
             Ok(())
         })
         .expect("resync an existing destination entry on retry");
         assert_eq!(synced, vec![second]);
+    }
+
+    #[test]
+    fn ledger_lock_does_not_implicitly_create_a_missing_directory() {
+        let container = tempfile::tempdir().expect("directory container");
+        let missing = container.path().join("missing");
+
+        assert!(LedgerLock::acquire(&missing).is_err());
+        assert!(!missing.exists());
     }
 
     #[test]
@@ -2007,6 +2010,7 @@ mod transaction_tests {
         let pending = build_pending_restore(&ledger_payload, &snapshot_payload, &verified)
             .expect("build restore intent");
         {
+            canonical_directory(&destination).expect("durably create destination directory");
             let _lock = LedgerLock::acquire(&destination).expect("acquire destination lock");
             write_pending_restore(&destination, &pending).expect("persist restore intent");
             write_atomic(&destination.join(LEDGER_FILE_NAME), &ledger_payload)
