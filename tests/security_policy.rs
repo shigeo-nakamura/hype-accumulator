@@ -336,7 +336,7 @@ fn acknowledged_caps_and_reserve_drive_effective_pacing() {
 }
 
 #[test]
-fn schedule_capacity_accounts_for_the_attached_fixed_reserve() {
+fn schedule_capacity_accounts_for_the_global_reserve_across_tranches() {
     let env = live_environment();
     let runtime = live_runtime_toml()
         .replace(
@@ -352,7 +352,7 @@ fn schedule_capacity_accounts_for_the_attached_fixed_reserve() {
         Err(ConfigError::Invalid(message)) if message.contains("configured schedule")
     ));
 
-    let policy = live_policy_template()
+    let multi_tranche_policy = live_policy_template()
         .replace(
             "max_auto_deposit_microusd = 100000000",
             "max_auto_deposit_microusd = 80000000",
@@ -362,15 +362,49 @@ fn schedule_capacity_accounts_for_the_attached_fixed_reserve() {
             "max_daily_notional_microusd = 10000000",
         )
         .replace("reserve_microusd = 1000000", "reserve_microusd = 10000000");
-    let expected = Config::from_toml_with_security_policy(&runtime, &policy)
+    let expected = Config::from_toml_with_security_policy(&runtime, &multi_tranche_policy)
         .expect("live documents")
         .expected_live_acknowledgement(&env)
         .expect("effective acknowledgement");
-    let acknowledged = policy.replace(
+    let acknowledged = multi_tranche_policy.replace(
         "live_acknowledgement = \"\"",
         &format!("live_acknowledgement = \"{expected}\""),
     );
-    Config::from_toml_with_security_policy(&runtime, &acknowledged)
+    assert!(matches!(
+        Config::from_toml_with_security_policy(&runtime, &acknowledged)
+            .expect("acknowledged multi-tranche documents")
+            .validate_at(&env, at("2026-08-24T00:00:00Z")),
+        Err(ConfigError::Invalid(message)) if message.contains("configured schedule")
+    ));
+
+    let one_tranche_runtime = runtime
+        .replace(
+            "yearly_deployment_cap_usdc = 500.0",
+            "yearly_deployment_cap_usdc = 80.0",
+        )
+        .replace(
+            "cumulative_deployment_cap_usdc = 1000.0",
+            "cumulative_deployment_cap_usdc = 80.0",
+        );
+    let one_tranche_policy = multi_tranche_policy
+        .replace(
+            "max_yearly_deployable_microusd = 500000000",
+            "max_yearly_deployable_microusd = 80000000",
+        )
+        .replace(
+            "max_cumulative_deployable_microusd = 1000000000",
+            "max_cumulative_deployable_microusd = 80000000",
+        );
+    let expected =
+        Config::from_toml_with_security_policy(&one_tranche_runtime, &one_tranche_policy)
+            .expect("single-tranche live documents")
+            .expected_live_acknowledgement(&env)
+            .expect("effective acknowledgement");
+    let acknowledged = one_tranche_policy.replace(
+        "live_acknowledgement = \"\"",
+        &format!("live_acknowledgement = \"{expected}\""),
+    );
+    Config::from_toml_with_security_policy(&one_tranche_runtime, &acknowledged)
         .expect("acknowledged documents")
         .validate_at(&env, at("2026-08-24T00:00:00Z"))
         .expect("70 USDC capacity fits the 80 USDC cap minus 10 USDC reserve");

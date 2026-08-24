@@ -260,11 +260,19 @@ impl Config {
             self.capital.max_automatically_deployable_usdc,
             "runtime automatic capital cap",
         )?;
+        let cumulative_cap_microusd = usdc_to_microusd(
+            self.capital.cumulative_deployment_cap_usdc,
+            "runtime cumulative capital cap",
+        )?;
         let fixed_reserve_microusd = self
             .effective_security_reserve_microusd()
             .unwrap_or_default();
-        let schedulable_cap_microusd =
-            automatic_cap_microusd.saturating_sub(fixed_reserve_microusd);
+        // The reserve reduces the first admitted tranche, but an expired
+        // tranche may later hold it for the account as a whole. A subsequent
+        // active tranche can therefore spend up to the automatic cap, bounded
+        // only by cumulative capacity remaining after that global reserve.
+        let schedulable_cap_microusd = automatic_cap_microusd
+            .min(cumulative_cap_microusd.saturating_sub(fixed_reserve_microusd));
         let schedule_capacity_microusd =
             usdc_to_microusd(schedule_capacity, "runtime schedule capacity")?;
         if schedulable_cap_microusd > schedule_capacity_microusd {
