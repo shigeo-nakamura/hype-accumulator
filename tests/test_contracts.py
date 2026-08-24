@@ -57,6 +57,22 @@ class PointInTimeContractTests(unittest.TestCase):
 
         self.assertGreater(deposit.first_usable_at, decision)
 
+    def test_view_as_of_excludes_later_revision(self) -> None:
+        _, revisions, _ = load_dataset(FIXTURES / "dataset-manifest.json")
+        view = PointInTimeView(revisions, timestamp("2025-12-23T23:59:59Z"))
+
+        history = view.history(
+            "btc_etf_flow_usd",
+            timestamp("2025-12-31T23:00:00Z"),
+            publication_lag_days=1,
+        )
+
+        observation = next(
+            row for row in history if row.observation_date.isoformat() == "2025-12-20"
+        )
+        self.assertEqual(observation.value, -80)
+        self.assertEqual(observation.revision_id, "initial")
+
     def test_manifest_checksum_detects_tampering(self) -> None:
         original = json.loads((FIXTURES / "capital-one-manifest.json").read_text(encoding="utf-8"))
         with tempfile.TemporaryDirectory() as directory:
@@ -75,4 +91,3 @@ class PointInTimeContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

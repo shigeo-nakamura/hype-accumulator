@@ -152,6 +152,39 @@ class EngineInvariantTests(unittest.TestCase):
 
         self.assertEqual(result["trades"][0]["multiplier"], 1.0)
 
+    def test_missing_feature_obeys_skip_fallback(self) -> None:
+        utc = timezone.utc
+        at = datetime(2025, 1, 1, 12, tzinfo=utc)
+        deposit = CapitalEvent("deposit", "deposit", 20.0, at, at, at)
+        result = run_backtest(
+            [PriceBar(at, 10.0)],
+            [deposit],
+            PointInTimeView([], at),
+            {
+                "name": "adaptive",
+                "kind": "adaptive",
+                "cadence": "daily",
+                "horizon": "2025-01-01",
+                "features": ["missing-feature"],
+                "sensitivity": 0.5,
+                "min_multiplier": 0.5,
+                "max_multiplier": 1.5,
+                "stale_after_days": 3,
+                "stale_behavior": "skip",
+            },
+            {
+                "min_trade_usd": 1.0,
+                "max_trade_usd": 100.0,
+                "fee_bps": 0.0,
+                "half_spread_bps": 0.0,
+                "slippage_bps": 0.0,
+            },
+            at,
+        )
+
+        self.assertEqual(result["trade_count"], 0)
+        self.assertEqual(result["skipped_days"]["stale_features"], 1)
+
     def test_fixture_cannot_produce_economic_go_recommendation(self) -> None:
         self.assertTrue(REPORT["fixture_only"])
         self.assertEqual(REPORT["recommendation"], "no-go")

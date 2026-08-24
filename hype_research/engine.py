@@ -57,6 +57,7 @@ def feature_score(view: PointInTimeView, decision_at: datetime, enabled: set[str
     for series in sorted(enabled):
         history = view.history(series, decision_at, publication_lag_days=1 if series == "btc_etf_flow_usd" else 0)
         if len(history) < 2:
+            stale = True
             continue
         stale |= (decision_at.date() - history[-1].observation_date).days > stale_after_days
         values = [item.value for item in history[-5:]]
