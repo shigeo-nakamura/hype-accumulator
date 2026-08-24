@@ -11,27 +11,27 @@ pub const DASHBOARD_SCHEMA_VERSION: u8 = 1;
 /// not be included. `total_equity_usdc` is always derived by this type.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct AccumulatorStatus {
-    pub total_equity_usdc: f64,
-    pub usdc_balance: f64,
-    pub hype_balance: f64,
-    pub hype_price_usdc: f64,
-    pub balance_observed_at: DateTime<Utc>,
-    pub last_trade_at: Option<DateTime<Utc>>,
-    pub trade_cadence: String,
-    pub healthy: bool,
+    total_equity_usdc: f64,
+    usdc_balance: f64,
+    hype_balance: f64,
+    hype_price_usdc: f64,
+    balance_observed_at: DateTime<Utc>,
+    last_trade_at: Option<DateTime<Utc>>,
+    trade_cadence: String,
+    healthy: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub health_reason: Option<String>,
+    health_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct DashboardStatus {
-    pub schema_version: u8,
-    pub ts: i64,
-    pub updated_at: DateTime<Utc>,
-    pub process_started_at: i64,
-    pub dex: &'static str,
-    pub dry_run: bool,
-    pub accumulator: AccumulatorStatus,
+    schema_version: u8,
+    ts: i64,
+    updated_at: DateTime<Utc>,
+    process_started_at: i64,
+    dex: &'static str,
+    dry_run: bool,
+    accumulator: AccumulatorStatus,
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -102,6 +102,51 @@ impl AccumulatorStatus {
             healthy: health_reason.is_none(),
             health_reason,
         })
+    }
+
+    #[must_use]
+    pub const fn total_equity_usdc(&self) -> f64 {
+        self.total_equity_usdc
+    }
+
+    #[must_use]
+    pub const fn usdc_balance(&self) -> f64 {
+        self.usdc_balance
+    }
+
+    #[must_use]
+    pub const fn hype_balance(&self) -> f64 {
+        self.hype_balance
+    }
+
+    #[must_use]
+    pub const fn hype_price_usdc(&self) -> f64 {
+        self.hype_price_usdc
+    }
+
+    #[must_use]
+    pub const fn balance_observed_at(&self) -> &DateTime<Utc> {
+        &self.balance_observed_at
+    }
+
+    #[must_use]
+    pub const fn last_trade_at(&self) -> Option<&DateTime<Utc>> {
+        self.last_trade_at.as_ref()
+    }
+
+    #[must_use]
+    pub fn trade_cadence(&self) -> &str {
+        &self.trade_cadence
+    }
+
+    #[must_use]
+    pub const fn is_healthy(&self) -> bool {
+        self.healthy
+    }
+
+    #[must_use]
+    pub fn health_reason(&self) -> Option<&str> {
+        self.health_reason.as_deref()
     }
 }
 

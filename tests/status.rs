@@ -52,9 +52,9 @@ fn degraded_status_requires_a_nonempty_reason() {
         Some("account reconciliation delayed".to_owned()),
     )
     .unwrap();
-    assert!(!degraded.healthy);
+    assert!(!degraded.is_healthy());
     assert_eq!(
-        degraded.health_reason.as_deref(),
+        degraded.health_reason(),
         Some("account reconciliation delayed")
     );
 
