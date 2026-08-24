@@ -4,7 +4,8 @@ use hype_accumulator::{
     workflow::{
         ActionKind, AppendOutcome, BoundFillEvidence, DecisionBinding, DurableWorkflow,
         ExternalAction, ExternalReceipt, HypeAtoms, InventoryBaseline,
-        OrderBoundEligibilityEvidence, OrderFinality, PrepareOutcome, WorkflowError, WorkflowStage,
+        OrderBoundEligibilityEvidence, OrderEnvelopeBinding, OrderFinality, PrepareOutcome,
+        WorkflowError, WorkflowStage,
     },
 };
 use std::{
@@ -82,6 +83,12 @@ fn binding() -> DecisionBinding {
             delegated_hype_atoms: hype(19_000),
             configured_residual_hype_atoms: hype(10),
         },
+        OrderEnvelopeBinding {
+            original_quantity_hype: hype(500),
+            limit_price_usdc_per_hype: usdc(200_000),
+            l1_nonce: 7,
+            signed_expiry_at: at(30),
+        },
     )
     .expect("valid workflow binding")
 }
@@ -108,6 +115,10 @@ fn bound_evidence(
             .expect("canonical order envelope hashes"),
         authorized_planned_usdc: binding.planned_usdc,
         authorized_max_debit_usdc: binding.committed_usdc,
+        original_quantity_hype: binding.order_envelope.original_quantity_hype,
+        limit_price_usdc_per_hype: binding.order_envelope.limit_price_usdc_per_hype,
+        l1_nonce: binding.order_envelope.l1_nonce,
+        signed_expiry_at: binding.order_envelope.signed_expiry_at,
         authorized_at: binding.decided_at,
         order_id: state
             .exchange_order_id()
@@ -158,9 +169,12 @@ fn deterministic_identity_is_independent_of_allocation_input_order() {
     let first_binding = binding();
     let mut reversed = decision();
     reversed.allocations.reverse();
-    let second_binding =
-        DecisionBinding::from_pacing_decision(&reversed, first_binding.inventory_before.clone())
-            .expect("reversed decision binds");
+    let second_binding = DecisionBinding::from_pacing_decision(
+        &reversed,
+        first_binding.inventory_before.clone(),
+        first_binding.order_envelope.clone(),
+    )
+    .expect("reversed decision binds");
 
     assert_eq!(first_binding, second_binding);
     let mut first = reopen(&temp.path().join("first.jsonl"), &first_binding);
@@ -176,11 +190,19 @@ fn deterministic_identity_is_independent_of_allocation_input_order() {
             client_order_id,
             notional_usdc,
             max_debit_usdc,
+            original_quantity_hype,
+            limit_price_usdc_per_hype,
+            l1_nonce,
+            signed_expiry_at,
             ..
         } if client_order_id.starts_with("0x")
             && client_order_id.len() == 34
             && notional_usdc == usdc(50_000_000)
             && max_debit_usdc == usdc(51_000_000)
+            && original_quantity_hype == hype(500)
+            && limit_price_usdc_per_hype == usdc(200_000)
+            && l1_nonce == 7
+            && signed_expiry_at == at(30)
     ));
 }
 
@@ -853,9 +875,12 @@ fn later_capital_never_resizes_a_decided_or_ambiguous_order() {
         filled_usdc: usdc(0),
         debited_usdc: usdc(0),
     });
-    let changed =
-        DecisionBinding::from_pacing_decision(&changed_decision, original.inventory_before.clone())
-            .expect("later decision shape is internally valid");
+    let changed = DecisionBinding::from_pacing_decision(
+        &changed_decision,
+        original.inventory_before.clone(),
+        original.order_envelope.clone(),
+    )
+    .expect("later decision shape is internally valid");
     assert_binding_mismatch(&DurableWorkflow::open_or_create(&path, &changed));
 
     let mut restarted = reopen(&path, &original);
@@ -1071,4 +1096,112 @@ fn accepted_order_without_bound_authorization_is_permanently_ineligible() {
         reopen(&path, &binding).state().stage(),
         WorkflowStage::ManualReview
     );
+}
+
+#[test]
+fn every_signed_order_field_must_match_for_eligibility() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let binding = binding();
+    for mismatch in ["quantity", "limit", "nonce", "expiry"] {
+        let path = temp.path().join(format!("mismatched-{mismatch}.jsonl"));
+        let mut workflow = reopen(&path, &binding);
+        ready(workflow.prepare_order(at(1)).expect("order prepared"));
+        workflow
+            .observe_order_submission("exchange-order-1", at(2))
+            .expect("submission observed");
+        workflow
+            .finalize_order(hype(0), usdc(0), usdc(0), OrderFinality::Expired, at(3))
+            .expect("order finalized");
+        let mut evidence = bound_evidence(&workflow, &[]);
+        match mismatch {
+            "quantity" => evidence.original_quantity_hype = hype(501),
+            "limit" => evidence.limit_price_usdc_per_hype = usdc(200_001),
+            "nonce" => evidence.l1_nonce = 8,
+            "expiry" => evidence.signed_expiry_at = at(29),
+            _ => unreachable!("complete fixture set"),
+        }
+
+        assert!(matches!(
+            workflow.record_staking_eligibility(Some(evidence), at(4)),
+            Err(WorkflowError::ContradictoryObservation(_))
+        ));
+        assert_eq!(workflow.state().stage(), WorkflowStage::ManualReview);
+        drop(workflow);
+        assert_eq!(
+            reopen(&path, &binding).state().stage(),
+            WorkflowStage::ManualReview
+        );
+    }
+}
+
+#[test]
+fn stale_invalid_eligibility_evidence_cannot_be_replaced() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("stale-eligibility.jsonl");
+    let binding = binding();
+    let mut workflow = reopen(&path, &binding);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    workflow
+        .observe_order_submission("exchange-order-1", at(2))
+        .expect("submission observed");
+    workflow
+        .finalize_order(hype(0), usdc(0), usdc(0), OrderFinality::Expired, at(4))
+        .expect("order finalized");
+    let valid_evidence = bound_evidence(&workflow, &[]);
+
+    assert!(matches!(
+        workflow.record_staking_eligibility(None, at(3)),
+        Err(WorkflowError::InvalidTransition(_))
+    ));
+    assert_eq!(workflow.state().stage(), WorkflowStage::ManualReview);
+    assert!(matches!(
+        workflow.record_staking_eligibility(Some(valid_evidence), at(5)),
+        Err(WorkflowError::InvalidTransition(_))
+    ));
+    drop(workflow);
+    assert_eq!(
+        reopen(&path, &binding).state().stage(),
+        WorkflowStage::ManualReview
+    );
+}
+
+#[test]
+fn bootstrap_head_recovers_initial_journal_fsync_crash_window() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("initial-checkpoint-lag.jsonl");
+    let binding = binding();
+    let workflow = reopen(&path, &binding);
+    let workflow_id = workflow.state().workflow_id().to_owned();
+    drop(workflow);
+
+    let checkpoint = checkpoint_path(&path);
+    let payload = fs::read(&checkpoint).expect("durable head read");
+    let mut bootstrap: serde_json::Value = serde_json::from_slice(
+        payload
+            .strip_suffix(b"\n")
+            .expect("durable head is newline terminated"),
+    )
+    .expect("durable head parses");
+    bootstrap["sequence"] = serde_json::Value::Null;
+    bootstrap["record_hash"] = serde_json::Value::String(String::new());
+    bootstrap["journal_len"] = serde_json::Value::from(0_u64);
+    let mut encoded = serde_json::to_vec(&bootstrap).expect("bootstrap head serializes");
+    encoded.push(b'\n');
+    fs::write(&checkpoint, &encoded).expect("bootstrap head restored");
+
+    let mut recovered = reopen(&path, &binding);
+    assert_eq!(recovered.record_count(), 1);
+    assert_eq!(recovered.state().workflow_id(), workflow_id);
+    let advanced = fs::read(&checkpoint).expect("advanced durable head read");
+    assert!(!String::from_utf8(advanced)
+        .expect("head is UTF-8 JSON")
+        .contains("\"sequence\":null"));
+
+    ready(recovered.prepare_order(at(1)).expect("order prepared"));
+    drop(recovered);
+    fs::write(&checkpoint, encoded).expect("bootstrap head restored after later record");
+    assert!(matches!(
+        DurableWorkflow::open_or_create(&path, &binding),
+        Err(WorkflowError::RollbackDetected(_))
+    ));
 }

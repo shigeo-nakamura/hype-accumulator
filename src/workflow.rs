@@ -65,6 +65,15 @@ impl InventoryBaseline {
     }
 }
 
+/// Immutable fields of the signer-authorized IOC order envelope.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OrderEnvelopeBinding {
+    pub original_quantity_hype: HypeAtoms,
+    pub limit_price_usdc_per_hype: UsdcMicros,
+    pub l1_nonce: u64,
+    pub signed_expiry_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CapitalCommitment {
     pub event_id: String,
@@ -83,6 +92,7 @@ pub struct DecisionBinding {
     pub committed_usdc: UsdcMicros,
     pub capital_commitments: Vec<CapitalCommitment>,
     pub inventory_before: InventoryBaseline,
+    pub order_envelope: OrderEnvelopeBinding,
 }
 
 impl DecisionBinding {
@@ -98,6 +108,7 @@ impl DecisionBinding {
     pub fn from_pacing_decision(
         decision: &DailyDecision,
         inventory_before: InventoryBaseline,
+        order_envelope: OrderEnvelopeBinding,
     ) -> Result<Self, WorkflowError> {
         if decision.settled
             || decision.planned_usdc.is_zero()
@@ -132,6 +143,7 @@ impl DecisionBinding {
             committed_usdc: decision.committed_usdc,
             capital_commitments: commitments,
             inventory_before,
+            order_envelope,
         };
         binding.validate()?;
         Ok(binding)
@@ -148,6 +160,9 @@ impl DecisionBinding {
                 .is_empty()
             || self.planned_usdc.is_zero()
             || self.committed_usdc < self.planned_usdc
+            || self.order_envelope.original_quantity_hype.is_zero()
+            || self.order_envelope.limit_price_usdc_per_hype.is_zero()
+            || self.order_envelope.signed_expiry_at <= self.decided_at
             || self.capital_commitments.is_empty()
             || self.decided_at.date_naive() != self.decision_date
         {
@@ -223,6 +238,10 @@ pub enum ExternalAction {
         client_order_id: String,
         notional_usdc: UsdcMicros,
         max_debit_usdc: UsdcMicros,
+        original_quantity_hype: HypeAtoms,
+        limit_price_usdc_per_hype: UsdcMicros,
+        l1_nonce: u64,
+        signed_expiry_at: DateTime<Utc>,
     },
     DepositToStaking {
         action_id: String,
@@ -305,6 +324,10 @@ pub struct OrderBoundEligibilityEvidence {
     pub canonical_order_envelope_hash: String,
     pub authorized_planned_usdc: UsdcMicros,
     pub authorized_max_debit_usdc: UsdcMicros,
+    pub original_quantity_hype: HypeAtoms,
+    pub limit_price_usdc_per_hype: UsdcMicros,
+    pub l1_nonce: u64,
+    pub signed_expiry_at: DateTime<Utc>,
     pub authorized_at: DateTime<Utc>,
     pub order_id: String,
     pub accepted_at: DateTime<Utc>,
@@ -818,11 +841,21 @@ impl WorkflowState {
                 client_order_id,
                 notional_usdc,
                 max_debit_usdc,
+                original_quantity_hype,
+                limit_price_usdc_per_hype,
+                l1_nonce,
+                signed_expiry_at,
                 ..
             } if self.stage == WorkflowStage::Decided
                 && client_order_id == &client_order_id_for(&self.workflow_id)
                 && *notional_usdc == self.binding.planned_usdc
-                && *max_debit_usdc == self.binding.committed_usdc =>
+                && *max_debit_usdc == self.binding.committed_usdc
+                && *original_quantity_hype
+                    == self.binding.order_envelope.original_quantity_hype
+                && *limit_price_usdc_per_hype
+                    == self.binding.order_envelope.limit_price_usdc_per_hype
+                && *l1_nonce == self.binding.order_envelope.l1_nonce
+                && *signed_expiry_at == self.binding.order_envelope.signed_expiry_at =>
             {
                 Ok(())
             }
@@ -880,6 +913,11 @@ impl WorkflowState {
             || evidence.canonical_order_envelope_hash != canonical_order_envelope_hash(self)?
             || evidence.authorized_planned_usdc != self.binding.planned_usdc
             || evidence.authorized_max_debit_usdc != self.binding.committed_usdc
+            || evidence.original_quantity_hype != self.binding.order_envelope.original_quantity_hype
+            || evidence.limit_price_usdc_per_hype
+                != self.binding.order_envelope.limit_price_usdc_per_hype
+            || evidence.l1_nonce != self.binding.order_envelope.l1_nonce
+            || evidence.signed_expiry_at != self.binding.order_envelope.signed_expiry_at
             || evidence.order_id != order_id
             || evidence.accepted_at != accepted_at
             || evidence.authorized_at < self.binding.decided_at
@@ -887,6 +925,7 @@ impl WorkflowState {
             || evidence.order_bound_at < accepted_at
             || evidence.order_bound_at > recorded_at
             || evidence.effective_expiry_at <= accepted_at
+            || evidence.effective_expiry_at > evidence.signed_expiry_at
             || recorded_at >= evidence.effective_expiry_at
             || evidence.residual_reservation_hype
                 != self.binding.inventory_before.residual_hype_deficit()
@@ -949,6 +988,7 @@ impl WorkflowState {
             || cumulative_debited_usdc < cumulative_filled_usdc
             || cumulative_filled_usdc > self.binding.planned_usdc
             || cumulative_debited_usdc > self.binding.committed_usdc
+            || cumulative_hype > self.binding.order_envelope.original_quantity_hype
         {
             return Err(WorkflowError::ContradictoryObservation(
                 "cumulative fill/debit regressed, violated its cap, or had zero HYPE".into(),
@@ -982,6 +1022,7 @@ impl WorkflowState {
     fn invalid_transition_contradiction_reason(
         &self,
         transition: &WorkflowTransition,
+        at: DateTime<Utc>,
     ) -> Option<String> {
         match transition {
             WorkflowTransition::OrderSubmissionObserved { .. } if self.order_is_terminal() => {
@@ -1047,6 +1088,19 @@ impl WorkflowState {
                     _ => None,
                 }
             }
+            WorkflowTransition::StakingEligibilityRecorded { evidence, .. }
+                if self.stage == WorkflowStage::OrderFinalized =>
+            {
+                if at < self.last_transition_at {
+                    return Some(
+                        "eligibility evidence predates terminal order reconciliation".into(),
+                    );
+                }
+                match self.validate_eligibility_evidence(evidence.as_ref(), at) {
+                    Err(WorkflowError::ContradictoryObservation(reason)) => Some(reason),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
@@ -1071,7 +1125,7 @@ struct JournalRecord {
 struct JournalCheckpoint {
     schema_version: u8,
     workflow_id: String,
-    sequence: u64,
+    sequence: Option<u64>,
     record_hash: String,
     journal_len: u64,
 }
@@ -1106,13 +1160,13 @@ impl DurableWorkflow {
         binding.validate()?;
         let path = path.as_ref().to_path_buf();
         let records = load_records(&path)?;
+        let workflow_id = workflow_id_for(binding)?;
         if records.is_empty() {
             if checkpoint_path(&path).exists() {
-                return Err(WorkflowError::RollbackDetected(
-                    "journal is empty while its durable head exists".into(),
-                ));
+                verify_bootstrap_checkpoint(&path, &workflow_id)?;
+            } else {
+                write_checkpoint(&path, &bootstrap_checkpoint(&workflow_id))?;
             }
-            let workflow_id = workflow_id_for(binding)?;
             let initial = WorkflowEvent {
                 event_id: event_id_for_decision(&workflow_id),
                 at: binding.decided_at,
@@ -1599,7 +1653,7 @@ impl DurableWorkflow {
     ) -> Result<AppendOutcome, WorkflowError> {
         let invalid_transition_contradiction = self
             .state
-            .invalid_transition_contradiction_reason(&transition);
+            .invalid_transition_contradiction_reason(&transition, at);
         let result = self.append_transition(event_id, at, transition);
         let reason = match &result {
             Err(WorkflowError::ContradictoryObservation(reason)) => Some(reason.clone()),
@@ -1667,10 +1721,8 @@ impl DurableWorkflow {
         }
         if let Some(last) = self.records.last() {
             verify_checkpoint_exact(&self.path, last, &self.state.workflow_id, self.file_len)?;
-        } else if checkpoint_path(&self.path).exists() {
-            return Err(WorkflowError::RollbackDetected(
-                "unexpected durable head exists before the first record".into(),
-            ));
+        } else {
+            verify_bootstrap_checkpoint(&self.path, &self.state.workflow_id)?;
         }
         let mut line = serde_json::to_vec(record).map_err(WorkflowError::json)?;
         line.push(b'\n');
@@ -1698,7 +1750,7 @@ impl DurableWorkflow {
             &JournalCheckpoint {
                 schema_version: CHECKPOINT_SCHEMA_VERSION,
                 workflow_id: self.state.workflow_id.clone(),
-                sequence: record.sequence,
+                sequence: Some(record.sequence),
                 record_hash: record.record_hash.clone(),
                 journal_len: new_file_len,
             },
@@ -1720,6 +1772,10 @@ fn external_action_for(
                 client_order_id: client_order_id_for(state.workflow_id()),
                 notional_usdc: state.binding.planned_usdc,
                 max_debit_usdc: state.binding.committed_usdc,
+                original_quantity_hype: state.binding.order_envelope.original_quantity_hype,
+                limit_price_usdc_per_hype: state.binding.order_envelope.limit_price_usdc_per_hype,
+                l1_nonce: state.binding.order_envelope.l1_nonce,
+                signed_expiry_at: state.binding.order_envelope.signed_expiry_at,
             })
         }
         ActionKind::DepositToStaking if state.stage == WorkflowStage::OrderFinalized => {
@@ -1775,6 +1831,10 @@ struct CanonicalOrderEnvelope<'a> {
     client_order_id: String,
     planned_usdc: UsdcMicros,
     max_debit_usdc: UsdcMicros,
+    original_quantity_hype: HypeAtoms,
+    limit_price_usdc_per_hype: UsdcMicros,
+    l1_nonce: u64,
+    signed_expiry_at: DateTime<Utc>,
     market: &'static str,
     side: &'static str,
     time_in_force: &'static str,
@@ -1787,6 +1847,10 @@ fn canonical_order_envelope_hash(state: &WorkflowState) -> Result<String, Workfl
         client_order_id: client_order_id_for(&state.workflow_id),
         planned_usdc: state.binding.planned_usdc,
         max_debit_usdc: state.binding.committed_usdc,
+        original_quantity_hype: state.binding.order_envelope.original_quantity_hype,
+        limit_price_usdc_per_hype: state.binding.order_envelope.limit_price_usdc_per_hype,
+        l1_nonce: state.binding.order_envelope.l1_nonce,
+        signed_expiry_at: state.binding.order_envelope.signed_expiry_at,
         market: "HYPE/USDC",
         side: "buy",
         time_in_force: "IOC",
@@ -1977,6 +2041,26 @@ fn write_checkpoint(path: &Path, checkpoint: &JournalCheckpoint) -> Result<(), W
         .map_err(WorkflowError::io)
 }
 
+fn bootstrap_checkpoint(workflow_id: &str) -> JournalCheckpoint {
+    JournalCheckpoint {
+        schema_version: CHECKPOINT_SCHEMA_VERSION,
+        workflow_id: workflow_id.to_owned(),
+        sequence: None,
+        record_hash: String::new(),
+        journal_len: 0,
+    }
+}
+
+fn verify_bootstrap_checkpoint(path: &Path, workflow_id: &str) -> Result<(), WorkflowError> {
+    if read_checkpoint(path)? == bootstrap_checkpoint(workflow_id) {
+        Ok(())
+    } else {
+        Err(WorkflowError::RollbackDetected(
+            "empty journal does not match its bootstrap durable head".into(),
+        ))
+    }
+}
+
 fn journal_len_through(records: &[JournalRecord], sequence: usize) -> Result<u64, WorkflowError> {
     let mut len = 0_u64;
     for record in records.iter().take(sequence.saturating_add(1)) {
@@ -2001,7 +2085,7 @@ fn verify_checkpoint_exact(
     let checkpoint = read_checkpoint(path)?;
     if checkpoint.schema_version != CHECKPOINT_SCHEMA_VERSION
         || checkpoint.workflow_id != workflow_id
-        || checkpoint.sequence != last.sequence
+        || checkpoint.sequence != Some(last.sequence)
         || checkpoint.record_hash != last.record_hash
         || checkpoint.journal_len != journal_len
     {
@@ -2022,7 +2106,34 @@ fn verify_or_advance_checkpoint(
         WorkflowError::CorruptJournal("cannot verify a head for an empty journal".into())
     })?;
     let checkpoint = read_checkpoint(path)?;
-    let sequence = usize::try_from(checkpoint.sequence).map_err(|_| {
+    if checkpoint.schema_version != CHECKPOINT_SCHEMA_VERSION
+        || checkpoint.workflow_id != workflow_id
+    {
+        return Err(WorkflowError::RollbackDetected(
+            "journal identity does not match its durable head".into(),
+        ));
+    }
+    let Some(checkpoint_sequence) = checkpoint.sequence else {
+        if checkpoint != bootstrap_checkpoint(workflow_id)
+            || records.len() != 1
+            || last.sequence != 0
+        {
+            return Err(WorkflowError::RollbackDetected(
+                "initial journal does not match its bootstrap durable head".into(),
+            ));
+        }
+        return write_checkpoint(
+            path,
+            &JournalCheckpoint {
+                schema_version: CHECKPOINT_SCHEMA_VERSION,
+                workflow_id: workflow_id.to_owned(),
+                sequence: Some(last.sequence),
+                record_hash: last.record_hash.clone(),
+                journal_len,
+            },
+        );
+    };
+    let sequence = usize::try_from(checkpoint_sequence).map_err(|_| {
         WorkflowError::RollbackDetected("durable head sequence is out of range".into())
     })?;
     let Some(checkpoint_record) = records.get(sequence) else {
@@ -2031,16 +2142,14 @@ fn verify_or_advance_checkpoint(
         ));
     };
     let expected_prefix_len = journal_len_through(records, sequence)?;
-    if checkpoint.schema_version != CHECKPOINT_SCHEMA_VERSION
-        || checkpoint.workflow_id != workflow_id
-        || checkpoint.record_hash != checkpoint_record.record_hash
+    if checkpoint.record_hash != checkpoint_record.record_hash
         || checkpoint.journal_len != expected_prefix_len
     {
         return Err(WorkflowError::RollbackDetected(
             "journal prefix does not match its durable head".into(),
         ));
     }
-    if checkpoint.sequence == last.sequence {
+    if checkpoint.sequence == Some(last.sequence) {
         if checkpoint.journal_len != journal_len {
             return Err(WorkflowError::RollbackDetected(
                 "journal length does not match its durable head".into(),
@@ -2053,7 +2162,7 @@ fn verify_or_advance_checkpoint(
         &JournalCheckpoint {
             schema_version: CHECKPOINT_SCHEMA_VERSION,
             workflow_id: workflow_id.to_owned(),
-            sequence: last.sequence,
+            sequence: Some(last.sequence),
             record_hash: last.record_hash.clone(),
             journal_len,
         },
