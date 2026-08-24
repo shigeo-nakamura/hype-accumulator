@@ -2,15 +2,15 @@ use chrono::{DateTime, TimeZone, Utc};
 use hype_accumulator::{
     pacing::{DailyDecision, DecisionAllocation, DecisionReason, PacingExplanation, UsdcMicros},
     workflow::{
-        ActionKind, AppendOutcome, DecisionBinding, DurableWorkflow, ExternalAction,
-        ExternalReceipt, HypeAtoms, InventoryBaseline, OrderFinality, PrepareOutcome,
-        WorkflowError, WorkflowStage,
+        ActionKind, AppendOutcome, BoundFillEvidence, DecisionBinding, DurableWorkflow,
+        ExternalAction, ExternalReceipt, HypeAtoms, InventoryBaseline,
+        OrderBoundEligibilityEvidence, OrderFinality, PrepareOutcome, WorkflowError, WorkflowStage,
     },
 };
 use std::{
     fs::{self, OpenOptions},
     io::Write,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 fn at(minute: u32) -> DateTime<Utc> {
@@ -76,6 +76,7 @@ fn binding() -> DecisionBinding {
     DecisionBinding::from_pacing_decision(
         &decision(),
         InventoryBaseline {
+            execution_identity_hash: "signer-identity-hash-a".to_owned(),
             spot_hype_atoms: hype(10_000),
             staking_hype_atoms: hype(20_000),
             delegated_hype_atoms: hype(19_000),
@@ -85,8 +86,59 @@ fn binding() -> DecisionBinding {
     .expect("valid workflow binding")
 }
 
+fn bound_evidence(
+    workflow: &DurableWorkflow,
+    fills: &[(&str, u64, u32)],
+) -> OrderBoundEligibilityEvidence {
+    let state = workflow.state();
+    let binding = state.binding();
+    let residual_reservation = binding
+        .inventory_before
+        .configured_residual_hype_atoms
+        .as_atoms()
+        .saturating_sub(binding.inventory_before.spot_hype_atoms.as_atoms());
+    OrderBoundEligibilityEvidence {
+        authorization_id: "order-bound-authorization-a".to_owned(),
+        authorization_record_hash: "authorization-record-hash-a".to_owned(),
+        decision_id: binding.decision_id.clone(),
+        execution_identity_hash: binding.inventory_before.execution_identity_hash.clone(),
+        client_order_id: state.client_order_id(),
+        canonical_order_envelope_hash: state
+            .canonical_order_envelope_hash()
+            .expect("canonical order envelope hashes"),
+        authorized_planned_usdc: binding.planned_usdc,
+        authorized_max_debit_usdc: binding.committed_usdc,
+        authorized_at: binding.decided_at,
+        order_id: state
+            .exchange_order_id()
+            .expect("accepted order identity")
+            .to_owned(),
+        accepted_at: state.order_accepted_at().expect("accepted order timestamp"),
+        order_bound_at: state.order_accepted_at().expect("accepted order timestamp"),
+        effective_expiry_at: at(30),
+        residual_reservation_hype: hype(residual_reservation),
+        policy_version: "custody-policy-v1".to_owned(),
+        fills: fills
+            .iter()
+            .map(|(fill_id, atoms, minute)| BoundFillEvidence {
+                fill_id: (*fill_id).to_owned(),
+                purchased_hype: hype(*atoms),
+                executed_at: at(*minute),
+                first_observed_at: at(*minute),
+                registration_deadline_at: at(30),
+            })
+            .collect(),
+    }
+}
+
 fn reopen(path: &Path, binding: &DecisionBinding) -> DurableWorkflow {
     DurableWorkflow::open_or_create(path, binding).expect("journal reopens")
+}
+
+fn checkpoint_path(path: &Path) -> PathBuf {
+    let mut checkpoint = path.as_os_str().to_os_string();
+    checkpoint.push(".head");
+    PathBuf::from(checkpoint)
 }
 
 fn ready(outcome: PrepareOutcome) -> ExternalAction {
@@ -222,8 +274,9 @@ fn every_transition_survives_a_restart_without_double_counting() {
     workflow = reopen(&path, &binding);
     assert_eq!(workflow.state().stage(), WorkflowStage::OrderFinalized);
 
+    let evidence = bound_evidence(&workflow, &[("fill-1", 100, 3), ("fill-2", 150, 4)]);
     let eligibility = workflow
-        .record_staking_eligibility(at(6))
+        .record_staking_eligibility(Some(evidence), at(6))
         .expect("unsigned eligibility recorded");
     assert_eq!(eligibility.residual_hype, hype(0));
     assert_eq!(eligibility.eligible_hype, hype(250));
@@ -393,7 +446,7 @@ fn conclusively_absent_submission_releases_pending_intent_and_completes() {
     assert!(workflow.state().pending_action().is_none());
     assert_eq!(
         workflow
-            .record_staking_eligibility(at(5))
+            .record_staking_eligibility(None, at(5))
             .expect("zero-fill eligibility recorded"),
         hype_accumulator::workflow::StakingEligibility {
             residual_hype: hype(0),
@@ -450,8 +503,12 @@ fn partial_fill_cancel_race_uses_one_final_cumulative_fill_and_never_rebuys() {
         workflow.prepare_order(at(6)),
         Err(WorkflowError::InvalidTransition(_))
     ));
+    let evidence = bound_evidence(
+        &workflow,
+        &[("partial-before-cancel", 100, 3), ("terminal-fill", 50, 5)],
+    );
     let eligibility = workflow
-        .record_staking_eligibility(at(7))
+        .record_staking_eligibility(Some(evidence), at(7))
         .expect("unsigned eligibility recorded from final cumulative fill");
     assert_eq!(eligibility.residual_hype, hype(0));
     assert_eq!(eligibility.eligible_hype, hype(150));
@@ -474,8 +531,9 @@ fn zero_fill_terminal_orders_complete_without_staking_intent() {
         workflow
             .finalize_order(hype(0), usdc(0), usdc(0), finality, at(3))
             .expect("zero-fill terminal order finalized");
+        let evidence = bound_evidence(&workflow, &[]);
         let eligibility = workflow
-            .record_staking_eligibility(at(4))
+            .record_staking_eligibility(Some(evidence), at(4))
             .expect("zero eligibility recorded");
         assert_eq!(eligibility.residual_hype, hype(0));
         assert_eq!(eligibility.eligible_hype, hype(0));
@@ -520,8 +578,9 @@ fn residual_only_fill_records_zero_eligibility_and_completes() {
             at(4),
         )
         .expect("residual-only order finalized");
+    let evidence = bound_evidence(&workflow, &[("residual-fill", 5, 3)]);
     let eligibility = workflow
-        .record_staking_eligibility(at(5))
+        .record_staking_eligibility(Some(evidence), at(5))
         .expect("residual-only eligibility recorded");
     assert_eq!(eligibility.residual_hype, hype(5));
     assert_eq!(eligibility.eligible_hype, hype(0));
@@ -595,7 +654,7 @@ fn event_collision_after_completion_durably_invalidates_the_result() {
         .finalize_order(hype(0), usdc(0), usdc(0), OrderFinality::Expired, at(3))
         .expect("order finalized");
     workflow
-        .record_staking_eligibility(at(4))
+        .record_staking_eligibility(Some(bound_evidence(&workflow, &[])), at(4))
         .expect("eligibility recorded");
     workflow.complete(at(5)).expect("workflow completed");
 
@@ -647,7 +706,7 @@ fn fresh_late_order_evidence_durably_invalidates_terminal_results() {
         .finalize_order(hype(0), usdc(0), usdc(0), OrderFinality::Expired, at(3))
         .expect("order finalized");
     completed
-        .record_staking_eligibility(at(4))
+        .record_staking_eligibility(Some(bound_evidence(&completed, &[])), at(4))
         .expect("eligibility recorded");
     completed.complete(at(5)).expect("workflow completed");
     assert!(matches!(
@@ -855,8 +914,9 @@ fn staking_and_delegation_actions_remain_hard_disabled() {
     ));
     assert_eq!(workflow.state().stage(), WorkflowStage::OrderFinalized);
     assert!(workflow.state().pending_action().is_none());
+    let evidence = bound_evidence(&workflow, &[("fill-1", 250, 3)]);
     let eligibility = workflow
-        .record_staking_eligibility(at(7))
+        .record_staking_eligibility(Some(evidence), at(7))
         .expect("unsigned eligibility recorded");
     assert_eq!(eligibility.eligible_hype, hype(250));
 }
@@ -897,4 +957,118 @@ fn truncated_and_hash_corrupted_journals_fail_closed() {
         DurableWorkflow::open_or_create(&corrupt_path, &binding),
         Err(WorkflowError::CorruptJournal(_))
     ));
+}
+
+#[test]
+fn complete_record_prefix_rollback_is_detected_by_the_independent_head() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("rollback.jsonl");
+    let binding = binding();
+    let mut workflow = reopen(&path, &binding);
+    let decision_only = fs::read(&path).expect("decision record read");
+
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    drop(workflow);
+    fs::write(&path, decision_only).expect("journal rolled back to a complete valid prefix");
+
+    assert!(matches!(
+        DurableWorkflow::open_or_create(&path, &binding),
+        Err(WorkflowError::RollbackDetected(_))
+    ));
+}
+
+#[test]
+fn durable_head_lag_after_journal_fsync_recovers_without_resubmission() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("checkpoint-lag.jsonl");
+    let binding = binding();
+    let mut workflow = reopen(&path, &binding);
+    let decision_head = fs::read(checkpoint_path(&path)).expect("decision head read");
+    let prepared = ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    drop(workflow);
+
+    fs::write(checkpoint_path(&path), &decision_head).expect("stale head restored");
+    let mut recovered = reopen(&path, &binding);
+    assert_eq!(recovered.state().pending_action(), Some(&prepared));
+    assert!(matches!(
+        recovered.prepare_order(at(2)),
+        Ok(PrepareOutcome::ReconcileOnly { .. })
+    ));
+    assert_ne!(
+        fs::read(checkpoint_path(&path)).expect("advanced head read"),
+        decision_head
+    );
+}
+
+#[test]
+fn late_terminal_finalization_after_absence_durably_halts() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("late-finalization.jsonl");
+    let binding = binding();
+    let mut workflow = reopen(&path, &binding);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    workflow
+        .record_order_submission_absent("post-expiry-cloid-not-found", at(2))
+        .expect("authoritative absence recorded");
+    workflow
+        .record_staking_eligibility(None, at(3))
+        .expect("absence-only eligibility recorded");
+    workflow.complete(at(4)).expect("workflow completed");
+
+    assert!(matches!(
+        workflow.finalize_order(
+            hype(1),
+            usdc(100_000),
+            usdc(101_000),
+            OrderFinality::Filled,
+            at(5),
+        ),
+        Err(WorkflowError::InvalidTransition(_))
+    ));
+    assert_eq!(workflow.state().stage(), WorkflowStage::ManualReview);
+    drop(workflow);
+    assert_eq!(
+        reopen(&path, &binding).state().stage(),
+        WorkflowStage::ManualReview
+    );
+}
+
+#[test]
+fn accepted_order_without_bound_authorization_is_permanently_ineligible() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("missing-authorization.jsonl");
+    let binding = binding();
+    let mut workflow = reopen(&path, &binding);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    workflow
+        .observe_order_submission("exchange-order-1", at(2))
+        .expect("submission observed");
+    workflow
+        .observe_order_fill("fill-1", hype(1), usdc(100_000), usdc(101_000), true, at(3))
+        .expect("fill observed");
+    workflow
+        .finalize_order(
+            hype(1),
+            usdc(100_000),
+            usdc(101_000),
+            OrderFinality::Filled,
+            at(4),
+        )
+        .expect("order finalized");
+
+    assert!(matches!(
+        workflow.record_staking_eligibility(None, at(5)),
+        Err(WorkflowError::ContradictoryObservation(_))
+    ));
+    assert_eq!(workflow.state().stage(), WorkflowStage::ManualReview);
+    let valid_evidence = bound_evidence(&workflow, &[("fill-1", 1, 3)]);
+    assert!(matches!(
+        workflow.record_staking_eligibility(Some(valid_evidence), at(6)),
+        Err(WorkflowError::InvalidTransition(_))
+    ));
+    drop(workflow);
+    assert_eq!(
+        reopen(&path, &binding).state().stage(),
+        WorkflowStage::ManualReview
+    );
 }
