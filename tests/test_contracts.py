@@ -89,6 +89,31 @@ class PointInTimeContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "checksum mismatch"):
                 load_capital_events(manifest)
 
+    def test_simultaneous_deposit_admissions_are_rejected(self) -> None:
+        original = json.loads(
+            (FIXTURES / "capital-one-manifest.json").read_text(encoding="utf-8")
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            events = root / "events.csv"
+            events.write_text(
+                "event_id,kind,amount_usd,occurred_at,confirmed_at,first_usable_at\n"
+                "z-deposit,deposit,60,2025-01-01T08:00:00Z,2025-01-01T09:00:00Z,2025-01-01T09:01:00Z\n"
+                "a-deposit,deposit,40,2025-01-01T08:30:00Z,2025-01-01T09:00:00Z,2025-01-01T09:01:00Z\n",
+                encoding="utf-8",
+            )
+            original["files"]["events"] = {
+                "path": events.name,
+                "sha256": digest(events),
+            }
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps(original), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                ValueError, "deposit first_usable_at timestamps must be unique"
+            ):
+                load_capital_events(manifest)
+
     def test_nonfinite_observation_is_rejected(self) -> None:
         original = json.loads((FIXTURES / "dataset-manifest.json").read_text(encoding="utf-8"))
         with tempfile.TemporaryDirectory() as directory:

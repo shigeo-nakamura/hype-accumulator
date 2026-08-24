@@ -120,6 +120,9 @@ def load_capital_events(manifest_path: Path) -> tuple[list[CapitalEvent], dict[s
             events.append(event)
     if len({e.event_id for e in events}) != len(events):
         raise ValueError("capital event IDs must be unique and authoritative")
+    deposit_slots = [event.first_usable_at for event in events if event.kind == "deposit"]
+    if len(set(deposit_slots)) != len(deposit_slots):
+        raise ValueError("deposit first_usable_at timestamps must be unique")
     return sorted(events, key=capital_event_sort_key), manifest
 
 
