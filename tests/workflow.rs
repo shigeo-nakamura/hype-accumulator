@@ -2,13 +2,13 @@ use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use hype_accumulator::{
     pacing::{DailyDecision, DecisionAllocation, DecisionReason, PacingExplanation, UsdcMicros},
     workflow::{
-        ActionKind, AppendOutcome, AuthorizationInputFreshness, BoundFillEvidence,
-        BoundMovementEvidence, ConclusiveAbsenceEvidence, DecisionBinding, DurableWorkflow,
-        EligibilityPolicyBinding, ExchangeFillOwner, ExchangeOrderOwner, ExchangeOrderOwnerStore,
-        ExternalAction, ExternalReceipt, GapFreeHistoryWatermark, HistoryDomain, HypeAtoms,
-        InventoryBaseline, OrderBoundEligibilityEvidence, OrderEnvelopeBinding, OrderFinality,
-        PrepareOutcome, ProtectedWorkflowHead, ProtectedWorkflowHeadStore, WorkflowError,
-        WorkflowStage,
+        ActionKind, AppendOutcome, AuthenticatedOrderSubmission, AuthorizationInputFreshness,
+        BoundFillEvidence, BoundMovementEvidence, ConclusiveAbsenceEvidence, DecisionBinding,
+        DurableWorkflow, EligibilityPolicyBinding, ExchangeFillOwner, ExchangeOrderOwner,
+        ExchangeOrderOwnerStore, ExternalAction, ExternalReceipt, GapFreeHistoryWatermark,
+        HistoryDomain, HypeAtoms, InventoryBaseline, OrderBoundEligibilityEvidence,
+        OrderEnvelopeBinding, OrderFinality, OwnershipCommitOutcome, PrepareOutcome,
+        ProtectedWorkflowHead, ProtectedWorkflowHeadStore, WorkflowError, WorkflowStage,
     },
 };
 use std::{
@@ -50,17 +50,33 @@ impl ExchangeOrderOwnerStore for MemoryExchangeOrderOwnerStore {
         }
     }
 
-    fn claim_fills(&self, owners: &[ExchangeFillOwner]) -> Result<bool, String> {
-        let mut claims = BTreeMap::new();
-        for owner in owners {
-            let key = (owner.execution_identity_hash.clone(), owner.fill_id.clone());
-            if claims
-                .insert(key, owner.clone())
-                .is_some_and(|existing| existing != *owner)
-            {
-                return Ok(false);
-            }
+    fn claim_and_commit(
+        &self,
+        owner: &ExchangeOrderOwner,
+        commit: &mut dyn FnMut() -> bool,
+    ) -> Result<OwnershipCommitOutcome, String> {
+        let key = (
+            owner.execution_identity_hash.clone(),
+            owner.exchange_order_id.clone(),
+        );
+        let mut owners = self
+            .order_owners
+            .lock()
+            .map_err(|error| error.to_string())?;
+        if owners.get(&key).is_some_and(|existing| existing != owner) {
+            return Ok(OwnershipCommitOutcome::Conflict);
         }
+        if !commit() {
+            return Ok(OwnershipCommitOutcome::CommitRejected);
+        }
+        owners.entry(key).or_insert_with(|| owner.clone());
+        Ok(OwnershipCommitOutcome::Committed)
+    }
+
+    fn claim_fills(&self, owners: &[ExchangeFillOwner]) -> Result<bool, String> {
+        let Some(claims) = Self::fill_claims(owners) else {
+            return Ok(false);
+        };
         let mut owners = self.fill_owners.lock().map_err(|error| error.to_string())?;
         if claims
             .iter()
@@ -73,14 +89,64 @@ impl ExchangeOrderOwnerStore for MemoryExchangeOrderOwnerStore {
         }
         Ok(true)
     }
+
+    fn claim_fills_and_commit(
+        &self,
+        owners: &[ExchangeFillOwner],
+        commit: &mut dyn FnMut() -> bool,
+    ) -> Result<OwnershipCommitOutcome, String> {
+        let Some(claims) = Self::fill_claims(owners) else {
+            return Ok(OwnershipCommitOutcome::Conflict);
+        };
+        let mut owners = self.fill_owners.lock().map_err(|error| error.to_string())?;
+        if claims
+            .iter()
+            .any(|(key, owner)| owners.get(key).is_some_and(|existing| existing != owner))
+        {
+            return Ok(OwnershipCommitOutcome::Conflict);
+        }
+        if !commit() {
+            return Ok(OwnershipCommitOutcome::CommitRejected);
+        }
+        for (key, owner) in claims {
+            owners.entry(key).or_insert(owner);
+        }
+        Ok(OwnershipCommitOutcome::Committed)
+    }
 }
 
 impl MemoryExchangeOrderOwnerStore {
+    fn fill_claims(
+        owners: &[ExchangeFillOwner],
+    ) -> Option<BTreeMap<(String, String), ExchangeFillOwner>> {
+        let mut claims = BTreeMap::new();
+        for owner in owners {
+            let key = (owner.execution_identity_hash.clone(), owner.fill_id.clone());
+            if claims
+                .insert(key, owner.clone())
+                .is_some_and(|existing| existing != *owner)
+            {
+                return None;
+            }
+        }
+        Some(claims)
+    }
+
     fn has_fill_owner(&self, execution_identity_hash: &str, fill_id: &str) -> bool {
         self.fill_owners
             .lock()
             .expect("fill owners lock")
             .contains_key(&(execution_identity_hash.to_owned(), fill_id.to_owned()))
+    }
+
+    fn has_order_owner(&self, execution_identity_hash: &str, exchange_order_id: &str) -> bool {
+        self.order_owners
+            .lock()
+            .expect("order owners lock")
+            .contains_key(&(
+                execution_identity_hash.to_owned(),
+                exchange_order_id.to_owned(),
+            ))
     }
 }
 
@@ -267,6 +333,61 @@ fn binding() -> DecisionBinding {
         eligibility_policy(),
     )
     .expect("valid workflow binding")
+}
+
+fn submission_evidence(
+    workflow: &DurableWorkflow,
+    exchange_order_id: &str,
+    accepted_at: DateTime<Utc>,
+) -> AuthenticatedOrderSubmission {
+    let binding = workflow.state().binding();
+    let execution_identity_hash = binding.inventory_before.execution_identity_hash.clone();
+    AuthenticatedOrderSubmission {
+        observation_id: format!("venue-order-observation-{exchange_order_id}"),
+        account_scope_evidence_hash: format!("account-scope-evidence-{exchange_order_id}"),
+        order_envelope_evidence_hash: format!("order-envelope-evidence-{exchange_order_id}"),
+        execution_identity_hash: execution_identity_hash.clone(),
+        signer_identity_hash: execution_identity_hash,
+        decision_id: binding.decision_id.clone(),
+        client_order_id: workflow.state().client_order_id(),
+        exchange_order_id: exchange_order_id.to_owned(),
+        canonical_order_envelope_hash: workflow
+            .state()
+            .canonical_order_envelope_hash()
+            .expect("canonical order envelope hashes"),
+        planned_usdc: binding.planned_usdc,
+        max_debit_usdc: binding.committed_usdc,
+        original_quantity_hype: binding.order_envelope.original_quantity_hype,
+        hype_atoms_per_hype: binding.order_envelope.hype_atoms_per_hype,
+        market_metadata_digest: binding.order_envelope.market_metadata_digest.clone(),
+        limit_price_usdc_per_hype: binding.order_envelope.limit_price_usdc_per_hype,
+        l1_nonce: binding.order_envelope.l1_nonce,
+        signed_expiry_at: binding.order_envelope.signed_expiry_at,
+        effective_expiry_at: binding.order_envelope.effective_expiry_at,
+        market: "HYPE/USDC".to_owned(),
+        side: "buy".to_owned(),
+        time_in_force: "IOC".to_owned(),
+        accepted_at,
+    }
+}
+
+fn observe_submission(
+    workflow: &mut DurableWorkflow,
+    exchange_order_id: &str,
+    accepted_at: DateTime<Utc>,
+) -> Result<AppendOutcome, WorkflowError> {
+    let evidence = submission_evidence(workflow, exchange_order_id, accepted_at);
+    workflow.observe_order_submission(&evidence, accepted_at)
+}
+
+fn observe_submission_recorded_at(
+    workflow: &mut DurableWorkflow,
+    exchange_order_id: &str,
+    accepted_at: DateTime<Utc>,
+    recorded_at: DateTime<Utc>,
+) -> Result<AppendOutcome, WorkflowError> {
+    let evidence = submission_evidence(workflow, exchange_order_id, accepted_at);
+    workflow.observe_order_submission(&evidence, recorded_at)
 }
 
 fn bound_evidence(
@@ -582,11 +703,10 @@ fn one_exchange_order_cannot_be_owned_by_two_decision_workflows() {
     ready(first.prepare_order(at(1)).expect("first order prepared"));
     ready(second.prepare_order(at(1)).expect("second order prepared"));
 
-    first
-        .observe_order_submission("shared-exchange-order", at(2))
+    observe_submission(&mut first, "shared-exchange-order", at(2))
         .expect("first decision claims exchange order");
     assert!(matches!(
-        second.observe_order_submission("shared-exchange-order", at(2)),
+        observe_submission(&mut second, "shared-exchange-order", at(2)),
         Err(WorkflowError::ContradictoryObservation(_))
     ));
     assert_eq!(second.state().stage(), WorkflowStage::ManualReview);
@@ -641,7 +761,7 @@ fn invalid_submission_does_not_claim_the_correct_workflows_order() {
     .expect("correct workflow opens");
 
     assert!(matches!(
-        invalid.observe_order_submission("correct-exchange-order", at(2)),
+        observe_submission(&mut invalid, "correct-exchange-order", at(2)),
         Err(WorkflowError::InvalidTransition(_))
     ));
     assert!(owner_store
@@ -655,8 +775,7 @@ fn invalid_submission_does_not_claim_the_correct_workflows_order() {
             .prepare_order(at(1))
             .expect("correct order prepared"),
     );
-    correct
-        .observe_order_submission("correct-exchange-order", at(2))
+    observe_submission(&mut correct, "correct-exchange-order", at(2))
         .expect("correct workflow claims order after validation");
     assert_eq!(correct.state().stage(), WorkflowStage::OrderSubmitted);
     assert_eq!(
@@ -670,6 +789,127 @@ fn invalid_submission_does_not_claim_the_correct_workflows_order() {
 }
 
 #[test]
+fn mismatched_authenticated_order_envelope_halts_before_claim() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("mismatched-venue-envelope.jsonl");
+    let binding = binding();
+    let owner_store = Arc::new(MemoryExchangeOrderOwnerStore::default());
+    let mut workflow = DurableWorkflow::open_or_create(
+        &path,
+        &binding,
+        Arc::new(MemoryProtectedHeadStore::default()),
+        owner_store.clone(),
+    )
+    .expect("workflow opens");
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    let mut evidence = submission_evidence(&workflow, "wrong-envelope-order", at(2));
+    evidence.original_quantity_hype = hype(249);
+
+    assert!(matches!(
+        workflow.observe_order_submission(&evidence, at(2)),
+        Err(WorkflowError::ContradictoryObservation(_))
+    ));
+    assert_eq!(workflow.state().stage(), WorkflowStage::ManualReview);
+    assert!(workflow.state().exchange_order_id().is_none());
+    assert!(!owner_store.has_order_owner(
+        &binding.inventory_before.execution_identity_hash,
+        "wrong-envelope-order",
+    ));
+}
+
+#[test]
+fn losing_journal_commit_does_not_retain_an_order_claim() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("concurrent-order-claim.jsonl");
+    let binding = binding();
+    let head_store = Arc::new(MemoryProtectedHeadStore::default());
+    let owner_store = Arc::new(MemoryExchangeOrderOwnerStore::default());
+    let mut initializer =
+        DurableWorkflow::open_or_create(&path, &binding, head_store.clone(), owner_store.clone())
+            .expect("workflow initializes");
+    ready(initializer.prepare_order(at(1)).expect("order prepared"));
+    drop(initializer);
+    let mut winner =
+        DurableWorkflow::open_or_create(&path, &binding, head_store.clone(), owner_store.clone())
+            .expect("winner opens");
+    let mut loser =
+        DurableWorkflow::open_or_create(&path, &binding, head_store, owner_store.clone())
+            .expect("loser opens from the same head");
+
+    observe_submission(&mut winner, "winning-order", at(2)).expect("winner commits");
+    assert!(matches!(
+        observe_submission(&mut loser, "losing-order", at(2)),
+        Err(WorkflowError::ConcurrentModification | WorkflowError::RollbackDetected(_))
+    ));
+    assert!(owner_store.has_order_owner(
+        &binding.inventory_before.execution_identity_hash,
+        "winning-order",
+    ));
+    assert!(!owner_store.has_order_owner(
+        &binding.inventory_before.execution_identity_hash,
+        "losing-order",
+    ));
+}
+
+#[test]
+fn losing_journal_commit_does_not_retain_fill_claims() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("concurrent-fill-claim.jsonl");
+    let binding = binding();
+    let head_store = Arc::new(MemoryProtectedHeadStore::default());
+    let owner_store = Arc::new(MemoryExchangeOrderOwnerStore::default());
+    let mut initializer =
+        DurableWorkflow::open_or_create(&path, &binding, head_store.clone(), owner_store.clone())
+            .expect("workflow initializes");
+    ready(initializer.prepare_order(at(1)).expect("order prepared"));
+    observe_submission(&mut initializer, "exchange-order-1", at(2)).expect("submission observed");
+    initializer
+        .observe_order_fill(
+            "fill-observation",
+            hype(250),
+            usdc(50_000_000),
+            usdc(50_500_000),
+            true,
+            at(3),
+        )
+        .expect("fill observed");
+    initializer
+        .finalize_order(
+            hype(250),
+            usdc(50_000_000),
+            usdc(50_500_000),
+            OrderFinality::Filled,
+            at(4),
+        )
+        .expect("order finalized");
+    drop(initializer);
+    let mut winner =
+        DurableWorkflow::open_or_create(&path, &binding, head_store.clone(), owner_store.clone())
+            .expect("winner opens");
+    let mut loser =
+        DurableWorkflow::open_or_create(&path, &binding, head_store, owner_store.clone())
+            .expect("loser opens from the same head");
+    let winner_evidence = bound_evidence(&winner, &[("winning-fill", 250, 3)], at(5));
+    let loser_evidence = bound_evidence(&loser, &[("losing-fill", 250, 3)], at(5));
+
+    winner
+        .record_staking_eligibility(Some(winner_evidence), at(5))
+        .expect("winner commits eligibility");
+    assert!(matches!(
+        loser.record_staking_eligibility(Some(loser_evidence), at(5)),
+        Err(WorkflowError::ConcurrentModification | WorkflowError::RollbackDetected(_))
+    ));
+    assert!(owner_store.has_fill_owner(
+        &binding.inventory_before.execution_identity_hash,
+        "winning-fill",
+    ));
+    assert!(!owner_store.has_fill_owner(
+        &binding.inventory_before.execution_identity_hash,
+        "losing-fill",
+    ));
+}
+
+#[test]
 fn acceptance_at_effective_expiry_halts_before_claiming_the_order() {
     let temp = tempfile::tempdir().expect("temp directory");
     let path = temp.path().join("acceptance-at-expiry.jsonl");
@@ -678,7 +918,8 @@ fn acceptance_at_effective_expiry_halts_before_claiming_the_order() {
     ready(workflow.prepare_order(at(1)).expect("order prepared"));
 
     assert!(matches!(
-        workflow.observe_order_submission(
+        observe_submission(
+            &mut workflow,
             "late-exchange-order",
             binding.order_envelope.effective_expiry_at,
         ),
@@ -704,12 +945,12 @@ fn duplicate_acceptance_at_effective_expiry_durably_halts() {
     let binding = binding();
     let mut workflow = reopen(&path, &binding);
     ready(workflow.prepare_order(at(1)).expect("order prepared"));
-    workflow
-        .observe_order_submission("exchange-order-1", at(2))
+    observe_submission(&mut workflow, "exchange-order-1", at(2))
         .expect("timely acceptance recorded");
 
     assert!(matches!(
-        workflow.observe_order_submission(
+        observe_submission(
+            &mut workflow,
             "exchange-order-1",
             binding.order_envelope.effective_expiry_at,
         ),
@@ -759,9 +1000,7 @@ fn one_exchange_fill_cannot_be_owned_by_two_decision_workflows() {
         (&mut second, "exchange-order-second"),
     ] {
         ready(workflow.prepare_order(at(1)).expect("order prepared"));
-        workflow
-            .observe_order_submission(order_id, at(2))
-            .expect("submission observed");
+        observe_submission(workflow, order_id, at(2)).expect("submission observed");
         workflow
             .observe_order_fill(
                 "fill-observation",
@@ -1021,8 +1260,7 @@ fn every_transition_survives_a_restart_without_double_counting() {
     workflow = reopen(&path, &binding);
     assert_eq!(workflow.state().pending_action(), Some(&order));
 
-    workflow
-        .observe_order_submission("exchange-order-1", at(2))
+    observe_submission(&mut workflow, "exchange-order-1", at(2))
         .expect("order submission reconciled");
     drop(workflow);
     workflow = reopen(&path, &binding);
@@ -1107,15 +1345,12 @@ fn duplicate_responses_are_idempotent_even_when_redelivered_later() {
     ready(workflow.prepare_order(at(1)).expect("order prepared"));
 
     assert_eq!(
-        workflow
-            .observe_order_submission("exchange-order-1", at(2))
-            .expect("submission appended"),
+        observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission appended"),
         AppendOutcome::Appended
     );
     let count = workflow.record_count();
     assert_eq!(
-        workflow
-            .observe_order_submission("exchange-order-1", at(3))
+        observe_submission_recorded_at(&mut workflow, "exchange-order-1", at(2), at(3))
             .expect("duplicate submission ignored"),
         AppendOutcome::Duplicate
     );
@@ -1161,9 +1396,7 @@ fn blank_fill_observation_ids_never_advance_the_journal() {
     let binding = binding();
     let mut workflow = reopen(&path, &binding);
     ready(workflow.prepare_order(at(1)).expect("order prepared"));
-    workflow
-        .observe_order_submission("exchange-order-1", at(2))
-        .expect("submission observed");
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
     let count = workflow.record_count();
 
     for observation_id in ["", "   "] {
@@ -1321,9 +1554,7 @@ fn fully_filled_observation_requires_the_full_signed_quantity() {
     let binding = binding();
     let mut workflow = reopen(&path, &binding);
     ready(workflow.prepare_order(at(1)).expect("order prepared"));
-    workflow
-        .observe_order_submission("exchange-order-1", at(2))
-        .expect("submission observed");
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
 
     assert!(matches!(
         workflow.observe_order_fill(
@@ -1351,9 +1582,7 @@ fn filled_finality_requires_the_full_signed_quantity() {
     let binding = binding();
     let mut workflow = reopen(&path, &binding);
     ready(workflow.prepare_order(at(1)).expect("order prepared"));
-    workflow
-        .observe_order_submission("exchange-order-1", at(2))
-        .expect("submission observed");
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
     workflow
         .observe_order_fill(
             "partial-fill",
@@ -1390,9 +1619,7 @@ fn partial_fill_cancel_race_uses_one_final_cumulative_fill_and_never_rebuys() {
     let binding = binding();
     let mut workflow = reopen(&path, &binding);
     ready(workflow.prepare_order(at(1)).expect("order prepared"));
-    workflow
-        .observe_order_submission("exchange-order-1", at(2))
-        .expect("submission observed");
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
     workflow
         .observe_order_fill(
             "partial-before-cancel",
@@ -1444,9 +1671,7 @@ fn timely_fill_evidence_can_reconcile_after_effective_expiry() {
     let binding = binding();
     let mut workflow = reopen(&path, &binding);
     ready(workflow.prepare_order(at(1)).expect("order prepared"));
-    workflow
-        .observe_order_submission("exchange-order-1", at(2))
-        .expect("submission observed");
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
     workflow
         .observe_order_fill(
             "timely-fill",
@@ -1484,9 +1709,7 @@ fn zero_fill_terminal_orders_complete_without_staking_intent() {
         let path = temp.path().join(format!("{name}.jsonl"));
         let mut workflow = reopen(&path, &binding);
         ready(workflow.prepare_order(at(1)).expect("order prepared"));
-        workflow
-            .observe_order_submission("exchange-order-1", at(2))
-            .expect("submission observed");
+        observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
         workflow
             .finalize_order(hype(0), usdc(0), usdc(0), finality, at(3))
             .expect("zero-fill terminal order finalized");
@@ -1516,9 +1739,7 @@ fn residual_only_fill_records_zero_eligibility_and_completes() {
     binding.inventory_before.unconsumed_residual_spot_hype_atoms = hype(5);
     let mut workflow = reopen(&path, &binding);
     ready(workflow.prepare_order(at(1)).expect("order prepared"));
-    workflow
-        .observe_order_submission("exchange-order-1", at(2))
-        .expect("submission observed");
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
     workflow
         .observe_order_fill(
             "residual-fill",
@@ -1559,9 +1780,7 @@ fn consumed_residual_inventory_is_replenished_before_eligible_spot() {
     binding.inventory_before.unconsumed_residual_spot_hype_atoms = hype(0);
     let mut workflow = reopen(&path, &binding);
     ready(workflow.prepare_order(at(1)).expect("order prepared"));
-    workflow
-        .observe_order_submission("exchange-order-1", at(2))
-        .expect("submission observed");
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
     workflow
         .observe_order_fill(
             "mixed-fill",
@@ -1599,7 +1818,7 @@ fn acceptance_predating_the_prepared_action_durably_halts() {
     ready(workflow.prepare_order(at(2)).expect("order prepared"));
 
     assert!(matches!(
-        workflow.observe_order_submission("exchange-order-1", at(1)),
+        observe_submission(&mut workflow, "exchange-order-1", at(1)),
         Err(WorkflowError::InvalidTransition(_))
     ));
     assert_eq!(workflow.state().stage(), WorkflowStage::ManualReview);
@@ -1621,9 +1840,7 @@ fn late_event_collision_persists_manual_review_at_a_monotonic_time() {
     let binding = binding();
     let mut workflow = reopen(&path, &binding);
     ready(workflow.prepare_order(at(1)).expect("order prepared"));
-    workflow
-        .observe_order_submission("exchange-order-1", at(2))
-        .expect("submission observed");
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
     workflow
         .observe_order_fill(
             "fill-1",
@@ -1671,9 +1888,7 @@ fn event_collision_after_completion_durably_invalidates_the_result() {
     let binding = binding();
     let mut workflow = reopen(&path, &binding);
     ready(workflow.prepare_order(at(1)).expect("order prepared"));
-    workflow
-        .observe_order_submission("exchange-order-1", at(2))
-        .expect("submission observed");
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
     workflow
         .finalize_order(hype(0), usdc(0), usdc(0), OrderFinality::Expired, at(3))
         .expect("order finalized");
@@ -1683,7 +1898,7 @@ fn event_collision_after_completion_durably_invalidates_the_result() {
     workflow.complete(at(5)).expect("workflow completed");
 
     assert!(matches!(
-        workflow.observe_order_submission("conflicting-order", at(2)),
+        observe_submission(&mut workflow, "conflicting-order", at(2)),
         Err(WorkflowError::EventCollision(_))
     ));
     assert_eq!(workflow.state().stage(), WorkflowStage::ManualReview);
@@ -1711,7 +1926,7 @@ fn fresh_late_order_evidence_durably_invalidates_terminal_results() {
         .record_order_submission_absent(absence, at(31))
         .expect("authoritative absence recorded");
     assert!(matches!(
-        absent.observe_order_submission("late-accepted-order", at(32)),
+        observe_submission(&mut absent, "late-accepted-order", at(32)),
         Err(WorkflowError::ContradictoryObservation(_))
     ));
     assert_eq!(absent.state().stage(), WorkflowStage::ManualReview);
@@ -1724,9 +1939,7 @@ fn fresh_late_order_evidence_durably_invalidates_terminal_results() {
     let fill_path = temp.path().join("fresh-fill-after-complete.jsonl");
     let mut completed = reopen(&fill_path, &binding);
     ready(completed.prepare_order(at(1)).expect("order prepared"));
-    completed
-        .observe_order_submission("exchange-order-1", at(2))
-        .expect("submission observed");
+    observe_submission(&mut completed, "exchange-order-1", at(2)).expect("submission observed");
     completed
         .finalize_order(hype(0), usdc(0), usdc(0), OrderFinality::Expired, at(3))
         .expect("order finalized");
@@ -1761,8 +1974,7 @@ fn stale_contradictory_cumulative_evidence_durably_halts_before_completion() {
     let fill_path = temp.path().join("stale-contradictory-fill.jsonl");
     let mut fill = reopen(&fill_path, &binding);
     ready(fill.prepare_order(at(1)).expect("order prepared"));
-    fill.observe_order_submission("exchange-order-1", at(2))
-        .expect("submission observed");
+    observe_submission(&mut fill, "exchange-order-1", at(2)).expect("submission observed");
     fill.observe_order_fill(
         "partial-fill",
         hype(100),
@@ -1793,9 +2005,7 @@ fn stale_contradictory_cumulative_evidence_durably_halts_before_completion() {
     let final_path = temp.path().join("stale-contradictory-finalization.jsonl");
     let mut finalization = reopen(&final_path, &binding);
     ready(finalization.prepare_order(at(1)).expect("order prepared"));
-    finalization
-        .observe_order_submission("exchange-order-1", at(2))
-        .expect("submission observed");
+    observe_submission(&mut finalization, "exchange-order-1", at(2)).expect("submission observed");
     finalization
         .observe_order_fill(
             "partial-fill",
@@ -1835,9 +2045,7 @@ fn contradictory_authoritative_debits_fail_closed() {
         let path = temp.path().join(format!("{name}.jsonl"));
         let mut workflow = reopen(&path, &binding);
         ready(workflow.prepare_order(at(1)).expect("order prepared"));
-        workflow
-            .observe_order_submission("exchange-order-1", at(2))
-            .expect("submission observed");
+        observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
         assert!(matches!(
             workflow.observe_order_fill(
                 "contradictory-fill",
@@ -1912,9 +2120,7 @@ fn staking_and_delegation_actions_remain_hard_disabled() {
     let binding = binding();
     let mut workflow = reopen(&path, &binding);
     ready(workflow.prepare_order(at(1)).expect("order prepared"));
-    workflow
-        .observe_order_submission("exchange-order-1", at(2))
-        .expect("submission observed");
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
     workflow
         .observe_order_fill(
             "fill-1",
@@ -2133,9 +2339,7 @@ fn eligibility_requires_durable_timely_fill_registration() {
             .join(format!("invalid-registration-{invalid}.jsonl"));
         let mut workflow = reopen(&path, &binding);
         ready(workflow.prepare_order(at(1)).expect("order prepared"));
-        workflow
-            .observe_order_submission("exchange-order-1", at(2))
-            .expect("submission observed");
+        observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
         workflow
             .observe_order_fill(
                 "fill-1",
@@ -2204,9 +2408,7 @@ fn eligibility_expires_at_configured_max_age_boundary() {
         let path = temp.path().join(format!("eligibility-age-{case}.jsonl"));
         let mut workflow = reopen(&path, &binding);
         ready(workflow.prepare_order(at(1)).expect("order prepared"));
-        workflow
-            .observe_order_submission("exchange-order-1", at(2))
-            .expect("submission observed");
+        observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
         workflow
             .observe_order_fill(
                 "fill-1",
@@ -2279,9 +2481,7 @@ fn eligibility_requires_fresh_gap_free_movement_coverage() {
             .join(format!("invalid-movement-{invalid}.jsonl"));
         let mut workflow = reopen(&path, &binding);
         ready(workflow.prepare_order(at(1)).expect("order prepared"));
-        workflow
-            .observe_order_submission("exchange-order-1", at(2))
-            .expect("submission observed");
+        observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
         workflow
             .observe_order_fill(
                 "fill-1",
@@ -2341,9 +2541,7 @@ fn accepted_order_without_bound_authorization_is_permanently_ineligible() {
     let binding = binding();
     let mut workflow = reopen(&path, &binding);
     ready(workflow.prepare_order(at(1)).expect("order prepared"));
-    workflow
-        .observe_order_submission("exchange-order-1", at(2))
-        .expect("submission observed");
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
     workflow
         .observe_order_fill(
             "fill-1",
@@ -2391,9 +2589,7 @@ fn every_signed_order_field_must_match_for_eligibility() {
         let path = temp.path().join(format!("mismatched-{mismatch}.jsonl"));
         let mut workflow = reopen(&path, &binding);
         ready(workflow.prepare_order(at(1)).expect("order prepared"));
-        workflow
-            .observe_order_submission("exchange-order-1", at(2))
-            .expect("submission observed");
+        observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
         workflow
             .finalize_order(hype(0), usdc(0), usdc(0), OrderFinality::Expired, at(3))
             .expect("order finalized");
@@ -2429,9 +2625,7 @@ fn stale_invalid_eligibility_evidence_cannot_be_replaced() {
     let binding = binding();
     let mut workflow = reopen(&path, &binding);
     ready(workflow.prepare_order(at(1)).expect("order prepared"));
-    workflow
-        .observe_order_submission("exchange-order-1", at(2))
-        .expect("submission observed");
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
     workflow
         .finalize_order(hype(0), usdc(0), usdc(0), OrderFinality::Expired, at(4))
         .expect("order finalized");
@@ -2460,8 +2654,7 @@ fn cumulative_fill_notional_cannot_exceed_quantity_at_limit() {
     let binding = binding();
     let mut workflow = reopen(&path, &binding);
     ready(workflow.prepare_order(at(1)).expect("order prepared"));
-    workflow
-        .observe_order_submission("exchange-order-limit", at(2))
+    observe_submission(&mut workflow, "exchange-order-limit", at(2))
         .expect("order submission observed");
 
     assert!(matches!(
@@ -2492,8 +2685,7 @@ fn expired_residual_fill_does_not_invalidate_fresh_eligible_allocation() {
     binding.eligibility_policy.lot_eligibility_max_age_seconds = 90;
     let mut workflow = reopen(&path, &binding);
     ready(workflow.prepare_order(at(1)).expect("order prepared"));
-    workflow
-        .observe_order_submission("exchange-order-residual", at(2))
+    observe_submission(&mut workflow, "exchange-order-residual", at(2))
         .expect("order submission observed");
     workflow
         .observe_order_fill(
@@ -2574,6 +2766,54 @@ fn protected_head_response_loss_recovers_committed_append_on_reopen() {
             ..
         })
     ));
+}
+
+#[test]
+fn complete_recovered_journal_tail_is_synced_before_pending_is_cleared() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("complete-pending-tail.jsonl");
+    let binding = binding();
+    let store = protected_head_store(&path);
+    let mut workflow = DurableWorkflow::open_or_create(
+        &path,
+        &binding,
+        store.clone(),
+        exchange_order_owner_store(&path),
+    )
+    .expect("initial workflow opens");
+    store.lose_next_compare_and_swap_response();
+    assert!(matches!(
+        workflow.prepare_order(at(1)),
+        Err(WorkflowError::ProtectedHead(_))
+    ));
+    let mut pending_path = path.as_os_str().to_os_string();
+    pending_path.push(".pending-append.json");
+    let pending_path = PathBuf::from(pending_path);
+    let pending = String::from_utf8(fs::read(&pending_path).expect("pending append reads"))
+        .expect("pending append is UTF-8");
+    let record_start = pending
+        .find("\"record\":")
+        .map(|offset| offset + "\"record\":".len())
+        .expect("pending append contains a record");
+    let record_end = pending[record_start..]
+        .find(",\"next_head\":")
+        .map(|offset| record_start + offset)
+        .expect("pending append contains the next head");
+    let mut line = pending.as_bytes()[record_start..record_end].to_vec();
+    line.push(b'\n');
+    OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("journal opens")
+        .write_all(&line)
+        .expect("complete pending line reaches the journal");
+    drop(workflow);
+
+    let recovered =
+        DurableWorkflow::open_or_create(&path, &binding, store, exchange_order_owner_store(&path))
+            .expect("complete tail recovers");
+    assert_eq!(recovered.record_count(), 2);
+    assert!(!pending_path.exists());
 }
 
 #[test]
