@@ -46,9 +46,10 @@ external changes.
 
 The payload deliberately excludes account addresses, signing material,
 ciphertext, signed requests, and production topology. The read-only
-`hype-status` binary queries spot balances, the HYPE mark, recent HYPE fills,
-and staking summary/delegations without constructing a signer, then atomically
-writes one local status snapshot:
+`hype-status` binary queries spot balances, the HYPE mark, and staking
+summary/delegations without constructing a signer, then atomically writes one
+local status snapshot. Last-trade identity remains unavailable until supplied
+by the authoritative accumulator ledger:
 
 ```text
 HYPE_ACCOUNT_ID=0x... cargo run --locked --bin hype-status -- config.local.toml status.json
