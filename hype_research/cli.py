@@ -49,6 +49,15 @@ def require_supported_policy_values(experiment: dict) -> None:
                 raise ValueError(
                     f"unsupported stale behavior at policies[{index}]: {stale_behavior!r}"
                 )
+            stale_after_days = policy.get("stale_after_days", 3)
+            if (
+                isinstance(stale_after_days, bool)
+                or not isinstance(stale_after_days, int)
+                or stale_after_days < 0
+            ):
+                raise ValueError(
+                    f"stale_after_days at policies[{index}] must be a nonnegative integer"
+                )
     for index, sensitivity in enumerate(experiment["sensitivity"]["adaptive_sensitivity"]):
         require_finite_number(sensitivity, f"adaptive_sensitivity[{index}]")
 
