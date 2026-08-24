@@ -557,6 +557,39 @@ fn fixed_reserve_is_deducted_before_proportional_reserve() {
 }
 
 #[test]
+fn fixed_reserve_is_global_across_expired_and_active_horizons() {
+    let mut reserved = limits();
+    reserved.max_daily_notional_usdc = usd(100);
+    reserved.fixed_reserve_usdc = usd(10);
+    let mut state = PacingState::default();
+    state
+        .reconcile_capital(
+            &[deposit("prior-reserve", 10, at(2026, 12, 31, 8))],
+            at(2026, 12, 31, 10),
+            &reserved,
+        )
+        .expect("prior reserve admitted");
+    let prior = state
+        .decide(&input(at(2026, 12, 31, 12), 10), &reserved)
+        .expect("prior reserve held");
+    assert_eq!(prior.decision().planned_usdc, usd(0));
+
+    state
+        .reconcile_capital(
+            &[deposit("new-horizon", 100, at(2027, 12, 31, 8))],
+            at(2027, 12, 31, 10),
+            &reserved,
+        )
+        .expect("new horizon admitted");
+    let next = state
+        .decide(&input(at(2027, 12, 31, 12), 110), &reserved)
+        .expect("existing reserve applies globally");
+    assert_eq!(next.decision().planned_usdc, usd(100));
+    assert_eq!(state.deposits()["prior-reserve"].residual_usdc(), usd(10));
+    assert_eq!(state.deposits()["new-horizon"].committed_usdc, usd(100));
+}
+
+#[test]
 fn automatic_admission_limit_is_per_deposit() {
     let mut limits = limits();
     limits.max_automatically_admitted_usdc = usd(100);

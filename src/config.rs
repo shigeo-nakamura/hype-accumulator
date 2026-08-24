@@ -125,6 +125,7 @@ pub enum ConfigError {
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeActionPolicy {
     pub max_order_usdc: f64,
+    pub max_daily_notional_microusd: u64,
     pub max_slippage_bps: u16,
     pub max_purchase_fee_bps: u16,
     pub acknowledgement_expires_at: Option<DateTime<Utc>>,
@@ -350,8 +351,16 @@ impl Config {
                 "live acknowledgement expiry",
             )?)
         };
+        let max_daily_notional_microusd = match &self.security_policy {
+            Some(policy) => policy.wire.capital.max_daily_notional_microusd,
+            None => usdc_to_microusd(
+                self.effective_max_order_usdc(),
+                "runtime effective maximum order",
+            )?,
+        };
         Ok(RuntimeActionPolicy {
             max_order_usdc: self.effective_max_order_usdc(),
+            max_daily_notional_microusd,
             max_slippage_bps: self.execution.max_slippage_bps,
             max_purchase_fee_bps,
             acknowledgement_expires_at,

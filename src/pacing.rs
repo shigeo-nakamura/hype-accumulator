@@ -141,8 +141,17 @@ impl PacingLimits {
         Ok(())
     }
 
-    fn spendable_budget(&self, value: UsdcMicros) -> Result<UsdcMicros, PacingError> {
-        apply_reserves(value, self.fixed_reserve_usdc, self.fee_spread_reserve_bps)
+    fn spendable_budget(
+        &self,
+        active: UsdcMicros,
+        aggregate: UsdcMicros,
+    ) -> Result<UsdcMicros, PacingError> {
+        apply_reserves(
+            active,
+            aggregate,
+            self.fixed_reserve_usdc,
+            self.fee_spread_reserve_bps,
+        )
     }
 }
 
@@ -1079,7 +1088,8 @@ impl PacingState {
         let admitted_unspent =
             checked_sum(self.deposits.values().map(DepositTranche::residual_usdc))?;
         let unadmitted = checked_sum(self.deposits.values().map(DepositTranche::unadmitted_usdc))?;
-        let observed_budget = limits.spendable_budget(input.observed_spot_usdc)?;
+        let observed_budget =
+            limits.spendable_budget(input.observed_spot_usdc, input.observed_spot_usdc)?;
         let mut alerts = Vec::new();
         if !unadmitted.is_zero() {
             alerts.push(PacingAlert::UnadmittedCapital {
@@ -1118,7 +1128,7 @@ impl PacingState {
             };
         } else {
             let active_residual = checked_sum(due_rows.iter().map(|row| row.3))?;
-            let admitted_budget = limits.spendable_budget(active_residual)?;
+            let admitted_budget = limits.spendable_budget(active_residual, admitted_unspent)?;
             if active_residual < limits.min_order_usdc {
                 reason = DecisionReason::BelowExchangeMinimum;
             } else if admitted_budget < limits.min_order_usdc {
@@ -1149,7 +1159,8 @@ impl PacingState {
             unadmitted_usdc: unadmitted,
             fixed_required_usdc: fixed_required,
             observed_budget_after_reserve_usdc: observed_budget,
-            admitted_budget_after_reserve_usdc: limits.spendable_budget(admitted_unspent)?,
+            admitted_budget_after_reserve_usdc: limits
+                .spendable_budget(admitted_unspent, admitted_unspent)?,
             exchange_minimum_usdc: limits.min_order_usdc,
             daily_cap_usdc: limits.max_daily_notional_usdc,
             fee_spread_reserve_bps: limits.fee_spread_reserve_bps,
@@ -1484,12 +1495,13 @@ fn apply_reserve(value: UsdcMicros, reserve_bps: u16) -> Result<UsdcMicros, Paci
 }
 
 fn apply_reserves(
-    value: UsdcMicros,
+    active: UsdcMicros,
+    aggregate: UsdcMicros,
     fixed_reserve: UsdcMicros,
     reserve_bps: u16,
 ) -> Result<UsdcMicros, PacingError> {
-    let after_fixed = UsdcMicros(value.0.checked_sub(fixed_reserve.0).unwrap_or_default());
-    apply_reserve(after_fixed, reserve_bps)
+    let aggregate_after_fixed = aggregate.0.checked_sub(fixed_reserve.0).unwrap_or_default();
+    apply_reserve(UsdcMicros(active.0.min(aggregate_after_fixed)), reserve_bps)
 }
 
 fn gross_up_reserve(value: UsdcMicros, reserve_bps: u16) -> Result<UsdcMicros, PacingError> {

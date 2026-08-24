@@ -1,12 +1,16 @@
 use crate::{
     clock::{Clock, SystemClock},
     config::{Config, ConfigError, Environment, RuntimeActionPolicy},
-    exchange::{validate_order_intent, Exchange, ExchangeError, OrderIntent, Submission},
+    exchange::{
+        validate_order_intent, DailyNotionalLedger, Exchange, ExchangeError, OrderIntent,
+        OrderTimeInForce, Submission,
+    },
 };
 pub struct Executor<E, C = SystemClock> {
     exchange: E,
     policy: RuntimeActionPolicy,
     clock: C,
+    daily_notional: DailyNotionalLedger,
 }
 
 impl<E: Exchange> Executor<E, SystemClock> {
@@ -41,6 +45,7 @@ impl<E: Exchange, C: Clock> Executor<E, C> {
             exchange,
             policy,
             clock,
+            daily_notional: DailyNotionalLedger::default(),
         })
     }
 
@@ -55,8 +60,11 @@ impl<E: Exchange, C: Clock> Executor<E, C> {
             notional_usdc,
             max_slippage_bps: self.policy.max_slippage_bps,
             max_purchase_fee_bps: self.policy.max_purchase_fee_bps,
+            time_in_force: OrderTimeInForce::ImmediateOrCancel,
         };
-        validate_order_intent(&intent, &self.policy, self.clock.now())?;
+        let now = self.clock.now();
+        validate_order_intent(&intent, &self.policy, now)?;
+        self.daily_notional.reserve(&intent, &self.policy, now)?;
         self.exchange.submit(&intent)
     }
 }

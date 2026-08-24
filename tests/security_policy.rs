@@ -3,7 +3,9 @@ use hype_accumulator::{
     bootstrap_with_clock,
     clock::Clock,
     config::{Config, ConfigError, SecurityPolicyError},
-    exchange::{DryRunExchange, Exchange, ExchangeError, OrderIntent, Submission},
+    exchange::{
+        DryRunExchange, Exchange, ExchangeError, OrderIntent, OrderTimeInForce, Submission,
+    },
     execution::Executor,
     pacing::{
         CapitalEvent, DecisionInput, DecisionReason, DepositEvent, PacingError, PacingLimits,
@@ -388,6 +390,14 @@ fn fee_ceiling_and_acknowledgement_expiry_are_enforced_per_action() {
         recording.0.lock().expect("intent lock")[0].max_purchase_fee_bps,
         5
     );
+    assert_eq!(
+        recording.0.lock().expect("intent lock")[0].time_in_force,
+        OrderTimeInForce::ImmediateOrCancel
+    );
+    assert!(matches!(
+        executor.execute(16.0),
+        Err(ExchangeError::Rejected(message)) if message.contains("daily notional")
+    ));
     clock.set(at(EXPIRY));
     assert!(matches!(
         executor.execute(10.0),
@@ -404,6 +414,7 @@ fn fee_ceiling_and_acknowledgement_expiry_are_enforced_per_action() {
             notional_usdc: 10.0,
             max_slippage_bps: 20,
             max_purchase_fee_bps: 5,
+            time_in_force: OrderTimeInForce::ImmediateOrCancel,
         }),
         Ok(Submission::Simulated)
     );
@@ -412,8 +423,36 @@ fn fee_ceiling_and_acknowledgement_expiry_are_enforced_per_action() {
             notional_usdc: 10.0,
             max_slippage_bps: 20,
             max_purchase_fee_bps: 6,
+            time_in_force: OrderTimeInForce::ImmediateOrCancel,
         }),
         Err(ExchangeError::Rejected(message)) if message.contains("fee")
+    ));
+    assert!(matches!(
+        guarded.submit(&OrderIntent {
+            notional_usdc: 10.0,
+            max_slippage_bps: 20,
+            max_purchase_fee_bps: 5,
+            time_in_force: OrderTimeInForce::GoodTilCanceled,
+        }),
+        Err(ExchangeError::Rejected(message)) if message.contains("immediate-or-cancel")
+    ));
+    assert_eq!(
+        guarded.submit(&OrderIntent {
+            notional_usdc: 15.0,
+            max_slippage_bps: 20,
+            max_purchase_fee_bps: 5,
+            time_in_force: OrderTimeInForce::ImmediateOrCancel,
+        }),
+        Ok(Submission::Simulated)
+    );
+    assert!(matches!(
+        guarded.submit(&OrderIntent {
+            notional_usdc: 0.000_001,
+            max_slippage_bps: 20,
+            max_purchase_fee_bps: 5,
+            time_in_force: OrderTimeInForce::ImmediateOrCancel,
+        }),
+        Err(ExchangeError::Rejected(message)) if message.contains("daily notional")
     ));
     clock.set(at(EXPIRY));
     assert!(matches!(
@@ -421,6 +460,7 @@ fn fee_ceiling_and_acknowledgement_expiry_are_enforced_per_action() {
             notional_usdc: 10.0,
             max_slippage_bps: 20,
             max_purchase_fee_bps: 5,
+            time_in_force: OrderTimeInForce::ImmediateOrCancel,
         }),
         Err(ExchangeError::Rejected(message)) if message.contains("expired")
     ));
