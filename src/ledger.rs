@@ -1212,6 +1212,18 @@ fn record_purchase_decision(
     planned_usdc: UsdcMicros,
     committed_usdc: UsdcMicros,
 ) -> Result<(), LedgerError> {
+    if let Some(commitment) = state.commitments.get(commitment_id) {
+        if commitment.settled || commitment.committed_usdc < committed_usdc {
+            return Err(LedgerError::InsufficientDecisionBacking(
+                decision_id.to_owned(),
+            ));
+        }
+        if occurred_at < commitment.occurred_at {
+            return Err(LedgerError::InvalidEvent(
+                "decision predates its backing commitment".into(),
+            ));
+        }
+    }
     record_daily_outcome(state, occurred_at.date_naive(), decision_date, decision_id)?;
     if state.decision_commitment_ids.contains(commitment_id) {
         return Err(LedgerError::DecisionCommitmentCollision(
@@ -3489,6 +3501,67 @@ mod transaction_tests {
         );
         assert_eq!(ledger.state().committed_usdc(), usd(20));
         assert_eq!(ledger.state().spent_usdc(), UsdcMicros::default());
+    }
+
+    #[test]
+    fn settled_commitment_cannot_be_linked_to_a_delayed_decision() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let anchor = anchor_store();
+        let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+        for event in [
+            deposit("deposit-before-delayed-decision", 1),
+            LedgerEvent {
+                event_id: "admission-before-delayed-decision".into(),
+                occurred_at: at(2),
+                kind: LedgerEventKind::DepositAdmission {
+                    deposit_event_id: "deposit-before-delayed-decision".into(),
+                    amount_usdc: usd(20),
+                },
+            },
+            LedgerEvent {
+                event_id: "commit-before-delayed-decision".into(),
+                occurred_at: at(3),
+                kind: LedgerEventKind::CapitalCommitted {
+                    commitment_id: "settled-before-delayed-decision".into(),
+                    amount_usdc: usd(20),
+                },
+            },
+            LedgerEvent {
+                event_id: "settlement-before-delayed-decision".into(),
+                occurred_at: at(4),
+                kind: LedgerEventKind::CapitalSettled {
+                    commitment_id: "settled-before-delayed-decision".into(),
+                    debited_usdc: usd(20),
+                },
+            },
+        ] {
+            ledger
+                .append(event)
+                .expect("append delayed decision fixture");
+        }
+        let durable_before =
+            fs::read(directory.path().join(LEDGER_FILE_NAME)).expect("read ledger before reject");
+
+        assert_eq!(
+            ledger.append(LedgerEvent {
+                event_id: "delayed-decision-after-settlement".into(),
+                occurred_at: at(5),
+                kind: LedgerEventKind::DailyDecision {
+                    decision_id: "purchase-after-settlement".into(),
+                    decision_date: at(5).date_naive(),
+                    commitment_id: "settled-before-delayed-decision".into(),
+                    planned_usdc: usd(10),
+                    committed_usdc: usd(10),
+                },
+            }),
+            Err(LedgerError::InsufficientDecisionBacking(
+                "purchase-after-settlement".into()
+            ))
+        );
+        assert_eq!(
+            fs::read(directory.path().join(LEDGER_FILE_NAME)).expect("read unchanged ledger"),
+            durable_before
+        );
     }
 
     #[test]
