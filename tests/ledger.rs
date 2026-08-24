@@ -805,6 +805,60 @@ fn opposing_restores_acquire_directory_locks_in_the_same_order() {
     right_to_left.join().expect("right-to-left thread");
 }
 
+#[cfg(unix)]
+#[test]
+fn opening_a_symlinked_journal_fails_without_modifying_its_target() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().expect("ledger directory");
+    let foreign_directory = tempfile::tempdir().expect("foreign directory");
+    let anchor = anchor_store();
+    let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+    ledger
+        .append(deposit("deposit-before-symlink", 1, 100))
+        .expect("append deposit");
+    drop(ledger);
+
+    let journal = ledger_path(directory.path());
+    let foreign_journal = foreign_directory.path().join("foreign-ledger.jsonl");
+    let expected = fs::read(&journal).expect("read valid journal");
+    fs::write(&foreign_journal, &expected).expect("write matching foreign journal");
+    fs::remove_file(&journal).expect("remove local journal");
+    symlink(&foreign_journal, &journal).expect("replace journal with symlink");
+
+    assert!(open(directory.path(), &anchor).is_err());
+    assert_eq!(
+        fs::read(&foreign_journal).expect("foreign journal remains"),
+        expected
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn appending_rejects_a_multiply_linked_journal() {
+    let directory = tempfile::tempdir().expect("ledger directory");
+    let foreign_directory = tempfile::tempdir().expect("foreign directory");
+    let anchor = anchor_store();
+    let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+    ledger
+        .append(deposit("deposit-before-hard-link", 1, 100))
+        .expect("append deposit");
+
+    let journal = ledger_path(directory.path());
+    let foreign_journal = foreign_directory.path().join("foreign-ledger.jsonl");
+    fs::hard_link(&journal, &foreign_journal).expect("hard link journal");
+    let expected = fs::read(&foreign_journal).expect("read linked journal");
+
+    assert!(matches!(
+        ledger.append(observed("observation-after-hard-link", 2, 100, 1)),
+        Err(LedgerError::UnsafeJournalFile)
+    ));
+    assert_eq!(
+        fs::read(&foreign_journal).expect("linked journal remains"),
+        expected
+    );
+}
+
 #[test]
 fn protected_anchor_rejects_complete_local_ledger_and_snapshot_loss() {
     let directory = tempfile::tempdir().expect("temporary directory");

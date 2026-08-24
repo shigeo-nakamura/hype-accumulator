@@ -15,7 +15,7 @@ use std::{
     env,
     fmt::Write as _,
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -361,6 +361,7 @@ struct RestorePendingHashInput<'a> {
 
 pub struct DurableLedger {
     directory: PathBuf,
+    journal: File,
     anchor_store: Arc<dyn ProtectedAnchorStore>,
     anchor: Option<ProtectedHeadAnchor>,
     records: Vec<LedgerEnvelope>,
@@ -429,7 +430,8 @@ impl DurableLedger {
         directory: PathBuf,
         anchor_store: Arc<dyn ProtectedAnchorStore>,
     ) -> Result<Self, LedgerError> {
-        let payload = read_optional(&directory.join(LEDGER_FILE_NAME))?;
+        let mut journal = open_journal(&directory)?;
+        let payload = read_journal(&mut journal)?;
         let records = load_records(&payload)?;
         let anchor = load_protected_anchor(anchor_store.as_ref())?;
         validate_protected_anchor(anchor.as_ref(), &records)?;
@@ -449,6 +451,7 @@ impl DurableLedger {
         }
         Ok(Self {
             directory,
+            journal,
             anchor_store,
             anchor,
             records,
@@ -697,10 +700,11 @@ impl DurableLedger {
         })
     }
 
-    fn write_record(&self, record: &LedgerEnvelope) -> Result<u64, LedgerError> {
-        fs::create_dir_all(&self.directory).map_err(LedgerError::io)?;
-        let path = self.directory.join(LEDGER_FILE_NAME);
-        let created = !path.exists();
+    fn write_record(&mut self, record: &LedgerEnvelope) -> Result<u64, LedgerError> {
+        validate_journal_handle(&self.directory, &self.journal)?;
+        if self.journal.metadata().map_err(LedgerError::io)?.len() != self.file_len {
+            return Err(LedgerError::ConcurrentModification);
+        }
         let line = record_line(record)?;
         let next_file_len = self
             .file_len
@@ -709,24 +713,15 @@ impl DurableLedger {
                     .map_err(|_| LedgerError::CorruptLedger("file length overflowed".into()))?,
             )
             .ok_or_else(|| LedgerError::CorruptLedger("file length overflowed".into()))?;
-        let mut options = OpenOptions::new();
-        options.create(true).append(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o640);
-        }
-        let mut file = options.open(&path).map_err(LedgerError::io)?;
-        file.write_all(&line).map_err(LedgerError::io)?;
-        file.sync_all().map_err(LedgerError::io)?;
-        if created {
-            sync_directory(&self.directory)?;
-        }
+        self.journal.write_all(&line).map_err(LedgerError::io)?;
+        self.journal.sync_all().map_err(LedgerError::io)?;
         Ok(next_file_len)
     }
 
     fn ensure_current(&self) -> Result<(), LedgerError> {
-        let payload = read_optional(&self.directory.join(LEDGER_FILE_NAME))?;
+        validate_journal_handle(&self.directory, &self.journal)?;
+        let mut journal = self.journal.try_clone().map_err(LedgerError::io)?;
+        let payload = read_journal(&mut journal)?;
         let current_len = u64::try_from(payload.len())
             .map_err(|_| LedgerError::CorruptLedger("file length overflowed".into()))?;
         let records = load_records(&payload)?;
@@ -1519,6 +1514,87 @@ fn read_optional(path: &Path) -> Result<Vec<u8>, LedgerError> {
         .map_err(LedgerError::io)
 }
 
+fn open_journal(directory: &Path) -> Result<File, LedgerError> {
+    let path = directory.join(LEDGER_FILE_NAME);
+    let mut existing_options = OpenOptions::new();
+    configure_journal_options(&mut existing_options);
+    let (file, created) = match existing_options.open(&path) {
+        Ok(file) => (file, false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut create_options = OpenOptions::new();
+            configure_journal_options(&mut create_options);
+            create_options.create_new(true);
+            match create_options.open(&path) {
+                Ok(file) => (file, true),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (
+                    existing_options.open(&path).map_err(LedgerError::io)?,
+                    false,
+                ),
+                Err(error) => return Err(LedgerError::io(error)),
+            }
+        }
+        Err(error) => return Err(LedgerError::io(error)),
+    };
+    validate_journal_handle(directory, &file)?;
+    if created {
+        file.sync_all().map_err(LedgerError::io)?;
+        sync_directory(directory)?;
+    }
+    Ok(file)
+}
+
+fn configure_journal_options(options: &mut OpenOptions) {
+    options.read(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NOFOLLOW).mode(0o640);
+    }
+}
+
+fn read_journal(file: &mut File) -> Result<Vec<u8>, LedgerError> {
+    file.seek(SeekFrom::Start(0)).map_err(LedgerError::io)?;
+    let mut payload = Vec::new();
+    file.read_to_end(&mut payload).map_err(LedgerError::io)?;
+    Ok(payload)
+}
+
+fn validate_journal_handle(directory: &Path, file: &File) -> Result<(), LedgerError> {
+    let path_metadata =
+        fs::symlink_metadata(directory.join(LEDGER_FILE_NAME)).map_err(LedgerError::io)?;
+    let file_metadata = file.metadata().map_err(LedgerError::io)?;
+    if !path_metadata.file_type().is_file() || !file_metadata.file_type().is_file() {
+        return Err(LedgerError::UnsafeJournalFile);
+    }
+    validate_journal_identity(&path_metadata, &file_metadata)
+}
+
+#[cfg(unix)]
+fn validate_journal_identity(
+    path_metadata: &fs::Metadata,
+    file_metadata: &fs::Metadata,
+) -> Result<(), LedgerError> {
+    use std::os::unix::fs::MetadataExt;
+
+    if path_metadata.dev() != file_metadata.dev()
+        || path_metadata.ino() != file_metadata.ino()
+        || path_metadata.nlink() != 1
+        || file_metadata.nlink() != 1
+    {
+        return Err(LedgerError::UnsafeJournalFile);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_journal_identity(
+    _path_metadata: &fs::Metadata,
+    _file_metadata: &fs::Metadata,
+) -> Result<(), LedgerError> {
+    Ok(())
+}
+
 fn write_atomic(path: &Path, payload: &[u8]) -> Result<(), LedgerError> {
     let parent = path.parent().ok_or(LedgerError::InvalidPath)?;
     let file_name = path.file_name().ok_or(LedgerError::InvalidPath)?;
@@ -1794,6 +1870,8 @@ pub enum LedgerError {
     ProtectedAnchorStore(String),
     #[error("pending restore transaction is corrupt or belongs to another source")]
     CorruptRestorePending,
+    #[error("journal must be a single-linked regular file at its locked path")]
+    UnsafeJournalFile,
     #[error("restore destination is not empty")]
     RestoreDestinationNotEmpty,
     #[error("ledger changed since it was opened")]

@@ -1809,6 +1809,7 @@ dependencies = [
  "chrono",
  "dex-connector",
  "fs2",
+ "libc",
  "proptest",
  "reqwest",
  "rust_decimal",
