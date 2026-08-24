@@ -642,7 +642,8 @@ impl DurableLedger {
                 target
             }
             None if has_only_restore_entries(&destination, false)?
-                && destination_anchor.is_none() =>
+                && (destination_anchor.is_none()
+                    || destination_anchor.as_ref() == verified.anchor.as_ref()) =>
             {
                 write_pending_restore(&destination, &current_pending)?;
                 RestoreTarget::from_verified(ledger_payload, snapshot_payload, &verified)

@@ -1265,6 +1265,67 @@ fn clean_directory_restore_round_trips_exact_checkpoint() {
 }
 
 #[test]
+fn restore_reconstructs_missing_files_when_protected_anchor_matches() {
+    let source = tempfile::tempdir().expect("source directory");
+    let destination = tempfile::tempdir().expect("destination directory");
+    let source_anchor = anchor_store();
+    let destination_anchor = anchor_store();
+    let mut ledger = open(source.path(), &source_anchor).expect("open source ledger");
+    ledger
+        .append(deposit("deposit-before-local-loss", 1, 100))
+        .expect("append deposit");
+    let expected_state = ledger.state().clone();
+    let expected_head = ledger.head_hash().to_owned();
+    drop(ledger);
+
+    destination_anchor.replace_for_test(
+        source_anchor
+            .load()
+            .expect("load source anchor accepted by destination"),
+    );
+
+    let restored = restore(
+        source.path(),
+        destination.path(),
+        &source_anchor,
+        &destination_anchor,
+    )
+    .expect("matching protected anchor permits reconstruction");
+    assert_eq!(restored.state(), &expected_state);
+    assert_eq!(restored.head_hash(), expected_head);
+}
+
+#[test]
+fn restore_rejects_missing_files_when_protected_anchor_differs() {
+    let source = tempfile::tempdir().expect("source directory");
+    let destination = tempfile::tempdir().expect("destination directory");
+    let source_anchor = anchor_store();
+    let destination_anchor = anchor_store();
+    let mut ledger = open(source.path(), &source_anchor).expect("open source ledger");
+    ledger
+        .append(deposit("deposit-before-anchor-mismatch", 1, 100))
+        .expect("append deposit");
+    drop(ledger);
+
+    let mut mismatched_anchor = source_anchor
+        .load()
+        .expect("load source anchor")
+        .expect("nonempty source anchor");
+    mismatched_anchor.head_hash = "0".repeat(64);
+    destination_anchor.replace_for_test(Some(mismatched_anchor));
+
+    assert!(matches!(
+        restore(
+            source.path(),
+            destination.path(),
+            &source_anchor,
+            &destination_anchor,
+        ),
+        Err(LedgerError::RestoreDestinationNotEmpty)
+    ));
+}
+
+#[test]
 fn restore_preserves_unverified_atomic_temporary_and_fails_closed() {
     let source = tempfile::tempdir().expect("source directory");
     let container = tempfile::tempdir().expect("destination container");
