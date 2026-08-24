@@ -19,6 +19,7 @@ use std::{
 const EXECUTION_ACCOUNT: &str = "0x11111111111111111111111111111111111111aa";
 const OTHER_EXECUTION_ACCOUNT: &str = "0x2222222222222222222222222222222222222222";
 const VALIDATOR: &str = "0x3333333333333333333333333333333333333333";
+const OTHER_VALIDATOR: &str = "0x6666666666666666666666666666666666666666";
 const PARENT_ACCOUNT: &str = "0x4444444444444444444444444444444444444444";
 const OTHER_PARENT_ACCOUNT: &str = "0x5555555555555555555555555555555555555555";
 const EVIDENCE_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -521,6 +522,43 @@ fn resolved_parent_identity_is_digest_bound_when_inheritance_is_enabled() {
             SecurityPolicyError::AcknowledgementMismatch
         ))
     );
+}
+
+#[test]
+fn multiple_validators_are_normalized_as_a_digest_bound_set() {
+    let env = live_environment();
+    let single = format!("validator_allowlist = [\"{VALIDATOR}\"]");
+    let runtime = live_runtime_toml().replace(
+        &single,
+        &format!("validator_allowlist = [\"{OTHER_VALIDATOR}\", \"{VALIDATOR}\"]"),
+    );
+    let first = live_policy_template().replace(
+        &single,
+        &format!("validator_allowlist = [\"{VALIDATOR}\", \"{OTHER_VALIDATOR}\"]"),
+    );
+    let reversed = first.replace(
+        &format!("validator_allowlist = [\"{VALIDATOR}\", \"{OTHER_VALIDATOR}\"]"),
+        &format!("validator_allowlist = [\"{OTHER_VALIDATOR}\", \"{VALIDATOR}\"]"),
+    );
+    let expected = Config::from_toml_with_security_policy(&runtime, &first)
+        .expect("multi-validator documents")
+        .expected_live_acknowledgement(&env)
+        .expect("nonempty validator set is supported");
+    assert_eq!(
+        Config::from_toml_with_security_policy(&runtime, &reversed)
+            .expect("reversed validator documents")
+            .expected_live_acknowledgement(&env)
+            .expect("validator order is normalized"),
+        expected
+    );
+    let acknowledged = first.replace(
+        "live_acknowledgement = \"\"",
+        &format!("live_acknowledgement = \"{expected}\""),
+    );
+    Config::from_toml_with_security_policy(&runtime, &acknowledged)
+        .expect("acknowledged multi-validator documents")
+        .validate_at(&env, at("2026-08-31T23:59:59Z"))
+        .expect("matching nonempty validator sets validate");
 }
 
 #[test]

@@ -1205,7 +1205,7 @@ fn normalize_address(value: &str, field: &str) -> Result<String, SecurityPolicyE
 fn normalized_addresses(
     values: &[String],
     field: &str,
-    require_one: bool,
+    require_nonempty: bool,
 ) -> Result<Vec<String>, SecurityPolicyError> {
     let normalized = values
         .iter()
@@ -1214,8 +1214,8 @@ fn normalized_addresses(
     if normalized.len() != values.len() {
         return invalid_policy(&format!("{field} contains a duplicate"));
     }
-    if require_one && normalized.len() != 1 {
-        return invalid_policy(&format!("{field} must contain exactly one address"));
+    if require_nonempty && normalized.is_empty() {
+        return invalid_policy(&format!("{field} must contain at least one address"));
     }
     Ok(normalized.into_iter().collect())
 }
