@@ -385,6 +385,24 @@ fn raw_duplicate_payload_replays_but_conflicting_payload_is_rejected() {
 }
 
 #[test]
+fn normalization_rejects_ambiguous_authoritative_revision_timestamps() {
+    let mut ambiguous: serde_json::Value = serde_json::from_str(RAW).unwrap();
+    let mut row = ambiguous["auxiliary_revisions"][0].clone();
+    row["identity"]["source_version"] = serde_json::json!("v2");
+    row["identity"]["revision_id"] = serde_json::json!("same-slot-different-id");
+    row["value"]["raw_value_microunits"] = serde_json::json!(999_000_000);
+    ambiguous["auxiliary_revisions"]
+        .as_array_mut()
+        .unwrap()
+        .push(row);
+
+    assert_eq!(
+        LiveSignalNormalizer::normalize_json(&ambiguous.to_string()),
+        Err(SignalError::AmbiguousRevisionOrder(day("2026-07-02")))
+    );
+}
+
+#[test]
 fn canonical_hash_ignores_json_field_order_and_excludes_hash_field() {
     let snapshot = live_snapshot(&request(
         "2026-07-06T12:00:00Z",
@@ -397,7 +415,9 @@ fn canonical_hash_ignores_json_field_order_and_excludes_hash_field() {
     let value: serde_json::Value = serde_json::from_str(&canonical).unwrap();
     let shuffled = serde_json::to_string_pretty(&value).unwrap();
     let reparsed = SignalSnapshot::from_json(&shuffled).unwrap();
+    let directly_deserialized: SignalSnapshot = serde_json::from_str(&shuffled).unwrap();
     assert_eq!(snapshot, reparsed);
+    assert_eq!(snapshot, directly_deserialized);
     assert_eq!(snapshot.snapshot_hash(), reparsed.snapshot_hash());
     assert!(
         !String::from_utf8(snapshot.canonical_bytes_without_hash().unwrap())
@@ -411,6 +431,11 @@ fn canonical_hash_ignores_json_field_order_and_excludes_hash_field() {
         SignalSnapshot::from_json(&inconsistent_health.to_string()),
         Err(SignalError::InvalidSnapshotInvariant)
     );
+    let direct_inconsistent =
+        serde_json::from_value::<SignalSnapshot>(inconsistent_health).unwrap_err();
+    assert!(direct_inconsistent
+        .to_string()
+        .contains("invalid snapshot invariant"));
 
     let mut mismatched_query = value.clone();
     mismatched_query["body"]["core_query"]["observation_date"] = serde_json::json!("2026-07-05");
@@ -439,6 +464,10 @@ fn canonical_hash_ignores_json_field_order_and_excludes_hash_field() {
         SignalSnapshot::from_json(&tampered.to_string()),
         Err(SignalError::InvalidSnapshotHash)
     );
+    let direct_tampered = serde_json::from_value::<SignalSnapshot>(tampered).unwrap_err();
+    assert!(direct_tampered
+        .to_string()
+        .contains("snapshot hash does not match"));
 }
 
 #[test]

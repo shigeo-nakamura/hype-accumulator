@@ -483,6 +483,19 @@ impl<T: Eq> RevisionBook<T> {
     ///
     /// Returns [`SignalError::ConflictingRevision`] on identity reuse.
     pub fn insert(&mut self, revision: SignalRevision<T>) -> Result<InsertOutcome, SignalError> {
+        if self.entries.values().any(|existing| {
+            existing.identity != revision.identity
+                && existing.identity.source == revision.identity.source
+                && existing.identity.series == revision.identity.series
+                && existing.identity.observation_date == revision.identity.observation_date
+                && existing.timestamps.published_at == revision.timestamps.published_at
+                && existing.timestamps.fetched_at == revision.timestamps.fetched_at
+                && existing.timestamps.first_usable_at == revision.timestamps.first_usable_at
+        }) {
+            return Err(SignalError::AmbiguousRevisionOrder(
+                revision.identity.observation_date,
+            ));
+        }
         match self.entries.entry(revision.identity.clone()) {
             Entry::Vacant(entry) => {
                 entry.insert(revision);
@@ -511,7 +524,6 @@ impl<T: Eq> RevisionBook<T> {
                     revision.timestamps.first_usable_at,
                     revision.timestamps.fetched_at,
                     revision.timestamps.published_at,
-                    revision.identity.revision_id.clone(),
                 )
             })
     }
@@ -592,11 +604,28 @@ struct SignalSnapshotBody {
 }
 
 /// Canonical, typed daily decision input with a self-verifying SHA-256 hash.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignalSnapshot {
     body: SignalSnapshotBody,
     snapshot_hash: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignalSnapshotWire {
+    body: SignalSnapshotBody,
+    snapshot_hash: String,
+}
+
+impl<'de> Deserialize<'de> for SignalSnapshot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SignalSnapshotWire::deserialize(deserializer)?;
+        Self::from_wire(wire).map_err(serde::de::Error::custom)
+    }
 }
 
 impl SignalSnapshot {
@@ -608,6 +637,15 @@ impl SignalSnapshot {
         })
     }
 
+    fn from_wire(wire: SignalSnapshotWire) -> Result<Self, SignalError> {
+        let snapshot = Self {
+            body: wire.body,
+            snapshot_hash: wire.snapshot_hash,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
     /// Parses typed JSON, validates all snapshot invariants, and verifies the
     /// canonical hash. JSON object field order is irrelevant.
     ///
@@ -616,10 +654,9 @@ impl SignalSnapshot {
     /// Returns [`SignalError`] for malformed JSON, unsupported schema,
     /// inconsistent health/eligibility fields, or a hash mismatch.
     pub fn from_json(input: &str) -> Result<Self, SignalError> {
-        let snapshot: Self =
+        let wire =
             serde_json::from_str(input).map_err(|error| SignalError::Json(error.to_string()))?;
-        snapshot.validate()?;
-        Ok(snapshot)
+        Self::from_wire(wire)
     }
 
     /// Serializes the typed snapshot in stable struct-field order.
@@ -897,6 +934,8 @@ pub enum SignalError {
     InvalidIdentity,
     #[error("revision identity conflicts with a different payload: {0}")]
     ConflictingRevision(String),
+    #[error("revision ordering is ambiguous for observation date: {0}")]
+    AmbiguousRevisionOrder(NaiveDate),
     #[error("freshness limit must be positive")]
     InvalidFreshnessLimit,
     #[error("unsupported signal schema version: {0}")]
