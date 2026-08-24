@@ -19,6 +19,7 @@ paths. `config/example.toml` is safe and non-routable.
 - `config`: typed configuration and fail-closed validation
 - `account` / `capital`: observed, confirmed, and admitted capital reconciliation
 - `signal`: read-only signal inputs
+- `pacing`: exact-USDC deposit admission and deterministic fixed-DCA decisions
 - `clock` / `exchange`: deterministic boundaries and test doubles
 - `execution`: order limits and exchange workflow
 - `ledger`: durable-ledger interface
@@ -27,6 +28,27 @@ paths. `config/example.toml` is safe and non-routable.
 
 The live adapter and persistent ledger backend are intentionally outside this
 bootstrap. The crate pins tagged `dex-connector` with `hyperliquid-sdk` only.
+
+## Offline fixed-DCA fallback
+
+The `pacing` state machine is an offline planner. It accepts uniquely identified
+authoritative deposit and withdrawal events, admits deposits only after the
+configured confirmations, cooldown, explicit admission approval, and cumulative
+caps, then assigns each admitted tranche a 31 December receipt-year horizon.
+Unmatched balance changes and unadmitted deposit residual never become
+deployable capital.
+
+Each eligible UTC date produces one durable decision ID. A skip is durable too;
+same-day replay after a restart or an after-decision deposit returns the existing
+audit record and no new economic intent. Plans use exact USDC microunits, preserve
+per-tranche committed/filled/withdrawn attribution, reserve fee/spread capacity,
+respect exchange minimum and daily caps, and hold an infeasible horizon residual
+for explicit approval. The configured final catch-up window adds daily eligible
+slots but never relaxes the daily cap.
+
+This fallback deliberately has no market-signal multiplier, signer, exchange
+submission, state-file backend, or live configuration. The caller must durably
+persist a new decision before any separately approved execution integration.
 
 The read-only status observer therefore treats HYPE attribution as unavailable:
 it reports zero HYPE with degraded health until an authoritative accumulator
