@@ -7,6 +7,7 @@ pub mod execution;
 pub mod ledger;
 pub mod metrics;
 pub mod signal;
+pub mod status;
 
 use config::{Config, ConfigError, Environment};
 use exchange::{DryRunExchange, Exchange};
