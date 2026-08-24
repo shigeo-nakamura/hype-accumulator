@@ -1253,48 +1253,102 @@ fn fills_and_fees_are_rejected_after_backing_settles() {
 
 #[test]
 fn purchase_order_requires_sufficient_unsettled_backing() {
-    for (case, backing, settle) in [("insufficient", 9, false), ("settled", 10, true)] {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let anchor = anchor_store();
-        let mut ledger = open(directory.path(), &anchor).expect("open ledger");
-        let date = at(0).date_naive();
-        let decision_id = format!("decision-{case}");
-        ledger
-            .append(daily_outcome(
-                &format!("daily-{case}"),
-                &decision_id,
-                date,
-                "decision",
-            ))
-            .expect("append decision");
-        append_decision_backing(&mut ledger, &decision_id, date, backing);
-        if settle {
-            ledger
-                .append(dated_event(
-                    "settle-before-order",
-                    date,
-                    5,
-                    LedgerEventKind::CapitalSettled {
-                        commitment_id: format!("commitment-{decision_id}"),
-                        debited_usdc: usd(10),
-                    },
-                ))
-                .expect("settle backing before order");
-        }
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let anchor = anchor_store();
+    let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+    let date = at(0).date_naive();
+    let decision_id = "decision-settled";
+    ledger
+        .append(daily_outcome(
+            "daily-settled",
+            decision_id,
+            date,
+            "decision",
+        ))
+        .expect("append decision");
+    append_decision_backing(&mut ledger, decision_id, date, 10);
+    ledger
+        .append(dated_event(
+            "settle-before-order",
+            date,
+            5,
+            LedgerEventKind::CapitalSettled {
+                commitment_id: format!("commitment-{decision_id}"),
+                debited_usdc: usd(10),
+            },
+        ))
+        .expect("settle backing before order");
 
-        assert_eq!(
-            ledger.append(dated_event(
-                format!("order-{case}"),
-                date,
-                6,
-                LedgerEventKind::OrderRecorded {
-                    order_id: format!("order-{case}"),
-                    decision_id: decision_id.clone(),
-                },
-            )),
-            Err(LedgerError::InsufficientDecisionBacking(decision_id))
-        );
+    assert_eq!(
+        ledger.append(dated_event(
+            "order-settled",
+            date,
+            6,
+            LedgerEventKind::OrderRecorded {
+                order_id: "order-settled".into(),
+                decision_id: decision_id.into(),
+            },
+        )),
+        Err(LedgerError::InsufficientDecisionBacking(decision_id.into()))
+    );
+}
+
+#[test]
+fn delayed_commitment_must_fully_back_its_existing_decision() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let anchor = anchor_store();
+    let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+    let date = at(0).date_naive();
+    ledger
+        .append(daily_outcome(
+            "daily-insufficient",
+            "decision-insufficient",
+            date,
+            "decision",
+        ))
+        .expect("append decision");
+    for event in [
+        dated_event(
+            "deposit-insufficient",
+            date,
+            2,
+            LedgerEventKind::AuthoritativeDeposit {
+                amount_usdc: usd(9),
+            },
+        ),
+        dated_event(
+            "admission-insufficient",
+            date,
+            3,
+            LedgerEventKind::DepositAdmission {
+                deposit_event_id: "deposit-insufficient".into(),
+                amount_usdc: usd(9),
+            },
+        ),
+    ] {
+        ledger.append(event).expect("append capital fixture");
     }
+    let durable_before = fs::read(ledger_path(directory.path())).expect("read ledger");
+
+    assert_eq!(
+        ledger.append(dated_event(
+            "capital-insufficient",
+            date,
+            4,
+            LedgerEventKind::CapitalCommitted {
+                commitment_id: "commitment-decision-insufficient".into(),
+                amount_usdc: usd(9),
+            },
+        )),
+        Err(LedgerError::InsufficientDecisionBacking(
+            "decision-insufficient".into()
+        ))
+    );
+    assert_eq!(ledger.state().committed_usdc(), UsdcMicros::default());
+    assert_eq!(
+        fs::read(ledger_path(directory.path())).expect("read unchanged ledger"),
+        durable_before
+    );
 }
 
 #[test]

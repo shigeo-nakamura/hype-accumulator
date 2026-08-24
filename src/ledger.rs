@@ -1077,6 +1077,22 @@ fn record_capital_commitment(
     if state.commitments.contains_key(commitment_id) {
         return Err(LedgerError::CommitmentCollision(commitment_id.to_owned()));
     }
+    if let Some((decision_id, decision)) = state
+        .purchase_decisions
+        .iter()
+        .find(|(_, decision)| decision.commitment_id == commitment_id)
+    {
+        if amount_usdc < decision.committed_usdc {
+            return Err(LedgerError::InsufficientDecisionBacking(
+                decision_id.to_owned(),
+            ));
+        }
+        if occurred_at < decision.occurred_at {
+            return Err(LedgerError::InvalidEvent(
+                "commitment predates its linked decision".into(),
+            ));
+        }
+    }
     record_capital_timeline_entry(state, occurred_at, UsdcMicros::default(), amount_usdc)?;
     state.committed_usdc = checked_add(state.committed_usdc, amount_usdc)?;
     state.commitments.insert(
