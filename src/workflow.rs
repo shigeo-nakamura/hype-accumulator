@@ -1739,9 +1739,8 @@ impl DurableWorkflow {
         binding.validate()?;
         let path = path.as_ref().to_path_buf();
         let workflow_id = workflow_id_for(binding);
-        let recovery_lock = acquire_journal_append_lock(&path)?;
+        let append_lock = acquire_journal_append_lock(&path)?;
         recover_pending_append(&path, &workflow_id, protected_head_store.as_ref())?;
-        drop(recovery_lock);
         let records = load_records(&path)?;
         if records.is_empty() {
             if protected_head_store
@@ -1777,7 +1776,7 @@ impl DurableWorkflow {
                 protected_head: None,
                 exchange_order_owner_store,
             };
-            workflow.append(initial)?;
+            workflow.append_while_locked(initial, &append_lock)?;
             Ok(workflow)
         } else {
             let events = records
@@ -1820,6 +1819,7 @@ impl DurableWorkflow {
                 protected_head,
                 exchange_order_owner_store,
             };
+            drop(append_lock);
             workflow.reconcile_exchange_order_owner()?;
             workflow.reconcile_exchange_fill_owners()?;
             Ok(workflow)
@@ -2511,6 +2511,22 @@ impl DurableWorkflow {
     }
 
     fn append(&mut self, event: WorkflowEvent) -> Result<AppendOutcome, WorkflowError> {
+        self.append_with_optional_lock(event, None)
+    }
+
+    fn append_while_locked(
+        &mut self,
+        event: WorkflowEvent,
+        append_lock: &File,
+    ) -> Result<AppendOutcome, WorkflowError> {
+        self.append_with_optional_lock(event, Some(append_lock))
+    }
+
+    fn append_with_optional_lock(
+        &mut self,
+        event: WorkflowEvent,
+        append_lock: Option<&File>,
+    ) -> Result<AppendOutcome, WorkflowError> {
         if let Some(existing) = self.events_by_id.get(&event.event_id) {
             return if existing.transition == event.transition {
                 Ok(AppendOutcome::Duplicate)
@@ -2539,7 +2555,11 @@ impl DurableWorkflow {
             event,
             record_hash,
         };
-        self.write_record(&record)?;
+        if let Some(append_lock) = append_lock {
+            self.write_record_while_locked(&record, append_lock)?;
+        } else {
+            self.write_record(&record)?;
+        }
         self.events_by_id
             .insert(record.event.event_id.clone(), record.event.clone());
         self.records.push(record);
@@ -2548,9 +2568,17 @@ impl DurableWorkflow {
     }
 
     fn write_record(&mut self, record: &JournalRecord) -> Result<(), WorkflowError> {
+        let append_lock = acquire_journal_append_lock(&self.path)?;
+        self.write_record_while_locked(record, &append_lock)
+    }
+
+    fn write_record_while_locked(
+        &mut self,
+        record: &JournalRecord,
+        _append_lock: &File,
+    ) -> Result<(), WorkflowError> {
         let parent = normalized_parent(&self.path);
         fs::create_dir_all(parent).map_err(WorkflowError::io)?;
-        let _append_lock = acquire_journal_append_lock(&self.path)?;
         let created = !self.path.exists();
         let current_len = fs::metadata(&self.path)
             .map(|metadata| metadata.len())
@@ -2708,12 +2736,16 @@ fn valid_gap_free_watermark(
     recorded_at: DateTime<Utc>,
 ) -> bool {
     watermark.domain == expected_domain
-        && !watermark.watermark_id.trim().is_empty()
+        && canonical_nonempty(&watermark.watermark_id)
         && watermark.cursor > 0
-        && !watermark.evidence_hash.trim().is_empty()
+        && canonical_nonempty(&watermark.evidence_hash)
         && watermark.gap_free_from_at <= required_from_at
         && watermark.through_at > effective_expiry_at
         && watermark.through_at <= recorded_at
+}
+
+fn canonical_nonempty(value: &str) -> bool {
+    !value.is_empty() && value == value.trim()
 }
 
 fn independent_history_watermarks(
@@ -2754,9 +2786,9 @@ fn valid_eligibility_history_watermark(
     recorded_at: DateTime<Utc>,
 ) -> bool {
     watermark.domain == expected_domain
-        && !watermark.watermark_id.trim().is_empty()
+        && canonical_nonempty(&watermark.watermark_id)
         && watermark.cursor > 0
-        && !watermark.evidence_hash.trim().is_empty()
+        && canonical_nonempty(&watermark.evidence_hash)
         && watermark.gap_free_from_at <= required_from_at
         && watermark.through_at == recorded_at
 }

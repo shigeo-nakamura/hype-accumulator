@@ -15,7 +15,7 @@ use hype_accumulator::{
 use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
-    io::Write,
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
 };
@@ -31,6 +31,68 @@ struct MemoryProtectedHeadStore {
 struct MemoryExchangeOrderOwnerStore {
     order_owners: Mutex<BTreeMap<(String, String), ExchangeOrderOwner>>,
     fill_owners: Mutex<BTreeMap<(String, String), ExchangeFillOwner>>,
+}
+
+struct InitializationLockCheckingHeadStore {
+    inner: MemoryProtectedHeadStore,
+    append_lock_path: PathBuf,
+    initial_load_checked: Mutex<bool>,
+}
+
+impl InitializationLockCheckingHeadStore {
+    fn new(path: &Path) -> Self {
+        let mut append_lock_path = path.as_os_str().to_os_string();
+        append_lock_path.push(".append.lock");
+        Self {
+            inner: MemoryProtectedHeadStore::default(),
+            append_lock_path: PathBuf::from(append_lock_path),
+            initial_load_checked: Mutex::new(false),
+        }
+    }
+
+    fn require_append_lock(&self) -> Result<(), String> {
+        let probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.append_lock_path)
+            .map_err(|error| error.to_string())?;
+        match probe.try_lock_exclusive() {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            Ok(()) => Err("initialization accessed protected state without the append lock".into()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn initial_load_checked(&self) -> bool {
+        *self
+            .initial_load_checked
+            .lock()
+            .expect("initial load check locks")
+    }
+}
+
+impl ProtectedWorkflowHeadStore for InitializationLockCheckingHeadStore {
+    fn load(&self) -> Result<Option<ProtectedWorkflowHead>, String> {
+        let mut checked = self
+            .initial_load_checked
+            .lock()
+            .map_err(|error| error.to_string())?;
+        if !*checked {
+            self.require_append_lock()?;
+            *checked = true;
+        }
+        drop(checked);
+        self.inner.load()
+    }
+
+    fn compare_and_swap(
+        &self,
+        expected: Option<&ProtectedWorkflowHead>,
+        next: &ProtectedWorkflowHead,
+    ) -> Result<bool, String> {
+        self.require_append_lock()?;
+        self.inner.compare_and_swap(expected, next)
+    }
 }
 
 impl ExchangeOrderOwnerStore for MemoryExchangeOrderOwnerStore {
@@ -934,6 +996,28 @@ fn append_lock_prevents_replacing_a_pending_recovery_intent() {
 }
 
 #[test]
+fn initialization_keeps_the_append_lock_through_the_initial_commit() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("locked-initialization.jsonl");
+    let binding = binding();
+    let head_store = Arc::new(InitializationLockCheckingHeadStore::new(&path));
+    let owner_store = Arc::new(MemoryExchangeOrderOwnerStore::default());
+
+    let mut workflow =
+        DurableWorkflow::open_or_create(&path, &binding, head_store.clone(), owner_store.clone())
+            .expect("initial workflow commit stays locked");
+    assert!(head_store.initial_load_checked());
+    assert_eq!(workflow.record_count(), 1);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    drop(workflow);
+
+    let reopened = DurableWorkflow::open_or_create(&path, &binding, head_store, owner_store)
+        .expect("initialized workflow reopens");
+    assert_eq!(reopened.state().stage(), WorkflowStage::Decided);
+    assert!(reopened.state().pending_action().is_some());
+}
+
+#[test]
 fn losing_journal_commit_does_not_retain_fill_claims() {
     let temp = tempfile::tempdir().expect("temp directory");
     let path = temp.path().join("concurrent-fill-claim.jsonl");
@@ -1592,6 +1676,7 @@ fn absence_requires_effective_expiry_and_both_gap_free_watermarks() {
         "order-domain",
         "fill-domain",
         "same-proof",
+        "whitespace-variant-proof",
     ] {
         let path = temp.path().join(format!("invalid-absence-{invalid}.jsonl"));
         let mut workflow = reopen(&path, &binding);
@@ -1618,6 +1703,13 @@ fn absence_requires_effective_expiry_and_both_gap_free_watermarks() {
             "same-proof" => {
                 evidence.fill_history.watermark_id = evidence.order_history.watermark_id.clone();
                 evidence.fill_history.evidence_hash = evidence.order_history.evidence_hash.clone();
+                at(31)
+            }
+            "whitespace-variant-proof" => {
+                evidence.fill_history.watermark_id =
+                    format!(" {}", evidence.order_history.watermark_id);
+                evidence.fill_history.evidence_hash =
+                    format!(" {}", evidence.order_history.evidence_hash);
                 at(31)
             }
             _ => unreachable!("complete fixture set"),
@@ -2564,6 +2656,7 @@ fn eligibility_requires_fresh_gap_free_movement_coverage() {
         "fill-domain",
         "movement-domain",
         "same-proof",
+        "whitespace-variant-proof",
     ] {
         let path = temp
             .path()
@@ -2606,6 +2699,12 @@ fn eligibility_requires_fresh_gap_free_movement_coverage() {
                 evidence.movement_history.watermark_id = evidence.fill_history.watermark_id.clone();
                 evidence.movement_history.evidence_hash =
                     evidence.fill_history.evidence_hash.clone();
+            }
+            "whitespace-variant-proof" => {
+                evidence.movement_history.watermark_id =
+                    format!(" {}", evidence.fill_history.watermark_id);
+                evidence.movement_history.evidence_hash =
+                    format!(" {}", evidence.fill_history.evidence_hash);
             }
             _ => unreachable!("complete fixture set"),
         }
