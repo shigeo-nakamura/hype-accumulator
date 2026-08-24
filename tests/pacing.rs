@@ -134,6 +134,29 @@ fn arbitrary_time_events_repace_only_future_decisions() {
 }
 
 #[test]
+fn future_deposit_cannot_retroactively_fund_an_earlier_withdrawal() {
+    let limits = limits();
+    let mut state = PacingState::default();
+    let withdrawn_at = at(2026, 1, 1, 8);
+    let deposited_at = at(2026, 1, 1, 9);
+    let result = state.reconcile_capital(
+        &[
+            withdrawal("earlier-withdrawal", 10, withdrawn_at),
+            deposit("later-deposit", 100, deposited_at),
+        ],
+        at(2026, 1, 1, 10),
+        &limits,
+    );
+    assert!(matches!(
+        result,
+        Err(hype_accumulator::pacing::PacingError::WithdrawalExceedsFreeCapital(id))
+            if id == "earlier-withdrawal"
+    ));
+    assert!(state.deposits().is_empty());
+    assert!(state.withdrawals().is_empty());
+}
+
+#[test]
 fn unadmitted_or_balance_only_capital_fails_closed() {
     let limits = limits();
     let mut balance_only = PacingState::default();

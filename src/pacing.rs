@@ -388,8 +388,7 @@ impl PacingState {
                 CapitalEvent::Withdrawal(withdrawal) => next.upsert_withdrawal(withdrawal)?,
             }
         }
-        next.refresh_admissions(at, limits)?;
-        next.apply_ready_withdrawals(at)?;
+        next.apply_ready_capital(at, limits)?;
         next.validate_invariants()?;
         *self = next;
         Ok(())
@@ -720,65 +719,65 @@ impl PacingState {
         Ok(())
     }
 
-    fn refresh_admissions(
+    fn apply_ready_capital(
         &mut self,
         at: DateTime<Utc>,
         limits: &PacingLimits,
     ) -> Result<(), PacingError> {
-        let mut ids = self.deposits.keys().cloned().collect::<Vec<_>>();
-        ids.sort_by_key(|id| {
-            let tranche = &self.deposits[id];
-            (
-                tranche.first_usable_at,
-                tranche.received_at,
-                tranche.event_id.clone(),
-            )
-        });
-        for id in ids {
-            let ready = {
-                let tranche = &self.deposits[&id];
-                tranche
-                    .first_usable_at
-                    .is_some_and(|usable_at| usable_at <= at)
-            };
-            if !ready {
-                let tranche = self
-                    .deposits
-                    .get_mut(&id)
-                    .ok_or(PacingError::CorruptState)?;
-                tranche.status = status_before_admission(tranche, limits, at);
-                continue;
-            }
-            let admission_year = self
-                .deposits
-                .get(&id)
-                .ok_or(PacingError::CorruptState)?
-                .received_at
-                .year();
-            let (admitted_total, admitted_year) = self.admitted_totals(admission_year)?;
-            let tranche = self
-                .deposits
-                .get_mut(&id)
-                .ok_or(PacingError::CorruptState)?;
-            let unadmitted = tranche.unadmitted_usdc();
-            let capacity = [
-                checked_sub_floor(limits.max_automatically_admitted_usdc, admitted_total),
-                checked_sub_floor(limits.cumulative_admission_cap_usdc, admitted_total),
-                checked_sub_floor(limits.yearly_admission_cap_usdc, admitted_year),
-            ]
-            .into_iter()
-            .min()
-            .ok_or(PacingError::CorruptState)?;
-            let newly_admitted = UsdcMicros(unadmitted.0.min(capacity.0));
-            tranche.admitted_usdc = checked_add(tranche.admitted_usdc, newly_admitted)?;
-            tranche.status = if tranche.admitted_usdc == tranche.source_amount_usdc {
-                AdmissionStatus::Admitted
-            } else if tranche.admitted_usdc.is_zero() {
-                AdmissionStatus::HeldByAdmissionCap
+        let mut timeline = Vec::<(DateTime<Utc>, u8, String)>::new();
+        for tranche in self.deposits.values_mut() {
+            if let Some(usable_at) = tranche.first_usable_at.filter(|value| *value <= at) {
+                if !tranche.unadmitted_usdc().is_zero() {
+                    timeline.push((usable_at, 0, tranche.event_id.clone()));
+                }
             } else {
-                AdmissionStatus::PartiallyAdmitted
-            };
+                tranche.status = status_before_admission(tranche, limits, at);
+            }
         }
+        timeline.extend(
+            self.withdrawals
+                .values()
+                .filter(|record| !record.applied && record.event.reconciled_at <= at)
+                .map(|record| (record.event.reconciled_at, 1, record.event.event_id.clone())),
+        );
+        timeline.sort();
+        for (_, kind, id) in timeline {
+            if kind == 0 {
+                self.admit_ready_deposit(&id, limits)?;
+            } else {
+                self.apply_ready_withdrawal(&id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn admit_ready_deposit(&mut self, id: &str, limits: &PacingLimits) -> Result<(), PacingError> {
+        let admission_year = self
+            .deposits
+            .get(id)
+            .ok_or(PacingError::CorruptState)?
+            .received_at
+            .year();
+        let (admitted_total, admitted_year) = self.admitted_totals(admission_year)?;
+        let tranche = self.deposits.get_mut(id).ok_or(PacingError::CorruptState)?;
+        let unadmitted = tranche.unadmitted_usdc();
+        let capacity = [
+            checked_sub_floor(limits.max_automatically_admitted_usdc, admitted_total),
+            checked_sub_floor(limits.cumulative_admission_cap_usdc, admitted_total),
+            checked_sub_floor(limits.yearly_admission_cap_usdc, admitted_year),
+        ]
+        .into_iter()
+        .min()
+        .ok_or(PacingError::CorruptState)?;
+        let newly_admitted = UsdcMicros(unadmitted.0.min(capacity.0));
+        tranche.admitted_usdc = checked_add(tranche.admitted_usdc, newly_admitted)?;
+        tranche.status = if tranche.admitted_usdc == tranche.source_amount_usdc {
+            AdmissionStatus::Admitted
+        } else if tranche.admitted_usdc.is_zero() {
+            AdmissionStatus::HeldByAdmissionCap
+        } else {
+            AdmissionStatus::PartiallyAdmitted
+        };
         Ok(())
     }
 
@@ -794,62 +793,52 @@ impl PacingState {
         Ok((admitted_total, admitted_year))
     }
 
-    fn apply_ready_withdrawals(&mut self, at: DateTime<Utc>) -> Result<(), PacingError> {
-        let mut ids = self.withdrawals.keys().cloned().collect::<Vec<_>>();
-        ids.sort_by_key(|id| {
-            let record = &self.withdrawals[id];
-            (record.event.reconciled_at, record.event.event_id.clone())
+    fn apply_ready_withdrawal(&mut self, id: &str) -> Result<(), PacingError> {
+        let record = self.withdrawals.get(id).ok_or(PacingError::CorruptState)?;
+        let free = checked_sum(self.deposits.values().map(DepositTranche::residual_usdc))?;
+        if record.event.amount_usdc > free {
+            return Err(PacingError::WithdrawalExceedsFreeCapital(id.to_owned()));
+        }
+        let target = record.event.amount_usdc;
+        let mut tranche_ids = self.deposits.keys().cloned().collect::<Vec<_>>();
+        tranche_ids.sort_by_key(|tranche_id| {
+            let tranche = &self.deposits[tranche_id];
+            (
+                tranche.target_horizon,
+                tranche.received_at,
+                tranche.event_id.clone(),
+            )
         });
-        for id in ids {
-            let record = &self.withdrawals[&id];
-            if record.applied || record.event.reconciled_at > at {
+        let mut remaining = target.0;
+        let mut allocations = Vec::new();
+        for tranche_id in tranche_ids {
+            if remaining == 0 {
+                break;
+            }
+            let tranche = self
+                .deposits
+                .get_mut(&tranche_id)
+                .ok_or(PacingError::CorruptState)?;
+            let amount = tranche.residual_usdc().0.min(remaining);
+            if amount == 0 {
                 continue;
             }
-            let free = checked_sum(self.deposits.values().map(DepositTranche::residual_usdc))?;
-            if record.event.amount_usdc > free {
-                return Err(PacingError::WithdrawalExceedsFreeCapital(id));
-            }
-            let target = record.event.amount_usdc;
-            let mut tranche_ids = self.deposits.keys().cloned().collect::<Vec<_>>();
-            tranche_ids.sort_by_key(|tranche_id| {
-                let tranche = &self.deposits[tranche_id];
-                (
-                    tranche.target_horizon,
-                    tranche.received_at,
-                    tranche.event_id.clone(),
-                )
+            tranche.withdrawn_usdc = checked_add(tranche.withdrawn_usdc, UsdcMicros(amount))?;
+            remaining -= amount;
+            allocations.push(CapitalAllocation {
+                tranche_id,
+                amount_usdc: UsdcMicros(amount),
             });
-            let mut remaining = target.0;
-            let mut allocations = Vec::new();
-            for tranche_id in tranche_ids {
-                if remaining == 0 {
-                    break;
-                }
-                let tranche = self
-                    .deposits
-                    .get_mut(&tranche_id)
-                    .ok_or(PacingError::CorruptState)?;
-                let amount = tranche.residual_usdc().0.min(remaining);
-                if amount == 0 {
-                    continue;
-                }
-                tranche.withdrawn_usdc = checked_add(tranche.withdrawn_usdc, UsdcMicros(amount))?;
-                remaining -= amount;
-                allocations.push(CapitalAllocation {
-                    tranche_id,
-                    amount_usdc: UsdcMicros(amount),
-                });
-            }
-            if remaining != 0 {
-                return Err(PacingError::CorruptState);
-            }
-            let record = self
-                .withdrawals
-                .get_mut(&id)
-                .ok_or(PacingError::CorruptState)?;
-            record.applied = true;
-            record.allocations = allocations;
         }
+        if remaining != 0 {
+            return Err(PacingError::CorruptState);
+        }
+        let record = self
+            .withdrawals
+            .get_mut(id)
+            .ok_or(PacingError::CorruptState)?;
+        record.applied = true;
+        record.allocations = allocations;
         Ok(())
     }
 
