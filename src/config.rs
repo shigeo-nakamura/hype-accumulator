@@ -303,6 +303,18 @@ impl Config {
             })
     }
 
+    pub(crate) fn effective_max_order_usdc(&self) -> f64 {
+        self.pacing
+            .max_order_usdc
+            .min(self.execution.max_order_usdc)
+    }
+
+    pub(crate) fn effective_security_reserve_microusd(&self) -> Option<u64> {
+        self.security_policy
+            .as_ref()
+            .map(|policy| policy.wire.capital.reserve_microusd)
+    }
+
     /// Resolves the public account identity used by the read-only status probe.
     /// This path never reads or validates the signing-key environment variable.
     ///
@@ -612,7 +624,8 @@ struct CanonicalRuntimeBindings<'a> {
     hyperliquid_endpoint: &'a str,
     min_deposit_confirmations: u32,
     pacing_min_order_microusd: u64,
-    pacing_max_order_microusd: u64,
+    effective_max_order_microusd: u64,
+    execution_max_order_microusd: u64,
     pacing_deposit_cooldown_seconds: u64,
     pacing_target_horizon_days: u32,
     pacing_fee_spread_reserve_bps: u16,
@@ -790,9 +803,13 @@ impl SecurityPolicy {
                     config.pacing.min_order_usdc,
                     "runtime minimum order",
                 )?,
-                pacing_max_order_microusd: usdc_to_microusd(
-                    config.pacing.max_order_usdc,
-                    "runtime pacing maximum order",
+                effective_max_order_microusd: usdc_to_microusd(
+                    config.effective_max_order_usdc(),
+                    "runtime effective maximum order",
+                )?,
+                execution_max_order_microusd: usdc_to_microusd(
+                    config.execution.max_order_usdc,
+                    "runtime execution maximum order",
                 )?,
                 pacing_deposit_cooldown_seconds: config.pacing.deposit_cooldown_seconds,
                 pacing_target_horizon_days: config.pacing.target_horizon_days,
@@ -996,7 +1013,10 @@ impl SecurityPolicy {
                     "runtime cumulative capital cap",
                 )?
             || capital.max_daily_notional_microusd
-                != usdc_to_microusd(config.execution.max_order_usdc, "runtime maximum order")?
+                != usdc_to_microusd(
+                    config.effective_max_order_usdc(),
+                    "runtime effective maximum order",
+                )?
         {
             return invalid_policy("runtime and policy capital limits differ");
         }

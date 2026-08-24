@@ -1,5 +1,11 @@
-use chrono::{DateTime, Utc};
-use hype_accumulator::config::{Config, ConfigError, SecurityPolicyError};
+use chrono::{DateTime, TimeZone, Utc};
+use hype_accumulator::{
+    config::{Config, ConfigError, SecurityPolicyError},
+    pacing::{
+        CapitalEvent, DecisionInput, DecisionReason, DepositEvent, PacingError, PacingLimits,
+        PacingState, UsdcMicros,
+    },
+};
 use std::collections::HashMap;
 
 const EXECUTION_ACCOUNT: &str = "0x11111111111111111111111111111111111111aa";
@@ -169,6 +175,10 @@ fn live_runtime_without_attached_policy_fails_closed() {
         config.validate_at(&live_environment(), at("2026-08-24T00:00:00Z")),
         Err(ConfigError::MissingSecurityPolicy)
     );
+    assert_eq!(
+        PacingLimits::from_config(&config),
+        Err(PacingError::InvalidLimits)
+    );
 }
 
 #[test]
@@ -245,6 +255,79 @@ fn canonical_digest_excludes_acknowledgement_but_binds_policy_fields() {
         Err(ConfigError::SecurityPolicy(
             SecurityPolicyError::AcknowledgementMismatch
         ))
+    );
+}
+
+#[test]
+fn acknowledged_caps_and_reserve_drive_effective_pacing() {
+    let env = live_environment();
+    let runtime = live_runtime_toml().replace(
+        "execution = { max_order_usdc = 25.0",
+        "execution = { max_order_usdc = 40.0",
+    );
+    let policy = live_policy_template();
+    let expected = Config::from_toml_with_security_policy(&runtime, &policy)
+        .expect("live documents")
+        .expected_live_acknowledgement(&env)
+        .expect("effective acknowledgement");
+    let acknowledged = policy.replace(
+        "live_acknowledgement = \"\"",
+        &format!("live_acknowledgement = \"{expected}\""),
+    );
+    let config = Config::from_toml_with_security_policy(&runtime, &acknowledged)
+        .expect("acknowledged live documents");
+    config
+        .validate_at(&env, at("2026-08-24T00:00:00Z"))
+        .expect("effective pacing cap is acknowledged");
+    let limits = PacingLimits::from_config(&config).expect("validated pacing limits");
+    assert_eq!(
+        limits.max_daily_notional_usdc,
+        UsdcMicros::from_micros(25_000_000)
+    );
+    assert_eq!(
+        limits.fixed_reserve_usdc,
+        UsdcMicros::from_micros(1_000_000)
+    );
+
+    let received_at = Utc
+        .with_ymd_and_hms(2026, 8, 24, 8, 0, 0)
+        .single()
+        .expect("valid UTC fixture");
+    let mut state = PacingState::default();
+    state
+        .reconcile_capital(
+            &[CapitalEvent::Deposit(DepositEvent {
+                event_id: "policy-reserve".to_owned(),
+                amount_usdc: UsdcMicros::from_micros(5_500_000),
+                received_at,
+                confirmed_at: Some(received_at),
+                confirmation_count: 2,
+                admission_approved_at: Some(received_at),
+            })],
+            Utc.with_ymd_and_hms(2026, 8, 24, 10, 0, 0)
+                .single()
+                .expect("valid UTC fixture"),
+            &limits,
+        )
+        .expect("capital admitted");
+    let decision = state
+        .decide(
+            &DecisionInput {
+                at: Utc
+                    .with_ymd_and_hms(2026, 8, 24, 12, 0, 0)
+                    .single()
+                    .expect("valid UTC fixture"),
+                observed_spot_usdc: UsdcMicros::from_micros(5_500_000),
+                capital_history_complete: true,
+                manual_pause: false,
+            },
+            &limits,
+        )
+        .expect("fail-closed pacing decision");
+    assert_eq!(decision.decision().planned_usdc, UsdcMicros::from_micros(0));
+    assert_eq!(
+        decision.decision().reason,
+        DecisionReason::ReserveBelowMinimum
     );
 }
 

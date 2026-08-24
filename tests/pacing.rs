@@ -28,6 +28,7 @@ fn limits() -> PacingLimits {
         deposit_cooldown_seconds: 1,
         min_order_usdc: usd(1),
         max_daily_notional_usdc: usd(25),
+        fixed_reserve_usdc: usd(0),
         fee_spread_reserve_bps: 0,
         final_catch_up_days: 7,
         carry_over_policy: CarryOverPolicy::HoldForApproval,
@@ -511,6 +512,47 @@ fn admission_minimum_daily_cap_and_reserve_are_enforced() {
             .explanation
             .admitted_budget_after_reserve_usdc,
         usd(90)
+    );
+}
+
+#[test]
+fn fixed_reserve_is_deducted_before_proportional_reserve() {
+    let mut reserved = limits();
+    reserved.max_daily_notional_usdc = usd(100);
+    reserved.fixed_reserve_usdc = usd(10);
+    reserved.fee_spread_reserve_bps = 1_000;
+    let received = at(2026, 12, 31, 8);
+    let mut state = PacingState::default();
+    state
+        .reconcile_capital(
+            &[deposit("fixed-reserve", 100, received)],
+            at(2026, 12, 31, 10),
+            &reserved,
+        )
+        .expect("reserve deposit");
+
+    let decision = state
+        .decide(&input(at(2026, 12, 31, 12), 100), &reserved)
+        .expect("reserve-aware decision");
+    assert_eq!(decision.decision().planned_usdc, usd(81));
+    assert_eq!(decision.decision().committed_usdc, usd(90));
+    assert_eq!(state.deposits()["fixed-reserve"].residual_usdc(), usd(10));
+
+    let mut blocked = PacingState::default();
+    blocked
+        .reconcile_capital(
+            &[deposit("observed-floor", 100, received)],
+            at(2026, 12, 31, 10),
+            &reserved,
+        )
+        .expect("reserve deposit");
+    let blocked_decision = blocked
+        .decide(&input(at(2026, 12, 31, 12), 10), &reserved)
+        .expect("balance at reserve fails closed");
+    assert_eq!(blocked_decision.decision().planned_usdc, usd(0));
+    assert_eq!(
+        blocked_decision.decision().reason,
+        DecisionReason::InsufficientObservedBalance
     );
 }
 
