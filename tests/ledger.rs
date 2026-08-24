@@ -422,6 +422,76 @@ fn stable_fill_ids_are_idempotent_and_cannot_change_ownership() {
 }
 
 #[test]
+fn stable_fee_ids_are_idempotent_and_cannot_change_ownership() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let anchor = anchor_store();
+    let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+    let date = at(0).date_naive();
+    ledger
+        .append(daily_outcome(
+            "daily-fee-identity",
+            "decision-fee-identity",
+            date,
+            "decision",
+        ))
+        .expect("append decision");
+    append_decision_backing(&mut ledger, "decision-fee-identity", date, 10);
+    ledger
+        .append(dated_event(
+            "order-fee-identity",
+            date,
+            5,
+            LedgerEventKind::OrderRecorded {
+                order_id: "order-fee-identity".into(),
+                decision_id: "decision-fee-identity".into(),
+            },
+        ))
+        .expect("append order");
+    let fee = dated_event(
+        "fee-envelope-first",
+        date,
+        6,
+        LedgerEventKind::FeeRecorded {
+            fee_id: "venue-fee-stable".into(),
+            order_id: "order-fee-identity".into(),
+            fee_usdc: usd(1),
+        },
+    );
+    ledger.append(fee.clone()).expect("append venue fee");
+    let durable_before_retry = fs::read(ledger_path(directory.path())).expect("read ledger");
+    let record_count = ledger.record_count();
+
+    assert_eq!(
+        ledger
+            .append(LedgerEvent {
+                event_id: "fee-envelope-retry".into(),
+                ..fee
+            })
+            .expect("identical fee retry"),
+        AppendOutcome::Duplicate
+    );
+    assert_eq!(ledger.record_count(), record_count);
+    assert_eq!(
+        fs::read(ledger_path(directory.path())).expect("read unchanged retry ledger"),
+        durable_before_retry
+    );
+    assert_eq!(
+        ledger.append(dated_event(
+            "fee-envelope-conflict",
+            date,
+            7,
+            LedgerEventKind::FeeRecorded {
+                fee_id: "venue-fee-stable".into(),
+                order_id: "order-fee-identity".into(),
+                fee_usdc: usd(2),
+            },
+        )),
+        Err(LedgerError::FeeIdCollision("venue-fee-stable".into()))
+    );
+    assert_eq!(ledger.record_count(), record_count);
+}
+
+#[test]
 fn one_daily_decision_or_skip_outcome_is_allowed_per_date() {
     for (first, second) in [
         ("decision", "decision"),
@@ -651,6 +721,7 @@ fn order_linked_events_require_a_unique_owned_purchase_order() {
         (
             "unknown-order-fee",
             LedgerEventKind::FeeRecorded {
+                fee_id: "fee-unknown-order".into(),
                 order_id: "order-missing".into(),
                 fee_usdc: usd(1),
             },
@@ -692,6 +763,7 @@ fn order_linked_events_require_a_unique_owned_purchase_order() {
                 .expect("valid fee time")
                 .and_utc(),
             kind: LedgerEventKind::FeeRecorded {
+                fee_id: "fee-owned-order".into(),
                 order_id: "order-owned".into(),
                 fee_usdc: usd(1),
             },
@@ -825,6 +897,7 @@ fn fills_and_fees_share_the_decision_commitment_cap() {
             date,
             7,
             LedgerEventKind::FeeRecorded {
+                fee_id: "fee-cost-cap".into(),
                 order_id: "order-cost-cap".into(),
                 fee_usdc: usd(2),
             },
@@ -836,6 +909,7 @@ fn fills_and_fees_share_the_decision_commitment_cap() {
             date,
             8,
             LedgerEventKind::FeeRecorded {
+                fee_id: "fee-over-cost-cap".into(),
                 order_id: "order-cost-cap".into(),
                 fee_usdc: usd(1),
             },
@@ -896,6 +970,7 @@ fn fills_and_fees_are_rejected_after_backing_settles() {
         (
             "fee-after-settle",
             LedgerEventKind::FeeRecorded {
+                fee_id: "fee-after-settle".into(),
                 order_id: "order-settled-costs".into(),
                 fee_usdc: usd(1),
             },

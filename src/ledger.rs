@@ -117,6 +117,7 @@ pub enum LedgerEventKind {
         received_hype_atoms: u64,
     },
     FeeRecorded {
+        fee_id: String,
         order_id: String,
         fee_usdc: UsdcMicros,
     },
@@ -194,6 +195,8 @@ pub struct ReplayState {
     orders: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     fills: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    fees: BTreeMap<String, String>,
     admitted_usdc: UsdcMicros,
     withdrawn_usdc: UsdcMicros,
     committed_usdc: UsdcMicros,
@@ -522,6 +525,9 @@ impl DurableLedger {
         if self.is_duplicate_fill(&event)? {
             return Ok(AppendOutcome::Duplicate);
         }
+        if self.is_duplicate_fee(&event)? {
+            return Ok(AppendOutcome::Duplicate);
+        }
         let prepared = self.prepare_append(event)?;
         write_pending(&self.directory, &prepared.pending)?;
         let next_anchor = protected_anchor_for_snapshot(&prepared.snapshot)?;
@@ -721,6 +727,38 @@ impl DurableLedger {
         Ok(false)
     }
 
+    fn is_duplicate_fee(&self, candidate: &LedgerEvent) -> Result<bool, LedgerError> {
+        let LedgerEventKind::FeeRecorded {
+            fee_id,
+            order_id,
+            fee_usdc,
+        } = &candidate.kind
+        else {
+            return Ok(false);
+        };
+        for existing in self.events_by_id.values() {
+            let LedgerEventKind::FeeRecorded {
+                fee_id: existing_fee_id,
+                order_id: existing_order_id,
+                fee_usdc: existing_fee_usdc,
+            } = &existing.kind
+            else {
+                continue;
+            };
+            if existing_fee_id != fee_id {
+                continue;
+            }
+            if existing.occurred_at == candidate.occurred_at
+                && existing_order_id == order_id
+                && existing_fee_usdc == fee_usdc
+            {
+                return Ok(true);
+            }
+            return Err(LedgerError::FeeIdCollision(fee_id.clone()));
+        }
+        Ok(false)
+    }
+
     fn prepare_append(&self, event: LedgerEvent) -> Result<PreparedAppend, LedgerError> {
         let mut events = self
             .records
@@ -903,8 +941,12 @@ fn apply_event(state: &mut ReplayState, event: &LedgerEvent) -> Result<(), Ledge
             filled_usdc,
             ..
         } => record_fill(state, fill_id, order_id, *filled_usdc)?,
-        LedgerEventKind::FeeRecorded { order_id, fee_usdc } => {
-            record_fee(state, order_id, *fee_usdc)?;
+        LedgerEventKind::FeeRecorded {
+            fee_id,
+            order_id,
+            fee_usdc,
+        } => {
+            record_fee(state, fee_id, order_id, *fee_usdc)?;
         }
         LedgerEventKind::StakingDepositRecorded { .. }
         | LedgerEventKind::DelegationRecorded { .. }
@@ -1118,10 +1160,14 @@ fn record_fill(
 
 fn record_fee(
     state: &mut ReplayState,
+    fee_id: &str,
     order_id: &str,
     fee_usdc: UsdcMicros,
 ) -> Result<(), LedgerError> {
     let decision_id = decision_id_for_order(state, order_id)?;
+    if state.fees.contains_key(fee_id) {
+        return Err(LedgerError::FeeIdCollision(fee_id.to_owned()));
+    }
     require_unsettled_decision_backing(state, &decision_id)?;
     let decision = state
         .purchase_decisions
@@ -1132,6 +1178,7 @@ fn record_fee(
         return Err(LedgerError::DecisionCostsExceedCommitment(decision_id));
     }
     decision.fee_usdc = next_fee;
+    state.fees.insert(fee_id.to_owned(), order_id.to_owned());
     Ok(())
 }
 
@@ -1222,7 +1269,12 @@ fn validate_event(event: &LedgerEvent) -> Result<(), LedgerError> {
             require_nonzero(*filled_usdc)?;
             require_hype(*received_hype_atoms)?;
         }
-        LedgerEventKind::FeeRecorded { order_id, fee_usdc } => {
+        LedgerEventKind::FeeRecorded {
+            fee_id,
+            order_id,
+            fee_usdc,
+        } => {
+            validate_id("fee_id", fee_id)?;
             validate_id("order_id", order_id)?;
             require_nonzero(*fee_usdc)?;
         }
@@ -2400,6 +2452,8 @@ pub enum LedgerError {
     OrderIdCollision(String),
     #[error("venue fill ID collision: {0}")]
     FillIdCollision(String),
+    #[error("venue fee ID collision: {0}")]
+    FeeIdCollision(String),
     #[error("unknown order: {0}")]
     UnknownOrder(String),
     #[error("fills exceed the purchase decision plan: {0}")]
@@ -2875,6 +2929,7 @@ mod transaction_tests {
                 event_id: "fee-settlement-floor".into(),
                 occurred_at: at(7),
                 kind: LedgerEventKind::FeeRecorded {
+                    fee_id: "fee-settlement-floor".into(),
                     order_id: "order-settlement-floor".into(),
                     fee_usdc: usd(2),
                 },
