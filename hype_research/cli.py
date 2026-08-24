@@ -10,11 +10,14 @@ from .contracts import PointInTimeView, load_capital_events, load_dataset, resol
 from .engine import run_backtest
 
 
-def require_supported_policy_kinds(experiment: dict) -> None:
+def require_supported_policy_values(experiment: dict) -> None:
     for index, policy in enumerate(experiment["policies"]):
         kind = policy.get("kind")
         if kind not in {"fixed", "adaptive"}:
             raise ValueError(f"unsupported policy kind at policies[{index}]: {kind!r}")
+        cadence = policy.get("cadence", "daily")
+        if cadence not in {"daily", "weekly"}:
+            raise ValueError(f"unsupported policy cadence at policies[{index}]: {cadence!r}")
 
 
 def require_snapshot_at_least(child_manifest: dict, experiment_as_of: datetime, label: str) -> None:
@@ -28,7 +31,7 @@ def require_snapshot_at_least(child_manifest: dict, experiment_as_of: datetime, 
 
 def run_experiment(path: Path) -> dict:
     experiment = resolve_manifest(path)
-    require_supported_policy_kinds(experiment)
+    require_supported_policy_values(experiment)
     root = experiment["_root"]
     as_of = timestamp(experiment["as_of"])
     prices, revisions, dataset_manifest = load_dataset((root / experiment["dataset_manifest"]).resolve())

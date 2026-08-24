@@ -24,6 +24,17 @@ class ExperimentContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unsupported policy kind"):
                 run_experiment(manifest)
 
+    def test_experiment_rejects_unknown_policy_cadence(self) -> None:
+        experiment = json.loads((FIXTURES / "experiment.json").read_text(encoding="utf-8"))
+        experiment["policies"][0]["cadence"] = "weeky"
+
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "experiment.json"
+            manifest.write_text(json.dumps(experiment), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "unsupported policy cadence"):
+                run_experiment(manifest)
+
     def test_experiment_cannot_advance_past_dataset_snapshot(self) -> None:
         experiment = json.loads((FIXTURES / "experiment.json").read_text(encoding="utf-8"))
         experiment["as_of"] = "2026-01-01T00:00:00Z"
