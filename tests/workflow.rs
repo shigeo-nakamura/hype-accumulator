@@ -572,6 +572,60 @@ fn event_collision_after_completion_durably_invalidates_the_result() {
 }
 
 #[test]
+fn fresh_late_order_evidence_durably_invalidates_terminal_results() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let binding = binding();
+
+    let absent_path = temp.path().join("accepted-after-absence.jsonl");
+    let mut absent = reopen(&absent_path, &binding);
+    ready(absent.prepare_order(at(1)).expect("order prepared"));
+    absent
+        .record_order_submission_absent("post-expiry-cloid-not-found", at(2))
+        .expect("authoritative absence recorded");
+    assert!(matches!(
+        absent.observe_order_submission("late-accepted-order", at(3)),
+        Err(WorkflowError::ContradictoryObservation(_))
+    ));
+    assert_eq!(absent.state().stage(), WorkflowStage::ManualReview);
+    drop(absent);
+    assert_eq!(
+        reopen(&absent_path, &binding).state().stage(),
+        WorkflowStage::ManualReview
+    );
+
+    let fill_path = temp.path().join("fresh-fill-after-complete.jsonl");
+    let mut completed = reopen(&fill_path, &binding);
+    ready(completed.prepare_order(at(1)).expect("order prepared"));
+    completed
+        .observe_order_submission("exchange-order-1", at(2))
+        .expect("submission observed");
+    completed
+        .finalize_order(hype(0), usdc(0), usdc(0), OrderFinality::Expired, at(3))
+        .expect("order finalized");
+    completed
+        .record_staking_eligibility(at(4))
+        .expect("eligibility recorded");
+    completed.complete(at(5)).expect("workflow completed");
+    assert!(matches!(
+        completed.observe_order_fill(
+            "fresh-late-fill",
+            hype(1),
+            usdc(100_000),
+            usdc(101_000),
+            false,
+            at(2),
+        ),
+        Err(WorkflowError::InvalidTransition(_))
+    ));
+    assert_eq!(completed.state().stage(), WorkflowStage::ManualReview);
+    drop(completed);
+    assert_eq!(
+        reopen(&fill_path, &binding).state().stage(),
+        WorkflowStage::ManualReview
+    );
+}
+
+#[test]
 fn contradictory_authoritative_debits_fail_closed() {
     let temp = tempfile::tempdir().expect("temp directory");
     let binding = binding();

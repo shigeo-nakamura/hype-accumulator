@@ -498,6 +498,11 @@ impl WorkflowState {
                 action_id,
                 exchange_order_id,
             } => {
+                if self.order_is_terminal() {
+                    return Err(WorkflowError::ContradictoryObservation(
+                        "accepted order appeared after terminal reconciliation".into(),
+                    ));
+                }
                 self.require_pending(ActionKind::SubmitOrder, action_id)?;
                 if self.stage != WorkflowStage::Decided || exchange_order_id.trim().is_empty() {
                     return Err(WorkflowError::InvalidTransition(
@@ -512,6 +517,11 @@ impl WorkflowState {
                 action_id,
                 observation_id,
             } => {
+                if self.exchange_order_id.is_some() {
+                    return Err(WorkflowError::ContradictoryObservation(
+                        "order absence contradicted an accepted order".into(),
+                    ));
+                }
                 self.require_pending(ActionKind::SubmitOrder, action_id)?;
                 if self.stage != WorkflowStage::Decided || observation_id.trim().is_empty() {
                     return Err(WorkflowError::InvalidTransition(
@@ -528,6 +538,11 @@ impl WorkflowState {
                 fully_filled,
                 ..
             } => {
+                if self.order_is_terminal() {
+                    return Err(WorkflowError::ContradictoryObservation(
+                        "new fill appeared after terminal reconciliation".into(),
+                    ));
+                }
                 if !matches!(
                     self.stage,
                     WorkflowStage::OrderSubmitted
@@ -764,6 +779,36 @@ impl WorkflowState {
             _ => Err(WorkflowError::InvalidTransition(
                 "response does not match the pending write-ahead action".into(),
             )),
+        }
+    }
+
+    fn order_is_terminal(&self) -> bool {
+        matches!(
+            self.stage,
+            WorkflowStage::OrderFinalized
+                | WorkflowStage::StakingEligibilityRecorded
+                | WorkflowStage::StakingDepositSubmitted
+                | WorkflowStage::StakingBalanceConfirmed
+                | WorkflowStage::DelegationSubmitted
+                | WorkflowStage::DelegatedConfirmed
+                | WorkflowStage::Complete
+        )
+    }
+
+    fn late_order_evidence_reason(&self, transition: &WorkflowTransition) -> Option<&'static str> {
+        match transition {
+            WorkflowTransition::OrderSubmissionObserved { .. } if self.order_is_terminal() => {
+                Some("accepted order appeared after terminal reconciliation")
+            }
+            WorkflowTransition::OrderSubmissionAbsent { .. }
+                if self.exchange_order_id.is_some() =>
+            {
+                Some("order absence contradicted an accepted order")
+            }
+            WorkflowTransition::OrderFillObserved { .. } if self.order_is_terminal() => {
+                Some("new fill appeared after terminal reconciliation")
+            }
+            _ => None,
         }
     }
 }
@@ -1271,12 +1316,17 @@ impl DurableWorkflow {
         at: DateTime<Utc>,
         transition: WorkflowTransition,
     ) -> Result<AppendOutcome, WorkflowError> {
+        let late_order_evidence = self
+            .state
+            .late_order_evidence_reason(&transition)
+            .map(str::to_owned);
         let result = self.append_transition(event_id, at, transition);
         let reason = match &result {
             Err(WorkflowError::ContradictoryObservation(reason)) => Some(reason.clone()),
             Err(WorkflowError::EventCollision(event_id)) => {
                 Some(format!("conflicting replay for event {event_id}"))
             }
+            Err(WorkflowError::InvalidTransition(_)) => late_order_evidence,
             _ => None,
         };
         if let Some(reason) = reason {
