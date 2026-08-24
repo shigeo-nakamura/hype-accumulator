@@ -88,7 +88,7 @@ def run_backtest(
     cost_rate = (execution["fee_bps"] + execution["half_spread_bps"] + execution["slippage_bps"]) / 10_000
     cadence = policy.get("cadence", "daily")
     for index, bar in enumerate(bars):
-        if bar.decision_at > as_of:
+        if bar.decision_at > as_of or bar.decision_at.date() > horizon:
             break
         final_price = bar.price_usd
         while event_index < len(pending) and pending[event_index].first_usable_at <= bar.decision_at:
@@ -102,7 +102,7 @@ def run_backtest(
         peak_value = max(peak_value, inventory_value)
         if peak_value:
             max_drawdown = max(max_drawdown, (peak_value - inventory_value) / peak_value)
-        if bar.decision_at.date() > horizon or (cadence == "weekly" and bar.decision_at.weekday() != 0):
+        if cadence == "weekly" and bar.decision_at.weekday() != 0:
             continue
         if last_trade_date == bar.decision_at.date():
             skipped["duplicate_decision_day"] = skipped.get("duplicate_decision_day", 0) + 1

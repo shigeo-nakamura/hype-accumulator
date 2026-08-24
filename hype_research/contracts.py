@@ -5,6 +5,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -86,8 +87,10 @@ def load_dataset(manifest_path: Path) -> tuple[list[PriceBar], list[Revision], d
             revisions.append(Revision(row["series"], date.fromisoformat(row["observation_date"]), float(row["value"]), timestamp(row["available_at"]), row["revision_id"]))
     if prices != sorted(prices, key=lambda item: item.decision_at) or len({p.decision_at for p in prices}) != len(prices):
         raise ValueError("prices must be strictly ordered and unique")
-    if any(item.price_usd <= 0 for item in prices):
+    if any(not isfinite(item.price_usd) or item.price_usd <= 0 for item in prices):
         raise ValueError("prices must be positive")
+    if any(not isfinite(item.value) for item in revisions):
+        raise ValueError("observations must be finite")
     return prices, revisions, manifest
 
 
@@ -98,7 +101,7 @@ def load_capital_events(manifest_path: Path) -> tuple[list[CapitalEvent], dict[s
     with path.open(newline="", encoding="utf-8") as handle:
         for row in csv.DictReader(handle):
             event = CapitalEvent(row["event_id"], row["kind"], float(row["amount_usd"]), timestamp(row["occurred_at"]), timestamp(row["confirmed_at"]), timestamp(row["first_usable_at"]))
-            if event.kind not in {"deposit", "withdrawal"} or event.amount_usd <= 0:
+            if event.kind not in {"deposit", "withdrawal"} or not isfinite(event.amount_usd) or event.amount_usd <= 0:
                 raise ValueError(f"invalid capital event: {event}")
             if not event.occurred_at <= event.confirmed_at <= event.first_usable_at:
                 raise ValueError(f"invalid capital event timing: {event.event_id}")

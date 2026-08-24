@@ -7,6 +7,7 @@ from pathlib import Path
 
 from hype_research.contracts import (
     PointInTimeView,
+    digest,
     load_capital_events,
     load_dataset,
     timestamp,
@@ -87,6 +88,30 @@ class PointInTimeContractTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "checksum mismatch"):
                 load_capital_events(manifest)
+
+    def test_nonfinite_observation_is_rejected(self) -> None:
+        original = json.loads((FIXTURES / "dataset-manifest.json").read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prices = root / "prices.csv"
+            observations = root / "observations.csv"
+            prices.write_bytes((FIXTURES / original["files"]["prices"]["path"]).read_bytes())
+            observations.write_text(
+                (FIXTURES / original["files"]["observations"]["path"])
+                .read_text(encoding="utf-8")
+                .replace(",100,", ",NaN,", 1),
+                encoding="utf-8",
+            )
+            original["files"]["prices"] = {"path": prices.name, "sha256": digest(prices)}
+            original["files"]["observations"] = {
+                "path": observations.name,
+                "sha256": digest(observations),
+            }
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps(original), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "observations must be finite"):
+                load_dataset(manifest)
 
 
 if __name__ == "__main__":

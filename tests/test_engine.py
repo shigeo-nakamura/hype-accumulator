@@ -116,6 +116,39 @@ class EngineInvariantTests(unittest.TestCase):
         self.assertEqual(result["skipped_days"]["duplicate_decision_day"], 1)
         self.assertEqual(result["ending_inventory_usd"], 110.0)
 
+    def test_post_horizon_capital_events_are_not_admitted(self) -> None:
+        utc = timezone.utc
+        first = datetime(2025, 1, 1, 12, tzinfo=utc)
+        after_horizon = datetime(2025, 1, 2, 12, tzinfo=utc)
+        events = [
+            CapitalEvent("initial", "deposit", 100.0, first, first, first),
+            CapitalEvent("future-deposit", "deposit", 25.0, after_horizon, after_horizon, after_horizon),
+            CapitalEvent("future-withdrawal", "withdrawal", 200.0, after_horizon, after_horizon, after_horizon),
+        ]
+        result = run_backtest(
+            [PriceBar(first, 10.0), PriceBar(after_horizon, 100.0)],
+            events,
+            PointInTimeView([], after_horizon),
+            {
+                "name": "daily",
+                "kind": "fixed",
+                "cadence": "daily",
+                "horizon": "2025-01-01",
+                "features": [],
+            },
+            {
+                "min_trade_usd": 1.0,
+                "max_trade_usd": 100.0,
+                "fee_bps": 0.0,
+                "half_spread_bps": 0.0,
+                "slippage_bps": 0.0,
+            },
+            after_horizon,
+        )
+
+        self.assertEqual([row["event_id"] for row in result["capital_cohorts"]], ["initial"])
+        self.assertEqual(result["ending_inventory_usd"], 100.0)
+
     def test_stale_fixed_fallback_disables_adaptive_multiplier(self) -> None:
         utc = timezone.utc
         revisions = [
