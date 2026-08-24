@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    env,
     fmt::Write as _,
     fs::{self, File, OpenOptions},
     io::{self, Write},
@@ -535,7 +536,7 @@ impl DurableLedger {
         destination_anchor_store: Arc<dyn ProtectedAnchorStore>,
     ) -> Result<Self, LedgerError> {
         let source = canonical_directory(source.as_ref())?;
-        let destination = canonical_directory(destination.as_ref())?;
+        let destination = canonical_restore_directory(destination.as_ref())?;
         if source == destination {
             return Err(LedgerError::RestoreDestinationNotEmpty);
         }
@@ -1471,6 +1472,62 @@ fn canonical_directory(path: &Path) -> Result<PathBuf, LedgerError> {
     fs::canonicalize(path).map_err(LedgerError::io)
 }
 
+fn canonical_restore_directory(path: &Path) -> Result<PathBuf, LedgerError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir().map_err(LedgerError::io)?.join(path)
+    };
+    create_restore_directory_all(&absolute, &mut sync_directory)?;
+    fs::canonicalize(absolute).map_err(LedgerError::io)
+}
+
+fn create_restore_directory_all<F>(path: &Path, sync_parent: &mut F) -> Result<(), LedgerError>
+where
+    F: FnMut(&Path) -> Result<(), LedgerError>,
+{
+    let mut missing = Vec::new();
+    let mut current = path;
+    loop {
+        match fs::metadata(current) {
+            Ok(metadata) if metadata.is_dir() => break,
+            Ok(_) => {
+                return Err(LedgerError::io(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    format!("restore path is not a directory: {}", current.display()),
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(current.to_path_buf());
+                current = current.parent().ok_or(LedgerError::InvalidPath)?;
+            }
+            Err(error) => return Err(LedgerError::io(error)),
+        }
+    }
+
+    if missing.is_empty() {
+        if let Some(parent) = path.parent() {
+            sync_parent(parent)?;
+        }
+        return Ok(());
+    }
+
+    for directory in missing.iter().rev() {
+        match fs::create_dir(directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if !fs::metadata(directory).map_err(LedgerError::io)?.is_dir() {
+                    return Err(LedgerError::io(error));
+                }
+            }
+            Err(error) => return Err(LedgerError::io(error)),
+        }
+        let parent = directory.parent().ok_or(LedgerError::InvalidPath)?;
+        sync_parent(parent)?;
+    }
+    Ok(())
+}
+
 impl LedgerLock {
     fn acquire(directory: &Path) -> Result<Self, LedgerError> {
         fs::create_dir_all(directory).map_err(LedgerError::io)?;
@@ -1778,6 +1835,39 @@ mod transaction_tests {
             ledger.append(interrupted).expect("retry append"),
             AppendOutcome::Appended
         );
+    }
+
+    #[test]
+    fn restore_directory_creation_syncs_each_new_parent_entry() {
+        let container = tempfile::tempdir().expect("destination container");
+        let first = container.path().join("first");
+        let second = first.join("second");
+        let destination = second.join("restored");
+        let mut synced = Vec::new();
+
+        create_restore_directory_all(&destination, &mut |parent| {
+            synced.push(parent.to_path_buf());
+            Ok(())
+        })
+        .expect("durably create nested destination");
+
+        assert!(destination.is_dir());
+        assert_eq!(
+            synced,
+            vec![
+                container.path().to_path_buf(),
+                first.clone(),
+                second.clone()
+            ]
+        );
+
+        synced.clear();
+        create_restore_directory_all(&destination, &mut |parent| {
+            synced.push(parent.to_path_buf());
+            Ok(())
+        })
+        .expect("resync an existing destination entry on retry");
+        assert_eq!(synced, vec![second]);
     }
 
     #[test]
