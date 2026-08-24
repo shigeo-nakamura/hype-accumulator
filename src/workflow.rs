@@ -6,7 +6,8 @@
 //! files to an otherwise valid historical prefix. Every external action is
 //! durably prepared and anchored before it can be returned to a caller. After a
 //! restart, a prepared action is reconciliation-only and is never returned as a
-//! new submission.
+//! new submission. A separately shared append-only owner store prevents one
+//! stable venue order identity from settling more than one decision workflow.
 
 use crate::pacing::{DailyDecision, DecisionReason, UsdcMicros};
 use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
@@ -25,7 +26,10 @@ use thiserror::Error;
 const JOURNAL_SCHEMA_VERSION: u8 = 1;
 const CHECKPOINT_SCHEMA_VERSION: u8 = 1;
 const PROTECTED_HEAD_SCHEMA_VERSION: u8 = 1;
+const EXCHANGE_ORDER_OWNER_SCHEMA_VERSION: u8 = 1;
 const PENDING_APPEND_SCHEMA_VERSION: u8 = 1;
+const EXCHANGE_ORDER_OWNER_CONFLICT_REASON: &str =
+    "exchange order ID is already owned by another workflow";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -1503,6 +1507,37 @@ pub trait ProtectedWorkflowHeadStore: Send + Sync {
     ) -> Result<bool, String>;
 }
 
+/// Immutable ownership of one stable venue order identity.
+///
+/// The store key is `(execution_identity_hash, exchange_order_id)`. The
+/// remaining fields bind that venue order to exactly one decision workflow and
+/// its signer-authorized envelope.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExchangeOrderOwner {
+    pub schema_version: u8,
+    pub execution_identity_hash: String,
+    pub exchange_order_id: String,
+    pub decision_id: String,
+    pub workflow_id: String,
+    pub client_order_id: String,
+    pub canonical_order_envelope_hash: String,
+}
+
+/// Shared append-only ownership storage for exchange order identities.
+///
+/// One store must cover every workflow for the execution identities it serves;
+/// it must not be scoped to a decision or journal path. `claim` must atomically
+/// and durably insert a missing key, return `true` for an exact existing owner,
+/// and return `false` without mutation when the key belongs to another owner.
+pub trait ExchangeOrderOwnerStore: Send + Sync {
+    /// Claims an exchange order identity for exactly one decision workflow.
+    ///
+    /// # Errors
+    ///
+    /// Returns an implementation-specific availability or persistence error.
+    fn claim(&self, owner: &ExchangeOrderOwner) -> Result<bool, String>;
+}
+
 #[derive(Serialize)]
 struct RecordHashInput<'a> {
     schema_version: u8,
@@ -1519,6 +1554,7 @@ pub struct DurableWorkflow {
     file_len: u64,
     protected_head_store: Arc<dyn ProtectedWorkflowHeadStore>,
     protected_head: Option<ProtectedWorkflowHead>,
+    exchange_order_owner_store: Arc<dyn ExchangeOrderOwnerStore>,
 }
 
 impl DurableWorkflow {
@@ -1532,6 +1568,7 @@ impl DurableWorkflow {
         path: impl AsRef<Path>,
         binding: &DecisionBinding,
         protected_head_store: Arc<dyn ProtectedWorkflowHeadStore>,
+        exchange_order_owner_store: Arc<dyn ExchangeOrderOwnerStore>,
     ) -> Result<Self, WorkflowError> {
         binding.validate()?;
         let path = path.as_ref().to_path_buf();
@@ -1570,6 +1607,7 @@ impl DurableWorkflow {
                 file_len: 0,
                 protected_head_store,
                 protected_head: None,
+                exchange_order_owner_store,
             };
             workflow.append(initial)?;
             Ok(workflow)
@@ -1604,7 +1642,7 @@ impl DurableWorkflow {
                 ));
             }
             verify_or_advance_checkpoint(&path, &records, &state.workflow_id, file_len)?;
-            Ok(Self {
+            let mut workflow = Self {
                 path,
                 records,
                 events_by_id,
@@ -1612,7 +1650,10 @@ impl DurableWorkflow {
                 file_len,
                 protected_head_store,
                 protected_head,
-            })
+                exchange_order_owner_store,
+            };
+            workflow.reconcile_exchange_order_owner()?;
+            Ok(workflow)
         }
     }
 
@@ -1624,6 +1665,51 @@ impl DurableWorkflow {
     #[must_use]
     pub fn record_count(&self) -> usize {
         self.records.len()
+    }
+
+    fn exchange_order_owner(
+        &self,
+        exchange_order_id: &str,
+    ) -> Result<ExchangeOrderOwner, WorkflowError> {
+        Ok(ExchangeOrderOwner {
+            schema_version: EXCHANGE_ORDER_OWNER_SCHEMA_VERSION,
+            execution_identity_hash: self
+                .state
+                .binding
+                .inventory_before
+                .execution_identity_hash
+                .clone(),
+            exchange_order_id: exchange_order_id.to_owned(),
+            decision_id: self.state.binding.decision_id.clone(),
+            workflow_id: self.state.workflow_id().to_owned(),
+            client_order_id: self.state.client_order_id(),
+            canonical_order_envelope_hash: self.state.canonical_order_envelope_hash()?,
+        })
+    }
+
+    fn claim_exchange_order(&self, exchange_order_id: &str) -> Result<bool, WorkflowError> {
+        let owner = self.exchange_order_owner(exchange_order_id)?;
+        self.exchange_order_owner_store
+            .claim(&owner)
+            .map_err(WorkflowError::exchange_order_owner)
+    }
+
+    fn reconcile_exchange_order_owner(&mut self) -> Result<(), WorkflowError> {
+        let Some(exchange_order_id) = self.state.exchange_order_id().map(str::to_owned) else {
+            return Ok(());
+        };
+        if self.claim_exchange_order(&exchange_order_id)?
+            || self.state.stage == WorkflowStage::ManualReview
+        {
+            return Ok(());
+        }
+        self.mark_manual_review(
+            EXCHANGE_ORDER_OWNER_CONFLICT_REASON,
+            self.state.last_transition_at,
+        )?;
+        Err(WorkflowError::ContradictoryObservation(
+            EXCHANGE_ORDER_OWNER_CONFLICT_REASON.into(),
+        ))
     }
 
     /// Persists the order intent before returning it as externally actionable.
@@ -1649,6 +1735,18 @@ impl DurableWorkflow {
         exchange_order_id: impl Into<String>,
         at: DateTime<Utc>,
     ) -> Result<AppendOutcome, WorkflowError> {
+        let exchange_order_id = exchange_order_id.into().trim().to_owned();
+        if !exchange_order_id.is_empty() && !self.claim_exchange_order(&exchange_order_id)? {
+            if self.state.stage != WorkflowStage::ManualReview {
+                self.mark_manual_review(
+                    EXCHANGE_ORDER_OWNER_CONFLICT_REASON,
+                    at.max(self.state.last_transition_at),
+                )?;
+            }
+            return Err(WorkflowError::ContradictoryObservation(
+                EXCHANGE_ORDER_OWNER_CONFLICT_REASON.into(),
+            ));
+        }
         let action_id = action_id_for(self.state.workflow_id(), ActionKind::SubmitOrder);
         self.append_observation(
             stable_id(
@@ -1658,7 +1756,7 @@ impl DurableWorkflow {
             at,
             WorkflowTransition::OrderSubmissionObserved {
                 action_id,
-                exchange_order_id: exchange_order_id.into(),
+                exchange_order_id,
             },
         )
     }
@@ -3022,6 +3120,8 @@ pub enum WorkflowError {
     RollbackDetected(String),
     #[error("protected workflow head failed: {0}")]
     ProtectedHead(String),
+    #[error("exchange order owner store failed: {0}")]
+    ExchangeOrderOwner(String),
     #[error("journal I/O failed: {0}")]
     Io(String),
     #[error("journal serialization failed: {0}")]
@@ -3042,5 +3142,10 @@ impl WorkflowError {
     #[allow(clippy::needless_pass_by_value)]
     fn protected_head(error: String) -> Self {
         Self::ProtectedHead(error)
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn exchange_order_owner(error: String) -> Self {
+        Self::ExchangeOrderOwner(error)
     }
 }

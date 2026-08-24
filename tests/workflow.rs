@@ -4,10 +4,10 @@ use hype_accumulator::{
     workflow::{
         ActionKind, AppendOutcome, AuthorizationInputFreshness, BoundFillEvidence,
         BoundMovementEvidence, ConclusiveAbsenceEvidence, DecisionBinding, DurableWorkflow,
-        EligibilityPolicyBinding, ExternalAction, ExternalReceipt, GapFreeHistoryWatermark,
-        HistoryDomain, HypeAtoms, InventoryBaseline, OrderBoundEligibilityEvidence,
-        OrderEnvelopeBinding, OrderFinality, PrepareOutcome, ProtectedWorkflowHead,
-        ProtectedWorkflowHeadStore, WorkflowError, WorkflowStage,
+        EligibilityPolicyBinding, ExchangeOrderOwner, ExchangeOrderOwnerStore, ExternalAction,
+        ExternalReceipt, GapFreeHistoryWatermark, HistoryDomain, HypeAtoms, InventoryBaseline,
+        OrderBoundEligibilityEvidence, OrderEnvelopeBinding, OrderFinality, PrepareOutcome,
+        ProtectedWorkflowHead, ProtectedWorkflowHeadStore, WorkflowError, WorkflowStage,
     },
 };
 use std::{
@@ -23,6 +23,27 @@ struct MemoryProtectedHeadStore {
     head: Mutex<Option<ProtectedWorkflowHead>>,
     reject_next_compare_and_swap: Mutex<bool>,
     lose_next_compare_and_swap_response: Mutex<bool>,
+}
+
+#[derive(Default)]
+struct MemoryExchangeOrderOwnerStore {
+    owners: Mutex<BTreeMap<(String, String), ExchangeOrderOwner>>,
+}
+
+impl ExchangeOrderOwnerStore for MemoryExchangeOrderOwnerStore {
+    fn claim(&self, owner: &ExchangeOrderOwner) -> Result<bool, String> {
+        let key = (
+            owner.execution_identity_hash.clone(),
+            owner.exchange_order_id.clone(),
+        );
+        let mut owners = self.owners.lock().map_err(|error| error.to_string())?;
+        if let Some(existing) = owners.get(&key) {
+            Ok(existing == owner)
+        } else {
+            owners.insert(key, owner.clone());
+            Ok(true)
+        }
+    }
 }
 
 impl ProtectedWorkflowHeadStore for MemoryProtectedHeadStore {
@@ -90,6 +111,19 @@ fn protected_head_store(path: &Path) -> Arc<MemoryProtectedHeadStore> {
     stores
         .entry(path.to_path_buf())
         .or_insert_with(|| Arc::new(MemoryProtectedHeadStore::default()))
+        .clone()
+}
+
+fn exchange_order_owner_store(path: &Path) -> Arc<MemoryExchangeOrderOwnerStore> {
+    static STORES: OnceLock<Mutex<BTreeMap<PathBuf, Arc<MemoryExchangeOrderOwnerStore>>>> =
+        OnceLock::new();
+    let mut stores = STORES
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .expect("exchange order owner registry locks");
+    stores
+        .entry(path.to_path_buf())
+        .or_insert_with(|| Arc::new(MemoryExchangeOrderOwnerStore::default()))
         .clone()
 }
 
@@ -316,8 +350,13 @@ fn absence_evidence(workflow: &DurableWorkflow, observation_id: &str) -> Conclus
 }
 
 fn reopen(path: &Path, binding: &DecisionBinding) -> DurableWorkflow {
-    DurableWorkflow::open_or_create(path, binding, protected_head_store(path))
-        .expect("journal reopens")
+    DurableWorkflow::open_or_create(
+        path,
+        binding,
+        protected_head_store(path),
+        exchange_order_owner_store(path),
+    )
+    .expect("journal reopens")
 }
 
 fn checkpoint_path(path: &Path) -> PathBuf {
@@ -428,16 +467,21 @@ fn one_stable_decision_cannot_own_alternative_workflow_bindings() {
     let mut altered = original.clone();
     altered.order_envelope.l1_nonce += 1;
     let ownership_store = Arc::new(MemoryProtectedHeadStore::default());
+    let order_owner_store = Arc::new(MemoryExchangeOrderOwnerStore::default());
 
-    let mut first =
-        DurableWorkflow::open_or_create(&first_path, &original, ownership_store.clone())
-            .expect("stable decision acquires ownership");
+    let mut first = DurableWorkflow::open_or_create(
+        &first_path,
+        &original,
+        ownership_store.clone(),
+        order_owner_store.clone(),
+    )
+    .expect("stable decision acquires ownership");
     let expected_client_order_id = first.state().client_order_id();
     let first_action = ready(first.prepare_order(at(1)).expect("first order prepared"));
     drop(first);
 
     assert!(matches!(
-        DurableWorkflow::open_or_create(&second_path, &altered, ownership_store),
+        DurableWorkflow::open_or_create(&second_path, &altered, ownership_store, order_owner_store,),
         Err(WorkflowError::RollbackDetected(_))
     ));
     assert!(!second_path.exists());
@@ -446,6 +490,69 @@ fn one_stable_decision_cannot_own_alternative_workflow_bindings() {
         ExternalAction::SubmitOrder { client_order_id, .. }
             if client_order_id == expected_client_order_id
     ));
+}
+
+#[test]
+fn one_exchange_order_cannot_be_owned_by_two_decision_workflows() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let first_path = temp.path().join("order-owner-first.jsonl");
+    let second_path = temp.path().join("order-owner-second.jsonl");
+    let first_binding = binding();
+    let mut second_binding = first_binding.clone();
+    second_binding.decision_id = "decision-2026-08-24-second".to_owned();
+    let first_head_store = Arc::new(MemoryProtectedHeadStore::default());
+    let second_head_store = Arc::new(MemoryProtectedHeadStore::default());
+    let order_owner_store = Arc::new(MemoryExchangeOrderOwnerStore::default());
+
+    let mut first = DurableWorkflow::open_or_create(
+        &first_path,
+        &first_binding,
+        first_head_store.clone(),
+        order_owner_store.clone(),
+    )
+    .expect("first decision workflow opens");
+    let mut second = DurableWorkflow::open_or_create(
+        &second_path,
+        &second_binding,
+        second_head_store.clone(),
+        order_owner_store.clone(),
+    )
+    .expect("second decision workflow opens");
+    ready(first.prepare_order(at(1)).expect("first order prepared"));
+    ready(second.prepare_order(at(1)).expect("second order prepared"));
+
+    first
+        .observe_order_submission("shared-exchange-order", at(2))
+        .expect("first decision claims exchange order");
+    assert!(matches!(
+        second.observe_order_submission("shared-exchange-order", at(2)),
+        Err(WorkflowError::ContradictoryObservation(_))
+    ));
+    assert_eq!(second.state().stage(), WorkflowStage::ManualReview);
+    assert!(second.state().exchange_order_id().is_none());
+    assert!(second
+        .state()
+        .manual_review_reason()
+        .is_some_and(|reason| reason.contains("already owned by another workflow")));
+    drop(first);
+    drop(second);
+
+    let first = DurableWorkflow::open_or_create(
+        &first_path,
+        &first_binding,
+        first_head_store,
+        order_owner_store.clone(),
+    )
+    .expect("first order ownership survives restart");
+    assert_eq!(first.state().stage(), WorkflowStage::OrderSubmitted);
+    let second = DurableWorkflow::open_or_create(
+        &second_path,
+        &second_binding,
+        second_head_store,
+        order_owner_store,
+    )
+    .expect("owner mismatch halt survives restart");
+    assert_eq!(second.state().stage(), WorkflowStage::ManualReview);
 }
 
 #[test]
@@ -1505,6 +1612,7 @@ fn later_capital_never_resizes_a_decided_or_ambiguous_order() {
         &path,
         &changed,
         protected_head_store(&path),
+        exchange_order_owner_store(&path),
     ));
 
     let mut restarted = reopen(&path, &original);
@@ -1587,6 +1695,7 @@ fn truncated_and_hash_corrupted_journals_fail_closed() {
             &truncated_path,
             &binding,
             protected_head_store(&truncated_path),
+            exchange_order_owner_store(&truncated_path),
         ),
         Err(WorkflowError::TruncatedJournal)
     ));
@@ -1611,6 +1720,7 @@ fn truncated_and_hash_corrupted_journals_fail_closed() {
             &corrupt_path,
             &binding,
             protected_head_store(&corrupt_path),
+            exchange_order_owner_store(&corrupt_path),
         ),
         Err(WorkflowError::CorruptJournal(_))
     ));
@@ -1632,7 +1742,12 @@ fn complete_record_prefix_rollback_is_detected_by_the_independent_head() {
         .expect("adjacent head rolled back to the same valid prefix");
 
     assert!(matches!(
-        DurableWorkflow::open_or_create(&path, &binding, protected_head_store(&path)),
+        DurableWorkflow::open_or_create(
+            &path,
+            &binding,
+            protected_head_store(&path),
+            exchange_order_owner_store(&path),
+        ),
         Err(WorkflowError::RollbackDetected(_))
     ));
 }
@@ -1649,6 +1764,7 @@ fn a_nonempty_journal_requires_its_independently_protected_head_scope() {
             &path,
             &binding,
             Arc::new(MemoryProtectedHeadStore::default()),
+            exchange_order_owner_store(&path),
         ),
         Err(WorkflowError::RollbackDetected(_))
     ));
@@ -2148,8 +2264,13 @@ fn protected_head_response_loss_recovers_committed_append_on_reopen() {
     let path = temp.path().join("protected-head-recovery.jsonl");
     let binding = binding();
     let store = protected_head_store(&path);
-    let mut workflow = DurableWorkflow::open_or_create(&path, &binding, store.clone())
-        .expect("initial workflow opens");
+    let mut workflow = DurableWorkflow::open_or_create(
+        &path,
+        &binding,
+        store.clone(),
+        exchange_order_owner_store(&path),
+    )
+    .expect("initial workflow opens");
     store.lose_next_compare_and_swap_response();
 
     assert!(matches!(
@@ -2162,8 +2283,9 @@ fn protected_head_response_loss_recovers_committed_append_on_reopen() {
     assert!(pending_path.exists());
     drop(workflow);
 
-    let mut restarted = DurableWorkflow::open_or_create(&path, &binding, store)
-        .expect("protected pending append restores its local journal on reopen");
+    let mut restarted =
+        DurableWorkflow::open_or_create(&path, &binding, store, exchange_order_owner_store(&path))
+            .expect("protected pending append restores its local journal on reopen");
     assert_eq!(restarted.record_count(), 2);
     assert!(!pending_path.exists());
     assert!(matches!(
@@ -2181,8 +2303,13 @@ fn rejected_protected_head_does_not_commit_a_local_pending_append() {
     let path = temp.path().join("protected-head-rejection.jsonl");
     let binding = binding();
     let store = protected_head_store(&path);
-    let mut workflow = DurableWorkflow::open_or_create(&path, &binding, store.clone())
-        .expect("initial workflow opens");
+    let mut workflow = DurableWorkflow::open_or_create(
+        &path,
+        &binding,
+        store.clone(),
+        exchange_order_owner_store(&path),
+    )
+    .expect("initial workflow opens");
     store.reject_next_compare_and_swap();
 
     assert!(matches!(
@@ -2191,8 +2318,9 @@ fn rejected_protected_head_does_not_commit_a_local_pending_append() {
     ));
     drop(workflow);
 
-    let mut restarted = DurableWorkflow::open_or_create(&path, &binding, store)
-        .expect("uncommitted local pending append is discarded on reopen");
+    let mut restarted =
+        DurableWorkflow::open_or_create(&path, &binding, store, exchange_order_owner_store(&path))
+            .expect("uncommitted local pending append is discarded on reopen");
     assert_eq!(restarted.record_count(), 1);
     assert!(matches!(
         restarted.prepare_order(at(2)),
@@ -2236,7 +2364,12 @@ fn bootstrap_head_recovers_initial_journal_fsync_crash_window() {
     drop(recovered);
     fs::write(&checkpoint, encoded).expect("bootstrap head restored after later record");
     assert!(matches!(
-        DurableWorkflow::open_or_create(&path, &binding, protected_head_store(&path)),
+        DurableWorkflow::open_or_create(
+            &path,
+            &binding,
+            protected_head_store(&path),
+            exchange_order_owner_store(&path),
+        ),
         Err(WorkflowError::RollbackDetected(_))
     ));
 }
