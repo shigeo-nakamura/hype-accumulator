@@ -4,10 +4,11 @@ use hype_accumulator::{
     workflow::{
         ActionKind, AppendOutcome, AuthorizationInputFreshness, BoundFillEvidence,
         BoundMovementEvidence, ConclusiveAbsenceEvidence, DecisionBinding, DurableWorkflow,
-        EligibilityPolicyBinding, ExchangeOrderOwner, ExchangeOrderOwnerStore, ExternalAction,
-        ExternalReceipt, GapFreeHistoryWatermark, HistoryDomain, HypeAtoms, InventoryBaseline,
-        OrderBoundEligibilityEvidence, OrderEnvelopeBinding, OrderFinality, PrepareOutcome,
-        ProtectedWorkflowHead, ProtectedWorkflowHeadStore, WorkflowError, WorkflowStage,
+        EligibilityPolicyBinding, ExchangeFillOwner, ExchangeOrderOwner, ExchangeOrderOwnerStore,
+        ExternalAction, ExternalReceipt, GapFreeHistoryWatermark, HistoryDomain, HypeAtoms,
+        InventoryBaseline, OrderBoundEligibilityEvidence, OrderEnvelopeBinding, OrderFinality,
+        PrepareOutcome, ProtectedWorkflowHead, ProtectedWorkflowHeadStore, WorkflowError,
+        WorkflowStage,
     },
 };
 use std::{
@@ -27,7 +28,8 @@ struct MemoryProtectedHeadStore {
 
 #[derive(Default)]
 struct MemoryExchangeOrderOwnerStore {
-    owners: Mutex<BTreeMap<(String, String), ExchangeOrderOwner>>,
+    order_owners: Mutex<BTreeMap<(String, String), ExchangeOrderOwner>>,
+    fill_owners: Mutex<BTreeMap<(String, String), ExchangeFillOwner>>,
 }
 
 impl ExchangeOrderOwnerStore for MemoryExchangeOrderOwnerStore {
@@ -36,7 +38,21 @@ impl ExchangeOrderOwnerStore for MemoryExchangeOrderOwnerStore {
             owner.execution_identity_hash.clone(),
             owner.exchange_order_id.clone(),
         );
-        let mut owners = self.owners.lock().map_err(|error| error.to_string())?;
+        let mut owners = self
+            .order_owners
+            .lock()
+            .map_err(|error| error.to_string())?;
+        if let Some(existing) = owners.get(&key) {
+            Ok(existing == owner)
+        } else {
+            owners.insert(key, owner.clone());
+            Ok(true)
+        }
+    }
+
+    fn claim_fill(&self, owner: &ExchangeFillOwner) -> Result<bool, String> {
+        let key = (owner.execution_identity_hash.clone(), owner.fill_id.clone());
+        let mut owners = self.fill_owners.lock().map_err(|error| error.to_string())?;
         if let Some(existing) = owners.get(&key) {
             Ok(existing == owner)
         } else {
@@ -552,6 +568,128 @@ fn one_exchange_order_cannot_be_owned_by_two_decision_workflows() {
         order_owner_store,
     )
     .expect("owner mismatch halt survives restart");
+    assert_eq!(second.state().stage(), WorkflowStage::ManualReview);
+}
+
+#[test]
+fn acceptance_at_effective_expiry_halts_before_claiming_the_order() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("acceptance-at-expiry.jsonl");
+    let binding = binding();
+    let mut workflow = reopen(&path, &binding);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+
+    assert!(matches!(
+        workflow.observe_order_submission(
+            "late-exchange-order",
+            binding.order_envelope.effective_expiry_at,
+        ),
+        Err(WorkflowError::ContradictoryObservation(_))
+    ));
+    assert_eq!(workflow.state().stage(), WorkflowStage::ManualReview);
+    assert!(workflow.state().exchange_order_id().is_none());
+    assert!(workflow
+        .state()
+        .manual_review_reason()
+        .is_some_and(|reason| reason.contains("effective expiry horizon")));
+    drop(workflow);
+    assert_eq!(
+        reopen(&path, &binding).state().stage(),
+        WorkflowStage::ManualReview
+    );
+}
+
+#[test]
+fn one_exchange_fill_cannot_be_owned_by_two_decision_workflows() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let first_path = temp.path().join("fill-owner-first.jsonl");
+    let second_path = temp.path().join("fill-owner-second.jsonl");
+    let first_binding = binding();
+    let mut second_binding = first_binding.clone();
+    second_binding.decision_id = "decision-2026-08-24-second-fill-owner".to_owned();
+    second_binding.order_envelope.l1_nonce += 1;
+    let first_head_store = Arc::new(MemoryProtectedHeadStore::default());
+    let second_head_store = Arc::new(MemoryProtectedHeadStore::default());
+    let owner_store = Arc::new(MemoryExchangeOrderOwnerStore::default());
+
+    let mut first = DurableWorkflow::open_or_create(
+        &first_path,
+        &first_binding,
+        first_head_store.clone(),
+        owner_store.clone(),
+    )
+    .expect("first workflow opens");
+    let mut second = DurableWorkflow::open_or_create(
+        &second_path,
+        &second_binding,
+        second_head_store.clone(),
+        owner_store.clone(),
+    )
+    .expect("second workflow opens");
+    for (workflow, order_id) in [
+        (&mut first, "exchange-order-first"),
+        (&mut second, "exchange-order-second"),
+    ] {
+        ready(workflow.prepare_order(at(1)).expect("order prepared"));
+        workflow
+            .observe_order_submission(order_id, at(2))
+            .expect("submission observed");
+        workflow
+            .observe_order_fill(
+                "fill-observation",
+                hype(250),
+                usdc(50_000_000),
+                usdc(50_500_000),
+                true,
+                at(3),
+            )
+            .expect("fill observed");
+        workflow
+            .finalize_order(
+                hype(250),
+                usdc(50_000_000),
+                usdc(50_500_000),
+                OrderFinality::Filled,
+                at(4),
+            )
+            .expect("order finalized");
+    }
+
+    let first_evidence = bound_evidence(&first, &[("shared-venue-fill", 250, 3)], at(6));
+    let second_evidence = bound_evidence(&second, &[("shared-venue-fill", 250, 3)], at(6));
+    first
+        .record_staking_eligibility(Some(first_evidence), at(6))
+        .expect("first workflow claims fill");
+    assert!(matches!(
+        second.record_staking_eligibility(Some(second_evidence), at(6)),
+        Err(WorkflowError::ContradictoryObservation(_))
+    ));
+    assert_eq!(second.state().stage(), WorkflowStage::ManualReview);
+    assert!(second
+        .state()
+        .manual_review_reason()
+        .is_some_and(|reason| reason.contains("fill ID is already owned")));
+    drop(first);
+    drop(second);
+
+    let first = DurableWorkflow::open_or_create(
+        &first_path,
+        &first_binding,
+        first_head_store,
+        owner_store.clone(),
+    )
+    .expect("first fill ownership survives restart");
+    assert_eq!(
+        first.state().stage(),
+        WorkflowStage::StakingEligibilityRecorded
+    );
+    let second = DurableWorkflow::open_or_create(
+        &second_path,
+        &second_binding,
+        second_head_store,
+        owner_store,
+    )
+    .expect("fill owner mismatch halt survives restart");
     assert_eq!(second.state().stage(), WorkflowStage::ManualReview);
 }
 

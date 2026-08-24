@@ -27,9 +27,12 @@ const JOURNAL_SCHEMA_VERSION: u8 = 1;
 const CHECKPOINT_SCHEMA_VERSION: u8 = 1;
 const PROTECTED_HEAD_SCHEMA_VERSION: u8 = 1;
 const EXCHANGE_ORDER_OWNER_SCHEMA_VERSION: u8 = 1;
+const EXCHANGE_FILL_OWNER_SCHEMA_VERSION: u8 = 1;
 const PENDING_APPEND_SCHEMA_VERSION: u8 = 1;
 const EXCHANGE_ORDER_OWNER_CONFLICT_REASON: &str =
     "exchange order ID is already owned by another workflow";
+const EXCHANGE_FILL_OWNER_CONFLICT_REASON: &str =
+    "exchange fill ID is already owned by another workflow";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -735,6 +738,11 @@ impl WorkflowState {
                         "order submission response is invalid for current state".into(),
                     ));
                 }
+                if event.at >= self.binding.order_envelope.effective_expiry_at {
+                    return Err(WorkflowError::ContradictoryObservation(
+                        "order acceptance reached its effective expiry horizon".into(),
+                    ));
+                }
                 self.exchange_order_id = Some(exchange_order_id.trim().to_owned());
                 self.order_accepted_at = Some(event.at);
                 self.pending_action = None;
@@ -1339,6 +1347,11 @@ impl WorkflowState {
             WorkflowTransition::OrderSubmissionObserved { .. } if at < self.last_transition_at => {
                 Some("accepted order predates the durable order preparation".into())
             }
+            WorkflowTransition::OrderSubmissionObserved { .. }
+                if at >= self.binding.order_envelope.effective_expiry_at =>
+            {
+                Some("order acceptance reached its effective expiry horizon".into())
+            }
             WorkflowTransition::OrderSubmissionObserved { .. } if self.order_is_terminal() => {
                 Some("accepted order appeared after terminal reconciliation".into())
             }
@@ -1523,7 +1536,25 @@ pub struct ExchangeOrderOwner {
     pub canonical_order_envelope_hash: String,
 }
 
-/// Shared append-only ownership storage for exchange order identities.
+/// Immutable ownership of one stable venue fill identity.
+///
+/// The key is `(execution_identity_hash, fill_id)`. The remaining fields bind
+/// that fill to exactly one signer authorization, venue order, and decision.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExchangeFillOwner {
+    pub schema_version: u8,
+    pub execution_identity_hash: String,
+    pub fill_id: String,
+    pub decision_id: String,
+    pub workflow_id: String,
+    pub authorization_id: String,
+    pub authorization_record_hash: String,
+    pub exchange_order_id: String,
+    pub client_order_id: String,
+    pub canonical_order_envelope_hash: String,
+}
+
+/// Shared append-only ownership storage for exchange order and fill identities.
 ///
 /// One store must cover every workflow for the execution identities it serves;
 /// it must not be scoped to a decision or journal path. `claim` must atomically
@@ -1536,6 +1567,13 @@ pub trait ExchangeOrderOwnerStore: Send + Sync {
     ///
     /// Returns an implementation-specific availability or persistence error.
     fn claim(&self, owner: &ExchangeOrderOwner) -> Result<bool, String>;
+
+    /// Claims a venue fill identity for exactly one authorization and order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an implementation-specific availability or persistence error.
+    fn claim_fill(&self, owner: &ExchangeFillOwner) -> Result<bool, String>;
 }
 
 #[derive(Serialize)]
@@ -1653,6 +1691,7 @@ impl DurableWorkflow {
                 exchange_order_owner_store,
             };
             workflow.reconcile_exchange_order_owner()?;
+            workflow.reconcile_exchange_fill_owners()?;
             Ok(workflow)
         }
     }
@@ -1694,6 +1733,42 @@ impl DurableWorkflow {
             .map_err(WorkflowError::exchange_order_owner)
     }
 
+    fn exchange_fill_owner(
+        &self,
+        evidence: &OrderBoundEligibilityEvidence,
+        fill: &BoundFillEvidence,
+    ) -> ExchangeFillOwner {
+        ExchangeFillOwner {
+            schema_version: EXCHANGE_FILL_OWNER_SCHEMA_VERSION,
+            execution_identity_hash: fill.execution_identity_hash.clone(),
+            fill_id: fill.fill_id.clone(),
+            decision_id: self.state.binding.decision_id.clone(),
+            workflow_id: self.state.workflow_id().to_owned(),
+            authorization_id: fill.authorization_id.clone(),
+            authorization_record_hash: fill.authorization_record_hash.clone(),
+            exchange_order_id: fill.order_id.clone(),
+            client_order_id: fill.client_order_id.clone(),
+            canonical_order_envelope_hash: evidence.canonical_order_envelope_hash.clone(),
+        }
+    }
+
+    fn claim_exchange_fills(
+        &self,
+        evidence: &OrderBoundEligibilityEvidence,
+    ) -> Result<bool, WorkflowError> {
+        for fill in &evidence.fills {
+            let owner = self.exchange_fill_owner(evidence, fill);
+            if !self
+                .exchange_order_owner_store
+                .claim_fill(&owner)
+                .map_err(WorkflowError::exchange_fill_owner)?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn reconcile_exchange_order_owner(&mut self) -> Result<(), WorkflowError> {
         let Some(exchange_order_id) = self.state.exchange_order_id().map(str::to_owned) else {
             return Ok(());
@@ -1709,6 +1784,34 @@ impl DurableWorkflow {
         )?;
         Err(WorkflowError::ContradictoryObservation(
             EXCHANGE_ORDER_OWNER_CONFLICT_REASON.into(),
+        ))
+    }
+
+    fn reconcile_exchange_fill_owners(&mut self) -> Result<(), WorkflowError> {
+        let evidence = self.records.iter().rev().find_map(|record| {
+            if let WorkflowTransition::StakingEligibilityRecorded {
+                evidence: Some(evidence),
+                ..
+            } = &record.event.transition
+            {
+                Some((**evidence).clone())
+            } else {
+                None
+            }
+        });
+        let Some(evidence) = evidence else {
+            return Ok(());
+        };
+        if self.claim_exchange_fills(&evidence)? || self.state.stage == WorkflowStage::ManualReview
+        {
+            return Ok(());
+        }
+        self.mark_manual_review(
+            EXCHANGE_FILL_OWNER_CONFLICT_REASON,
+            self.state.last_transition_at,
+        )?;
+        Err(WorkflowError::ContradictoryObservation(
+            EXCHANGE_FILL_OWNER_CONFLICT_REASON.into(),
         ))
     }
 
@@ -1736,6 +1839,15 @@ impl DurableWorkflow {
         at: DateTime<Utc>,
     ) -> Result<AppendOutcome, WorkflowError> {
         let exchange_order_id = exchange_order_id.into().trim().to_owned();
+        if !exchange_order_id.is_empty()
+            && at >= self.state.binding.order_envelope.effective_expiry_at
+        {
+            let reason = "order acceptance reached its effective expiry horizon";
+            if self.state.stage != WorkflowStage::ManualReview {
+                self.mark_manual_review(reason, at.max(self.state.last_transition_at))?;
+            }
+            return Err(WorkflowError::ContradictoryObservation(reason.into()));
+        }
         if !exchange_order_id.is_empty() && !self.claim_exchange_order(&exchange_order_id)? {
             if self.state.stage != WorkflowStage::ManualReview {
                 self.mark_manual_review(
@@ -1912,6 +2024,28 @@ impl DurableWorkflow {
             return Err(WorkflowError::InvalidTransition(
                 "staking eligibility requires a terminal order".into(),
             ));
+        }
+        if let Some(bound_evidence) = evidence.as_ref() {
+            if let Err(error) = self
+                .state
+                .validate_eligibility_evidence(Some(bound_evidence), at)
+            {
+                if let WorkflowError::ContradictoryObservation(reason) = &error {
+                    self.mark_manual_review(reason.clone(), at.max(self.state.last_transition_at))?;
+                }
+                return Err(error);
+            }
+            if !self.claim_exchange_fills(bound_evidence)? {
+                if self.state.stage != WorkflowStage::ManualReview {
+                    self.mark_manual_review(
+                        EXCHANGE_FILL_OWNER_CONFLICT_REASON,
+                        at.max(self.state.last_transition_at),
+                    )?;
+                }
+                return Err(WorkflowError::ContradictoryObservation(
+                    EXCHANGE_FILL_OWNER_CONFLICT_REASON.into(),
+                ));
+            }
         }
         self.append_observation(
             stable_id(
@@ -3122,6 +3256,8 @@ pub enum WorkflowError {
     ProtectedHead(String),
     #[error("exchange order owner store failed: {0}")]
     ExchangeOrderOwner(String),
+    #[error("exchange fill owner store failed: {0}")]
+    ExchangeFillOwner(String),
     #[error("journal I/O failed: {0}")]
     Io(String),
     #[error("journal serialization failed: {0}")]
@@ -3147,5 +3283,10 @@ impl WorkflowError {
     #[allow(clippy::needless_pass_by_value)]
     fn exchange_order_owner(error: String) -> Self {
         Self::ExchangeOrderOwner(error)
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn exchange_fill_owner(error: String) -> Self {
+        Self::ExchangeFillOwner(error)
     }
 }
