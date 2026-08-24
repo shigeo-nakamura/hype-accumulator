@@ -65,6 +65,13 @@ impl InventoryBaseline {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EligibilityPolicyBinding {
+    pub policy_version: String,
+    pub fill_registration_deadline_seconds: u64,
+    pub lot_eligibility_max_age_seconds: u64,
+}
+
 /// Immutable fields of the signer-authorized IOC order envelope.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OrderEnvelopeBinding {
@@ -100,6 +107,7 @@ pub struct DecisionBinding {
     pub capital_commitments: Vec<CapitalCommitment>,
     pub inventory_before: InventoryBaseline,
     pub order_envelope: OrderEnvelopeBinding,
+    pub eligibility_policy: EligibilityPolicyBinding,
 }
 
 impl DecisionBinding {
@@ -116,6 +124,7 @@ impl DecisionBinding {
         decision: &DailyDecision,
         inventory_before: InventoryBaseline,
         order_envelope: OrderEnvelopeBinding,
+        eligibility_policy: EligibilityPolicyBinding,
     ) -> Result<Self, WorkflowError> {
         if decision.settled
             || decision.planned_usdc.is_zero()
@@ -151,6 +160,7 @@ impl DecisionBinding {
             capital_commitments: commitments,
             inventory_before,
             order_envelope,
+            eligibility_policy,
         };
         binding.validate()?;
         Ok(binding)
@@ -171,6 +181,10 @@ impl DecisionBinding {
             || self.order_envelope.original_quantity_hype.is_zero()
             || self.order_envelope.hype_atoms_per_hype == 0
             || self.order_envelope.market_metadata_digest.trim().is_empty()
+            || self.eligibility_policy.policy_version.trim().is_empty()
+            || policy_time_delta(self.eligibility_policy.fill_registration_deadline_seconds)
+                .is_none()
+            || policy_time_delta(self.eligibility_policy.lot_eligibility_max_age_seconds).is_none()
             || self.order_envelope.limit_price_usdc_per_hype.is_zero()
             || max_order_notional_usdc.is_none_or(|notional| {
                 notional > self.planned_usdc || notional > self.committed_usdc
@@ -322,6 +336,10 @@ pub struct BoundFillEvidence {
     pub purchased_hype: HypeAtoms,
     pub executed_at: DateTime<Utc>,
     pub first_observed_at: DateTime<Utc>,
+    pub registration_record_id: String,
+    pub registration_record_hash: String,
+    pub registration_cursor: u64,
+    pub registered_at: DateTime<Utc>,
     pub registration_deadline_at: DateTime<Utc>,
 }
 
@@ -993,6 +1011,7 @@ impl WorkflowState {
         if evidence.authorization_id.trim().is_empty()
             || evidence.authorization_record_hash.trim().is_empty()
             || evidence.policy_version.trim().is_empty()
+            || evidence.policy_version != self.binding.eligibility_policy.policy_version
             || evidence.decision_id != self.binding.decision_id
             || evidence.execution_identity_hash
                 != self.binding.inventory_before.execution_identity_hash
@@ -1039,11 +1058,58 @@ impl WorkflowState {
                     .into(),
             ));
         }
+        self.validate_bound_fills(evidence, accepted_at, recorded_at)
+    }
+
+    fn validate_bound_fills(
+        &self,
+        evidence: &OrderBoundEligibilityEvidence,
+        accepted_at: DateTime<Utc>,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<(), WorkflowError> {
+        let registration_window = policy_time_delta(
+            self.binding
+                .eligibility_policy
+                .fill_registration_deadline_seconds,
+        )
+        .ok_or_else(|| {
+            WorkflowError::ContradictoryObservation(
+                "fill registration deadline cannot be represented".into(),
+            )
+        })?;
+        let lot_max_age = policy_time_delta(
+            self.binding
+                .eligibility_policy
+                .lot_eligibility_max_age_seconds,
+        )
+        .ok_or_else(|| {
+            WorkflowError::ContradictoryObservation(
+                "lot eligibility maximum age cannot be represented".into(),
+            )
+        })?;
         let mut fill_ids = BTreeSet::new();
+        let mut registration_record_ids = BTreeSet::new();
+        let mut registration_cursors = BTreeSet::new();
         let mut purchased = 0_u64;
         let mut previous: Option<(DateTime<Utc>, &str)> = None;
         for fill in &evidence.fills {
             let key = (fill.executed_at, fill.fill_id.as_str());
+            let registration_deadline_at = fill
+                .first_observed_at
+                .checked_add_signed(registration_window)
+                .ok_or_else(|| {
+                    WorkflowError::ContradictoryObservation(
+                        "fill registration deadline overflowed".into(),
+                    )
+                })?;
+            let eligibility_expires_at = fill
+                .executed_at
+                .checked_add_signed(lot_max_age)
+                .ok_or_else(|| {
+                    WorkflowError::ContradictoryObservation(
+                        "lot eligibility deadline overflowed".into(),
+                    )
+                })?;
             if fill.fill_id.trim().is_empty()
                 || fill.purchased_hype.is_zero()
                 || !fill_ids.insert(fill.fill_id.as_str())
@@ -1051,8 +1117,19 @@ impl WorkflowState {
                 || fill.executed_at < accepted_at
                 || fill.executed_at >= evidence.effective_expiry_at
                 || fill.first_observed_at < fill.executed_at
+                || fill.registration_record_id.trim().is_empty()
+                || !registration_record_ids.insert(fill.registration_record_id.as_str())
+                || fill.registration_record_hash.trim().is_empty()
+                || fill.registration_cursor == 0
+                || !registration_cursors.insert(fill.registration_cursor)
+                || fill.registration_cursor > evidence.fill_history.cursor
+                || fill.registered_at < fill.first_observed_at
+                || fill.registered_at >= fill.registration_deadline_at
+                || fill.registered_at > recorded_at
+                || fill.registration_deadline_at != registration_deadline_at
                 || fill.registration_deadline_at < fill.first_observed_at
                 || recorded_at < fill.first_observed_at
+                || recorded_at >= eligibility_expires_at
             {
                 return Err(WorkflowError::ContradictoryObservation(
                     "fill evidence is late, duplicated, unsorted, or outside the authorized order window"
@@ -1960,6 +2037,10 @@ fn max_order_notional_usdc(envelope: &OrderEnvelopeBinding) -> Option<UsdcMicros
     let rounded_micros = numerator.checked_add(rounding)?.checked_div(scale)?;
     let rounded_micros = u64::try_from(rounded_micros).ok()?;
     (rounded_micros > 0).then(|| UsdcMicros::from_micros(rounded_micros))
+}
+
+fn policy_time_delta(seconds: u64) -> Option<TimeDelta> {
+    i64::try_from(seconds).ok().and_then(TimeDelta::try_seconds)
 }
 
 fn valid_eligibility_history_watermark(

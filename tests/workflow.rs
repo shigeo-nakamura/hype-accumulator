@@ -1,10 +1,10 @@
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use hype_accumulator::{
     pacing::{DailyDecision, DecisionAllocation, DecisionReason, PacingExplanation, UsdcMicros},
     workflow::{
         ActionKind, AppendOutcome, BoundFillEvidence, BoundMovementEvidence,
-        ConclusiveAbsenceEvidence, DecisionBinding, DurableWorkflow, ExternalAction,
-        ExternalReceipt, GapFreeHistoryWatermark, HypeAtoms, InventoryBaseline,
+        ConclusiveAbsenceEvidence, DecisionBinding, DurableWorkflow, EligibilityPolicyBinding,
+        ExternalAction, ExternalReceipt, GapFreeHistoryWatermark, HypeAtoms, InventoryBaseline,
         OrderBoundEligibilityEvidence, OrderEnvelopeBinding, OrderFinality, PrepareOutcome,
         WorkflowError, WorkflowStage,
     },
@@ -74,6 +74,14 @@ fn decision() -> DailyDecision {
     }
 }
 
+fn eligibility_policy() -> EligibilityPolicyBinding {
+    EligibilityPolicyBinding {
+        policy_version: "custody-policy-v1".to_owned(),
+        fill_registration_deadline_seconds: 60,
+        lot_eligibility_max_age_seconds: 3_600,
+    }
+}
+
 fn binding() -> DecisionBinding {
     DecisionBinding::from_pacing_decision(
         &decision(),
@@ -97,6 +105,7 @@ fn binding() -> DecisionBinding {
             venue_clock_evidence_digest: "venue-clock-evidence-a".to_owned(),
             max_venue_clock_lag_ms: 59_999,
         },
+        eligibility_policy(),
     )
     .expect("valid workflow binding")
 }
@@ -139,7 +148,7 @@ fn bound_evidence(
         order_bound_at: state.order_accepted_at().expect("accepted order timestamp"),
         effective_expiry_at: binding.order_envelope.effective_expiry_at,
         residual_reservation_hype: hype(residual_reservation),
-        policy_version: "custody-policy-v1".to_owned(),
+        policy_version: binding.eligibility_policy.policy_version.clone(),
         fill_history: GapFreeHistoryWatermark {
             watermark_id: "eligibility-fill-watermark-a".to_owned(),
             cursor: 303,
@@ -157,12 +166,17 @@ fn bound_evidence(
         movements: Vec::new(),
         fills: fills
             .iter()
-            .map(|(fill_id, atoms, minute)| BoundFillEvidence {
+            .enumerate()
+            .map(|(index, (fill_id, atoms, minute))| BoundFillEvidence {
                 fill_id: (*fill_id).to_owned(),
                 purchased_hype: hype(*atoms),
                 executed_at: at(*minute),
                 first_observed_at: at(*minute),
-                registration_deadline_at: at(30),
+                registration_record_id: format!("registration-{fill_id}"),
+                registration_record_hash: format!("registration-hash-{fill_id}"),
+                registration_cursor: 200 + u64::try_from(index).expect("fixture cursor"),
+                registered_at: at(*minute),
+                registration_deadline_at: at(*minute + 1),
             })
             .collect(),
     }
@@ -228,6 +242,7 @@ fn deterministic_identity_is_independent_of_allocation_input_order() {
         &reversed,
         first_binding.inventory_before.clone(),
         first_binding.order_envelope.clone(),
+        first_binding.eligibility_policy.clone(),
     )
     .expect("reversed decision binds");
 
@@ -287,7 +302,12 @@ fn expiry_binding_requires_exact_verified_clock_lag_gap() {
             _ => unreachable!("complete fixture set"),
         }
         assert!(matches!(
-            DecisionBinding::from_pacing_decision(&decision(), valid.inventory_before, envelope,),
+            DecisionBinding::from_pacing_decision(
+                &decision(),
+                valid.inventory_before,
+                envelope,
+                valid.eligibility_policy,
+            ),
             Err(WorkflowError::InvalidBinding(_))
         ));
     }
@@ -317,7 +337,35 @@ fn order_binding_caps_quantity_times_limit_notional() {
             _ => unreachable!("complete fixture set"),
         }
         assert!(matches!(
-            DecisionBinding::from_pacing_decision(&decision(), valid.inventory_before, envelope),
+            DecisionBinding::from_pacing_decision(
+                &decision(),
+                valid.inventory_before,
+                envelope,
+                valid.eligibility_policy,
+            ),
+            Err(WorkflowError::InvalidBinding(_))
+        ));
+    }
+}
+
+#[test]
+fn eligibility_policy_durations_must_be_representable() {
+    for invalid in ["version", "registration", "age"] {
+        let valid = binding();
+        let mut policy = valid.eligibility_policy;
+        match invalid {
+            "version" => policy.policy_version.clear(),
+            "registration" => policy.fill_registration_deadline_seconds = u64::MAX,
+            "age" => policy.lot_eligibility_max_age_seconds = u64::MAX,
+            _ => unreachable!("complete fixture set"),
+        }
+        assert!(matches!(
+            DecisionBinding::from_pacing_decision(
+                &decision(),
+                valid.inventory_before,
+                valid.order_envelope,
+                policy,
+            ),
             Err(WorkflowError::InvalidBinding(_))
         ));
     }
@@ -1070,6 +1118,7 @@ fn later_capital_never_resizes_a_decided_or_ambiguous_order() {
         &changed_decision,
         original.inventory_before.clone(),
         original.order_envelope.clone(),
+        original.eligibility_policy.clone(),
     )
     .expect("later decision shape is internally valid");
     assert_binding_mismatch(&DurableWorkflow::open_or_create(&path, &changed));
@@ -1251,6 +1300,147 @@ fn late_terminal_finalization_after_absence_durably_halts() {
 }
 
 #[test]
+fn eligibility_requires_durable_timely_fill_registration() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    for invalid in [
+        "missing-record-id",
+        "missing-record-hash",
+        "zero-cursor",
+        "cursor-beyond-watermark",
+        "registered-at-deadline",
+        "wrong-deadline",
+        "zero-window",
+    ] {
+        let mut binding = binding();
+        if invalid == "zero-window" {
+            binding
+                .eligibility_policy
+                .fill_registration_deadline_seconds = 0;
+        }
+        let path = temp
+            .path()
+            .join(format!("invalid-registration-{invalid}.jsonl"));
+        let mut workflow = reopen(&path, &binding);
+        ready(workflow.prepare_order(at(1)).expect("order prepared"));
+        workflow
+            .observe_order_submission("exchange-order-1", at(2))
+            .expect("submission observed");
+        workflow
+            .observe_order_fill(
+                "fill-1",
+                hype(250),
+                usdc(50_000_000),
+                usdc(50_500_000),
+                true,
+                at(3),
+            )
+            .expect("fill observed");
+        workflow
+            .finalize_order(
+                hype(250),
+                usdc(50_000_000),
+                usdc(50_500_000),
+                OrderFinality::Filled,
+                at(4),
+            )
+            .expect("order finalized");
+        let mut evidence = bound_evidence(&workflow, &[("fill-1", 250, 3)], at(6));
+        let fill = &mut evidence.fills[0];
+        match invalid {
+            "missing-record-id" => fill.registration_record_id.clear(),
+            "missing-record-hash" => fill.registration_record_hash.clear(),
+            "zero-cursor" => fill.registration_cursor = 0,
+            "cursor-beyond-watermark" => {
+                fill.registration_cursor = evidence.fill_history.cursor + 1;
+            }
+            "registered-at-deadline" => fill.registered_at = fill.registration_deadline_at,
+            "wrong-deadline" => fill.registration_deadline_at = at(5),
+            "zero-window" => fill.registration_deadline_at = fill.first_observed_at,
+            _ => unreachable!("complete fixture set"),
+        }
+
+        assert!(matches!(
+            workflow.record_staking_eligibility(Some(evidence), at(6)),
+            Err(WorkflowError::ContradictoryObservation(_))
+        ));
+        assert_eq!(workflow.state().stage(), WorkflowStage::ManualReview);
+        drop(workflow);
+        assert_eq!(
+            reopen(&path, &binding).state().stage(),
+            WorkflowStage::ManualReview
+        );
+    }
+}
+
+#[test]
+fn eligibility_expires_at_configured_max_age_boundary() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    for case in ["just-before", "boundary", "zero-age"] {
+        let mut binding = binding();
+        if case == "zero-age" {
+            binding.eligibility_policy.lot_eligibility_max_age_seconds = 0;
+        }
+        let path = temp.path().join(format!("eligibility-age-{case}.jsonl"));
+        let mut workflow = reopen(&path, &binding);
+        ready(workflow.prepare_order(at(1)).expect("order prepared"));
+        workflow
+            .observe_order_submission("exchange-order-1", at(2))
+            .expect("submission observed");
+        workflow
+            .observe_order_fill(
+                "fill-1",
+                hype(250),
+                usdc(50_000_000),
+                usdc(50_500_000),
+                true,
+                at(3),
+            )
+            .expect("fill observed");
+        workflow
+            .finalize_order(
+                hype(250),
+                usdc(50_000_000),
+                usdc(50_500_000),
+                OrderFinality::Filled,
+                at(4),
+            )
+            .expect("order finalized");
+        let expiry_boundary = at(3) + TimeDelta::seconds(3_600);
+        let recorded_at = match case {
+            "just-before" => expiry_boundary - TimeDelta::milliseconds(1),
+            "boundary" => expiry_boundary,
+            "zero-age" => at(5),
+            _ => unreachable!("complete fixture set"),
+        };
+        let evidence = bound_evidence(&workflow, &[("fill-1", 250, 3)], recorded_at);
+        let result = workflow.record_staking_eligibility(Some(evidence), recorded_at);
+        if case == "just-before" {
+            assert!(result.is_ok());
+            assert_eq!(
+                workflow.state().stage(),
+                WorkflowStage::StakingEligibilityRecorded
+            );
+        } else {
+            assert!(matches!(
+                result,
+                Err(WorkflowError::ContradictoryObservation(_))
+            ));
+            assert_eq!(workflow.state().stage(), WorkflowStage::ManualReview);
+        }
+        drop(workflow);
+        let reopened = reopen(&path, &binding);
+        assert_eq!(
+            reopened.state().stage(),
+            if case == "just-before" {
+                WorkflowStage::StakingEligibilityRecorded
+            } else {
+                WorkflowStage::ManualReview
+            }
+        );
+    }
+}
+
+#[test]
 fn eligibility_requires_fresh_gap_free_movement_coverage() {
     let temp = tempfile::tempdir().expect("temp directory");
     let binding = binding();
@@ -1357,7 +1547,9 @@ fn accepted_order_without_bound_authorization_is_permanently_ineligible() {
 fn every_signed_order_field_must_match_for_eligibility() {
     let temp = tempfile::tempdir().expect("temp directory");
     let binding = binding();
-    for mismatch in ["quantity", "scale", "metadata", "limit", "nonce", "expiry"] {
+    for mismatch in [
+        "quantity", "scale", "metadata", "limit", "nonce", "expiry", "policy",
+    ] {
         let path = temp.path().join(format!("mismatched-{mismatch}.jsonl"));
         let mut workflow = reopen(&path, &binding);
         ready(workflow.prepare_order(at(1)).expect("order prepared"));
@@ -1375,6 +1567,7 @@ fn every_signed_order_field_must_match_for_eligibility() {
             "limit" => evidence.limit_price_usdc_per_hype = usdc(200_001),
             "nonce" => evidence.l1_nonce = 8,
             "expiry" => evidence.signed_expiry_at = at(28),
+            "policy" => evidence.policy_version = "custody-policy-v2".to_owned(),
             _ => unreachable!("complete fixture set"),
         }
 
