@@ -161,8 +161,17 @@ pub enum AppendOutcome {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct DepositReplay {
+    occurred_at: DateTime<Utc>,
     authoritative_usdc: UsdcMicros,
     admitted_usdc: UsdcMicros,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CapitalTimelineEntry {
+    occurred_at: DateTime<Utc>,
+    credit_usdc: UsdcMicros,
+    debit_usdc: UsdcMicros,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -197,6 +206,7 @@ struct OrderReplay {
 #[serde(deny_unknown_fields)]
 pub struct ReplayState {
     deposits: BTreeMap<String, DepositReplay>,
+    capital_timeline: Vec<CapitalTimelineEntry>,
     commitments: BTreeMap<String, CommitmentReplay>,
     decision_outcomes: BTreeMap<NaiveDate, String>,
     decision_ids: BTreeSet<String>,
@@ -929,6 +939,7 @@ fn apply_event(state: &mut ReplayState, event: &LedgerEvent) -> Result<(), Ledge
             state.deposits.insert(
                 event.event_id.clone(),
                 DepositReplay {
+                    occurred_at: event.occurred_at,
                     authoritative_usdc: *amount_usdc,
                     admitted_usdc: UsdcMicros::default(),
                 },
@@ -937,9 +948,14 @@ fn apply_event(state: &mut ReplayState, event: &LedgerEvent) -> Result<(), Ledge
         LedgerEventKind::DepositAdmission {
             deposit_event_id,
             amount_usdc,
-        } => record_deposit_admission(state, deposit_event_id, *amount_usdc)?,
+        } => record_deposit_admission(state, event.occurred_at, deposit_event_id, *amount_usdc)?,
         LedgerEventKind::AuthoritativeWithdrawal { amount_usdc } => {
-            require_deployable(state, *amount_usdc)?;
+            record_capital_timeline_entry(
+                state,
+                event.occurred_at,
+                UsdcMicros::default(),
+                *amount_usdc,
+            )?;
             state.withdrawn_usdc = checked_add(state.withdrawn_usdc, *amount_usdc)?;
         }
         LedgerEventKind::CapitalCommitted {
@@ -1015,20 +1031,31 @@ fn apply_event(state: &mut ReplayState, event: &LedgerEvent) -> Result<(), Ledge
 
 fn record_deposit_admission(
     state: &mut ReplayState,
+    occurred_at: DateTime<Utc>,
     deposit_event_id: &str,
     amount_usdc: UsdcMicros,
 ) -> Result<(), LedgerError> {
     let deposit = state
         .deposits
-        .get_mut(deposit_event_id)
+        .get(deposit_event_id)
         .ok_or_else(|| LedgerError::UnknownDeposit(deposit_event_id.to_owned()))?;
+    if occurred_at < deposit.occurred_at {
+        return Err(LedgerError::InvalidEvent(
+            "deposit admission predates its authoritative deposit".into(),
+        ));
+    }
     let next_admitted = checked_add(deposit.admitted_usdc, amount_usdc)?;
     if next_admitted > deposit.authoritative_usdc {
         return Err(LedgerError::AdmissionExceedsDeposit(
             deposit_event_id.to_owned(),
         ));
     }
-    deposit.admitted_usdc = next_admitted;
+    record_capital_timeline_entry(state, occurred_at, amount_usdc, UsdcMicros::default())?;
+    state
+        .deposits
+        .get_mut(deposit_event_id)
+        .expect("deposit existence was validated")
+        .admitted_usdc = next_admitted;
     state.admitted_usdc = checked_add(state.admitted_usdc, amount_usdc)?;
     Ok(())
 }
@@ -1042,7 +1069,7 @@ fn record_capital_commitment(
     if state.commitments.contains_key(commitment_id) {
         return Err(LedgerError::CommitmentCollision(commitment_id.to_owned()));
     }
-    require_deployable(state, amount_usdc)?;
+    record_capital_timeline_entry(state, occurred_at, UsdcMicros::default(), amount_usdc)?;
     state.committed_usdc = checked_add(state.committed_usdc, amount_usdc)?;
     state.commitments.insert(
         commitment_id.to_owned(),
@@ -1102,8 +1129,14 @@ fn record_capital_settlement(
             commitment_id.to_owned(),
         ));
     }
-    state.committed_usdc = checked_sub(state.committed_usdc, commitment.committed_usdc)?;
+    let committed_usdc = commitment.committed_usdc;
+    record_capital_timeline_entry(state, occurred_at, committed_usdc, debited_usdc)?;
+    state.committed_usdc = checked_sub(state.committed_usdc, committed_usdc)?;
     state.spent_usdc = checked_add(state.spent_usdc, debited_usdc)?;
+    let commitment = state
+        .commitments
+        .get_mut(commitment_id)
+        .expect("commitment existence was validated");
     commitment.debited_usdc = debited_usdc;
     commitment.settled = true;
     Ok(())
@@ -1986,12 +2019,30 @@ fn checked_sub(left: UsdcMicros, right: UsdcMicros) -> Result<UsdcMicros, Ledger
         ))
 }
 
-fn require_deployable(state: &ReplayState, requested: UsdcMicros) -> Result<(), LedgerError> {
-    if requested <= state.deployable_usdc() {
-        Ok(())
-    } else {
-        Err(LedgerError::InsufficientDeployableCapital)
+fn record_capital_timeline_entry(
+    state: &mut ReplayState,
+    occurred_at: DateTime<Utc>,
+    credit_usdc: UsdcMicros,
+    debit_usdc: UsdcMicros,
+) -> Result<(), LedgerError> {
+    let mut timeline = state.capital_timeline.clone();
+    timeline.push(CapitalTimelineEntry {
+        occurred_at,
+        credit_usdc,
+        debit_usdc,
+    });
+    timeline.sort_by_key(|entry| entry.occurred_at);
+
+    let mut deployable = UsdcMicros::default();
+    for entry in &timeline {
+        deployable = checked_add(deployable, entry.credit_usdc)?;
+        if entry.debit_usdc > deployable {
+            return Err(LedgerError::InsufficientDeployableCapital);
+        }
+        deployable = checked_sub(deployable, entry.debit_usdc)?;
     }
+    state.capital_timeline = timeline;
+    Ok(())
 }
 
 fn require_nonzero(value: UsdcMicros) -> Result<(), LedgerError> {
@@ -2131,17 +2182,22 @@ fn validate_journal_identity(
     let mut options = OpenOptions::new();
     configure_journal_options(&mut options);
     let path_file = options.open(path).map_err(LedgerError::io)?;
-    let path_information =
-        winx::winapi_util::file::information(&path_file).map_err(LedgerError::io)?;
-    let file_information = winx::winapi_util::file::information(file).map_err(LedgerError::io)?;
-    if path_information.volume_serial_number() != file_information.volume_serial_number()
-        || path_information.file_index() != file_information.file_index()
-        || path_information.number_of_links() != 1
-        || file_information.number_of_links() != 1
-    {
+    let path_identity = windows_file_identity(&path_file)?;
+    let file_identity = windows_file_identity(file)?;
+    if path_identity != file_identity || path_identity.2 != 1 || file_identity.2 != 1 {
         return Err(LedgerError::UnsafeJournalFile);
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &File) -> Result<(u64, u64, u64), LedgerError> {
+    let information = winx::winapi_util::file::information(file).map_err(LedgerError::io)?;
+    Ok((
+        information.volume_serial_number(),
+        information.file_index(),
+        information.number_of_links(),
+    ))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -2283,13 +2339,13 @@ fn read_single_linked_regular(path: &Path) -> Result<Option<Vec<u8>>, LedgerErro
     }
     let mut file = options.open(path).map_err(LedgerError::io)?;
     let file_metadata = file.metadata().map_err(LedgerError::io)?;
-    if !single_linked_regular_identity(&path_metadata, &file_metadata) {
+    if !single_linked_regular_identity(path, &file, &path_metadata, &file_metadata) {
         return Ok(None);
     }
     let mut payload = Vec::new();
     file.read_to_end(&mut payload).map_err(LedgerError::io)?;
     let current_path_metadata = fs::symlink_metadata(path).map_err(LedgerError::io)?;
-    if !single_linked_regular_identity(&current_path_metadata, &file_metadata) {
+    if !single_linked_regular_identity(path, &file, &current_path_metadata, &file_metadata) {
         return Ok(None);
     }
     Ok(Some(payload))
@@ -2297,6 +2353,8 @@ fn read_single_linked_regular(path: &Path) -> Result<Option<Vec<u8>>, LedgerErro
 
 #[cfg(unix)]
 fn single_linked_regular_identity(
+    _path: &Path,
+    _file: &File,
     path_metadata: &fs::Metadata,
     file_metadata: &fs::Metadata,
 ) -> bool {
@@ -2310,8 +2368,32 @@ fn single_linked_regular_identity(
         && file_metadata.nlink() == 1
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn single_linked_regular_identity(
+    path: &Path,
+    file: &File,
+    path_metadata: &fs::Metadata,
+    file_metadata: &fs::Metadata,
+) -> bool {
+    if !path_metadata.file_type().is_file() || !file_metadata.file_type().is_file() {
+        return false;
+    }
+    let Ok(path_file) = OpenOptions::new().read(true).open(path) else {
+        return false;
+    };
+    let Ok(path_identity) = windows_file_identity(&path_file) else {
+        return false;
+    };
+    let Ok(file_identity) = windows_file_identity(file) else {
+        return false;
+    };
+    path_identity == file_identity && path_identity.2 == 1 && file_identity.2 == 1
+}
+
+#[cfg(not(any(unix, windows)))]
+fn single_linked_regular_identity(
+    _path: &Path,
+    _file: &File,
     path_metadata: &fs::Metadata,
     file_metadata: &fs::Metadata,
 ) -> bool {
@@ -2445,13 +2527,13 @@ impl LedgerLock {
     }
 
     fn validate(&self) -> Result<(), LedgerError> {
-        let path_metadata =
-            fs::symlink_metadata(self.directory.join(LOCK_FILE_NAME)).map_err(LedgerError::io)?;
+        let path = self.directory.join(LOCK_FILE_NAME);
+        let path_metadata = fs::symlink_metadata(&path).map_err(LedgerError::io)?;
         let file_metadata = self.file.metadata().map_err(LedgerError::io)?;
         if !path_metadata.file_type().is_file() || !file_metadata.file_type().is_file() {
             return Err(LedgerError::UnsafeLockFile);
         }
-        validate_lock_identity(&path_metadata, &file_metadata)
+        validate_lock_identity(&path, &self.file, &path_metadata, &file_metadata)
     }
 }
 
@@ -2474,6 +2556,8 @@ fn acquire_restore_locks(
 
 #[cfg(unix)]
 fn validate_lock_identity(
+    _path: &Path,
+    _file: &File,
     path_metadata: &fs::Metadata,
     file_metadata: &fs::Metadata,
 ) -> Result<(), LedgerError> {
@@ -2489,8 +2573,30 @@ fn validate_lock_identity(
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn validate_lock_identity(
+    path: &Path,
+    file: &File,
+    _path_metadata: &fs::Metadata,
+    _file_metadata: &fs::Metadata,
+) -> Result<(), LedgerError> {
+    let path_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(LedgerError::io)?;
+    let path_identity = windows_file_identity(&path_file)?;
+    let file_identity = windows_file_identity(file)?;
+    if path_identity != file_identity || path_identity.2 != 1 || file_identity.2 != 1 {
+        return Err(LedgerError::UnsafeLockFile);
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn validate_lock_identity(
+    _path: &Path,
+    _file: &File,
     _path_metadata: &fs::Metadata,
     _file_metadata: &fs::Metadata,
 ) -> Result<(), LedgerError> {
@@ -2506,7 +2612,14 @@ fn same_lock_identity(left: &File, right: &File) -> Result<bool, LedgerError> {
     Ok(left.dev() == right.dev() && left.ino() == right.ino())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn same_lock_identity(left: &File, right: &File) -> Result<bool, LedgerError> {
+    let left = windows_file_identity(left)?;
+    let right = windows_file_identity(right)?;
+    Ok(left.0 == right.0 && left.1 == right.1)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn same_lock_identity(_left: &File, _right: &File) -> Result<bool, LedgerError> {
     Ok(false)
 }

@@ -1472,6 +1472,58 @@ fn rejected_capital_transition_does_not_mutate_memory_or_disk() {
 }
 
 #[test]
+fn capital_commitment_cannot_use_a_future_admission() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let anchor = anchor_store();
+    let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+    ledger
+        .append(deposit("future-deposit", 10, 10))
+        .expect("append authoritative deposit");
+    assert_eq!(
+        ledger.append(event(
+            "admission-before-deposit",
+            9,
+            LedgerEventKind::DepositAdmission {
+                deposit_event_id: "future-deposit".into(),
+                amount_usdc: usd(10),
+            },
+        )),
+        Err(LedgerError::InvalidEvent(
+            "deposit admission predates its authoritative deposit".into()
+        ))
+    );
+    ledger
+        .append(event(
+            "future-admission",
+            11,
+            LedgerEventKind::DepositAdmission {
+                deposit_event_id: "future-deposit".into(),
+                amount_usdc: usd(10),
+            },
+        ))
+        .expect("append future admission");
+    let durable_before = fs::read(ledger_path(directory.path())).expect("read ledger");
+    let state_before = ledger.state().clone();
+
+    assert_eq!(
+        ledger.append(event(
+            "commitment-before-admission",
+            9,
+            LedgerEventKind::CapitalCommitted {
+                commitment_id: "commitment-before-admission".into(),
+                amount_usdc: usd(10),
+            },
+        )),
+        Err(LedgerError::InsufficientDeployableCapital)
+    );
+    assert_eq!(ledger.state(), &state_before);
+    assert_eq!(
+        fs::read(ledger_path(directory.path())).expect("read unchanged ledger"),
+        durable_before
+    );
+}
+
+#[test]
 fn journal_hash_tampering_is_detected() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let anchor = anchor_store();
@@ -2137,7 +2189,26 @@ fn opening_a_symlinked_lock_file_fails_without_modifying_its_target() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+#[test]
+fn opening_rejects_a_multiply_linked_lock() {
+    let directory = tempfile::tempdir().expect("ledger directory");
+    let foreign_directory = tempfile::tempdir().expect("foreign directory");
+    let foreign_lock = foreign_directory.path().join("foreign.lock");
+    fs::write(&foreign_lock, b"foreign lock contents").expect("write foreign lock");
+    fs::hard_link(&foreign_lock, directory.path().join(".ledger.lock")).expect("hard-link lock");
+
+    assert!(matches!(
+        open(directory.path(), &anchor_store()),
+        Err(LedgerError::UnsafeLockFile)
+    ));
+    assert_eq!(
+        fs::read(&foreign_lock).expect("foreign lock remains"),
+        b"foreign lock contents"
+    );
+}
+
+#[cfg(any(unix, windows))]
 #[test]
 fn restore_rejects_shared_hard_linked_locks_without_blocking() {
     let source = tempfile::tempdir().expect("source directory");
