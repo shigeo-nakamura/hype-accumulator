@@ -10,22 +10,34 @@ from .contracts import PointInTimeView, load_capital_events, load_dataset, resol
 from .engine import run_backtest
 
 
+def require_snapshot_at_least(child_manifest: dict, experiment_as_of: datetime, label: str) -> None:
+    child_as_of = timestamp(child_manifest["as_of"])
+    if experiment_as_of > child_as_of:
+        raise ValueError(
+            f"experiment as_of exceeds {label} snapshot boundary: "
+            f"{experiment_as_of.isoformat()} > {child_as_of.isoformat()}"
+        )
+
+
 def run_experiment(path: Path) -> dict:
     experiment = resolve_manifest(path)
     root = experiment["_root"]
     as_of = timestamp(experiment["as_of"])
     prices, revisions, dataset_manifest = load_dataset((root / experiment["dataset_manifest"]).resolve())
+    require_snapshot_at_least(dataset_manifest, as_of, "dataset")
     view = PointInTimeView(revisions, as_of)
     results = []
     for capital_spec in experiment["capital_paths"]:
-        events, _ = load_capital_events((root / capital_spec["manifest"]).resolve())
+        events, capital_manifest = load_capital_events((root / capital_spec["manifest"]).resolve())
+        require_snapshot_at_least(capital_manifest, as_of, f"capital path {capital_spec['name']}")
         policy_results = []
         for policy in experiment["policies"]:
             policy_results.append(run_backtest(prices, events, view, policy, experiment["execution"], as_of))
         results.append({"capital_path": capital_spec["name"], "policies": policy_results})
     sensitivity = []
     adaptive = next(policy for policy in experiment["policies"] if policy["kind"] == "adaptive")
-    events, _ = load_capital_events((root / experiment["capital_paths"][-1]["manifest"]).resolve())
+    events, capital_manifest = load_capital_events((root / experiment["capital_paths"][-1]["manifest"]).resolve())
+    require_snapshot_at_least(capital_manifest, as_of, "sensitivity capital path")
     for value in experiment["sensitivity"]["adaptive_sensitivity"]:
         policy = deepcopy(adaptive)
         policy["name"] = f"adaptive-sensitivity-{value}"
