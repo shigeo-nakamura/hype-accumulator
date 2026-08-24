@@ -231,14 +231,30 @@ expiry proves a bypass, mismatch, or venue invariant failure: the purchase remai
 visible and charged to capital but is permanently ineligible for automatic
 staking and triggers halt/manual review.
 
-As soon as an exact CLOID query finds the order, even before it is terminal, the
-reconciler locks and verifies the CLOID-owner row and atomically inserts or verifies
-an append-only unique `(execution account, stable venue order ID)` ownership row
-pointing to the same authorization and CLOID before moving `submission_claimed` to
-`order_bound`. An existing identical owner is an idempotent replay; an owner for a
-different authorization or CLOID halts reconciliation with every reservation
-intact. Later polls validate both immutable bindings without repeating the
-transition. Before any fill affects settlement, the same rule inserts or verifies
+An exact CLOID query returns only a candidate, not proof that the service submitted
+the order. Before any binding, the reconciler locks and verifies the CLOID-owner
+row and obtains the candidate's immutable original envelope and provenance from
+authoritative account-scoped venue history. Using the same canonicalization as the
+authorization, it requires exact equality for execution account, market, side,
+TIF, original quantity, limit price, canonical CLOID bytes, L1 nonce, signed
+`expiresAfter_ms`, and every venue-exposed signer/agent or request-digest field.
+The authoritative acceptance timestamp must be present and, after applying the
+acknowledged venue-clock lag bound and measurement uncertainty, must neither
+predate the durable `submission_claimed` timestamp nor reach
+`effective_expiry_ms`. A field needed for that comparison that is absent,
+ambiguous, mutable, or not authenticated makes live binding unapprovable.
+
+Only an exact envelope and provenance match may atomically insert or verify an
+append-only unique `(execution account, stable venue order ID)` ownership row
+pointing to the same authorization and CLOID and move `submission_claimed` to
+`order_bound`. A mismatched candidate remains unbound, retains every reservation,
+halts for account-compromise reconciliation, and may be cancelled only through
+the unknown-order containment path; it is never settled against the authorization
+or treated as conclusively absent. An existing identical owner is an idempotent
+replay; an owner for a different authorization or CLOID likewise halts with every
+reservation intact. Later polls validate the immutable envelope, provenance, and
+both ownership bindings without repeating the transition. Before any fill affects
+settlement, the same rule inserts or verifies
 an append-only unique `(execution account, stable venue fill ID)` owner tied to the
 bound authorization and order. A conflicting fill owner likewise halts without
 settlement, so one venue order or fill cannot discharge two authorizations. All
@@ -246,8 +262,8 @@ identifiers come from authoritative account-scoped venue history, never a caller
 A conclusively absent claim moves to a terminal unused state, retains its permanent
 CLOID ownership tombstone, and returns each committed cash slice to `uncommitted`
 within the same originating admission allocation, subtracts its full `N` from the
-originating
-daily row's `reserved` counter and every later mirrored encumbrance, releases
+originating daily row's `reserved` counter and every later mirrored encumbrance,
+releases
 every other policy and decision reservation, and clears the decision's active
 slot in the same transaction; no terminal authorization is reusable. This is not
 an exchange action and grants no generic master-signer
@@ -586,7 +602,7 @@ configuration must set all of these explicitly:
 | Co-host compromise | isolated Unix user, read-only config, no master key in trading process, least-privilege IAM, signer action allowlist | revoke API wallet from an offline master path; halt; reconcile from authoritative history |
 | Leaked API key | full trading authority assumed; dedicated execution account with no unrelated funds; no loss-cap credit without external enforcement proof; one named agent per process and no address reuse | alert on unknown signer/order or operational threshold breach; halt, cancel, revoke, reconcile, and generate a new address |
 | Replay or nonce pruning | durable atomic nonce, unique signer per process, bounded expiry where supported, append-only unique account/CLOID, account/order-ID, and account/fill-ID owners, lot consumption, never reuse deregistered/expired agent | reconcile by CLOID/history; halt on any ownership conflict; rotate signer; never resend an unknown action blindly |
-| Unauthorized API-wallet order | signer-side durable pre-purchase decision and globally owned CLOID authorization before execution; exact order-envelope binding | unmatched, mismatched, or multiply claimed orders/fills remain permanently ineligible for automatic staking; retain reservations, halt, and reconcile the trading-account compromise |
+| Unauthorized API-wallet order | signer-side durable pre-purchase decision and globally owned CLOID authorization before execution; bind only after the authoritative original account, envelope, nonce, signer/request provenance, and acceptance-time bounds exactly match | a same-CLOID mismatch remains unbound and cannot consume the authorization; unmatched, mismatched, or multiply claimed orders/fills retain reservations, halt, and require trading-account compromise reconciliation |
 | Concurrent decision reuse | unique decision-chain row; one active authorization; atomic `Q` and `N` decision reservations with global policy reservations | ambiguous predecessor retains the active slot; terminal reconciliation consumes fills and releases only proven remainder before reissue |
 | Delayed or stale order | signed `expiresAfter = effective_expiry_ms - verified venue lag L - 1` plus IOC-only live policy; missing/stale/unbounded clock evidence, GTC/ALO, and changed expiry rejected | even the slowest permitted venue clock is past signed expiry at the effective horizon; any fill at or beyond that horizon halts live action, remains charged, and is ineligible for automatic staking |
 | Delayed staking acceptance | automatic staking disabled because user-signed staking actions lack a venue-enforced acceptance deadline; no runtime signer, endpoint, or client | configuration rejects any enabled value before live capability; HYPE remains in spot and staking is manual/offline |
@@ -681,7 +697,12 @@ Before production secrets or funds are present, attach evidence for:
   CLOID remains rejected after restart and restore. Also attempt to bind one stable
   venue order ID, then one stable fill ID, to a second authorization and prove each
   conflict retains all reservations, halts before settlement, and cannot double
-  charge or discharge capital;
+  charge or discharge capital. Pre-submit a smaller and otherwise altered order
+  from another actor under the winner's CLOID; vary market, side, TIF, price,
+  quantity, nonce, signer/request provenance, and acceptance time independently,
+  and prove every mismatch or unavailable authoritative field prevents
+  `order_bound`, retains reservations across restart and restore, and cannot enter
+  settlement;
 - concurrent-authorization tests proving exact tranche slices totaling `C` move
   atomically from `uncommitted` to `committed` while preserving the reserve,
   without changing yearly or lifetime admission allocations; `N` is separately
