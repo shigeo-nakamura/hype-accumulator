@@ -70,6 +70,7 @@ pub struct RevisionTimestamps {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(clippy::struct_field_names)]
 struct RevisionTimestampsWire {
     observed_at: DateTime<Utc>,
@@ -150,6 +151,7 @@ pub struct RevisionIdentity {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RevisionIdentityWire {
     source: String,
     source_version: String,
@@ -234,6 +236,7 @@ impl<'de> Deserialize<'de> for RevisionIdentity {
 
 /// One normalized point-in-time revision.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SignalRevision<T> {
     identity: RevisionIdentity,
     timestamps: RevisionTimestamps,
@@ -276,6 +279,7 @@ pub struct CoreMarketData {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(clippy::struct_field_names)]
 struct CoreMarketDataWire {
     execution_price: PriceMicrounits,
@@ -349,6 +353,7 @@ impl<'de> Deserialize<'de> for CoreMarketData {
 /// Both fields are exact signed integers. They are retained for audit but do
 /// not affect pacing in this fixed-DCA-safe slice.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuxiliarySignal {
     pub raw_value_microunits: i64,
     pub feature_value_bps: i32,
@@ -356,6 +361,7 @@ pub struct AuxiliarySignal {
 
 /// A fully specified lookup that cannot silently forward-fill another date.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RevisionQuery {
     source: String,
     source_version: String,
@@ -526,7 +532,7 @@ impl<T: Eq> RevisionBook<T> {
 
 /// Purchase-gating health of core execution and book data.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "status")]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "status")]
 pub enum CoreHealth {
     Healthy { age_seconds: u64 },
     Missing,
@@ -536,7 +542,7 @@ pub enum CoreHealth {
 
 /// Independent auxiliary-input health. Every variant remains neutral here.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "status")]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "status")]
 pub enum AuxiliaryHealth {
     Healthy { age_seconds: u64 },
     Missing,
@@ -568,6 +574,7 @@ impl SnapshotRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct SignalSnapshotBody {
     schema_version: u8,
     decision_date: NaiveDate,
@@ -586,8 +593,8 @@ struct SignalSnapshotBody {
 
 /// Canonical, typed daily decision input with a self-verifying SHA-256 hash.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SignalSnapshot {
-    #[serde(flatten)]
     body: SignalSnapshotBody,
     snapshot_hash: String,
 }

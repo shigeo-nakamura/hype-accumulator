@@ -406,21 +406,35 @@ fn canonical_hash_ignores_json_field_order_and_excludes_hash_field() {
     );
 
     let mut inconsistent_health = value.clone();
-    inconsistent_health["core_health"]["age_seconds"] = serde_json::json!(21);
+    inconsistent_health["body"]["core_health"]["age_seconds"] = serde_json::json!(21);
     assert_eq!(
         SignalSnapshot::from_json(&inconsistent_health.to_string()),
         Err(SignalError::InvalidSnapshotInvariant)
     );
 
     let mut mismatched_query = value.clone();
-    mismatched_query["core_query"]["observation_date"] = serde_json::json!("2026-07-05");
+    mismatched_query["body"]["core_query"]["observation_date"] = serde_json::json!("2026-07-05");
     assert_eq!(
         SignalSnapshot::from_json(&mismatched_query.to_string()),
         Err(SignalError::InvalidSnapshotInvariant)
     );
 
+    let mut unknown_top_level = value.clone();
+    unknown_top_level["unhashed_note"] = serde_json::json!("injected");
+    assert!(matches!(
+        SignalSnapshot::from_json(&unknown_top_level.to_string()),
+        Err(SignalError::Json(_))
+    ));
+
+    let mut unknown_nested = value.clone();
+    unknown_nested["body"]["core"]["unhashed_note"] = serde_json::json!("injected");
+    assert!(matches!(
+        SignalSnapshot::from_json(&unknown_nested.to_string()),
+        Err(SignalError::Json(_))
+    ));
+
     let mut tampered = value;
-    tampered["core"]["value"]["execution_price"] = serde_json::json!(40_503_000);
+    tampered["body"]["core"]["value"]["execution_price"] = serde_json::json!(40_503_000);
     assert_eq!(
         SignalSnapshot::from_json(&tampered.to_string()),
         Err(SignalError::InvalidSnapshotHash)
