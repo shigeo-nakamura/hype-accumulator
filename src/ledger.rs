@@ -895,11 +895,13 @@ fn record_capital_settlement(
     commitment_id: &str,
     debited_usdc: UsdcMicros,
 ) -> Result<(), LedgerError> {
-    let recorded_fills = state
+    let recorded_costs = state
         .purchase_decisions
         .values()
         .find(|decision| decision.commitment_id == commitment_id)
-        .map_or_else(UsdcMicros::default, |decision| decision.filled_usdc);
+        .map_or(Ok(UsdcMicros::default()), |decision| {
+            checked_add(decision.filled_usdc, decision.fee_usdc)
+        })?;
     let commitment = state
         .commitments
         .get_mut(commitment_id)
@@ -914,8 +916,8 @@ fn record_capital_settlement(
             commitment_id.to_owned(),
         ));
     }
-    if debited_usdc < recorded_fills {
-        return Err(LedgerError::DebitBelowRecordedFills(
+    if debited_usdc < recorded_costs {
+        return Err(LedgerError::DebitBelowRecordedCosts(
             commitment_id.to_owned(),
         ));
     }
@@ -2325,8 +2327,8 @@ pub enum LedgerError {
     CommitmentAlreadySettled(String),
     #[error("cash debit exceeds commitment: {0}")]
     DebitExceedsCommitment(String),
-    #[error("cash debit is below recorded fills for commitment: {0}")]
-    DebitBelowRecordedFills(String),
+    #[error("cash debit is below recorded fills and fees for commitment: {0}")]
+    DebitBelowRecordedCosts(String),
     #[error("ledger is truncated")]
     TruncatedLedger,
     #[error("ledger is corrupt: {0}")]
@@ -2732,7 +2734,7 @@ mod transaction_tests {
     }
 
     #[test]
-    fn settlement_cannot_understate_recorded_fills() {
+    fn settlement_cannot_understate_recorded_costs() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let anchor = anchor_store();
         let mut ledger = open(directory.path(), &anchor).expect("open ledger");
@@ -2783,6 +2785,14 @@ mod transaction_tests {
                     received_hype_atoms: 1,
                 },
             },
+            LedgerEvent {
+                event_id: "fee-settlement-floor".into(),
+                occurred_at: at(7),
+                kind: LedgerEventKind::FeeRecorded {
+                    order_id: "order-settlement-floor".into(),
+                    fee_usdc: usd(2),
+                },
+            },
         ] {
             ledger.append(event).expect("append settlement fixture");
         }
@@ -2791,14 +2801,14 @@ mod transaction_tests {
 
         assert_eq!(
             ledger.append(LedgerEvent {
-                event_id: "settlement-below-fill".into(),
-                occurred_at: at(7),
+                event_id: "settlement-below-costs".into(),
+                occurred_at: at(8),
                 kind: LedgerEventKind::CapitalSettled {
                     commitment_id: "commitment-settlement-floor".into(),
-                    debited_usdc: usd(9),
+                    debited_usdc: usd(10),
                 },
             }),
-            Err(LedgerError::DebitBelowRecordedFills(
+            Err(LedgerError::DebitBelowRecordedCosts(
                 "commitment-settlement-floor".into()
             ))
         );
@@ -2809,14 +2819,14 @@ mod transaction_tests {
         ledger
             .append(LedgerEvent {
                 event_id: "settlement-at-fill".into(),
-                occurred_at: at(8),
+                occurred_at: at(9),
                 kind: LedgerEventKind::CapitalSettled {
                     commitment_id: "commitment-settlement-floor".into(),
-                    debited_usdc: usd(10),
+                    debited_usdc: usd(12),
                 },
             })
-            .expect("settle at the recorded fill floor");
-        assert_eq!(ledger.state().spent_usdc(), usd(10));
+            .expect("settle at the recorded cost floor");
+        assert_eq!(ledger.state().spent_usdc(), usd(12));
     }
 
     #[test]
