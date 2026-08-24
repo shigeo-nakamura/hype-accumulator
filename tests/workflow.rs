@@ -472,6 +472,31 @@ fn observe_submission_recorded_at(
     workflow.observe_order_submission(&evidence, recorded_at)
 }
 
+fn allocate_fill_notional(
+    index: usize,
+    final_index: usize,
+    atoms: u64,
+    total_atoms: u64,
+    total_notional: u64,
+    allocated: &mut u64,
+) -> u64 {
+    let notional = if index == final_index {
+        total_notional
+            .checked_sub(*allocated)
+            .expect("fixture notional allocation")
+    } else {
+        let prorated = u128::from(total_notional)
+            .checked_mul(u128::from(atoms))
+            .and_then(|value| value.checked_div(u128::from(total_atoms)))
+            .expect("fixture notional prorates");
+        u64::try_from(prorated).expect("fixture notional fits")
+    };
+    *allocated = allocated
+        .checked_add(notional)
+        .expect("fixture notional sums");
+    notional
+}
+
 fn bound_evidence(
     workflow: &DurableWorkflow,
     fills: &[(&str, u64, u32)],
@@ -489,6 +514,10 @@ fn bound_evidence(
                 .unconsumed_residual_spot_hype_atoms
                 .as_atoms(),
         );
+    let total_fill_atoms = fills.iter().map(|(_, atoms, _)| atoms).sum::<u64>();
+    let total_executed_notional = state.filled_usdc().as_micros();
+    let final_fill_index = fills.len().saturating_sub(1);
+    let mut allocated_notional = 0_u64;
     OrderBoundEligibilityEvidence {
         authorization_id: "order-bound-authorization-a".to_owned(),
         authorization_record_hash: "authorization-record-hash-a".to_owned(),
@@ -537,24 +566,38 @@ fn bound_evidence(
         fills: fills
             .iter()
             .enumerate()
-            .map(|(index, (fill_id, atoms, minute))| BoundFillEvidence {
-                fill_id: (*fill_id).to_owned(),
-                authorization_id: "order-bound-authorization-a".to_owned(),
-                authorization_record_hash: "authorization-record-hash-a".to_owned(),
-                execution_identity_hash: binding.inventory_before.execution_identity_hash.clone(),
-                client_order_id: state.client_order_id(),
-                order_id: state
-                    .exchange_order_id()
-                    .expect("accepted order identity")
-                    .to_owned(),
-                purchased_hype: hype(*atoms),
-                executed_at: at(*minute),
-                first_observed_at: at(*minute),
-                registration_record_id: format!("registration-{fill_id}"),
-                registration_record_hash: format!("registration-hash-{fill_id}"),
-                registration_cursor: 200 + u64::try_from(index).expect("fixture cursor"),
-                registered_at: at(*minute),
-                registration_deadline_at: at(*minute + 1),
+            .map(|(index, (fill_id, atoms, minute))| {
+                let executed_notional = allocate_fill_notional(
+                    index,
+                    final_fill_index,
+                    *atoms,
+                    total_fill_atoms,
+                    total_executed_notional,
+                    &mut allocated_notional,
+                );
+                BoundFillEvidence {
+                    fill_id: (*fill_id).to_owned(),
+                    authorization_id: "order-bound-authorization-a".to_owned(),
+                    authorization_record_hash: "authorization-record-hash-a".to_owned(),
+                    execution_identity_hash: binding
+                        .inventory_before
+                        .execution_identity_hash
+                        .clone(),
+                    client_order_id: state.client_order_id(),
+                    order_id: state
+                        .exchange_order_id()
+                        .expect("accepted order identity")
+                        .to_owned(),
+                    purchased_hype: hype(*atoms),
+                    executed_notional_usdc: usdc(executed_notional),
+                    executed_at: at(*minute),
+                    first_observed_at: at(*minute),
+                    registration_record_id: format!("registration-{fill_id}"),
+                    registration_record_hash: format!("registration-hash-{fill_id}"),
+                    registration_cursor: 200 + u64::try_from(index).expect("fixture cursor"),
+                    registered_at: at(*minute),
+                    registration_deadline_at: at(*minute + 1),
+                }
             })
             .collect(),
     }
@@ -688,6 +731,26 @@ fn execution_identity_hash_must_be_canonical() {
             Err(WorkflowError::InvalidBinding(_))
         ));
     }
+}
+
+#[test]
+fn capital_commitment_ids_must_be_canonical_before_uniqueness() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("noncanonical-capital-id.jsonl");
+    let mut invalid = binding();
+    invalid.capital_commitments[1].event_id =
+        format!(" {}", invalid.capital_commitments[0].event_id);
+
+    assert!(matches!(
+        DurableWorkflow::open_or_create(
+            &path,
+            &invalid,
+            Arc::new(MemoryProtectedHeadStore::default()),
+            Arc::new(MemoryExchangeOrderOwnerStore::default()),
+        ),
+        Err(WorkflowError::InvalidBinding(_))
+    ));
+    assert!(!path.exists());
 }
 
 #[test]
@@ -3048,6 +3111,65 @@ fn cumulative_fill_notional_cannot_exceed_quantity_at_limit() {
         reopen(&path, &binding).state().stage(),
         WorkflowStage::ManualReview
     );
+}
+
+#[test]
+fn individual_fill_notional_cannot_hide_above_limit_execution() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("individual-fill-limit.jsonl");
+    let binding = binding();
+    let head_store = Arc::new(MemoryProtectedHeadStore::default());
+    let owner_store = Arc::new(MemoryExchangeOrderOwnerStore::default());
+    let mut workflow =
+        DurableWorkflow::open_or_create(&path, &binding, head_store.clone(), owner_store.clone())
+            .expect("workflow opens");
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
+    workflow
+        .observe_order_fill(
+            "aggregate-fill-observation",
+            hype(250),
+            usdc(50_000_000),
+            usdc(50_500_000),
+            true,
+            at(4),
+        )
+        .expect("aggregate fill observed");
+    workflow
+        .finalize_order(
+            hype(250),
+            usdc(50_000_000),
+            usdc(50_500_000),
+            OrderFinality::Filled,
+            at(4),
+        )
+        .expect("aggregate order finalized");
+    let mut evidence = bound_evidence(
+        &workflow,
+        &[("above-limit-fill", 125, 3), ("below-limit-fill", 125, 4)],
+        at(5),
+    );
+    evidence.fills[0].executed_notional_usdc = usdc(25_125_000);
+    evidence.fills[1].executed_notional_usdc = usdc(24_875_000);
+
+    assert!(matches!(
+        workflow.record_staking_eligibility(Some(evidence), at(5)),
+        Err(WorkflowError::ContradictoryObservation(_))
+    ));
+    assert_eq!(workflow.state().stage(), WorkflowStage::ManualReview);
+    assert!(!owner_store.has_fill_owner(
+        &binding.inventory_before.execution_identity_hash,
+        "above-limit-fill",
+    ));
+    assert!(!owner_store.has_fill_owner(
+        &binding.inventory_before.execution_identity_hash,
+        "below-limit-fill",
+    ));
+    drop(workflow);
+
+    let reopened = DurableWorkflow::open_or_create(&path, &binding, head_store, owner_store)
+        .expect("manual review reopens");
+    assert_eq!(reopened.state().stage(), WorkflowStage::ManualReview);
 }
 
 #[test]

@@ -257,12 +257,13 @@ impl DecisionBinding {
         let mut committed_total = 0_u64;
         for commitment in &self.capital_commitments {
             if commitment.event_id.is_empty()
+                || commitment.event_id != commitment.event_id.trim()
                 || commitment.planned_usdc.is_zero()
                 || commitment.committed_usdc < commitment.planned_usdc
                 || !ids.insert(commitment.event_id.as_str())
             {
                 return Err(WorkflowError::InvalidBinding(
-                    "capital commitments must have unique non-empty IDs and amounts".into(),
+                    "capital commitments must have unique canonical IDs and amounts".into(),
                 ));
             }
             planned_total = planned_total
@@ -396,6 +397,7 @@ pub struct BoundFillEvidence {
     pub client_order_id: String,
     pub order_id: String,
     pub purchased_hype: HypeAtoms,
+    pub executed_notional_usdc: UsdcMicros,
     pub executed_at: DateTime<Utc>,
     pub first_observed_at: DateTime<Utc>,
     pub registration_record_id: String,
@@ -1192,30 +1194,13 @@ impl WorkflowState {
         accepted_at: DateTime<Utc>,
         recorded_at: DateTime<Utc>,
     ) -> Result<(), WorkflowError> {
-        let registration_window = policy_time_delta(
-            self.binding
-                .eligibility_policy
-                .fill_registration_deadline_seconds,
-        )
-        .ok_or_else(|| {
-            WorkflowError::ContradictoryObservation(
-                "fill registration deadline cannot be represented".into(),
-            )
-        })?;
-        let lot_max_age = policy_time_delta(
-            self.binding
-                .eligibility_policy
-                .lot_eligibility_max_age_seconds,
-        )
-        .ok_or_else(|| {
-            WorkflowError::ContradictoryObservation(
-                "lot eligibility maximum age cannot be represented".into(),
-            )
-        })?;
+        let (registration_window, lot_max_age) =
+            eligibility_policy_windows(&self.binding.eligibility_policy)?;
         let mut fill_ids = BTreeSet::new();
         let mut registration_record_ids = BTreeSet::new();
         let mut registration_cursors = BTreeSet::new();
         let mut purchased = 0_u64;
+        let mut executed_notional = 0_u64;
         let mut residual_remaining = evidence.residual_reservation_hype.as_atoms();
         let mut previous: Option<(DateTime<Utc>, &str)> = None;
         for fill in &evidence.fills {
@@ -1229,6 +1214,13 @@ impl WorkflowState {
                     )
                 })?;
             let residual_for_fill = residual_remaining.min(fill.purchased_hype.as_atoms());
+            let fill_notional_cap =
+                max_fill_notional_usdc(fill.purchased_hype, &self.binding.order_envelope)
+                    .ok_or_else(|| {
+                        WorkflowError::ContradictoryObservation(
+                            "fill quantity-at-limit notional overflowed".into(),
+                        )
+                    })?;
             let has_eligible_allocation = residual_for_fill < fill.purchased_hype.as_atoms();
             let eligibility_expired = if has_eligible_allocation {
                 let eligibility_expires_at = fill
@@ -1251,6 +1243,8 @@ impl WorkflowState {
                 || fill.client_order_id != evidence.client_order_id
                 || fill.order_id != evidence.order_id
                 || fill.purchased_hype.is_zero()
+                || fill.executed_notional_usdc.is_zero()
+                || fill.executed_notional_usdc > fill_notional_cap
                 || !fill_ids.insert(fill.fill_id.as_str())
                 || previous.is_some_and(|previous| previous >= key)
                 || fill.executed_at < accepted_at
@@ -1275,19 +1269,17 @@ impl WorkflowState {
                         .into(),
                 ));
             }
-            purchased = purchased
-                .checked_add(fill.purchased_hype.as_atoms())
-                .ok_or_else(|| {
-                    WorkflowError::ContradictoryObservation(
-                        "authorized fill quantity overflowed".into(),
-                    )
-                })?;
+            (purchased, executed_notional) =
+                checked_fill_totals(purchased, executed_notional, fill)?;
             residual_remaining = residual_remaining.saturating_sub(fill.purchased_hype.as_atoms());
             previous = Some(key);
         }
-        if purchased != self.purchased_hype.as_atoms() {
+        if purchased != self.purchased_hype.as_atoms()
+            || executed_notional != self.filled_usdc.as_micros()
+        {
             return Err(WorkflowError::ContradictoryObservation(
-                "authorized fill set does not equal the terminal purchased quantity".into(),
+                "authorized fill set does not equal the terminal quantity and execution notional"
+                    .into(),
             ));
         }
         Ok(())
@@ -2808,6 +2800,42 @@ fn max_fill_notional_usdc(
 
 fn policy_time_delta(seconds: u64) -> Option<TimeDelta> {
     i64::try_from(seconds).ok().and_then(TimeDelta::try_seconds)
+}
+
+fn eligibility_policy_windows(
+    policy: &EligibilityPolicyBinding,
+) -> Result<(TimeDelta, TimeDelta), WorkflowError> {
+    let registration_window = policy_time_delta(policy.fill_registration_deadline_seconds)
+        .ok_or_else(|| {
+            WorkflowError::ContradictoryObservation(
+                "fill registration deadline cannot be represented".into(),
+            )
+        })?;
+    let lot_max_age =
+        policy_time_delta(policy.lot_eligibility_max_age_seconds).ok_or_else(|| {
+            WorkflowError::ContradictoryObservation(
+                "lot eligibility maximum age cannot be represented".into(),
+            )
+        })?;
+    Ok((registration_window, lot_max_age))
+}
+
+fn checked_fill_totals(
+    purchased: u64,
+    executed_notional: u64,
+    fill: &BoundFillEvidence,
+) -> Result<(u64, u64), WorkflowError> {
+    let purchased = purchased
+        .checked_add(fill.purchased_hype.as_atoms())
+        .ok_or_else(|| {
+            WorkflowError::ContradictoryObservation("authorized fill quantity overflowed".into())
+        })?;
+    let executed_notional = executed_notional
+        .checked_add(fill.executed_notional_usdc.as_micros())
+        .ok_or_else(|| {
+            WorkflowError::ContradictoryObservation("authorized fill notional overflowed".into())
+        })?;
+    Ok((purchased, executed_notional))
 }
 
 fn valid_eligibility_history_watermark(
