@@ -107,7 +107,14 @@ that ledger's authoritative UTC database clock, inserts or locks the unique
 `N_D`, permanently consumed fill quantity/notional, the active authorization ID,
 and its reserved `Q` and `N`. The transaction requires no unresolved predecessor
 and atomically reserves `Q` and `N` no greater than both decision remainders; a
-decision can have only one active authorization.
+decision can have only one active authorization. The same transaction first
+canonicalizes the CLOID to its exact venue byte representation and inserts an
+append-only unique `(execution account, canonical CLOID bytes)` ownership row
+pointing to this authorization ID and decision chain. An existing row rejects the
+authorization even when its former authorization is expired, conclusively absent,
+terminal, or restored from backup; a committed CLOID owner is never deleted or
+reassigned. If any later reservation fails, the entire transaction, including the
+new CLOID claim, rolls back because no authorization was issued.
 
 In that same transaction, the authorizer deterministically selects
 admitted-uncommitted tranche slices in stable `(confirmation time, movement ID)`
@@ -119,9 +126,10 @@ second time. It separately reserves `N` against daily purchase-notional room and
 uses the appropriate full-asset exposure for the hot limit. It then commits the
 one-time pre-purchase authorization. If any complete decision, tranche, or policy
 reservation is unavailable, neither a partial transition nor a record is created.
-Concurrent authorizer instances serialize on the decision row, selected tranche
-rows, and limit-ledger rows; a process-local clock or ledger snapshot cannot
-authorize a purchase.
+Concurrent authorizer instances acquire CLOID-owner, decision, selected-tranche,
+and limit-ledger rows in one documented deterministic order; authorizations for
+different decisions but the same account/CLOID therefore cannot both commit. A
+process-local clock or ledger snapshot cannot authorize a purchase.
 The record contains:
 
 - an authorization ID, canonical decision-chain ID and digest, `Q_D`, `N_D`,
@@ -224,11 +232,21 @@ visible and charged to capital but is permanently ineligible for automatic
 staking and triggers halt/manual review.
 
 As soon as an exact CLOID query finds the order, even before it is terminal, the
-reconciler atomically binds the stable venue order ID and moves
-`submission_claimed` to `order_bound`. Later polls validate that immutable binding
-without repeating the transition. A conclusively absent claim moves to a terminal
-unused state, returns each committed cash slice to `uncommitted` in its same
-originating admission allocation, subtracts its full `N` from the originating
+reconciler locks and verifies the CLOID-owner row and atomically inserts or verifies
+an append-only unique `(execution account, stable venue order ID)` ownership row
+pointing to the same authorization and CLOID before moving `submission_claimed` to
+`order_bound`. An existing identical owner is an idempotent replay; an owner for a
+different authorization or CLOID halts reconciliation with every reservation
+intact. Later polls validate both immutable bindings without repeating the
+transition. Before any fill affects settlement, the same rule inserts or verifies
+an append-only unique `(execution account, stable venue fill ID)` owner tied to the
+bound authorization and order. A conflicting fill owner likewise halts without
+settlement, so one venue order or fill cannot discharge two authorizations. All
+identifiers come from authoritative account-scoped venue history, never a caller.
+A conclusively absent claim moves to a terminal unused state, retains its permanent
+CLOID ownership tombstone, and returns each committed cash slice to `uncommitted`
+within the same originating admission allocation, subtracts its full `N` from the
+originating
 daily row's `reserved` counter and every later mirrored encumbrance, releases
 every other policy and decision reservation, and clears the decision's active
 slot in the same transaction; no terminal authorization is reusable. This is not
@@ -470,7 +488,9 @@ All gates are conjunctive and fail closed:
    `expiresAfter = effective_expiry_ms - L - 1`, and remaining limits while
    atomically moving `C` from the
    selected admitted allocations' `uncommitted` state to `committed` and
-   reserving `N` against daily purchase-notional room. The executor must reject a
+   reserving `N` against daily purchase-notional room. The executor must lock and
+   verify that the append-only account/CLOID owner still names this exact
+   authorization before claim, signing, or submission. It must reject a
    claim at or beyond the earlier signed expiry or beyond any input freshness
    horizon. Only IOC with the venue-enforced
    signed request expiry is authorized; every resting TIF, omitted or altered
@@ -565,8 +585,8 @@ configuration must set all of these explicitly:
 | --- | --- | --- |
 | Co-host compromise | isolated Unix user, read-only config, no master key in trading process, least-privilege IAM, signer action allowlist | revoke API wallet from an offline master path; halt; reconcile from authoritative history |
 | Leaked API key | full trading authority assumed; dedicated execution account with no unrelated funds; no loss-cap credit without external enforcement proof; one named agent per process and no address reuse | alert on unknown signer/order or operational threshold breach; halt, cancel, revoke, reconcile, and generate a new address |
-| Replay or nonce pruning | durable atomic nonce, unique signer per process, bounded expiry where supported, purchase-time one-fill-to-workflow mapping, lot consumption, one-time authorization/order claims, never reuse deregistered/expired agent | reconcile by CLOID/history; block ambiguous order claims; rotate signer; never resend an unknown action blindly |
-| Unauthorized API-wallet order | signer-side durable pre-purchase decision and CLOID authorization before execution; exact order-envelope binding | unmatched or mismatched fills remain permanently ineligible for automatic staking; halt and reconcile the trading-account compromise |
+| Replay or nonce pruning | durable atomic nonce, unique signer per process, bounded expiry where supported, append-only unique account/CLOID, account/order-ID, and account/fill-ID owners, lot consumption, never reuse deregistered/expired agent | reconcile by CLOID/history; halt on any ownership conflict; rotate signer; never resend an unknown action blindly |
+| Unauthorized API-wallet order | signer-side durable pre-purchase decision and globally owned CLOID authorization before execution; exact order-envelope binding | unmatched, mismatched, or multiply claimed orders/fills remain permanently ineligible for automatic staking; retain reservations, halt, and reconcile the trading-account compromise |
 | Concurrent decision reuse | unique decision-chain row; one active authorization; atomic `Q` and `N` decision reservations with global policy reservations | ambiguous predecessor retains the active slot; terminal reconciliation consumes fills and releases only proven remainder before reissue |
 | Delayed or stale order | signed `expiresAfter = effective_expiry_ms - verified venue lag L - 1` plus IOC-only live policy; missing/stale/unbounded clock evidence, GTC/ALO, and changed expiry rejected | even the slowest permitted venue clock is past signed expiry at the effective horizon; any fill at or beyond that horizon halts live action, remains charged, and is ineligible for automatic staking |
 | Delayed staking acceptance | automatic staking disabled because user-signed staking actions lack a venue-enforced acceptance deadline; no runtime signer, endpoint, or client | configuration rejects any enabled value before live capability; HYPE remains in spot and staking is manual/offline |
@@ -654,6 +674,14 @@ Before production secrets or funds are present, attach evidence for:
   residual reissue without a new authorization remain permanently ineligible for
   automatic staking across retry and restore; fault injection must cover the
   `authorized`, `submission_claimed`, and `order_bound` transitions;
+- identifier-ownership tests racing separate authorizer instances with different
+  decision chains but the same execution account and canonical CLOID while every
+  policy cap has room. Exactly one complete authorization may commit; the loser
+  creates no authorization or reservation. Terminalize the winner and prove the
+  CLOID remains rejected after restart and restore. Also attempt to bind one stable
+  venue order ID, then one stable fill ID, to a second authorization and prove each
+  conflict retains all reservations, halts before settlement, and cannot double
+  charge or discharge capital;
 - concurrent-authorization tests proving exact tranche slices totaling `C` move
   atomically from `uncommitted` to `committed` while preserving the reserve,
   without changing yearly or lifetime admission allocations; `N` is separately
