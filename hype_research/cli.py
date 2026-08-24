@@ -28,6 +28,7 @@ def require_valid_execution(execution: dict) -> None:
 
 
 def require_supported_policy_values(experiment: dict) -> None:
+    adaptive_count = 0
     for index, policy in enumerate(experiment["policies"]):
         kind = policy.get("kind")
         if kind not in {"fixed", "adaptive"}:
@@ -36,6 +37,7 @@ def require_supported_policy_values(experiment: dict) -> None:
         if cadence not in {"daily", "weekly"}:
             raise ValueError(f"unsupported policy cadence at policies[{index}]: {cadence!r}")
         if kind == "adaptive":
+            adaptive_count += 1
             require_finite_number(policy["sensitivity"], f"policies[{index}] sensitivity")
             minimum = require_finite_number(policy["min_multiplier"], f"policies[{index}] min_multiplier")
             maximum = require_finite_number(policy["max_multiplier"], f"policies[{index}] max_multiplier")
@@ -58,8 +60,28 @@ def require_supported_policy_values(experiment: dict) -> None:
                 raise ValueError(
                     f"stale_after_days at policies[{index}] must be a nonnegative integer"
                 )
+    if adaptive_count != 1:
+        raise ValueError("experiments must declare exactly one adaptive policy")
     for index, sensitivity in enumerate(experiment["sensitivity"]["adaptive_sensitivity"]):
         require_finite_number(sensitivity, f"adaptive_sensitivity[{index}]")
+
+
+def select_analysis_capital_path(experiment: dict) -> dict:
+    capital_paths = experiment["capital_paths"]
+    names = [item.get("name") for item in capital_paths]
+    if any(not isinstance(name, str) or not name for name in names):
+        raise ValueError("capital path names must be nonempty strings")
+    if len(set(names)) != len(names):
+        raise ValueError("capital path names must be unique")
+    selected_name = experiment.get("analysis_capital_path")
+    if not isinstance(selected_name, str) or not selected_name:
+        raise ValueError("analysis_capital_path must name a declared capital path")
+    try:
+        return next(item for item in capital_paths if item["name"] == selected_name)
+    except StopIteration as error:
+        raise ValueError(
+            f"analysis_capital_path is not declared: {selected_name!r}"
+        ) from error
 
 
 def require_snapshot_at_least(child_manifest: dict, experiment_as_of: datetime, label: str) -> None:
@@ -95,6 +117,7 @@ def run_experiment(path: Path) -> dict:
     experiment = resolve_manifest(path)
     require_supported_policy_values(experiment)
     require_valid_execution(experiment["execution"])
+    analysis_capital_spec = select_analysis_capital_path(experiment)
     root = experiment["_root"]
     as_of = timestamp(experiment["as_of"])
     prices, revisions, dataset_manifest = load_dataset((root / experiment["dataset_manifest"]).resolve())
@@ -111,21 +134,31 @@ def run_experiment(path: Path) -> dict:
         results.append({"capital_path": capital_spec["name"], "policies": policy_results})
     sensitivity = []
     adaptive = next(policy for policy in experiment["policies"] if policy["kind"] == "adaptive")
-    events, capital_manifest = load_capital_events((root / experiment["capital_paths"][-1]["manifest"]).resolve())
-    require_snapshot_at_least(capital_manifest, as_of, "sensitivity capital path")
+    events, capital_manifest = load_capital_events((root / analysis_capital_spec["manifest"]).resolve())
+    require_snapshot_at_least(
+        capital_manifest, as_of, f"analysis capital path {analysis_capital_spec['name']}"
+    )
     for value in experiment["sensitivity"]["adaptive_sensitivity"]:
         policy = deepcopy(adaptive)
         policy["name"] = f"adaptive-sensitivity-{value}"
         policy["sensitivity"] = value
         result = run_backtest(prices, events, view, policy, experiment["execution"], as_of)
-        sensitivity.append({key: result[key] for key in ("policy", "acquisition_vwap_usd", "invested_usd", "remaining_cash_usd", "trade_count")})
+        sensitivity.append({
+            "source_policy": adaptive["name"],
+            "capital_path": analysis_capital_spec["name"],
+            **{key: result[key] for key in ("policy", "acquisition_vwap_usd", "invested_usd", "remaining_cash_usd", "trade_count")},
+        })
     ablations = []
     for features in experiment["ablations"]:
         policy = deepcopy(adaptive)
         policy["name"] = "adaptive-ablation-" + ("none" if not features else "+".join(features))
         policy["features"] = features
         result = run_backtest(prices, events, view, policy, experiment["execution"], as_of)
-        ablations.append({key: result[key] for key in ("policy", "acquisition_vwap_usd", "invested_usd", "remaining_cash_usd", "trade_count")})
+        ablations.append({
+            "source_policy": adaptive["name"],
+            "capital_path": analysis_capital_spec["name"],
+            **{key: result[key] for key in ("policy", "acquisition_vwap_usd", "invested_usd", "remaining_cash_usd", "trade_count")},
+        })
     return {
         "schema_version": 1, "generated_from_as_of": experiment["as_of"], "dataset_id": dataset_manifest["dataset_id"],
         "fixture_only": dataset_manifest.get("fixture_only", False),

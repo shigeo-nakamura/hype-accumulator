@@ -7,6 +7,7 @@
     {"name": "one-deposit", "manifest": "capital-one-manifest.json"},
     {"name": "frequent-before-after-multiple-withdrawal-late", "manifest": "capital-varied-manifest.json"}
   ],
+  "analysis_capital_path": "frequent-before-after-multiple-withdrawal-late",
   "execution": {"min_trade_usd": 10, "max_trade_usd": 25, "fee_bps": 5, "half_spread_bps": 3, "slippage_bps": 2},
   "policies": [
     {"name": "deposit-aware-equal-daily", "kind": "fixed", "cadence": "daily", "horizon": "2025-12-31", "features": []},

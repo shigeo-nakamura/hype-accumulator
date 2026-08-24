@@ -13,6 +13,12 @@ FIXTURES = ROOT / "fixtures"
 
 
 class ExperimentContractTests(unittest.TestCase):
+    @staticmethod
+    def make_paths_absolute(experiment: dict) -> None:
+        experiment["dataset_manifest"] = str(FIXTURES / "dataset-manifest.json")
+        for capital_path in experiment["capital_paths"]:
+            capital_path["manifest"] = str(FIXTURES / capital_path["manifest"])
+
     def test_experiment_rejects_unknown_policy_kind(self) -> None:
         experiment = json.loads((FIXTURES / "experiment.json").read_text(encoding="utf-8"))
         experiment["policies"][0]["kind"] = "adaptve"
@@ -114,9 +120,7 @@ class ExperimentContractTests(unittest.TestCase):
                     adaptive["features"] = ["hype_trned"]
                 else:
                     experiment["ablations"] = [["hype_trned"]]
-                experiment["dataset_manifest"] = str(FIXTURES / "dataset-manifest.json")
-                for capital_path in experiment["capital_paths"]:
-                    capital_path["manifest"] = str(FIXTURES / capital_path["manifest"])
+                self.make_paths_absolute(experiment)
 
                 with tempfile.TemporaryDirectory() as directory:
                     manifest = Path(directory) / "experiment.json"
@@ -128,15 +132,61 @@ class ExperimentContractTests(unittest.TestCase):
     def test_experiment_cannot_advance_past_dataset_snapshot(self) -> None:
         experiment = json.loads((FIXTURES / "experiment.json").read_text(encoding="utf-8"))
         experiment["as_of"] = "2026-01-01T00:00:00Z"
-        experiment["dataset_manifest"] = str(FIXTURES / "dataset-manifest.json")
-        for capital_path in experiment["capital_paths"]:
-            capital_path["manifest"] = str(FIXTURES / capital_path["manifest"])
+        self.make_paths_absolute(experiment)
 
         with tempfile.TemporaryDirectory() as directory:
             manifest = Path(directory) / "experiment.json"
             manifest.write_text(json.dumps(experiment), encoding="utf-8")
 
             with self.assertRaisesRegex(ValueError, "experiment as_of exceeds dataset snapshot boundary"):
+                run_experiment(manifest)
+
+    def test_experiment_requires_exactly_one_adaptive_policy(self) -> None:
+        experiment = json.loads((FIXTURES / "experiment.json").read_text(encoding="utf-8"))
+        adaptive = next(policy for policy in experiment["policies"] if policy["kind"] == "adaptive")
+        duplicate = dict(adaptive)
+        duplicate["name"] = "second-adaptive"
+        experiment["policies"].append(duplicate)
+
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "experiment.json"
+            manifest.write_text(json.dumps(experiment), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "exactly one adaptive policy"):
+                run_experiment(manifest)
+
+    def test_analysis_capital_path_is_named_and_order_independent(self) -> None:
+        experiment = json.loads((FIXTURES / "experiment.json").read_text(encoding="utf-8"))
+        self.make_paths_absolute(experiment)
+
+        with tempfile.TemporaryDirectory() as directory:
+            first_manifest = Path(directory) / "first.json"
+            first_manifest.write_text(json.dumps(experiment), encoding="utf-8")
+            first = run_experiment(first_manifest)
+
+            experiment["capital_paths"].reverse()
+            second_manifest = Path(directory) / "second.json"
+            second_manifest.write_text(json.dumps(experiment), encoding="utf-8")
+            second = run_experiment(second_manifest)
+
+        self.assertEqual(first["sensitivity"], second["sensitivity"])
+        self.assertEqual(first["signal_ablations"], second["signal_ablations"])
+        for result in first["sensitivity"] + first["signal_ablations"]:
+            self.assertEqual(
+                result["capital_path"],
+                "frequent-before-after-multiple-withdrawal-late",
+            )
+            self.assertEqual(result["source_policy"], "bounded-adaptive")
+
+    def test_analysis_capital_path_must_be_declared(self) -> None:
+        experiment = json.loads((FIXTURES / "experiment.json").read_text(encoding="utf-8"))
+        experiment["analysis_capital_path"] = "missing-path"
+
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "experiment.json"
+            manifest.write_text(json.dumps(experiment), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "analysis_capital_path is not declared"):
                 run_experiment(manifest)
 
 
