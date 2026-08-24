@@ -23,9 +23,11 @@ jobs:
       - run: cargo build --locked
 
   arm64-release:
-    name: Locked ARM64 release artifact
+    name: AL2023-compatible locked ARM64 release artifact
     needs: quality
     runs-on: ubuntu-24.04-arm
+    container:
+      image: amazonlinux:2023.12.20260817.0@sha256:2a7009e43cb69708fe603eff85c1c905ffc371f8e1ed017d7628c2bf30fcbf3e
     permissions:
       contents: read
       id-token: write
@@ -33,7 +35,23 @@ jobs:
       artifact-metadata: write
     env:
       TARGET: aarch64-unknown-linux-gnu
+      BUILD_IMAGE: amazonlinux:2023.12.20260817.0@sha256:2a7009e43cb69708fe603eff85c1c905ffc371f8e1ed017d7628c2bf30fcbf3e
     steps:
+      - name: Install pinned-AL2023 build dependencies
+        run: |
+          dnf install -y \
+            binutils \
+            file \
+            gcc \
+            gcc-c++ \
+            git \
+            gzip \
+            make \
+            openssl-devel \
+            perl \
+            pkgconf-pkg-config \
+            tar
+          dnf clean all
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
@@ -48,6 +66,45 @@ jobs:
         run: cargo test --all-targets --locked --target "$TARGET"
       - name: Build locked ARM64 release
         run: cargo build --release --locked --bins --target "$TARGET"
+      - name: Verify AL2023 ABI and signer-free runtime
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          test "$(rpm --eval "%{_arch}")" = aarch64
+          mkdir -p dist
+          {
+            printf "build_image=%s\n" "$BUILD_IMAGE"
+            printf "system_release=%s\n" "$(cat /etc/system-release)"
+            printf "libc=%s\n" "$(getconf GNU_LIBC_VERSION)"
+            rpm -q glibc openssl-libs
+          } > dist/AL2023-ABI.txt
+
+          for binary in \
+            "target/${TARGET}/release/hype-accumulator" \
+            "target/${TARGET}/release/hype-status"
+          do
+            file "$binary" | tee -a dist/AL2023-ABI.txt
+            ldd "$binary" | tee -a dist/AL2023-ABI.txt
+            if ldd "$binary" | grep -q "not found"; then
+              printf "unresolved shared library in %s\n" "$binary" >&2
+              exit 1
+            fi
+            {
+              printf "%s required glibc symbol versions:\n" "$binary"
+              readelf --version-info "$binary" \
+                | sed -n "s/.*Name: \(GLIBC_[^ ]*\).*/\1/p" \
+                | sort -Vu
+            } >> dist/AL2023-ABI.txt
+          done
+
+          test "$(target/${TARGET}/release/hype-accumulator config/example.toml)" = \
+            "mode=dry-run ready"
+          if target/${TARGET}/release/hype-status extra argument rejected; then
+            printf "hype-status unexpectedly accepted excess arguments\n" >&2
+            exit 1
+          else
+            test "$?" -eq 2
+          fi
       - name: Package checksummed release
         env:
           COMMIT_SHA: ${{ github.sha }}
@@ -60,17 +117,27 @@ jobs:
 
           install -m 0755 "target/${TARGET}/release/hype-accumulator" "$stage/hype-accumulator"
           install -m 0755 "target/${TARGET}/release/hype-status" "$stage/hype-status"
+          install -m 0644 dist/AL2023-ABI.txt "$stage/AL2023-ABI.txt"
           {
             printf 'repository=%s\n' "$REPOSITORY"
             printf 'commit=%s\n' "$COMMIT_SHA"
             printf 'target=%s\n' "$TARGET"
+            printf "build_image=%s\n" "$BUILD_IMAGE"
+            printf "system_release=%s\n" "$(cat /etc/system-release)"
+            printf "libc=%s\n" "$(getconf GNU_LIBC_VERSION)"
+            rpm -q glibc glibc-devel openssl-libs openssl-devel
             rustc --version --verbose
             cargo --version --verbose
             sha256sum Cargo.lock
           } > "$stage/BUILD-PROVENANCE.txt"
           (
             cd "$stage"
-            sha256sum BUILD-PROVENANCE.txt hype-accumulator hype-status > SHA256SUMS
+            sha256sum \
+              AL2023-ABI.txt \
+              BUILD-PROVENANCE.txt \
+              hype-accumulator \
+              hype-status \
+              > SHA256SUMS
           )
 
           tar \
@@ -81,7 +148,8 @@ jobs:
             --numeric-owner \
             -C "$stage" \
             -czf "dist/$archive" \
-            BUILD-PROVENANCE.txt SHA256SUMS hype-accumulator hype-status
+            AL2023-ABI.txt BUILD-PROVENANCE.txt SHA256SUMS \
+            hype-accumulator hype-status
           (
             cd dist
             sha256sum "$archive" > "$archive.sha256"
