@@ -89,6 +89,7 @@ def run_backtest(
     skipped: dict[str, int] = {}
     last_trade_date: date | None = None
     final_price = 0.0
+    final_price_at: datetime | None = None
     horizon = date.fromisoformat(policy["horizon"])
     cost_rate = (execution["fee_bps"] + execution["half_spread_bps"] + execution["slippage_bps"]) / 10_000
     cadence = policy.get("cadence", "daily")
@@ -96,6 +97,7 @@ def run_backtest(
         if bar.decision_at > as_of or bar.decision_at.date() > horizon:
             break
         final_price = bar.price_usd
+        final_price_at = bar.decision_at
         while event_index < len(pending) and pending[event_index].first_usable_at <= bar.decision_at:
             event = pending[event_index]
             if event.kind == "deposit":
@@ -145,10 +147,16 @@ def run_backtest(
         last_trade_date = bar.decision_at.date()
     cohort_rows = [{"event_id": c.event_id, "admitted_usd": round(c.admitted_usd, 8), "invested_usd": round(c.invested_usd, 8), "withdrawn_usd": round(c.withdrawn_usd, 8), "remaining_usd": round(c.cash_usd, 8), "utilization": round(c.invested_usd / c.admitted_usd, 8)} for c in ledger.cohorts]
     infeasible = ledger.cash > 1e-8 and any(e.kind == "deposit" for e in events if e.first_usable_at.date() <= horizon)
+    valuation_date = min(horizon, as_of.date())
+    ending_inventory_usd = (
+        round(units * final_price, 8)
+        if final_price_at is not None and final_price_at.date() == valuation_date
+        else None
+    )
     return {
         "policy": policy["name"], "trade_count": len(trades), "acquisition_vwap_usd": round(spend / units, 8) if units else None,
         "invested_usd": round(spend, 8), "remaining_cash_usd": round(ledger.cash, 8), "units": round(units, 10),
-        "ending_inventory_usd": round(units * final_price, 8), "max_inventory_drawdown": round(max_drawdown, 8),
+        "ending_inventory_usd": ending_inventory_usd, "max_inventory_drawdown": round(max_drawdown, 8),
         "turnover_usd": round(turnover, 8), "cost_usd": round(fees, 8), "horizon_complete": not infeasible,
         "horizon_infeasible": infeasible, "skipped_days": skipped, "capital_cohorts": cohort_rows, "trades": trades,
     }

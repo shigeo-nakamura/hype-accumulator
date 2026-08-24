@@ -60,6 +60,37 @@ class ExperimentContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "adaptive multiplier bounds"):
                 run_experiment(manifest)
 
+    def test_experiment_rejects_nonfinite_adaptive_sensitivities(self) -> None:
+        for field in ("policy", "grid"):
+            with self.subTest(field=field):
+                experiment = json.loads((FIXTURES / "experiment.json").read_text(encoding="utf-8"))
+                if field == "policy":
+                    adaptive = next(
+                        policy for policy in experiment["policies"] if policy["kind"] == "adaptive"
+                    )
+                    adaptive["sensitivity"] = float("nan")
+                else:
+                    experiment["sensitivity"]["adaptive_sensitivity"][0] = float("nan")
+
+                with tempfile.TemporaryDirectory() as directory:
+                    manifest = Path(directory) / "experiment.json"
+                    manifest.write_text(json.dumps(experiment), encoding="utf-8")
+
+                    with self.assertRaisesRegex(ValueError, "must be finite"):
+                        run_experiment(manifest)
+
+    def test_experiment_rejects_unknown_stale_behavior(self) -> None:
+        experiment = json.loads((FIXTURES / "experiment.json").read_text(encoding="utf-8"))
+        adaptive = next(policy for policy in experiment["policies"] if policy["kind"] == "adaptive")
+        adaptive["stale_behavior"] = "fiixed"
+
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "experiment.json"
+            manifest.write_text(json.dumps(experiment), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "unsupported stale behavior"):
+                run_experiment(manifest)
+
     def test_experiment_cannot_advance_past_dataset_snapshot(self) -> None:
         experiment = json.loads((FIXTURES / "experiment.json").read_text(encoding="utf-8"))
         experiment["as_of"] = "2026-01-01T00:00:00Z"

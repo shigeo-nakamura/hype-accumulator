@@ -36,6 +36,7 @@ def require_supported_policy_values(experiment: dict) -> None:
         if cadence not in {"daily", "weekly"}:
             raise ValueError(f"unsupported policy cadence at policies[{index}]: {cadence!r}")
         if kind == "adaptive":
+            require_finite_number(policy["sensitivity"], f"policies[{index}] sensitivity")
             minimum = require_finite_number(policy["min_multiplier"], f"policies[{index}] min_multiplier")
             maximum = require_finite_number(policy["max_multiplier"], f"policies[{index}] max_multiplier")
             if minimum < 0 or minimum > maximum:
@@ -43,6 +44,13 @@ def require_supported_policy_values(experiment: dict) -> None:
                     f"adaptive multiplier bounds at policies[{index}] must satisfy "
                     "0 <= min_multiplier <= max_multiplier"
                 )
+            stale_behavior = policy.get("stale_behavior", "fixed")
+            if stale_behavior not in {"fixed", "skip"}:
+                raise ValueError(
+                    f"unsupported stale behavior at policies[{index}]: {stale_behavior!r}"
+                )
+    for index, sensitivity in enumerate(experiment["sensitivity"]["adaptive_sensitivity"]):
+        require_finite_number(sensitivity, f"adaptive_sensitivity[{index}]")
 
 
 def require_snapshot_at_least(child_manifest: dict, experiment_as_of: datetime, label: str) -> None:
