@@ -4,10 +4,27 @@ import argparse
 import json
 from copy import deepcopy
 from datetime import datetime
+from math import isfinite
 from pathlib import Path
 
 from .contracts import PointInTimeView, load_capital_events, load_dataset, resolve_manifest, timestamp
 from .engine import run_backtest
+
+
+def require_finite_number(value: object, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value):
+        raise ValueError(f"{label} must be finite")
+    return float(value)
+
+
+def require_valid_execution(execution: dict) -> None:
+    minimum = require_finite_number(execution["min_trade_usd"], "execution min_trade_usd")
+    maximum = require_finite_number(execution["max_trade_usd"], "execution max_trade_usd")
+    if minimum <= 0 or maximum <= 0 or minimum > maximum:
+        raise ValueError("execution trade limits must be positive with min_trade_usd <= max_trade_usd")
+    for field in ("fee_bps", "half_spread_bps", "slippage_bps"):
+        if require_finite_number(execution[field], f"execution {field}") < 0:
+            raise ValueError(f"execution {field} must not be negative")
 
 
 def require_supported_policy_values(experiment: dict) -> None:
@@ -18,6 +35,14 @@ def require_supported_policy_values(experiment: dict) -> None:
         cadence = policy.get("cadence", "daily")
         if cadence not in {"daily", "weekly"}:
             raise ValueError(f"unsupported policy cadence at policies[{index}]: {cadence!r}")
+        if kind == "adaptive":
+            minimum = require_finite_number(policy["min_multiplier"], f"policies[{index}] min_multiplier")
+            maximum = require_finite_number(policy["max_multiplier"], f"policies[{index}] max_multiplier")
+            if minimum < 0 or minimum > maximum:
+                raise ValueError(
+                    f"adaptive multiplier bounds at policies[{index}] must satisfy "
+                    "0 <= min_multiplier <= max_multiplier"
+                )
 
 
 def require_snapshot_at_least(child_manifest: dict, experiment_as_of: datetime, label: str) -> None:
@@ -32,6 +57,7 @@ def require_snapshot_at_least(child_manifest: dict, experiment_as_of: datetime, 
 def run_experiment(path: Path) -> dict:
     experiment = resolve_manifest(path)
     require_supported_policy_values(experiment)
+    require_valid_execution(experiment["execution"])
     root = experiment["_root"]
     as_of = timestamp(experiment["as_of"])
     prices, revisions, dataset_manifest = load_dataset((root / experiment["dataset_manifest"]).resolve())

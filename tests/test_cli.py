@@ -35,6 +35,31 @@ class ExperimentContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unsupported policy cadence"):
                 run_experiment(manifest)
 
+    def test_experiment_rejects_nonpositive_execution_limits(self) -> None:
+        experiment = json.loads((FIXTURES / "experiment.json").read_text(encoding="utf-8"))
+        experiment["execution"]["min_trade_usd"] = -20
+        experiment["execution"]["max_trade_usd"] = -10
+
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "experiment.json"
+            manifest.write_text(json.dumps(experiment), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "execution trade limits"):
+                run_experiment(manifest)
+
+    def test_experiment_rejects_inverted_adaptive_bounds(self) -> None:
+        experiment = json.loads((FIXTURES / "experiment.json").read_text(encoding="utf-8"))
+        adaptive = next(policy for policy in experiment["policies"] if policy["kind"] == "adaptive")
+        adaptive["min_multiplier"] = 2.0
+        adaptive["max_multiplier"] = 1.0
+
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "experiment.json"
+            manifest.write_text(json.dumps(experiment), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "adaptive multiplier bounds"):
+                run_experiment(manifest)
+
     def test_experiment_cannot_advance_past_dataset_snapshot(self) -> None:
         experiment = json.loads((FIXTURES / "experiment.json").read_text(encoding="utf-8"))
         experiment["as_of"] = "2026-01-01T00:00:00Z"
