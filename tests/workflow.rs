@@ -340,6 +340,7 @@ fn assert_binding_mismatch(result: &Result<DurableWorkflow, WorkflowError>) {
 #[test]
 fn deterministic_identity_is_independent_of_allocation_input_order() {
     let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("stable-identity.jsonl");
     let first_binding = binding();
     let mut reversed = decision();
     reversed.allocations.reverse();
@@ -352,13 +353,13 @@ fn deterministic_identity_is_independent_of_allocation_input_order() {
     .expect("reversed decision binds");
 
     assert_eq!(first_binding, second_binding);
-    let mut first = reopen(&temp.path().join("first.jsonl"), &first_binding);
-    let mut second = reopen(&temp.path().join("second.jsonl"), &second_binding);
-    assert_eq!(first.state().workflow_id(), second.state().workflow_id());
+    let first = reopen(&path, &first_binding);
+    let workflow_id = first.state().workflow_id().to_owned();
+    drop(first);
+    let mut reopened = reopen(&path, &second_binding);
+    assert_eq!(reopened.state().workflow_id(), workflow_id);
 
-    let first_action = ready(first.prepare_order(at(1)).expect("first order prepared"));
-    let second_action = ready(second.prepare_order(at(1)).expect("second order prepared"));
-    assert_eq!(first_action, second_action);
+    let first_action = ready(reopened.prepare_order(at(1)).expect("order prepared once"));
     assert!(matches!(
         first_action,
         ExternalAction::SubmitOrder {
@@ -416,6 +417,35 @@ fn expiry_binding_requires_exact_verified_clock_lag_gap() {
             Err(WorkflowError::InvalidBinding(_))
         ));
     }
+}
+
+#[test]
+fn one_stable_decision_cannot_own_alternative_workflow_bindings() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let first_path = temp.path().join("owned-decision-a.jsonl");
+    let second_path = temp.path().join("owned-decision-b.jsonl");
+    let original = binding();
+    let mut altered = original.clone();
+    altered.order_envelope.l1_nonce += 1;
+    let ownership_store = Arc::new(MemoryProtectedHeadStore::default());
+
+    let mut first =
+        DurableWorkflow::open_or_create(&first_path, &original, ownership_store.clone())
+            .expect("stable decision acquires ownership");
+    let expected_client_order_id = first.state().client_order_id();
+    let first_action = ready(first.prepare_order(at(1)).expect("first order prepared"));
+    drop(first);
+
+    assert!(matches!(
+        DurableWorkflow::open_or_create(&second_path, &altered, ownership_store),
+        Err(WorkflowError::RollbackDetected(_))
+    ));
+    assert!(!second_path.exists());
+    assert!(matches!(
+        first_action,
+        ExternalAction::SubmitOrder { client_order_id, .. }
+            if client_order_id == expected_client_order_id
+    ));
 }
 
 #[test]

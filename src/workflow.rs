@@ -203,7 +203,8 @@ impl DecisionBinding {
 
     fn validate(&self) -> Result<(), WorkflowError> {
         let max_order_notional_usdc = max_order_notional_usdc(&self.order_envelope);
-        if self.decision_id.is_empty()
+        if self.decision_id.trim().is_empty()
+            || self.decision_id != self.decision_id.trim()
             || self.capital_snapshot_hash.is_empty()
             || self.input_snapshot_hash.is_empty()
             || self
@@ -652,7 +653,7 @@ impl WorkflowState {
                 "decision event ID is not deterministic".into(),
             ));
         }
-        let expected_workflow_id = workflow_id_for(binding)?;
+        let expected_workflow_id = workflow_id_for(binding);
         if workflow_id != &expected_workflow_id || first.at != binding.decided_at {
             return Err(WorkflowError::CorruptJournal(
                 "decision binding does not match workflow identity".into(),
@@ -1471,11 +1472,14 @@ pub struct ProtectedWorkflowHead {
     pub journal_len: u64,
 }
 
-/// Independently durable, monotonic storage for one workflow journal head.
+/// Independently durable, monotonic storage for one stable decision's head.
 ///
-/// A store instance must be scoped to one workflow. `compare_and_swap` must
-/// atomically and durably replace `expected` with `next`, returning `false`
-/// when the currently protected value differs from `expected`.
+/// A store instance must be scoped by the stable decision identity, never by a
+/// journal path or a hash of mutable execution inputs. Every attempted binding
+/// for one decision must therefore observe the same protected ownership head.
+/// `compare_and_swap` must atomically and durably replace `expected` with
+/// `next`, returning `false` when the currently protected value differs from
+/// `expected`.
 pub trait ProtectedWorkflowHeadStore: Send + Sync {
     /// Loads the currently protected head.
     ///
@@ -1528,7 +1532,7 @@ impl DurableWorkflow {
     ) -> Result<Self, WorkflowError> {
         binding.validate()?;
         let path = path.as_ref().to_path_buf();
-        let workflow_id = workflow_id_for(binding)?;
+        let workflow_id = workflow_id_for(binding);
         recover_pending_append(&path, &workflow_id, protected_head_store.as_ref())?;
         let records = load_records(&path)?;
         if records.is_empty() {
@@ -2354,9 +2358,11 @@ fn valid_expiry_binding(envelope: &OrderEnvelopeBinding, decided_at: DateTime<Ut
         && envelope.signed_expiry_at > decided_at
 }
 
-fn workflow_id_for(binding: &DecisionBinding) -> Result<String, WorkflowError> {
-    let encoded = serde_json::to_vec(binding).map_err(WorkflowError::json)?;
-    Ok(format!("wf_{}", digest_hex(&encoded)))
+fn workflow_id_for(binding: &DecisionBinding) -> String {
+    format!(
+        "wf_{}",
+        stable_id("workflow/decision/v2", &[binding.decision_id.as_str()])
+    )
 }
 
 #[derive(Serialize)]
