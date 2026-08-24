@@ -1,0 +1,251 @@
+{
+  "schema_version": 1,
+  "core_revisions": [
+    {
+      "identity": {
+        "source": "fixture-core",
+        "source_version": "v1",
+        "series": "hype_market",
+        "observation_date": "2026-03-08",
+        "revision_id": "spring-dst"
+      },
+      "timestamps": {
+        "observed_at": "2026-03-08T01:59:59-05:00",
+        "published_at": "2026-03-08T03:00:00-04:00",
+        "fetched_at": "2026-03-08T07:00:01Z",
+        "first_usable_at": "2026-03-08T07:00:02Z"
+      },
+      "value": {
+        "execution_price": 40126000,
+        "reference_price": 40125000,
+        "bid_price": 40124000,
+        "ask_price": 40126000
+      }
+    },
+    {
+      "identity": {
+        "source": "fixture-core",
+        "source_version": "v1",
+        "series": "hype_market",
+        "observation_date": "2026-11-01",
+        "revision_id": "fall-dst"
+      },
+      "timestamps": {
+        "observed_at": "2026-11-01T01:30:00-04:00",
+        "published_at": "2026-11-01T01:15:00-05:00",
+        "fetched_at": "2026-11-01T06:15:01Z",
+        "first_usable_at": "2026-11-01T06:15:02Z"
+      },
+      "value": {
+        "execution_price": 42002000,
+        "reference_price": 42000000,
+        "bid_price": 41998000,
+        "ask_price": 42002000
+      }
+    },
+    {
+      "identity": {
+        "source": "fixture-core",
+        "source_version": "v1",
+        "series": "hype_market",
+        "observation_date": "2026-07-03",
+        "revision_id": "holiday-market"
+      },
+      "timestamps": {
+        "observed_at": "2026-07-03T11:59:30Z",
+        "published_at": "2026-07-03T11:59:31Z",
+        "fetched_at": "2026-07-03T11:59:32Z",
+        "first_usable_at": "2026-07-03T11:59:33Z"
+      },
+      "value": {
+        "execution_price": 40002000,
+        "reference_price": 40000000,
+        "bid_price": 39998000,
+        "ask_price": 40002000
+      }
+    },
+    {
+      "identity": {
+        "source": "fixture-core",
+        "source_version": "v1",
+        "series": "hype_market",
+        "observation_date": "2026-07-04",
+        "revision_id": "weekend-market"
+      },
+      "timestamps": {
+        "observed_at": "2026-07-04T11:59:40Z",
+        "published_at": "2026-07-04T11:59:41Z",
+        "fetched_at": "2026-07-04T11:59:42Z",
+        "first_usable_at": "2026-07-04T11:59:43Z"
+      },
+      "value": {
+        "execution_price": 40202000,
+        "reference_price": 40200000,
+        "bid_price": 40198000,
+        "ask_price": 40202000
+      }
+    },
+    {
+      "identity": {
+        "source": "fixture-core",
+        "source_version": "v1",
+        "series": "hype_market",
+        "observation_date": "2026-07-06",
+        "revision_id": "market-0706"
+      },
+      "timestamps": {
+        "observed_at": "2026-07-06T11:59:40Z",
+        "published_at": "2026-07-06T11:59:41Z",
+        "fetched_at": "2026-07-06T11:59:42Z",
+        "first_usable_at": "2026-07-06T11:59:43Z"
+      },
+      "value": {
+        "execution_price": 40502000,
+        "reference_price": 40500000,
+        "bid_price": 40498000,
+        "ask_price": 40502000
+      }
+    },
+    {
+      "identity": {
+        "source": "fixture-core",
+        "source_version": "v1",
+        "series": "hype_market",
+        "observation_date": "2026-07-07",
+        "revision_id": "market-0707"
+      },
+      "timestamps": {
+        "observed_at": "2026-07-07T11:59:40Z",
+        "published_at": "2026-07-07T11:59:41Z",
+        "fetched_at": "2026-07-07T11:59:42Z",
+        "first_usable_at": "2026-07-07T11:59:43Z"
+      },
+      "value": {
+        "execution_price": 40602000,
+        "reference_price": 40600000,
+        "bid_price": 40598000,
+        "ask_price": 40602000
+      }
+    },
+    {
+      "identity": {
+        "source": "fixture-core",
+        "source_version": "v1",
+        "series": "hype_market",
+        "observation_date": "2026-07-09",
+        "revision_id": "recovered-market"
+      },
+      "timestamps": {
+        "observed_at": "2026-07-09T11:59:40Z",
+        "published_at": "2026-07-09T11:59:41Z",
+        "fetched_at": "2026-07-09T11:59:42Z",
+        "first_usable_at": "2026-07-09T11:59:43Z"
+      },
+      "value": {
+        "execution_price": 40802000,
+        "reference_price": 40800000,
+        "bid_price": 40798000,
+        "ask_price": 40802000
+      }
+    },
+    {
+      "identity": {
+        "source": "fixture-core",
+        "source_version": "v1",
+        "series": "hype_market",
+        "observation_date": "2026-07-10",
+        "revision_id": "future-market"
+      },
+      "timestamps": {
+        "observed_at": "2026-07-10T12:00:00Z",
+        "published_at": "2026-07-10T12:00:01Z",
+        "fetched_at": "2026-07-10T12:00:02Z",
+        "first_usable_at": "2026-07-10T12:00:10Z"
+      },
+      "value": {
+        "execution_price": 40902000,
+        "reference_price": 40900000,
+        "bid_price": 40898000,
+        "ask_price": 40902000
+      }
+    }
+  ],
+  "auxiliary_revisions": [
+    {
+      "identity": {
+        "source": "fixture-aux",
+        "source_version": "v1",
+        "series": "btc_etf_net_flow",
+        "observation_date": "2026-07-02",
+        "revision_id": "initial"
+      },
+      "timestamps": {
+        "observed_at": "2026-07-02T20:00:00Z",
+        "published_at": "2026-07-03T20:00:00Z",
+        "fetched_at": "2026-07-06T11:59:55Z",
+        "first_usable_at": "2026-07-06T12:00:00Z"
+      },
+      "value": {
+        "raw_value_microunits": 125000000,
+        "feature_value_bps": 250
+      }
+    },
+    {
+      "identity": {
+        "source": "fixture-aux",
+        "source_version": "v1",
+        "series": "btc_etf_net_flow",
+        "observation_date": "2026-07-02",
+        "revision_id": "corrected"
+      },
+      "timestamps": {
+        "observed_at": "2026-07-02T20:00:00Z",
+        "published_at": "2026-07-07T11:30:00Z",
+        "fetched_at": "2026-07-07T11:59:55Z",
+        "first_usable_at": "2026-07-07T12:00:00Z"
+      },
+      "value": {
+        "raw_value_microunits": 120000000,
+        "feature_value_bps": 240
+      }
+    },
+    {
+      "identity": {
+        "source": "fixture-aux",
+        "source_version": "v1",
+        "series": "btc_etf_net_flow",
+        "observation_date": "2026-03-07",
+        "revision_id": "spring-dst-aux"
+      },
+      "timestamps": {
+        "observed_at": "2026-03-07T16:00:00-05:00",
+        "published_at": "2026-03-08T01:00:00-05:00",
+        "fetched_at": "2026-03-08T03:00:01-04:00",
+        "first_usable_at": "2026-03-08T07:00:02Z"
+      },
+      "value": {
+        "raw_value_microunits": -25000000,
+        "feature_value_bps": -50
+      }
+    },
+    {
+      "identity": {
+        "source": "fixture-aux",
+        "source_version": "v1",
+        "series": "btc_etf_net_flow",
+        "observation_date": "2026-10-31",
+        "revision_id": "fall-dst-aux"
+      },
+      "timestamps": {
+        "observed_at": "2026-10-31T16:00:00-04:00",
+        "published_at": "2026-11-01T01:10:00-05:00",
+        "fetched_at": "2026-11-01T01:15:01-05:00",
+        "first_usable_at": "2026-11-01T06:15:02Z"
+      },
+      "value": {
+        "raw_value_microunits": 35000000,
+        "feature_value_bps": 70
+      }
+    }
+  ]
+}
