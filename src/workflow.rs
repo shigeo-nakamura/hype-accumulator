@@ -69,11 +69,14 @@ impl InventoryBaseline {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OrderEnvelopeBinding {
     pub original_quantity_hype: HypeAtoms,
+    pub hype_atoms_per_hype: u64,
+    pub market_metadata_digest: String,
     pub limit_price_usdc_per_hype: UsdcMicros,
     pub l1_nonce: u64,
     pub signed_expiry_at: DateTime<Utc>,
     pub effective_expiry_at: DateTime<Utc>,
     pub venue_clock_evidence_at: DateTime<Utc>,
+    pub venue_clock_evidence_valid_through_at: DateTime<Utc>,
     pub venue_clock_evidence_digest: String,
     pub max_venue_clock_lag_ms: u64,
 }
@@ -154,6 +157,7 @@ impl DecisionBinding {
     }
 
     fn validate(&self) -> Result<(), WorkflowError> {
+        let max_order_notional_usdc = max_order_notional_usdc(&self.order_envelope);
         if self.decision_id.is_empty()
             || self.capital_snapshot_hash.is_empty()
             || self.input_snapshot_hash.is_empty()
@@ -165,7 +169,12 @@ impl DecisionBinding {
             || self.planned_usdc.is_zero()
             || self.committed_usdc < self.planned_usdc
             || self.order_envelope.original_quantity_hype.is_zero()
+            || self.order_envelope.hype_atoms_per_hype == 0
+            || self.order_envelope.market_metadata_digest.trim().is_empty()
             || self.order_envelope.limit_price_usdc_per_hype.is_zero()
+            || max_order_notional_usdc.is_none_or(|notional| {
+                notional > self.planned_usdc || notional > self.committed_usdc
+            })
             || !valid_expiry_binding(&self.order_envelope, self.decided_at)
             || self.capital_commitments.is_empty()
             || self.decided_at.date_naive() != self.decision_date
@@ -243,6 +252,8 @@ pub enum ExternalAction {
         notional_usdc: UsdcMicros,
         max_debit_usdc: UsdcMicros,
         original_quantity_hype: HypeAtoms,
+        hype_atoms_per_hype: u64,
+        market_metadata_digest: String,
         limit_price_usdc_per_hype: UsdcMicros,
         l1_nonce: u64,
         signed_expiry_at: DateTime<Utc>,
@@ -314,6 +325,14 @@ pub struct BoundFillEvidence {
     pub registration_deadline_at: DateTime<Utc>,
 }
 
+/// One authoritative movement consuming quantity attributed to this workflow.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BoundMovementEvidence {
+    pub movement_id: String,
+    pub consumed_hype: HypeAtoms,
+    pub occurred_at: DateTime<Utc>,
+}
+
 /// Signer-authorized terminal evidence for an accepted order.
 ///
 /// This structure is deliberately complete and content-addressed when
@@ -329,6 +348,8 @@ pub struct OrderBoundEligibilityEvidence {
     pub authorized_planned_usdc: UsdcMicros,
     pub authorized_max_debit_usdc: UsdcMicros,
     pub original_quantity_hype: HypeAtoms,
+    pub hype_atoms_per_hype: u64,
+    pub market_metadata_digest: String,
     pub limit_price_usdc_per_hype: UsdcMicros,
     pub l1_nonce: u64,
     pub signed_expiry_at: DateTime<Utc>,
@@ -339,6 +360,9 @@ pub struct OrderBoundEligibilityEvidence {
     pub effective_expiry_at: DateTime<Utc>,
     pub residual_reservation_hype: HypeAtoms,
     pub policy_version: String,
+    pub fill_history: GapFreeHistoryWatermark,
+    pub movement_history: GapFreeHistoryWatermark,
+    pub movements: Vec<BoundMovementEvidence>,
     pub fills: Vec<BoundFillEvidence>,
 }
 
@@ -397,7 +421,7 @@ pub enum WorkflowTransition {
     },
     StakingEligibilityRecorded {
         eligibility_workflow_id: String,
-        evidence: Option<OrderBoundEligibilityEvidence>,
+        evidence: Option<Box<OrderBoundEligibilityEvidence>>,
         residual_hype: HypeAtoms,
         eligible_hype: HypeAtoms,
     },
@@ -761,10 +785,10 @@ impl WorkflowState {
                         "unsigned staking eligibility does not conserve purchased HYPE".into(),
                     ));
                 }
-                self.validate_eligibility_evidence(evidence.as_ref(), event.at)?;
+                self.validate_eligibility_evidence(evidence.as_deref(), event.at)?;
                 let expected_workflow_id = eligibility_workflow_id_for(
                     &self.workflow_id,
-                    evidence.as_ref(),
+                    evidence.as_deref(),
                     *residual_hype,
                     *eligible_hype,
                 )?;
@@ -868,6 +892,8 @@ impl WorkflowState {
                 notional_usdc,
                 max_debit_usdc,
                 original_quantity_hype,
+                hype_atoms_per_hype,
+                market_metadata_digest,
                 limit_price_usdc_per_hype,
                 l1_nonce,
                 signed_expiry_at,
@@ -878,6 +904,9 @@ impl WorkflowState {
                 && *max_debit_usdc == self.binding.committed_usdc
                 && *original_quantity_hype
                     == self.binding.order_envelope.original_quantity_hype
+                && *hype_atoms_per_hype == self.binding.order_envelope.hype_atoms_per_hype
+                && market_metadata_digest
+                    == &self.binding.order_envelope.market_metadata_digest
                 && *limit_price_usdc_per_hype
                     == self.binding.order_envelope.limit_price_usdc_per_hype
                 && *l1_nonce == self.binding.order_envelope.l1_nonce
@@ -972,6 +1001,8 @@ impl WorkflowState {
             || evidence.authorized_planned_usdc != self.binding.planned_usdc
             || evidence.authorized_max_debit_usdc != self.binding.committed_usdc
             || evidence.original_quantity_hype != self.binding.order_envelope.original_quantity_hype
+            || evidence.hype_atoms_per_hype != self.binding.order_envelope.hype_atoms_per_hype
+            || evidence.market_metadata_digest != self.binding.order_envelope.market_metadata_digest
             || evidence.limit_price_usdc_per_hype
                 != self.binding.order_envelope.limit_price_usdc_per_hype
             || evidence.l1_nonce != self.binding.order_envelope.l1_nonce
@@ -990,6 +1021,21 @@ impl WorkflowState {
         {
             return Err(WorkflowError::ContradictoryObservation(
                 "order_bound authorization does not exactly match the immutable order binding"
+                    .into(),
+            ));
+        }
+        if !valid_eligibility_history_watermark(
+            &evidence.fill_history,
+            self.binding.decided_at,
+            recorded_at,
+        ) || !valid_eligibility_history_watermark(
+            &evidence.movement_history,
+            self.binding.decided_at,
+            recorded_at,
+        ) || !evidence.movements.is_empty()
+        {
+            return Err(WorkflowError::ContradictoryObservation(
+                "eligibility lacks a fresh common fill/movement watermark or a workflow lot moved"
                     .into(),
             ));
         }
@@ -1164,7 +1210,7 @@ impl WorkflowState {
                         "eligibility evidence predates terminal order reconciliation".into(),
                     );
                 }
-                match self.validate_eligibility_evidence(evidence.as_ref(), at) {
+                match self.validate_eligibility_evidence(evidence.as_deref(), at) {
                     Err(WorkflowError::ContradictoryObservation(reason)) => Some(reason),
                     _ => None,
                 }
@@ -1489,7 +1535,7 @@ impl DurableWorkflow {
             at,
             WorkflowTransition::StakingEligibilityRecorded {
                 eligibility_workflow_id,
-                evidence,
+                evidence: evidence.map(Box::new),
                 residual_hype,
                 eligible_hype,
             },
@@ -1844,6 +1890,8 @@ fn external_action_for(
                 notional_usdc: state.binding.planned_usdc,
                 max_debit_usdc: state.binding.committed_usdc,
                 original_quantity_hype: state.binding.order_envelope.original_quantity_hype,
+                hype_atoms_per_hype: state.binding.order_envelope.hype_atoms_per_hype,
+                market_metadata_digest: state.binding.order_envelope.market_metadata_digest.clone(),
                 limit_price_usdc_per_hype: state.binding.order_envelope.limit_price_usdc_per_hype,
                 l1_nonce: state.binding.order_envelope.l1_nonce,
                 signed_expiry_at: state.binding.order_envelope.signed_expiry_at,
@@ -1904,6 +1952,28 @@ fn valid_gap_free_watermark(
         && watermark.through_at <= recorded_at
 }
 
+fn max_order_notional_usdc(envelope: &OrderEnvelopeBinding) -> Option<UsdcMicros> {
+    let scale = u128::from(envelope.hype_atoms_per_hype);
+    let rounding = scale.checked_sub(1)?;
+    let numerator = u128::from(envelope.original_quantity_hype.as_atoms())
+        .checked_mul(u128::from(envelope.limit_price_usdc_per_hype.as_micros()))?;
+    let rounded_micros = numerator.checked_add(rounding)?.checked_div(scale)?;
+    let rounded_micros = u64::try_from(rounded_micros).ok()?;
+    (rounded_micros > 0).then(|| UsdcMicros::from_micros(rounded_micros))
+}
+
+fn valid_eligibility_history_watermark(
+    watermark: &GapFreeHistoryWatermark,
+    required_from_at: DateTime<Utc>,
+    recorded_at: DateTime<Utc>,
+) -> bool {
+    !watermark.watermark_id.trim().is_empty()
+        && watermark.cursor > 0
+        && !watermark.evidence_hash.trim().is_empty()
+        && watermark.gap_free_from_at <= required_from_at
+        && watermark.through_at == recorded_at
+}
+
 fn valid_expiry_binding(envelope: &OrderEnvelopeBinding, decided_at: DateTime<Utc>) -> bool {
     let Ok(lag_ms) = i64::try_from(envelope.max_venue_clock_lag_ms) else {
         return false;
@@ -1922,6 +1992,12 @@ fn valid_expiry_binding(envelope: &OrderEnvelopeBinding, decided_at: DateTime<Ut
     envelope.max_venue_clock_lag_ms > 0
         && !envelope.venue_clock_evidence_digest.trim().is_empty()
         && envelope.venue_clock_evidence_at <= decided_at
+        && envelope.venue_clock_evidence_valid_through_at > envelope.effective_expiry_at
+        && envelope
+            .venue_clock_evidence_valid_through_at
+            .timestamp_subsec_nanos()
+            % 1_000_000
+            == 0
         && envelope.signed_expiry_at.timestamp_subsec_nanos() % 1_000_000 == 0
         && envelope.effective_expiry_at.timestamp_subsec_nanos() % 1_000_000 == 0
         && expected_signed_expiry_at.timestamp_millis() > 0
@@ -1942,11 +2018,14 @@ struct CanonicalOrderEnvelope<'a> {
     planned_usdc: UsdcMicros,
     max_debit_usdc: UsdcMicros,
     original_quantity_hype: HypeAtoms,
+    hype_atoms_per_hype: u64,
+    market_metadata_digest: &'a str,
     limit_price_usdc_per_hype: UsdcMicros,
     l1_nonce: u64,
     signed_expiry_at: DateTime<Utc>,
     effective_expiry_at: DateTime<Utc>,
     venue_clock_evidence_at: DateTime<Utc>,
+    venue_clock_evidence_valid_through_at: DateTime<Utc>,
     venue_clock_evidence_digest: &'a str,
     max_venue_clock_lag_ms: u64,
     market: &'static str,
@@ -1962,11 +2041,17 @@ fn canonical_order_envelope_hash(state: &WorkflowState) -> Result<String, Workfl
         planned_usdc: state.binding.planned_usdc,
         max_debit_usdc: state.binding.committed_usdc,
         original_quantity_hype: state.binding.order_envelope.original_quantity_hype,
+        hype_atoms_per_hype: state.binding.order_envelope.hype_atoms_per_hype,
+        market_metadata_digest: &state.binding.order_envelope.market_metadata_digest,
         limit_price_usdc_per_hype: state.binding.order_envelope.limit_price_usdc_per_hype,
         l1_nonce: state.binding.order_envelope.l1_nonce,
         signed_expiry_at: state.binding.order_envelope.signed_expiry_at,
         effective_expiry_at: state.binding.order_envelope.effective_expiry_at,
         venue_clock_evidence_at: state.binding.order_envelope.venue_clock_evidence_at,
+        venue_clock_evidence_valid_through_at: state
+            .binding
+            .order_envelope
+            .venue_clock_evidence_valid_through_at,
         venue_clock_evidence_digest: &state.binding.order_envelope.venue_clock_evidence_digest,
         max_venue_clock_lag_ms: state.binding.order_envelope.max_venue_clock_lag_ms,
         market: "HYPE/USDC",

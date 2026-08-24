@@ -2,10 +2,11 @@ use chrono::{DateTime, TimeZone, Utc};
 use hype_accumulator::{
     pacing::{DailyDecision, DecisionAllocation, DecisionReason, PacingExplanation, UsdcMicros},
     workflow::{
-        ActionKind, AppendOutcome, BoundFillEvidence, ConclusiveAbsenceEvidence, DecisionBinding,
-        DurableWorkflow, ExternalAction, ExternalReceipt, GapFreeHistoryWatermark, HypeAtoms,
-        InventoryBaseline, OrderBoundEligibilityEvidence, OrderEnvelopeBinding, OrderFinality,
-        PrepareOutcome, WorkflowError, WorkflowStage,
+        ActionKind, AppendOutcome, BoundFillEvidence, BoundMovementEvidence,
+        ConclusiveAbsenceEvidence, DecisionBinding, DurableWorkflow, ExternalAction,
+        ExternalReceipt, GapFreeHistoryWatermark, HypeAtoms, InventoryBaseline,
+        OrderBoundEligibilityEvidence, OrderEnvelopeBinding, OrderFinality, PrepareOutcome,
+        WorkflowError, WorkflowStage,
     },
 };
 use std::{
@@ -84,12 +85,15 @@ fn binding() -> DecisionBinding {
             configured_residual_hype_atoms: hype(10),
         },
         OrderEnvelopeBinding {
-            original_quantity_hype: hype(500),
+            original_quantity_hype: hype(250),
+            hype_atoms_per_hype: 1,
+            market_metadata_digest: "hype-market-metadata-a".to_owned(),
             limit_price_usdc_per_hype: usdc(200_000),
             l1_nonce: 7,
             signed_expiry_at: at(29),
             effective_expiry_at: at(30),
             venue_clock_evidence_at: at(0),
+            venue_clock_evidence_valid_through_at: at(31),
             venue_clock_evidence_digest: "venue-clock-evidence-a".to_owned(),
             max_venue_clock_lag_ms: 59_999,
         },
@@ -100,6 +104,7 @@ fn binding() -> DecisionBinding {
 fn bound_evidence(
     workflow: &DurableWorkflow,
     fills: &[(&str, u64, u32)],
+    recorded_at: DateTime<Utc>,
 ) -> OrderBoundEligibilityEvidence {
     let state = workflow.state();
     let binding = state.binding();
@@ -120,6 +125,8 @@ fn bound_evidence(
         authorized_planned_usdc: binding.planned_usdc,
         authorized_max_debit_usdc: binding.committed_usdc,
         original_quantity_hype: binding.order_envelope.original_quantity_hype,
+        hype_atoms_per_hype: binding.order_envelope.hype_atoms_per_hype,
+        market_metadata_digest: binding.order_envelope.market_metadata_digest.clone(),
         limit_price_usdc_per_hype: binding.order_envelope.limit_price_usdc_per_hype,
         l1_nonce: binding.order_envelope.l1_nonce,
         signed_expiry_at: binding.order_envelope.signed_expiry_at,
@@ -133,6 +140,21 @@ fn bound_evidence(
         effective_expiry_at: binding.order_envelope.effective_expiry_at,
         residual_reservation_hype: hype(residual_reservation),
         policy_version: "custody-policy-v1".to_owned(),
+        fill_history: GapFreeHistoryWatermark {
+            watermark_id: "eligibility-fill-watermark-a".to_owned(),
+            cursor: 303,
+            gap_free_from_at: binding.decided_at,
+            through_at: recorded_at,
+            evidence_hash: "eligibility-fill-history-a".to_owned(),
+        },
+        movement_history: GapFreeHistoryWatermark {
+            watermark_id: "eligibility-movement-watermark-a".to_owned(),
+            cursor: 404,
+            gap_free_from_at: binding.decided_at,
+            through_at: recorded_at,
+            evidence_hash: "eligibility-movement-history-a".to_owned(),
+        },
+        movements: Vec::new(),
         fills: fills
             .iter()
             .map(|(fill_id, atoms, minute)| BoundFillEvidence {
@@ -224,6 +246,8 @@ fn deterministic_identity_is_independent_of_allocation_input_order() {
             notional_usdc,
             max_debit_usdc,
             original_quantity_hype,
+            hype_atoms_per_hype,
+            market_metadata_digest,
             limit_price_usdc_per_hype,
             l1_nonce,
             signed_expiry_at,
@@ -232,7 +256,9 @@ fn deterministic_identity_is_independent_of_allocation_input_order() {
             && client_order_id.len() == 34
             && notional_usdc == usdc(50_000_000)
             && max_debit_usdc == usdc(51_000_000)
-            && original_quantity_hype == hype(500)
+            && original_quantity_hype == hype(250)
+            && hype_atoms_per_hype == 1
+            && market_metadata_digest == "hype-market-metadata-a"
             && limit_price_usdc_per_hype == usdc(200_000)
             && l1_nonce == 7
             && signed_expiry_at == at(29)
@@ -247,6 +273,7 @@ fn expiry_binding_requires_exact_verified_clock_lag_gap() {
         "overflow",
         "missing-evidence",
         "future-evidence",
+        "stale-horizon",
     ] {
         let valid = binding();
         let mut envelope = valid.order_envelope;
@@ -256,10 +283,41 @@ fn expiry_binding_requires_exact_verified_clock_lag_gap() {
             "overflow" => envelope.max_venue_clock_lag_ms = u64::MAX,
             "missing-evidence" => envelope.venue_clock_evidence_digest.clear(),
             "future-evidence" => envelope.venue_clock_evidence_at = at(1),
+            "stale-horizon" => envelope.venue_clock_evidence_valid_through_at = at(30),
             _ => unreachable!("complete fixture set"),
         }
         assert!(matches!(
             DecisionBinding::from_pacing_decision(&decision(), valid.inventory_before, envelope,),
+            Err(WorkflowError::InvalidBinding(_))
+        ));
+    }
+}
+
+#[test]
+fn order_binding_caps_quantity_times_limit_notional() {
+    for invalid in [
+        "above-planned",
+        "above-committed",
+        "overflow",
+        "zero-scale",
+        "missing-metadata",
+    ] {
+        let valid = binding();
+        let mut envelope = valid.order_envelope;
+        match invalid {
+            "above-planned" => envelope.original_quantity_hype = hype(251),
+            "above-committed" => envelope.original_quantity_hype = hype(256),
+            "overflow" => {
+                envelope.original_quantity_hype = hype(u64::MAX);
+                envelope.limit_price_usdc_per_hype = usdc(u64::MAX);
+                envelope.hype_atoms_per_hype = 1;
+            }
+            "zero-scale" => envelope.hype_atoms_per_hype = 0,
+            "missing-metadata" => envelope.market_metadata_digest.clear(),
+            _ => unreachable!("complete fixture set"),
+        }
+        assert!(matches!(
+            DecisionBinding::from_pacing_decision(&decision(), valid.inventory_before, envelope),
             Err(WorkflowError::InvalidBinding(_))
         ));
     }
@@ -355,7 +413,7 @@ fn every_transition_survives_a_restart_without_double_counting() {
     workflow = reopen(&path, &binding);
     assert_eq!(workflow.state().stage(), WorkflowStage::OrderFinalized);
 
-    let evidence = bound_evidence(&workflow, &[("fill-1", 100, 3), ("fill-2", 150, 4)]);
+    let evidence = bound_evidence(&workflow, &[("fill-1", 100, 3), ("fill-2", 150, 4)], at(6));
     let eligibility = workflow
         .record_staking_eligibility(Some(evidence), at(6))
         .expect("unsigned eligibility recorded");
@@ -623,6 +681,7 @@ fn partial_fill_cancel_race_uses_one_final_cumulative_fill_and_never_rebuys() {
     let evidence = bound_evidence(
         &workflow,
         &[("partial-before-cancel", 100, 3), ("terminal-fill", 50, 5)],
+        at(7),
     );
     let eligibility = workflow
         .record_staking_eligibility(Some(evidence), at(7))
@@ -660,7 +719,7 @@ fn timely_fill_evidence_can_reconcile_after_effective_expiry() {
             at(31),
         )
         .expect("terminal reconciliation may finish after expiry");
-    let evidence = bound_evidence(&workflow, &[("timely-fill", 250, 3)]);
+    let evidence = bound_evidence(&workflow, &[("timely-fill", 250, 3)], at(32));
     let eligibility = workflow
         .record_staking_eligibility(Some(evidence), at(32))
         .expect("timely fill remains eligible after delayed reconciliation");
@@ -684,7 +743,7 @@ fn zero_fill_terminal_orders_complete_without_staking_intent() {
         workflow
             .finalize_order(hype(0), usdc(0), usdc(0), finality, at(3))
             .expect("zero-fill terminal order finalized");
-        let evidence = bound_evidence(&workflow, &[]);
+        let evidence = bound_evidence(&workflow, &[], at(4));
         let eligibility = workflow
             .record_staking_eligibility(Some(evidence), at(4))
             .expect("zero eligibility recorded");
@@ -731,7 +790,7 @@ fn residual_only_fill_records_zero_eligibility_and_completes() {
             at(4),
         )
         .expect("residual-only order finalized");
-    let evidence = bound_evidence(&workflow, &[("residual-fill", 5, 3)]);
+    let evidence = bound_evidence(&workflow, &[("residual-fill", 5, 3)], at(5));
     let eligibility = workflow
         .record_staking_eligibility(Some(evidence), at(5))
         .expect("residual-only eligibility recorded");
@@ -807,7 +866,7 @@ fn event_collision_after_completion_durably_invalidates_the_result() {
         .finalize_order(hype(0), usdc(0), usdc(0), OrderFinality::Expired, at(3))
         .expect("order finalized");
     workflow
-        .record_staking_eligibility(Some(bound_evidence(&workflow, &[])), at(4))
+        .record_staking_eligibility(Some(bound_evidence(&workflow, &[], at(4))), at(4))
         .expect("eligibility recorded");
     workflow.complete(at(5)).expect("workflow completed");
 
@@ -860,7 +919,7 @@ fn fresh_late_order_evidence_durably_invalidates_terminal_results() {
         .finalize_order(hype(0), usdc(0), usdc(0), OrderFinality::Expired, at(3))
         .expect("order finalized");
     completed
-        .record_staking_eligibility(Some(bound_evidence(&completed, &[])), at(4))
+        .record_staking_eligibility(Some(bound_evidence(&completed, &[], at(4))), at(4))
         .expect("eligibility recorded");
     completed.complete(at(5)).expect("workflow completed");
     assert!(matches!(
@@ -1071,7 +1130,7 @@ fn staking_and_delegation_actions_remain_hard_disabled() {
     ));
     assert_eq!(workflow.state().stage(), WorkflowStage::OrderFinalized);
     assert!(workflow.state().pending_action().is_none());
-    let evidence = bound_evidence(&workflow, &[("fill-1", 250, 3)]);
+    let evidence = bound_evidence(&workflow, &[("fill-1", 250, 3)], at(7));
     let eligibility = workflow
         .record_staking_eligibility(Some(evidence), at(7))
         .expect("unsigned eligibility recorded");
@@ -1192,6 +1251,69 @@ fn late_terminal_finalization_after_absence_durably_halts() {
 }
 
 #[test]
+fn eligibility_requires_fresh_gap_free_movement_coverage() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let binding = binding();
+    for invalid in [
+        "movement",
+        "fill-watermark-stale",
+        "movement-gap",
+        "movement-zero-cursor",
+    ] {
+        let path = temp
+            .path()
+            .join(format!("invalid-movement-{invalid}.jsonl"));
+        let mut workflow = reopen(&path, &binding);
+        ready(workflow.prepare_order(at(1)).expect("order prepared"));
+        workflow
+            .observe_order_submission("exchange-order-1", at(2))
+            .expect("submission observed");
+        workflow
+            .observe_order_fill(
+                "fill-1",
+                hype(250),
+                usdc(50_000_000),
+                usdc(50_500_000),
+                true,
+                at(3),
+            )
+            .expect("fill observed");
+        workflow
+            .finalize_order(
+                hype(250),
+                usdc(50_000_000),
+                usdc(50_500_000),
+                OrderFinality::Filled,
+                at(4),
+            )
+            .expect("order finalized");
+        let mut evidence = bound_evidence(&workflow, &[("fill-1", 250, 3)], at(6));
+        match invalid {
+            "movement" => evidence.movements.push(BoundMovementEvidence {
+                movement_id: "external-sale-a".to_owned(),
+                consumed_hype: hype(1),
+                occurred_at: at(5),
+            }),
+            "fill-watermark-stale" => evidence.fill_history.through_at = at(5),
+            "movement-gap" => evidence.movement_history.gap_free_from_at = at(1),
+            "movement-zero-cursor" => evidence.movement_history.cursor = 0,
+            _ => unreachable!("complete fixture set"),
+        }
+
+        assert!(matches!(
+            workflow.record_staking_eligibility(Some(evidence), at(6)),
+            Err(WorkflowError::ContradictoryObservation(_))
+        ));
+        assert_eq!(workflow.state().stage(), WorkflowStage::ManualReview);
+        drop(workflow);
+        assert_eq!(
+            reopen(&path, &binding).state().stage(),
+            WorkflowStage::ManualReview
+        );
+    }
+}
+
+#[test]
 fn accepted_order_without_bound_authorization_is_permanently_ineligible() {
     let temp = tempfile::tempdir().expect("temp directory");
     let path = temp.path().join("missing-authorization.jsonl");
@@ -1219,7 +1341,7 @@ fn accepted_order_without_bound_authorization_is_permanently_ineligible() {
         Err(WorkflowError::ContradictoryObservation(_))
     ));
     assert_eq!(workflow.state().stage(), WorkflowStage::ManualReview);
-    let valid_evidence = bound_evidence(&workflow, &[("fill-1", 1, 3)]);
+    let valid_evidence = bound_evidence(&workflow, &[("fill-1", 1, 3)], at(6));
     assert!(matches!(
         workflow.record_staking_eligibility(Some(valid_evidence), at(6)),
         Err(WorkflowError::InvalidTransition(_))
@@ -1235,7 +1357,7 @@ fn accepted_order_without_bound_authorization_is_permanently_ineligible() {
 fn every_signed_order_field_must_match_for_eligibility() {
     let temp = tempfile::tempdir().expect("temp directory");
     let binding = binding();
-    for mismatch in ["quantity", "limit", "nonce", "expiry"] {
+    for mismatch in ["quantity", "scale", "metadata", "limit", "nonce", "expiry"] {
         let path = temp.path().join(format!("mismatched-{mismatch}.jsonl"));
         let mut workflow = reopen(&path, &binding);
         ready(workflow.prepare_order(at(1)).expect("order prepared"));
@@ -1245,9 +1367,11 @@ fn every_signed_order_field_must_match_for_eligibility() {
         workflow
             .finalize_order(hype(0), usdc(0), usdc(0), OrderFinality::Expired, at(3))
             .expect("order finalized");
-        let mut evidence = bound_evidence(&workflow, &[]);
+        let mut evidence = bound_evidence(&workflow, &[], at(4));
         match mismatch {
-            "quantity" => evidence.original_quantity_hype = hype(501),
+            "quantity" => evidence.original_quantity_hype = hype(251),
+            "scale" => evidence.hype_atoms_per_hype = 2,
+            "metadata" => evidence.market_metadata_digest = "hype-market-metadata-b".to_owned(),
             "limit" => evidence.limit_price_usdc_per_hype = usdc(200_001),
             "nonce" => evidence.l1_nonce = 8,
             "expiry" => evidence.signed_expiry_at = at(28),
@@ -1280,7 +1404,7 @@ fn stale_invalid_eligibility_evidence_cannot_be_replaced() {
     workflow
         .finalize_order(hype(0), usdc(0), usdc(0), OrderFinality::Expired, at(4))
         .expect("order finalized");
-    let valid_evidence = bound_evidence(&workflow, &[]);
+    let valid_evidence = bound_evidence(&workflow, &[], at(5));
 
     assert!(matches!(
         workflow.record_staking_eligibility(None, at(3)),
