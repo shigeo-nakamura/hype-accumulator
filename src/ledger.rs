@@ -609,17 +609,26 @@ impl DurableLedger {
             return Err(LedgerError::ConcurrentModification);
         }
         let current_pending = build_pending_restore(&ledger_payload, &snapshot_payload, &verified)?;
+        recover_pending_restore_temporary(&destination, &verified.records)?;
         let destination_anchor = load_protected_anchor(destination_anchor_store.as_ref())?;
         let target = match load_pending_restore(&destination)? {
             Some(existing) => {
-                if !has_only_restore_entries(&destination, true)? {
-                    return Err(LedgerError::CorruptRestorePending);
-                }
                 let target = if existing == current_pending {
                     RestoreTarget::from_verified(ledger_payload, snapshot_payload, &verified)
                 } else {
                     restore_target_from_pending(&existing, &verified.records)?
                 };
+                remove_authenticated_atomic_temporaries(
+                    &destination.join(LEDGER_FILE_NAME),
+                    &target.ledger_payload,
+                )?;
+                remove_authenticated_atomic_temporaries(
+                    &destination.join(SNAPSHOT_FILE_NAME),
+                    &target.snapshot_payload,
+                )?;
+                if !has_only_restore_entries(&destination, true)? {
+                    return Err(LedgerError::CorruptRestorePending);
+                }
                 // A stale local intent is authoritative only after the
                 // independently protected destination scope accepted that
                 // exact prefix. The current protected source head and its
@@ -886,6 +895,11 @@ fn record_capital_settlement(
     commitment_id: &str,
     debited_usdc: UsdcMicros,
 ) -> Result<(), LedgerError> {
+    let recorded_fills = state
+        .purchase_decisions
+        .values()
+        .find(|decision| decision.commitment_id == commitment_id)
+        .map_or_else(UsdcMicros::default, |decision| decision.filled_usdc);
     let commitment = state
         .commitments
         .get_mut(commitment_id)
@@ -897,6 +911,11 @@ fn record_capital_settlement(
     }
     if debited_usdc > commitment.committed_usdc {
         return Err(LedgerError::DebitExceedsCommitment(
+            commitment_id.to_owned(),
+        ));
+    }
+    if debited_usdc < recorded_fills {
+        return Err(LedgerError::DebitBelowRecordedFills(
             commitment_id.to_owned(),
         ));
     }
@@ -1563,9 +1582,14 @@ fn restore_pending_checksum(pending: &PendingRestore) -> Result<String, LedgerEr
 }
 
 fn write_pending_restore(directory: &Path, pending: &PendingRestore) -> Result<(), LedgerError> {
+    let payload = encode_pending_restore(pending)?;
+    write_atomic(&directory.join(RESTORE_PENDING_FILE_NAME), &payload)
+}
+
+fn encode_pending_restore(pending: &PendingRestore) -> Result<Vec<u8>, LedgerError> {
     let mut payload = serde_json::to_vec(pending).map_err(LedgerError::json)?;
     payload.push(b'\n');
-    write_atomic(&directory.join(RESTORE_PENDING_FILE_NAME), &payload)
+    Ok(payload)
 }
 
 fn clear_pending_restore(directory: &Path) -> Result<(), LedgerError> {
@@ -1866,6 +1890,147 @@ fn write_atomic(path: &Path, payload: &[u8]) -> Result<(), LedgerError> {
     result
 }
 
+fn recover_pending_restore_temporary(
+    directory: &Path,
+    current_records: &[LedgerEnvelope],
+) -> Result<(), LedgerError> {
+    let pending_path = directory.join(RESTORE_PENDING_FILE_NAME);
+    match fs::symlink_metadata(&pending_path) {
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(LedgerError::io(error)),
+    }
+
+    let mut authenticated = Vec::new();
+    for entry in fs::read_dir(directory).map_err(LedgerError::io)? {
+        let entry = entry.map_err(LedgerError::io)?;
+        if !is_atomic_temporary_for(&entry.file_name(), RESTORE_PENDING_FILE_NAME.as_ref()) {
+            continue;
+        }
+        let Some(payload) = read_single_linked_regular(&entry.path())? else {
+            continue;
+        };
+        let Ok(pending) = decode_pending_restore(&payload) else {
+            continue;
+        };
+        if restore_target_from_pending(&pending, current_records).is_ok() {
+            authenticated.push(entry.path());
+        }
+    }
+
+    if authenticated.len() > 1 {
+        return Err(LedgerError::CorruptRestorePending);
+    }
+    if let Some(temporary) = authenticated.pop() {
+        fs::rename(temporary, pending_path).map_err(LedgerError::io)?;
+        sync_directory(directory)?;
+    }
+    Ok(())
+}
+
+fn remove_authenticated_atomic_temporaries(
+    target: &Path,
+    expected_payload: &[u8],
+) -> Result<(), LedgerError> {
+    let directory = target.parent().ok_or(LedgerError::InvalidPath)?;
+    let target_name = target.file_name().ok_or(LedgerError::InvalidPath)?;
+    let mut removed = false;
+    for entry in fs::read_dir(directory).map_err(LedgerError::io)? {
+        let entry = entry.map_err(LedgerError::io)?;
+        if !is_atomic_temporary_for(&entry.file_name(), target_name) {
+            continue;
+        }
+        if read_single_linked_regular(&entry.path())?
+            .is_some_and(|payload| payload == expected_payload)
+        {
+            fs::remove_file(entry.path()).map_err(LedgerError::io)?;
+            removed = true;
+        }
+    }
+    if removed {
+        sync_directory(directory)?;
+    }
+    Ok(())
+}
+
+fn is_atomic_temporary_for(candidate: &std::ffi::OsStr, target: &std::ffi::OsStr) -> bool {
+    let Some(candidate) = candidate.to_str() else {
+        return false;
+    };
+    let Some(target) = target.to_str() else {
+        return false;
+    };
+    let Some(suffix) = candidate
+        .strip_prefix(target)
+        .and_then(|suffix| suffix.strip_prefix('.'))
+        .and_then(|suffix| suffix.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let mut components = suffix.split('.');
+    let Some(process_id) = components.next() else {
+        return false;
+    };
+    let Some(nonce) = components.next() else {
+        return false;
+    };
+    components.next().is_none()
+        && !process_id.is_empty()
+        && process_id.bytes().all(|byte| byte.is_ascii_digit())
+        && !nonce.is_empty()
+        && nonce.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn read_single_linked_regular(path: &Path) -> Result<Option<Vec<u8>>, LedgerError> {
+    let path_metadata = fs::symlink_metadata(path).map_err(LedgerError::io)?;
+    if !path_metadata.file_type().is_file() {
+        return Ok(None);
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(LedgerError::io)?;
+    let file_metadata = file.metadata().map_err(LedgerError::io)?;
+    if !single_linked_regular_identity(&path_metadata, &file_metadata) {
+        return Ok(None);
+    }
+    let mut payload = Vec::new();
+    file.read_to_end(&mut payload).map_err(LedgerError::io)?;
+    let current_path_metadata = fs::symlink_metadata(path).map_err(LedgerError::io)?;
+    if !single_linked_regular_identity(&current_path_metadata, &file_metadata) {
+        return Ok(None);
+    }
+    Ok(Some(payload))
+}
+
+#[cfg(unix)]
+fn single_linked_regular_identity(
+    path_metadata: &fs::Metadata,
+    file_metadata: &fs::Metadata,
+) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    path_metadata.file_type().is_file()
+        && file_metadata.file_type().is_file()
+        && path_metadata.dev() == file_metadata.dev()
+        && path_metadata.ino() == file_metadata.ino()
+        && path_metadata.nlink() == 1
+        && file_metadata.nlink() == 1
+}
+
+#[cfg(not(unix))]
+fn single_linked_regular_identity(
+    path_metadata: &fs::Metadata,
+    file_metadata: &fs::Metadata,
+) -> bool {
+    path_metadata.file_type().is_file() && file_metadata.file_type().is_file()
+}
+
 struct LedgerLock {
     directory: PathBuf,
     file: File,
@@ -2160,6 +2325,8 @@ pub enum LedgerError {
     CommitmentAlreadySettled(String),
     #[error("cash debit exceeds commitment: {0}")]
     DebitExceedsCommitment(String),
+    #[error("cash debit is below recorded fills for commitment: {0}")]
+    DebitBelowRecordedFills(String),
     #[error("ledger is truncated")]
     TruncatedLedger,
     #[error("ledger is corrupt: {0}")]
@@ -2565,6 +2732,94 @@ mod transaction_tests {
     }
 
     #[test]
+    fn settlement_cannot_understate_recorded_fills() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let anchor = anchor_store();
+        let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+        let decision_date = at(1).date_naive();
+        for event in [
+            deposit("deposit-settlement-floor", 1),
+            LedgerEvent {
+                event_id: "admission-settlement-floor".into(),
+                occurred_at: at(2),
+                kind: LedgerEventKind::DepositAdmission {
+                    deposit_event_id: "deposit-settlement-floor".into(),
+                    amount_usdc: usd(20),
+                },
+            },
+            LedgerEvent {
+                event_id: "commit-settlement-floor".into(),
+                occurred_at: at(3),
+                kind: LedgerEventKind::CapitalCommitted {
+                    commitment_id: "commitment-settlement-floor".into(),
+                    amount_usdc: usd(12),
+                },
+            },
+            LedgerEvent {
+                event_id: "decision-settlement-floor".into(),
+                occurred_at: at(4),
+                kind: LedgerEventKind::DailyDecision {
+                    decision_id: "purchase-settlement-floor".into(),
+                    decision_date,
+                    commitment_id: "commitment-settlement-floor".into(),
+                    planned_usdc: usd(10),
+                    committed_usdc: usd(12),
+                },
+            },
+            LedgerEvent {
+                event_id: "order-settlement-floor".into(),
+                occurred_at: at(5),
+                kind: LedgerEventKind::OrderRecorded {
+                    order_id: "order-settlement-floor".into(),
+                    decision_id: "purchase-settlement-floor".into(),
+                },
+            },
+            LedgerEvent {
+                event_id: "fill-settlement-floor".into(),
+                occurred_at: at(6),
+                kind: LedgerEventKind::FillRecorded {
+                    order_id: "order-settlement-floor".into(),
+                    filled_usdc: usd(10),
+                    received_hype_atoms: 1,
+                },
+            },
+        ] {
+            ledger.append(event).expect("append settlement fixture");
+        }
+        let durable_before =
+            fs::read(directory.path().join(LEDGER_FILE_NAME)).expect("read ledger before reject");
+
+        assert_eq!(
+            ledger.append(LedgerEvent {
+                event_id: "settlement-below-fill".into(),
+                occurred_at: at(7),
+                kind: LedgerEventKind::CapitalSettled {
+                    commitment_id: "commitment-settlement-floor".into(),
+                    debited_usdc: usd(9),
+                },
+            }),
+            Err(LedgerError::DebitBelowRecordedFills(
+                "commitment-settlement-floor".into()
+            ))
+        );
+        assert_eq!(
+            fs::read(directory.path().join(LEDGER_FILE_NAME)).expect("read unchanged ledger"),
+            durable_before
+        );
+        ledger
+            .append(LedgerEvent {
+                event_id: "settlement-at-fill".into(),
+                occurred_at: at(8),
+                kind: LedgerEventKind::CapitalSettled {
+                    commitment_id: "commitment-settlement-floor".into(),
+                    debited_usdc: usd(10),
+                },
+            })
+            .expect("settle at the recorded fill floor");
+        assert_eq!(ledger.state().spent_usdc(), usd(10));
+    }
+
+    #[test]
     fn restore_resumes_after_journal_publication_and_is_idempotent() {
         let source = tempfile::tempdir().expect("source directory");
         let container = tempfile::tempdir().expect("destination container");
@@ -2612,6 +2867,104 @@ mod transaction_tests {
         .expect("accept exact completed restore retry");
         assert_eq!(retried.records, verified.records);
         assert_eq!(retried.state, verified.state);
+    }
+
+    #[test]
+    fn restore_recovers_an_authenticated_pending_temporary() {
+        let source = tempfile::tempdir().expect("source directory");
+        let container = tempfile::tempdir().expect("destination container");
+        let destination = container.path().join("restored");
+        let source_anchor = anchor_store();
+        let destination_anchor = anchor_store();
+        let mut ledger = open(source.path(), &source_anchor).expect("open source ledger");
+        ledger
+            .append(deposit("deposit-before-pending-temporary", 1))
+            .expect("append deposit");
+        drop(ledger);
+
+        let verified = open(source.path(), &source_anchor).expect("verify source ledger");
+        let ledger_payload =
+            fs::read(source.path().join(LEDGER_FILE_NAME)).expect("read source journal");
+        let snapshot_payload =
+            fs::read(source.path().join(SNAPSHOT_FILE_NAME)).expect("read source snapshot");
+        let pending = build_pending_restore(&ledger_payload, &snapshot_payload, &verified)
+            .expect("build restore intent");
+        let pending_payload = encode_pending_restore(&pending).expect("encode restore intent");
+        canonical_directory(&destination).expect("durably create destination directory");
+        drop(LedgerLock::acquire(&destination).expect("create destination lock"));
+        let orphan = destination.join(".pending-restore.json.123.456.tmp");
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&orphan)
+            .expect("create pending temporary");
+        file.write_all(&pending_payload)
+            .expect("write pending temporary");
+        file.sync_all().expect("fsync pending temporary");
+        sync_directory(&destination).expect("sync pending temporary entry");
+
+        let restored = DurableLedger::restore_clean(
+            source.path(),
+            &destination,
+            source_anchor,
+            destination_anchor,
+        )
+        .expect("recover authenticated pending temporary");
+        assert_eq!(restored.records, verified.records);
+        assert!(!orphan.exists());
+        assert!(!destination.join(RESTORE_PENDING_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn restore_removes_only_byte_exact_payload_temporaries() {
+        let source = tempfile::tempdir().expect("source directory");
+        let container = tempfile::tempdir().expect("destination container");
+        let destination = container.path().join("restored");
+        let source_anchor = anchor_store();
+        let destination_anchor = anchor_store();
+        let mut ledger = open(source.path(), &source_anchor).expect("open source ledger");
+        ledger
+            .append(deposit("deposit-before-payload-temporaries", 1))
+            .expect("append deposit");
+        drop(ledger);
+
+        let verified = open(source.path(), &source_anchor).expect("verify source ledger");
+        let ledger_payload =
+            fs::read(source.path().join(LEDGER_FILE_NAME)).expect("read source journal");
+        let snapshot_payload =
+            fs::read(source.path().join(SNAPSHOT_FILE_NAME)).expect("read source snapshot");
+        let pending = build_pending_restore(&ledger_payload, &snapshot_payload, &verified)
+            .expect("build restore intent");
+        canonical_directory(&destination).expect("durably create destination directory");
+        {
+            let _lock = LedgerLock::acquire(&destination).expect("acquire destination lock");
+            write_pending_restore(&destination, &pending).expect("persist restore intent");
+            for (name, payload) in [
+                ("ledger.jsonl.123.456.tmp", ledger_payload.as_slice()),
+                ("snapshot.json.123.456.tmp", snapshot_payload.as_slice()),
+            ] {
+                let path = destination.join(name);
+                let mut file = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(path)
+                    .expect("create payload temporary");
+                file.write_all(payload).expect("write payload temporary");
+                file.sync_all().expect("fsync payload temporary");
+            }
+            sync_directory(&destination).expect("sync payload temporary entries");
+        }
+
+        let restored = DurableLedger::restore_clean(
+            source.path(),
+            &destination,
+            source_anchor,
+            destination_anchor,
+        )
+        .expect("recover byte-exact payload temporaries");
+        assert_eq!(restored.records, verified.records);
+        assert!(!destination.join("ledger.jsonl.123.456.tmp").exists());
+        assert!(!destination.join("snapshot.json.123.456.tmp").exists());
     }
 
     #[test]
