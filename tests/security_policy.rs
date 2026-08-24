@@ -336,6 +336,47 @@ fn acknowledged_caps_and_reserve_drive_effective_pacing() {
 }
 
 #[test]
+fn schedule_capacity_accounts_for_the_attached_fixed_reserve() {
+    let env = live_environment();
+    let runtime = live_runtime_toml()
+        .replace(
+            "max_automatically_deployable_usdc = 100.0",
+            "max_automatically_deployable_usdc = 80.0",
+        )
+        .replace("max_order_usdc = 25.0", "max_order_usdc = 10.0")
+        .replace("target_horizon_days = 365", "target_horizon_days = 7");
+    assert!(matches!(
+        Config::from_toml(&runtime)
+            .expect("runtime parses")
+            .validate_at(&env, at("2026-08-24T00:00:00Z")),
+        Err(ConfigError::Invalid(message)) if message.contains("configured schedule")
+    ));
+
+    let policy = live_policy_template()
+        .replace(
+            "max_auto_deposit_microusd = 100000000",
+            "max_auto_deposit_microusd = 80000000",
+        )
+        .replace(
+            "max_daily_notional_microusd = 25000000",
+            "max_daily_notional_microusd = 10000000",
+        )
+        .replace("reserve_microusd = 1000000", "reserve_microusd = 10000000");
+    let expected = Config::from_toml_with_security_policy(&runtime, &policy)
+        .expect("live documents")
+        .expected_live_acknowledgement(&env)
+        .expect("effective acknowledgement");
+    let acknowledged = policy.replace(
+        "live_acknowledgement = \"\"",
+        &format!("live_acknowledgement = \"{expected}\""),
+    );
+    Config::from_toml_with_security_policy(&runtime, &acknowledged)
+        .expect("acknowledged documents")
+        .validate_at(&env, at("2026-08-24T00:00:00Z"))
+        .expect("70 USDC capacity fits the 80 USDC cap minus 10 USDC reserve");
+}
+
+#[test]
 fn live_action_construction_requires_durable_authorization() {
     let env = live_environment();
     let policy = live_policy_template();

@@ -256,7 +256,18 @@ impl Config {
         let regular_slots = (f64::from(regular_days) * f64::from(scheduled_weekdays) / 7.0).ceil();
         let optimistic_slots = regular_slots + f64::from(self.pacing.final_catch_up_days);
         let schedule_capacity = optimistic_slots * self.pacing.max_order_usdc;
-        if self.capital.max_automatically_deployable_usdc > schedule_capacity {
+        let automatic_cap_microusd = usdc_to_microusd(
+            self.capital.max_automatically_deployable_usdc,
+            "runtime automatic capital cap",
+        )?;
+        let fixed_reserve_microusd = self
+            .effective_security_reserve_microusd()
+            .unwrap_or_default();
+        let schedulable_cap_microusd =
+            automatic_cap_microusd.saturating_sub(fixed_reserve_microusd);
+        let schedule_capacity_microusd =
+            usdc_to_microusd(schedule_capacity, "runtime schedule capacity")?;
+        if schedulable_cap_microusd > schedule_capacity_microusd {
             return Err(ConfigError::Invalid(
                 "automatic capital cap cannot fit the configured schedule and daily order cap"
                     .into(),
