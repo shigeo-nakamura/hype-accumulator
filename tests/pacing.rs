@@ -309,6 +309,39 @@ fn late_year_infeasibility_holds_residual_across_rollover() {
 }
 
 #[test]
+fn long_outage_repaces_remaining_days_without_breaking_the_daily_cap() {
+    let limits = limits();
+    let mut state = PacingState::default();
+    state
+        .reconcile_capital(
+            &[deposit("before-outage", 100, at(2026, 1, 1, 8))],
+            at(2026, 1, 1, 10),
+            &limits,
+        )
+        .expect("pre-outage deposit");
+
+    let resumed = state
+        .decide(&input(at(2026, 12, 30, 12), 100), &limits)
+        .expect("decision after long outage");
+    assert_eq!(resumed.decision().planned_usdc, usd(25));
+    assert!(resumed.decision().alerts.iter().any(|alert| matches!(
+        alert,
+        PacingAlert::HorizonInfeasible {
+            residual_usdc,
+            remaining_capacity_usdc,
+            ..
+        } if *residual_usdc == usd(100) && *remaining_capacity_usdc == usd(50)
+    )));
+    state
+        .settle_decision(&resumed.decision().decision_id, usd(25))
+        .expect("settle resumed purchase");
+    let final_day = state
+        .decide(&input(at(2026, 12, 31, 12), 75), &limits)
+        .expect("final capped decision");
+    assert_eq!(final_day.decision().planned_usdc, usd(25));
+}
+
+#[test]
 fn restart_is_deterministic_and_durable_skip_is_not_retried() {
     let limits = limits();
     let mut original = PacingState::default();
