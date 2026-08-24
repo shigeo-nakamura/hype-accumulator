@@ -1,10 +1,12 @@
 //! Crash-safe, signer-free orchestration for one daily HYPE allocation.
 //!
-//! The journal is single-writer and append-only. Its independently fsynced
-//! `<journal>.head` checkpoint detects rollback to an otherwise valid record
-//! prefix. Every external action is durably prepared and fsynced before it can
-//! be returned to a caller. After a restart, a prepared action is
-//! reconciliation-only and is never returned as a new submission.
+//! The journal is single-writer and append-only. Its fsynced `<journal>.head`
+//! checkpoint closes local crash windows, while a caller-supplied monotonic
+//! anchor in an independent rollback domain detects restoration of both local
+//! files to an otherwise valid historical prefix. Every external action is
+//! durably prepared and anchored before it can be returned to a caller. After a
+//! restart, a prepared action is reconciliation-only and is never returned as a
+//! new submission.
 
 use crate::pacing::{DailyDecision, DecisionReason, UsdcMicros};
 use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
@@ -16,11 +18,13 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use thiserror::Error;
 
 const JOURNAL_SCHEMA_VERSION: u8 = 1;
 const CHECKPOINT_SCHEMA_VERSION: u8 = 1;
+const PROTECTED_HEAD_SCHEMA_VERSION: u8 = 1;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -55,13 +59,42 @@ pub struct InventoryBaseline {
     pub staking_hype_atoms: HypeAtoms,
     pub delegated_hype_atoms: HypeAtoms,
     pub configured_residual_hype_atoms: HypeAtoms,
+    /// Reconciled, unconsumed quantity currently assigned to `residual_spot`.
+    pub unconsumed_residual_spot_hype_atoms: HypeAtoms,
 }
 
 impl InventoryBaseline {
     fn residual_hype_deficit(&self) -> HypeAtoms {
         self.configured_residual_hype_atoms
-            .checked_sub(self.spot_hype_atoms)
+            .checked_sub(self.unconsumed_residual_spot_hype_atoms)
             .unwrap_or_default()
+    }
+}
+
+/// Latest time through which every signer-side authorization input is valid.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AuthorizationInputFreshness {
+    pub decision_valid_through_at: DateTime<Utc>,
+    pub signal_evidence_valid_through_at: DateTime<Utc>,
+    pub book_evidence_valid_through_at: DateTime<Utc>,
+    pub account_evidence_valid_through_at: DateTime<Utc>,
+    pub fee_schedule_valid_through_at: DateTime<Utc>,
+    pub policy_acknowledgement_valid_through_at: DateTime<Utc>,
+}
+
+impl AuthorizationInputFreshness {
+    fn earliest_deadline(&self) -> DateTime<Utc> {
+        [
+            self.decision_valid_through_at,
+            self.signal_evidence_valid_through_at,
+            self.book_evidence_valid_through_at,
+            self.account_evidence_valid_through_at,
+            self.fee_schedule_valid_through_at,
+            self.policy_acknowledgement_valid_through_at,
+        ]
+        .into_iter()
+        .min()
+        .expect("authorization freshness has a fixed non-empty field set")
     }
 }
 
@@ -86,6 +119,7 @@ pub struct OrderEnvelopeBinding {
     pub venue_clock_evidence_valid_through_at: DateTime<Utc>,
     pub venue_clock_evidence_digest: String,
     pub max_venue_clock_lag_ms: u64,
+    pub input_freshness: AuthorizationInputFreshness,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -176,6 +210,10 @@ impl DecisionBinding {
                 .execution_identity_hash
                 .trim()
                 .is_empty()
+            || self.inventory_before.unconsumed_residual_spot_hype_atoms
+                > self.inventory_before.spot_hype_atoms
+            || self.inventory_before.unconsumed_residual_spot_hype_atoms
+                > self.inventory_before.configured_residual_hype_atoms
             || self.planned_usdc.is_zero()
             || self.committed_usdc < self.planned_usdc
             || self.order_envelope.original_quantity_hype.is_zero()
@@ -1390,6 +1428,44 @@ struct JournalCheckpoint {
     journal_len: u64,
 }
 
+/// Latest workflow journal head retained outside the journal rollback domain.
+///
+/// Implementations of [`ProtectedWorkflowHeadStore`] must durably persist this
+/// value independently of the journal and its adjacent checkpoint.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProtectedWorkflowHead {
+    pub schema_version: u8,
+    pub workflow_id: String,
+    pub sequence: u64,
+    pub record_hash: String,
+    pub journal_len: u64,
+}
+
+/// Independently durable, monotonic storage for one workflow journal head.
+///
+/// A store instance must be scoped to one workflow. `compare_and_swap` must
+/// atomically and durably replace `expected` with `next`, returning `false`
+/// when the currently protected value differs from `expected`.
+pub trait ProtectedWorkflowHeadStore: Send + Sync {
+    /// Loads the currently protected head.
+    ///
+    /// # Errors
+    ///
+    /// Returns an implementation-specific availability or integrity error.
+    fn load(&self) -> Result<Option<ProtectedWorkflowHead>, String>;
+
+    /// Durably advances the protected head if its current value is `expected`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an implementation-specific availability or persistence error.
+    fn compare_and_swap(
+        &self,
+        expected: Option<&ProtectedWorkflowHead>,
+        next: &ProtectedWorkflowHead,
+    ) -> Result<bool, String>;
+}
+
 #[derive(Serialize)]
 struct RecordHashInput<'a> {
     schema_version: u8,
@@ -1404,6 +1480,8 @@ pub struct DurableWorkflow {
     events_by_id: BTreeMap<String, WorkflowEvent>,
     state: WorkflowState,
     file_len: u64,
+    protected_head_store: Arc<dyn ProtectedWorkflowHeadStore>,
+    protected_head: Option<ProtectedWorkflowHead>,
 }
 
 impl DurableWorkflow {
@@ -1416,12 +1494,22 @@ impl DurableWorkflow {
     pub fn open_or_create(
         path: impl AsRef<Path>,
         binding: &DecisionBinding,
+        protected_head_store: Arc<dyn ProtectedWorkflowHeadStore>,
     ) -> Result<Self, WorkflowError> {
         binding.validate()?;
         let path = path.as_ref().to_path_buf();
         let records = load_records(&path)?;
         let workflow_id = workflow_id_for(binding)?;
         if records.is_empty() {
+            if protected_head_store
+                .load()
+                .map_err(WorkflowError::protected_head)?
+                .is_some()
+            {
+                return Err(WorkflowError::RollbackDetected(
+                    "protected head exists but the local journal is empty".into(),
+                ));
+            }
             if checkpoint_path(&path).exists() {
                 verify_bootstrap_checkpoint(&path, &workflow_id)?;
             } else {
@@ -1442,6 +1530,8 @@ impl DurableWorkflow {
                 events_by_id: BTreeMap::new(),
                 state,
                 file_len: 0,
+                protected_head_store,
+                protected_head: None,
             };
             workflow.append(initial)?;
             Ok(workflow)
@@ -1463,6 +1553,18 @@ impl DurableWorkflow {
                 }
             }
             let file_len = fs::metadata(&path).map_err(WorkflowError::io)?.len();
+            let last = records.last().ok_or_else(|| {
+                WorkflowError::CorruptJournal("non-empty journal has no final record".into())
+            })?;
+            let expected_protected_head = protected_head_for(last, &state.workflow_id, file_len);
+            let protected_head = protected_head_store
+                .load()
+                .map_err(WorkflowError::protected_head)?;
+            if protected_head.as_ref() != Some(&expected_protected_head) {
+                return Err(WorkflowError::RollbackDetected(
+                    "local journal does not match its independently protected head".into(),
+                ));
+            }
             verify_or_advance_checkpoint(&path, &records, &state.workflow_id, file_len)?;
             Ok(Self {
                 path,
@@ -1470,6 +1572,8 @@ impl DurableWorkflow {
                 events_by_id,
                 state,
                 file_len,
+                protected_head_store,
+                protected_head,
             })
         }
     }
@@ -1880,6 +1984,14 @@ impl DurableWorkflow {
                 "a different action is pending reconciliation".into(),
             ));
         }
+        if kind == ActionKind::SubmitOrder
+            && (at >= self.state.binding.order_envelope.signed_expiry_at
+                || at >= self.state.binding.order_envelope.effective_expiry_at)
+        {
+            return Err(WorkflowError::InvalidTransition(
+                "order preparation is at or after its bound expiry".into(),
+            ));
+        }
         let action = external_action_for(&self.state, kind)?;
         let event_id = stable_id(
             "event/action_prepared/v1",
@@ -1982,6 +2094,15 @@ impl DurableWorkflow {
         if current_len != self.file_len {
             return Err(WorkflowError::ConcurrentModification);
         }
+        let current_protected_head = self
+            .protected_head_store
+            .load()
+            .map_err(WorkflowError::protected_head)?;
+        if current_protected_head != self.protected_head {
+            return Err(WorkflowError::RollbackDetected(
+                "protected workflow head changed since open".into(),
+            ));
+        }
         if let Some(last) = self.records.last() {
             verify_checkpoint_exact(&self.path, last, &self.state.workflow_id, self.file_len)?;
         } else {
@@ -2018,6 +2139,17 @@ impl DurableWorkflow {
                 journal_len: new_file_len,
             },
         )?;
+        let next_protected_head = protected_head_for(record, &self.state.workflow_id, new_file_len);
+        let advanced = self
+            .protected_head_store
+            .compare_and_swap(self.protected_head.as_ref(), &next_protected_head)
+            .map_err(WorkflowError::protected_head)?;
+        if !advanced {
+            return Err(WorkflowError::RollbackDetected(
+                "protected workflow head compare-and-swap failed".into(),
+            ));
+        }
+        self.protected_head = Some(next_protected_head);
         self.file_len = new_file_len;
         Ok(())
     }
@@ -2156,6 +2288,7 @@ fn valid_expiry_binding(envelope: &OrderEnvelopeBinding, decided_at: DateTime<Ut
         && !envelope.venue_clock_evidence_digest.trim().is_empty()
         && envelope.venue_clock_evidence_at <= decided_at
         && envelope.venue_clock_evidence_valid_through_at > envelope.effective_expiry_at
+        && envelope.effective_expiry_at <= envelope.input_freshness.earliest_deadline()
         && envelope
             .venue_clock_evidence_valid_through_at
             .timestamp_subsec_nanos()
@@ -2191,6 +2324,7 @@ struct CanonicalOrderEnvelope<'a> {
     venue_clock_evidence_valid_through_at: DateTime<Utc>,
     venue_clock_evidence_digest: &'a str,
     max_venue_clock_lag_ms: u64,
+    input_freshness: &'a AuthorizationInputFreshness,
     market: &'static str,
     side: &'static str,
     time_in_force: &'static str,
@@ -2217,6 +2351,7 @@ fn canonical_order_envelope_hash(state: &WorkflowState) -> Result<String, Workfl
             .venue_clock_evidence_valid_through_at,
         venue_clock_evidence_digest: &state.binding.order_envelope.venue_clock_evidence_digest,
         max_venue_clock_lag_ms: state.binding.order_envelope.max_venue_clock_lag_ms,
+        input_freshness: &state.binding.order_envelope.input_freshness,
         market: "HYPE/USDC",
         side: "buy",
         time_in_force: "IOC",
@@ -2417,6 +2552,20 @@ fn bootstrap_checkpoint(workflow_id: &str) -> JournalCheckpoint {
     }
 }
 
+fn protected_head_for(
+    record: &JournalRecord,
+    workflow_id: &str,
+    journal_len: u64,
+) -> ProtectedWorkflowHead {
+    ProtectedWorkflowHead {
+        schema_version: PROTECTED_HEAD_SCHEMA_VERSION,
+        workflow_id: workflow_id.to_owned(),
+        sequence: record.sequence,
+        record_hash: record.record_hash.clone(),
+        journal_len,
+    }
+}
+
 fn verify_bootstrap_checkpoint(path: &Path, workflow_id: &str) -> Result<(), WorkflowError> {
     if read_checkpoint(path)? == bootstrap_checkpoint(workflow_id) {
         Ok(())
@@ -2603,6 +2752,8 @@ pub enum WorkflowError {
     ConcurrentModification,
     #[error("journal rollback detected: {0}")]
     RollbackDetected(String),
+    #[error("protected workflow head failed: {0}")]
+    ProtectedHead(String),
     #[error("journal I/O failed: {0}")]
     Io(String),
     #[error("journal serialization failed: {0}")]
@@ -2618,5 +2769,10 @@ impl WorkflowError {
     #[allow(clippy::needless_pass_by_value)]
     fn json(error: serde_json::Error) -> Self {
         Self::Json(error.to_string())
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn protected_head(error: String) -> Self {
+        Self::ProtectedHead(error)
     }
 }

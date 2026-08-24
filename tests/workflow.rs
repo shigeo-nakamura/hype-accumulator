@@ -2,18 +2,61 @@ use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use hype_accumulator::{
     pacing::{DailyDecision, DecisionAllocation, DecisionReason, PacingExplanation, UsdcMicros},
     workflow::{
-        ActionKind, AppendOutcome, BoundFillEvidence, BoundMovementEvidence,
-        ConclusiveAbsenceEvidence, DecisionBinding, DurableWorkflow, EligibilityPolicyBinding,
-        ExternalAction, ExternalReceipt, GapFreeHistoryWatermark, HistoryDomain, HypeAtoms,
-        InventoryBaseline, OrderBoundEligibilityEvidence, OrderEnvelopeBinding, OrderFinality,
-        PrepareOutcome, WorkflowError, WorkflowStage,
+        ActionKind, AppendOutcome, AuthorizationInputFreshness, BoundFillEvidence,
+        BoundMovementEvidence, ConclusiveAbsenceEvidence, DecisionBinding, DurableWorkflow,
+        EligibilityPolicyBinding, ExternalAction, ExternalReceipt, GapFreeHistoryWatermark,
+        HistoryDomain, HypeAtoms, InventoryBaseline, OrderBoundEligibilityEvidence,
+        OrderEnvelopeBinding, OrderFinality, PrepareOutcome, ProtectedWorkflowHead,
+        ProtectedWorkflowHeadStore, WorkflowError, WorkflowStage,
     },
 };
 use std::{
+    collections::BTreeMap,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
 };
+
+#[derive(Default)]
+struct MemoryProtectedHeadStore {
+    head: Mutex<Option<ProtectedWorkflowHead>>,
+}
+
+impl ProtectedWorkflowHeadStore for MemoryProtectedHeadStore {
+    fn load(&self) -> Result<Option<ProtectedWorkflowHead>, String> {
+        self.head
+            .lock()
+            .map(|head| head.clone())
+            .map_err(|error| error.to_string())
+    }
+
+    fn compare_and_swap(
+        &self,
+        expected: Option<&ProtectedWorkflowHead>,
+        next: &ProtectedWorkflowHead,
+    ) -> Result<bool, String> {
+        let mut head = self.head.lock().map_err(|error| error.to_string())?;
+        if head.as_ref() != expected {
+            return Ok(false);
+        }
+        *head = Some(next.clone());
+        Ok(true)
+    }
+}
+
+fn protected_head_store(path: &Path) -> Arc<MemoryProtectedHeadStore> {
+    static STORES: OnceLock<Mutex<BTreeMap<PathBuf, Arc<MemoryProtectedHeadStore>>>> =
+        OnceLock::new();
+    let mut stores = STORES
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .expect("protected head registry locks");
+    stores
+        .entry(path.to_path_buf())
+        .or_insert_with(|| Arc::new(MemoryProtectedHeadStore::default()))
+        .clone()
+}
 
 fn at(minute: u32) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 8, 24, 12, minute, 0)
@@ -91,6 +134,7 @@ fn binding() -> DecisionBinding {
             staking_hype_atoms: hype(20_000),
             delegated_hype_atoms: hype(19_000),
             configured_residual_hype_atoms: hype(10),
+            unconsumed_residual_spot_hype_atoms: hype(10),
         },
         OrderEnvelopeBinding {
             original_quantity_hype: hype(250),
@@ -104,6 +148,14 @@ fn binding() -> DecisionBinding {
             venue_clock_evidence_valid_through_at: at(31),
             venue_clock_evidence_digest: "venue-clock-evidence-a".to_owned(),
             max_venue_clock_lag_ms: 59_999,
+            input_freshness: AuthorizationInputFreshness {
+                decision_valid_through_at: at(30),
+                signal_evidence_valid_through_at: at(30),
+                book_evidence_valid_through_at: at(30),
+                account_evidence_valid_through_at: at(30),
+                fee_schedule_valid_through_at: at(30),
+                policy_acknowledgement_valid_through_at: at(30),
+            },
         },
         eligibility_policy(),
     )
@@ -121,7 +173,12 @@ fn bound_evidence(
         .inventory_before
         .configured_residual_hype_atoms
         .as_atoms()
-        .saturating_sub(binding.inventory_before.spot_hype_atoms.as_atoms());
+        .saturating_sub(
+            binding
+                .inventory_before
+                .unconsumed_residual_spot_hype_atoms
+                .as_atoms(),
+        );
     OrderBoundEligibilityEvidence {
         authorization_id: "order-bound-authorization-a".to_owned(),
         authorization_record_hash: "authorization-record-hash-a".to_owned(),
@@ -224,7 +281,8 @@ fn absence_evidence(workflow: &DurableWorkflow, observation_id: &str) -> Conclus
 }
 
 fn reopen(path: &Path, binding: &DecisionBinding) -> DurableWorkflow {
-    DurableWorkflow::open_or_create(path, binding).expect("journal reopens")
+    DurableWorkflow::open_or_create(path, binding, protected_head_store(path))
+        .expect("journal reopens")
 }
 
 fn checkpoint_path(path: &Path) -> PathBuf {
@@ -326,6 +384,44 @@ fn expiry_binding_requires_exact_verified_clock_lag_gap() {
 }
 
 #[test]
+fn effective_expiry_is_capped_by_every_authorization_input_horizon() {
+    for stale_input in [
+        "decision",
+        "signal",
+        "book",
+        "account",
+        "fee-schedule",
+        "policy-acknowledgement",
+    ] {
+        let valid = binding();
+        let mut envelope = valid.order_envelope;
+        let stale_at = at(29);
+        match stale_input {
+            "decision" => envelope.input_freshness.decision_valid_through_at = stale_at,
+            "signal" => envelope.input_freshness.signal_evidence_valid_through_at = stale_at,
+            "book" => envelope.input_freshness.book_evidence_valid_through_at = stale_at,
+            "account" => envelope.input_freshness.account_evidence_valid_through_at = stale_at,
+            "fee-schedule" => envelope.input_freshness.fee_schedule_valid_through_at = stale_at,
+            "policy-acknowledgement" => {
+                envelope
+                    .input_freshness
+                    .policy_acknowledgement_valid_through_at = stale_at;
+            }
+            _ => unreachable!("complete authorization input fixture"),
+        }
+        assert!(matches!(
+            DecisionBinding::from_pacing_decision(
+                &decision(),
+                valid.inventory_before,
+                envelope,
+                valid.eligibility_policy,
+            ),
+            Err(WorkflowError::InvalidBinding(_))
+        ));
+    }
+}
+
+#[test]
 fn order_binding_caps_quantity_times_limit_notional() {
     for invalid in [
         "above-planned",
@@ -353,6 +449,34 @@ fn order_binding_caps_quantity_times_limit_notional() {
                 &decision(),
                 valid.inventory_before,
                 envelope,
+                valid.eligibility_policy,
+            ),
+            Err(WorkflowError::InvalidBinding(_))
+        ));
+    }
+}
+
+#[test]
+fn residual_lot_inventory_cannot_exceed_spot_or_its_configured_target() {
+    for invalid in ["aggregate-spot", "configured-target"] {
+        let valid = binding();
+        let mut inventory = valid.inventory_before;
+        match invalid {
+            "aggregate-spot" => {
+                inventory.spot_hype_atoms = hype(5);
+                inventory.unconsumed_residual_spot_hype_atoms = hype(6);
+            }
+            "configured-target" => {
+                inventory.configured_residual_hype_atoms = hype(10);
+                inventory.unconsumed_residual_spot_hype_atoms = hype(11);
+            }
+            _ => unreachable!("complete residual baseline fixture"),
+        }
+        assert!(matches!(
+            DecisionBinding::from_pacing_decision(
+                &decision(),
+                inventory,
+                valid.order_envelope,
                 valid.eligibility_policy,
             ),
             Err(WorkflowError::InvalidBinding(_))
@@ -406,6 +530,31 @@ fn prepared_order_is_durable_and_restart_is_reconciliation_only() {
         }
     );
     assert_eq!(restarted.record_count(), 2);
+}
+
+#[test]
+fn an_unprepared_order_is_rejected_at_both_bound_expiries_without_journaling() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("expired-before-prepare.jsonl");
+    let binding = binding();
+    let mut workflow = reopen(&path, &binding);
+    let durable_before = fs::read(&path).expect("decision journal read");
+
+    for expired_at in [
+        binding.order_envelope.signed_expiry_at,
+        binding.order_envelope.effective_expiry_at,
+    ] {
+        assert!(matches!(
+            workflow.prepare_order(expired_at),
+            Err(WorkflowError::InvalidTransition(_))
+        ));
+        assert_eq!(workflow.record_count(), 1);
+        assert!(workflow.state().pending_action().is_none());
+        assert_eq!(
+            fs::read(&path).expect("unchanged journal read"),
+            durable_before
+        );
+    }
 }
 
 #[test]
@@ -915,6 +1064,7 @@ fn residual_only_fill_records_zero_eligibility_and_completes() {
     let path = temp.path().join("residual-only.jsonl");
     let mut binding = binding();
     binding.inventory_before.spot_hype_atoms = hype(5);
+    binding.inventory_before.unconsumed_residual_spot_hype_atoms = hype(5);
     let mut workflow = reopen(&path, &binding);
     ready(workflow.prepare_order(at(1)).expect("order prepared"));
     workflow
@@ -949,6 +1099,46 @@ fn residual_only_fill_records_zero_eligibility_and_completes() {
         .complete(at(6))
         .expect("residual-only workflow completed");
     assert_eq!(workflow.state().stage(), WorkflowStage::Complete);
+}
+
+#[test]
+fn consumed_residual_inventory_is_replenished_before_eligible_spot() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("consumed-residual.jsonl");
+    let mut binding = binding();
+    binding.inventory_before.spot_hype_atoms = hype(90);
+    binding.inventory_before.unconsumed_residual_spot_hype_atoms = hype(0);
+    let mut workflow = reopen(&path, &binding);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    workflow
+        .observe_order_submission("exchange-order-1", at(2))
+        .expect("submission observed");
+    workflow
+        .observe_order_fill(
+            "mixed-fill",
+            hype(20),
+            usdc(4_000_000),
+            usdc(4_040_000),
+            false,
+            at(3),
+        )
+        .expect("mixed fill observed");
+    workflow
+        .finalize_order(
+            hype(20),
+            usdc(4_000_000),
+            usdc(4_040_000),
+            OrderFinality::Canceled,
+            at(4),
+        )
+        .expect("mixed order finalized");
+    let evidence = bound_evidence(&workflow, &[("mixed-fill", 20, 3)], at(5));
+    let eligibility = workflow
+        .record_staking_eligibility(Some(evidence), at(5))
+        .expect("mixed eligibility recorded");
+
+    assert_eq!(eligibility.residual_hype, hype(10));
+    assert_eq!(eligibility.eligible_hype, hype(10));
 }
 
 #[test]
@@ -1222,7 +1412,11 @@ fn later_capital_never_resizes_a_decided_or_ambiguous_order() {
         original.eligibility_policy.clone(),
     )
     .expect("later decision shape is internally valid");
-    assert_binding_mismatch(&DurableWorkflow::open_or_create(&path, &changed));
+    assert_binding_mismatch(&DurableWorkflow::open_or_create(
+        &path,
+        &changed,
+        protected_head_store(&path),
+    ));
 
     let mut restarted = reopen(&path, &original);
     assert_eq!(restarted.state().binding().planned_usdc, usdc(50_000_000));
@@ -1300,7 +1494,11 @@ fn truncated_and_hash_corrupted_journals_fail_closed() {
         .write_all(b"{")
         .expect("partial record injected");
     assert!(matches!(
-        DurableWorkflow::open_or_create(&truncated_path, &binding),
+        DurableWorkflow::open_or_create(
+            &truncated_path,
+            &binding,
+            protected_head_store(&truncated_path),
+        ),
         Err(WorkflowError::TruncatedJournal)
     ));
 
@@ -1320,7 +1518,11 @@ fn truncated_and_hash_corrupted_journals_fail_closed() {
     };
     fs::write(&corrupt_path, payload).expect("corrupt journal written");
     assert!(matches!(
-        DurableWorkflow::open_or_create(&corrupt_path, &binding),
+        DurableWorkflow::open_or_create(
+            &corrupt_path,
+            &binding,
+            protected_head_store(&corrupt_path),
+        ),
         Err(WorkflowError::CorruptJournal(_))
     ));
 }
@@ -1332,13 +1534,33 @@ fn complete_record_prefix_rollback_is_detected_by_the_independent_head() {
     let binding = binding();
     let mut workflow = reopen(&path, &binding);
     let decision_only = fs::read(&path).expect("decision record read");
+    let decision_head = fs::read(checkpoint_path(&path)).expect("decision head read");
 
     ready(workflow.prepare_order(at(1)).expect("order prepared"));
     drop(workflow);
     fs::write(&path, decision_only).expect("journal rolled back to a complete valid prefix");
+    fs::write(checkpoint_path(&path), decision_head)
+        .expect("adjacent head rolled back to the same valid prefix");
 
     assert!(matches!(
-        DurableWorkflow::open_or_create(&path, &binding),
+        DurableWorkflow::open_or_create(&path, &binding, protected_head_store(&path)),
+        Err(WorkflowError::RollbackDetected(_))
+    ));
+}
+
+#[test]
+fn a_nonempty_journal_requires_its_independently_protected_head_scope() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("missing-protected-head.jsonl");
+    let binding = binding();
+    drop(reopen(&path, &binding));
+
+    assert!(matches!(
+        DurableWorkflow::open_or_create(
+            &path,
+            &binding,
+            Arc::new(MemoryProtectedHeadStore::default()),
+        ),
         Err(WorkflowError::RollbackDetected(_))
     ));
 }
@@ -1783,7 +2005,7 @@ fn bootstrap_head_recovers_initial_journal_fsync_crash_window() {
     drop(recovered);
     fs::write(&checkpoint, encoded).expect("bootstrap head restored after later record");
     assert!(matches!(
-        DurableWorkflow::open_or_create(&path, &binding),
+        DurableWorkflow::open_or_create(&path, &binding, protected_head_store(&path)),
         Err(WorkflowError::RollbackDetected(_))
     ));
 }
