@@ -1971,6 +1971,7 @@ fn eligibility_requires_durable_timely_fill_registration() {
     for invalid in [
         "missing-record-id",
         "missing-record-hash",
+        "noncanonical-fill-id",
         "zero-cursor",
         "cursor-beyond-watermark",
         "registered-at-deadline",
@@ -2020,6 +2021,7 @@ fn eligibility_requires_durable_timely_fill_registration() {
         match invalid {
             "missing-record-id" => fill.registration_record_id.clear(),
             "missing-record-hash" => fill.registration_record_hash.clear(),
+            "noncanonical-fill-id" => fill.fill_id = " fill-1 ".to_owned(),
             "zero-cursor" => fill.registration_cursor = 0,
             "cursor-beyond-watermark" => {
                 fill.registration_cursor = evidence.fill_history.cursor + 1;

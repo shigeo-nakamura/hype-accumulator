@@ -1191,6 +1191,7 @@ impl WorkflowState {
                 false
             };
             if fill.fill_id.trim().is_empty()
+                || fill.fill_id.trim() != fill.fill_id
                 || fill.authorization_id != evidence.authorization_id
                 || fill.authorization_record_hash != evidence.authorization_record_hash
                 || fill.execution_identity_hash != evidence.execution_identity_hash
