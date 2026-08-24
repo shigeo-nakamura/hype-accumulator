@@ -1022,6 +1022,42 @@ fn unknown_unhashed_journal_field_is_rejected() {
 }
 
 #[test]
+fn blank_journal_records_are_rejected() {
+    for placement in ["between", "tail"] {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let anchor = anchor_store();
+        let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+        ledger
+            .append(deposit("deposit-blank-line", 1, 100))
+            .expect("append deposit");
+        ledger
+            .append(observed("balance-blank-line", 2, 100, 1))
+            .expect("append balance");
+        drop(ledger);
+
+        let path = ledger_path(directory.path());
+        let mut payload = fs::read(&path).expect("read ledger");
+        match placement {
+            "between" => {
+                let first_terminator = payload
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .expect("first record terminator");
+                payload.insert(first_terminator + 1, b'\n');
+            }
+            "tail" => payload.push(b'\n'),
+            _ => unreachable!("complete placement fixture"),
+        }
+        fs::write(path, payload).expect("insert blank record");
+
+        assert!(matches!(
+            open(directory.path(), &anchor),
+            Err(LedgerError::CorruptLedger(_))
+        ));
+    }
+}
+
+#[test]
 fn partial_final_record_is_reported_as_truncation() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let anchor = anchor_store();

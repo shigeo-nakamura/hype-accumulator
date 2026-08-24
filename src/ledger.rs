@@ -1252,12 +1252,20 @@ fn load_records(payload: &[u8]) -> Result<Vec<LedgerEnvelope>, LedgerError> {
     if payload.last() != Some(&b'\n') {
         return Err(LedgerError::TruncatedLedger);
     }
+    let body = &payload[..payload.len() - 1];
+    if body.is_empty() {
+        return Err(LedgerError::CorruptLedger(
+            "journal contains a blank record".into(),
+        ));
+    }
     let mut records = Vec::new();
     let mut expected_previous_hash = GENESIS_HASH.to_owned();
-    for line in payload
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-    {
+    for line in body.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            return Err(LedgerError::CorruptLedger(
+                "journal contains a blank record".into(),
+            ));
+        }
         let record: LedgerEnvelope = serde_json::from_slice(line).map_err(LedgerError::json)?;
         let expected_sequence = u64::try_from(records.len())
             .map_err(|_| LedgerError::CorruptLedger("sequence overflowed".into()))?;
