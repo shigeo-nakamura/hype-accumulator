@@ -122,6 +122,14 @@ pub enum ConfigError {
     SecurityPolicy(#[from] SecurityPolicyError),
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeActionPolicy {
+    pub max_order_usdc: f64,
+    pub max_slippage_bps: u16,
+    pub max_purchase_fee_bps: u16,
+    pub acknowledgement_expires_at: Option<DateTime<Utc>>,
+}
+
 impl Config {
     /// Parses a complete configuration from TOML.
     ///
@@ -313,6 +321,41 @@ impl Config {
         self.security_policy
             .as_ref()
             .map(|policy| policy.wire.capital.reserve_microusd)
+    }
+
+    pub(crate) fn runtime_action_policy_at<E: Environment>(
+        &self,
+        env: &E,
+        now: DateTime<Utc>,
+    ) -> Result<RuntimeActionPolicy, ConfigError> {
+        self.validate_at(env, now)?;
+        let max_purchase_fee_bps = self
+            .security_policy
+            .as_ref()
+            .map_or(0, |policy| policy.wire.execution.max_purchase_fee_bps);
+        if max_purchase_fee_bps >= 10_000 {
+            return Err(ConfigError::SecurityPolicy(SecurityPolicyError::Invalid(
+                "purchase-fee ceiling must be below 10000 bps".to_owned(),
+            )));
+        }
+        let acknowledgement_expires_at = if self.dry_run {
+            None
+        } else {
+            let policy = self
+                .security_policy
+                .as_ref()
+                .ok_or(ConfigError::MissingSecurityPolicy)?;
+            Some(parse_canonical_utc(
+                &policy.wire.operator.live_acknowledgement_expires_at,
+                "live acknowledgement expiry",
+            )?)
+        };
+        Ok(RuntimeActionPolicy {
+            max_order_usdc: self.effective_max_order_usdc(),
+            max_slippage_bps: self.execution.max_slippage_bps,
+            max_purchase_fee_bps,
+            acknowledgement_expires_at,
+        })
     }
 
     /// Resolves the public account identity used by the read-only status probe.
