@@ -18,7 +18,6 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 
@@ -896,13 +895,17 @@ fn record_capital_settlement(
     commitment_id: &str,
     debited_usdc: UsdcMicros,
 ) -> Result<(), LedgerError> {
-    let recorded_costs = state
+    let (recorded_costs, decision_commitment) = match state
         .purchase_decisions
         .values()
         .find(|decision| decision.commitment_id == commitment_id)
-        .map_or(Ok(UsdcMicros::default()), |decision| {
-            checked_add(decision.filled_usdc, decision.fee_usdc)
-        })?;
+    {
+        Some(decision) => (
+            checked_add(decision.filled_usdc, decision.fee_usdc)?,
+            Some(decision.committed_usdc),
+        ),
+        None => (UsdcMicros::default(), None),
+    };
     let commitment = state
         .commitments
         .get_mut(commitment_id)
@@ -912,7 +915,9 @@ fn record_capital_settlement(
             commitment_id.to_owned(),
         ));
     }
-    if debited_usdc > commitment.committed_usdc {
+    if debited_usdc > commitment.committed_usdc
+        || decision_commitment.is_some_and(|limit| debited_usdc > limit)
+    {
         return Err(LedgerError::DebitExceedsCommitment(
             commitment_id.to_owned(),
         ));
@@ -1874,31 +1879,23 @@ fn write_atomic(path: &Path, payload: &[u8]) -> Result<(), LedgerError> {
     let parent = path.parent().ok_or(LedgerError::InvalidPath)?;
     let file_name = path.file_name().ok_or(LedgerError::InvalidPath)?;
     fs::create_dir_all(parent).map_err(LedgerError::io)?;
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| LedgerError::Io(error.to_string()))?
-        .as_nanos();
-    let mut temporary_name = file_name.to_os_string();
-    temporary_name.push(format!(".{}.{}.tmp", std::process::id(), nonce));
-    let temporary = parent.join(temporary_name);
-    let result = (|| -> Result<(), LedgerError> {
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o640);
-        }
-        let mut file = options.open(&temporary).map_err(LedgerError::io)?;
-        file.write_all(payload).map_err(LedgerError::io)?;
-        file.sync_all().map_err(LedgerError::io)?;
-        fs::rename(&temporary, path).map_err(LedgerError::io)?;
-        sync_directory(parent)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+    let mut prefix = file_name.to_os_string();
+    prefix.push(format!(".{}.", std::process::id()));
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(&prefix).suffix(".tmp");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        builder.permissions(fs::Permissions::from_mode(0o640));
     }
-    result
+    let mut temporary = builder.tempfile_in(parent).map_err(LedgerError::io)?;
+    temporary.write_all(payload).map_err(LedgerError::io)?;
+    temporary.as_file().sync_all().map_err(LedgerError::io)?;
+    temporary
+        .persist(path)
+        .map_err(|error| LedgerError::io(error.error))?;
+    sync_directory(parent)
 }
 
 fn recover_pending_restore_temporary(
@@ -1989,7 +1986,7 @@ fn is_atomic_temporary_for(candidate: &std::ffi::OsStr, target: &std::ffi::OsStr
         && !process_id.is_empty()
         && process_id.bytes().all(|byte| byte.is_ascii_digit())
         && !nonce.is_empty()
-        && nonce.bytes().all(|byte| byte.is_ascii_digit())
+        && nonce.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
 fn read_single_linked_regular(path: &Path) -> Result<Option<Vec<u8>>, LedgerError> {
@@ -2836,6 +2833,62 @@ mod transaction_tests {
             })
             .expect("settle at the recorded cost floor");
         assert_eq!(ledger.state().spent_usdc(), usd(12));
+    }
+
+    #[test]
+    fn settlement_cannot_exceed_linked_decision_commitment() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let anchor = anchor_store();
+        let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+        let decision_date = at(1).date_naive();
+        for event in [
+            deposit("deposit-settlement-cap", 1),
+            LedgerEvent {
+                event_id: "admission-settlement-cap".into(),
+                occurred_at: at(2),
+                kind: LedgerEventKind::DepositAdmission {
+                    deposit_event_id: "deposit-settlement-cap".into(),
+                    amount_usdc: usd(20),
+                },
+            },
+            LedgerEvent {
+                event_id: "commit-settlement-cap".into(),
+                occurred_at: at(3),
+                kind: LedgerEventKind::CapitalCommitted {
+                    commitment_id: "commitment-settlement-cap".into(),
+                    amount_usdc: usd(20),
+                },
+            },
+            LedgerEvent {
+                event_id: "decision-settlement-cap".into(),
+                occurred_at: at(4),
+                kind: LedgerEventKind::DailyDecision {
+                    decision_id: "purchase-settlement-cap".into(),
+                    decision_date,
+                    commitment_id: "commitment-settlement-cap".into(),
+                    planned_usdc: usd(10),
+                    committed_usdc: usd(10),
+                },
+            },
+        ] {
+            ledger.append(event).expect("append settlement fixture");
+        }
+
+        assert_eq!(
+            ledger.append(LedgerEvent {
+                event_id: "settlement-above-decision-cap".into(),
+                occurred_at: at(5),
+                kind: LedgerEventKind::CapitalSettled {
+                    commitment_id: "commitment-settlement-cap".into(),
+                    debited_usdc: usd(11),
+                },
+            }),
+            Err(LedgerError::DebitExceedsCommitment(
+                "commitment-settlement-cap".into()
+            ))
+        );
+        assert_eq!(ledger.state().committed_usdc(), usd(20));
+        assert_eq!(ledger.state().spent_usdc(), UsdcMicros::default());
     }
 
     #[test]
