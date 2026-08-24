@@ -111,6 +111,7 @@ pub enum LedgerEventKind {
         decision_id: String,
     },
     FillRecorded {
+        fill_id: String,
         order_id: String,
         filled_usdc: UsdcMicros,
         received_hype_atoms: u64,
@@ -191,6 +192,8 @@ pub struct ReplayState {
     purchase_decisions: BTreeMap<String, PurchaseDecisionReplay>,
     decision_commitment_ids: BTreeSet<String>,
     orders: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    fills: BTreeMap<String, String>,
     admitted_usdc: UsdcMicros,
     withdrawn_usdc: UsdcMicros,
     committed_usdc: UsdcMicros,
@@ -516,6 +519,9 @@ impl DurableLedger {
                 Err(LedgerError::EventCollision(event.event_id))
             };
         }
+        if self.is_duplicate_fill(&event)? {
+            return Ok(AppendOutcome::Duplicate);
+        }
         let prepared = self.prepare_append(event)?;
         write_pending(&self.directory, &prepared.pending)?;
         let next_anchor = protected_anchor_for_snapshot(&prepared.snapshot)?;
@@ -678,6 +684,41 @@ impl DurableLedger {
         }
         clear_pending_restore(&destination)?;
         Ok(restored)
+    }
+
+    fn is_duplicate_fill(&self, candidate: &LedgerEvent) -> Result<bool, LedgerError> {
+        let LedgerEventKind::FillRecorded {
+            fill_id,
+            order_id,
+            filled_usdc,
+            received_hype_atoms,
+        } = &candidate.kind
+        else {
+            return Ok(false);
+        };
+        for existing in self.events_by_id.values() {
+            let LedgerEventKind::FillRecorded {
+                fill_id: existing_fill_id,
+                order_id: existing_order_id,
+                filled_usdc: existing_filled_usdc,
+                received_hype_atoms: existing_received_hype_atoms,
+            } = &existing.kind
+            else {
+                continue;
+            };
+            if existing_fill_id != fill_id {
+                continue;
+            }
+            if existing.occurred_at == candidate.occurred_at
+                && existing_order_id == order_id
+                && existing_filled_usdc == filled_usdc
+                && existing_received_hype_atoms == received_hype_atoms
+            {
+                return Ok(true);
+            }
+            return Err(LedgerError::FillIdCollision(fill_id.clone()));
+        }
+        Ok(false)
     }
 
     fn prepare_append(&self, event: LedgerEvent) -> Result<PreparedAppend, LedgerError> {
@@ -857,10 +898,11 @@ fn apply_event(state: &mut ReplayState, event: &LedgerEvent) -> Result<(), Ledge
             decision_id,
         } => record_order(state, order_id, decision_id)?,
         LedgerEventKind::FillRecorded {
+            fill_id,
             order_id,
             filled_usdc,
             ..
-        } => record_fill(state, order_id, *filled_usdc)?,
+        } => record_fill(state, fill_id, order_id, *filled_usdc)?,
         LedgerEventKind::FeeRecorded { order_id, fee_usdc } => {
             record_fee(state, order_id, *fee_usdc)?;
         }
@@ -1049,10 +1091,14 @@ fn record_order(
 
 fn record_fill(
     state: &mut ReplayState,
+    fill_id: &str,
     order_id: &str,
     filled_usdc: UsdcMicros,
 ) -> Result<(), LedgerError> {
     let decision_id = decision_id_for_order(state, order_id)?;
+    if state.fills.contains_key(fill_id) {
+        return Err(LedgerError::FillIdCollision(fill_id.to_owned()));
+    }
     require_unsettled_decision_backing(state, &decision_id)?;
     let decision = state
         .purchase_decisions
@@ -1066,6 +1112,7 @@ fn record_fill(
         return Err(LedgerError::DecisionCostsExceedCommitment(decision_id));
     }
     decision.filled_usdc = next_filled;
+    state.fills.insert(fill_id.to_owned(), order_id.to_owned());
     Ok(())
 }
 
@@ -1165,10 +1212,12 @@ fn validate_event(event: &LedgerEvent) -> Result<(), LedgerError> {
             validate_id("decision_id", decision_id)?;
         }
         LedgerEventKind::FillRecorded {
+            fill_id,
             order_id,
             filled_usdc,
             received_hype_atoms,
         } => {
+            validate_id("fill_id", fill_id)?;
             validate_id("order_id", order_id)?;
             require_nonzero(*filled_usdc)?;
             require_hype(*received_hype_atoms)?;
@@ -2349,6 +2398,8 @@ pub enum LedgerError {
     InsufficientDecisionBacking(String),
     #[error("order ID collision: {0}")]
     OrderIdCollision(String),
+    #[error("venue fill ID collision: {0}")]
+    FillIdCollision(String),
     #[error("unknown order: {0}")]
     UnknownOrder(String),
     #[error("fills exceed the purchase decision plan: {0}")]
@@ -2814,6 +2865,7 @@ mod transaction_tests {
                 event_id: "fill-settlement-floor".into(),
                 occurred_at: at(6),
                 kind: LedgerEventKind::FillRecorded {
+                    fill_id: "fill-settlement-floor".into(),
                     order_id: "order-settlement-floor".into(),
                     filled_usdc: usd(10),
                     received_hype_atoms: 1,

@@ -350,6 +350,78 @@ fn reconciliation_correction_ids_cannot_be_reused() {
 }
 
 #[test]
+fn stable_fill_ids_are_idempotent_and_cannot_change_ownership() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let anchor = anchor_store();
+    let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+    let date = at(0).date_naive();
+    ledger
+        .append(daily_outcome(
+            "daily-fill-identity",
+            "decision-fill-identity",
+            date,
+            "decision",
+        ))
+        .expect("append decision");
+    append_decision_backing(&mut ledger, "decision-fill-identity", date, 10);
+    ledger
+        .append(dated_event(
+            "order-fill-identity",
+            date,
+            5,
+            LedgerEventKind::OrderRecorded {
+                order_id: "order-fill-identity".into(),
+                decision_id: "decision-fill-identity".into(),
+            },
+        ))
+        .expect("append order");
+    let fill = dated_event(
+        "fill-envelope-first",
+        date,
+        6,
+        LedgerEventKind::FillRecorded {
+            fill_id: "venue-fill-stable".into(),
+            order_id: "order-fill-identity".into(),
+            filled_usdc: usd(5),
+            received_hype_atoms: 1,
+        },
+    );
+    ledger.append(fill.clone()).expect("append venue fill");
+    let durable_before_retry = fs::read(ledger_path(directory.path())).expect("read ledger");
+    let record_count = ledger.record_count();
+
+    assert_eq!(
+        ledger
+            .append(LedgerEvent {
+                event_id: "fill-envelope-retry".into(),
+                ..fill
+            })
+            .expect("identical fill retry"),
+        AppendOutcome::Duplicate
+    );
+    assert_eq!(ledger.record_count(), record_count);
+    assert_eq!(
+        fs::read(ledger_path(directory.path())).expect("read unchanged retry ledger"),
+        durable_before_retry
+    );
+    assert_eq!(
+        ledger.append(dated_event(
+            "fill-envelope-conflict",
+            date,
+            7,
+            LedgerEventKind::FillRecorded {
+                fill_id: "venue-fill-stable".into(),
+                order_id: "order-fill-identity".into(),
+                filled_usdc: usd(4),
+                received_hype_atoms: 1,
+            },
+        )),
+        Err(LedgerError::FillIdCollision("venue-fill-stable".into()))
+    );
+    assert_eq!(ledger.record_count(), record_count);
+}
+
+#[test]
 fn one_daily_decision_or_skip_outcome_is_allowed_per_date() {
     for (first, second) in [
         ("decision", "decision"),
@@ -570,6 +642,7 @@ fn order_linked_events_require_a_unique_owned_purchase_order() {
         (
             "unknown-order-fill",
             LedgerEventKind::FillRecorded {
+                fill_id: "fill-unknown-order".into(),
                 order_id: "order-missing".into(),
                 filled_usdc: usd(1),
                 received_hype_atoms: 1,
@@ -604,6 +677,7 @@ fn order_linked_events_require_a_unique_owned_purchase_order() {
                 .expect("valid fill time")
                 .and_utc(),
             kind: LedgerEventKind::FillRecorded {
+                fill_id: "fill-owned-order".into(),
                 order_id: "order-owned".into(),
                 filled_usdc: usd(5),
                 received_hype_atoms: 2,
@@ -663,6 +737,7 @@ fn fills_are_capped_across_all_orders_for_one_decision() {
                 date,
                 hour,
                 LedgerEventKind::FillRecorded {
+                    fill_id: event_id.into(),
                     order_id: order_id.into(),
                     filled_usdc: usd(amount),
                     received_hype_atoms: 1,
@@ -677,6 +752,7 @@ fn fills_are_capped_across_all_orders_for_one_decision() {
             date,
             9,
             LedgerEventKind::FillRecorded {
+                fill_id: "fill-over-plan".into(),
                 order_id: "order-cap-b".into(),
                 filled_usdc: usd(1),
                 received_hype_atoms: 1,
@@ -736,6 +812,7 @@ fn fills_and_fees_share_the_decision_commitment_cap() {
             date,
             6,
             LedgerEventKind::FillRecorded {
+                fill_id: "fill-cost-cap".into(),
                 order_id: "order-cost-cap".into(),
                 filled_usdc: usd(10),
                 received_hype_atoms: 1,
@@ -810,6 +887,7 @@ fn fills_and_fees_are_rejected_after_backing_settles() {
         (
             "fill-after-settle",
             LedgerEventKind::FillRecorded {
+                fill_id: "fill-after-settle".into(),
                 order_id: "order-settled-costs".into(),
                 filled_usdc: usd(1),
                 received_hype_atoms: 1,
