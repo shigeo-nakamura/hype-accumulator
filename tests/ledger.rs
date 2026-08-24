@@ -631,6 +631,27 @@ fn settlement_cannot_predate_recorded_execution_costs() {
             },
         ))
         .expect("append causal order");
+    let durable_before_order_settlement =
+        fs::read(ledger_path(directory.path())).expect("read ledger before settlement");
+    assert_eq!(
+        ledger.append(dated_event(
+            "settlement-before-order",
+            date,
+            4,
+            LedgerEventKind::CapitalSettled {
+                commitment_id: "commitment-decision-causal-settlement".into(),
+                debited_usdc: UsdcMicros::default(),
+            },
+        )),
+        Err(LedgerError::InvalidEvent(
+            "settlement predates its commitment or linked activity".into()
+        ))
+    );
+    assert_eq!(
+        fs::read(ledger_path(directory.path())).expect("read unchanged ledger"),
+        durable_before_order_settlement
+    );
+
     ledger
         .append(dated_event(
             "causal-settlement-fill",
@@ -657,7 +678,7 @@ fn settlement_cannot_predate_recorded_execution_costs() {
             },
         )),
         Err(LedgerError::InvalidEvent(
-            "settlement predates its commitment or recorded execution costs".into()
+            "settlement predates its commitment or linked activity".into()
         ))
     );
     assert_eq!(

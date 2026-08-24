@@ -626,24 +626,7 @@ impl DurableLedger {
         let (_first_lock, _second_lock) = acquire_restore_locks(&source, &destination)?;
         recover_pending(&source, source_anchor_store.as_ref())?;
         let verified = Self::open_unlocked(source.clone(), source_anchor_store)?;
-        let snapshot_payload = read_optional(&source.join(SNAPSHOT_FILE_NAME))?;
-        if snapshot_payload.is_empty() {
-            return Err(LedgerError::MissingSnapshot);
-        }
-        let snapshot = decode_snapshot(&snapshot_payload)?;
-        if snapshot.record_count
-            != u64::try_from(verified.records.len())
-                .map_err(|_| LedgerError::CorruptLedger("record count overflowed".into()))?
-            || snapshot.head_hash != verified.head_hash()
-            || snapshot.state != verified.state
-        {
-            return Err(LedgerError::StaleSnapshot);
-        }
-        let ledger_payload = read_optional(&source.join(LEDGER_FILE_NAME))?;
-        let source_records = load_records(&ledger_payload)?;
-        if source_records != verified.records {
-            return Err(LedgerError::ConcurrentModification);
-        }
+        let (ledger_payload, snapshot_payload) = validated_restore_payloads(&source, &verified)?;
         let current_pending = build_pending_restore(&ledger_payload, &snapshot_payload, &verified)?;
         recover_pending_restore_temporary(&destination, &verified.records)?;
         let destination_anchor = load_protected_anchor(destination_anchor_store.as_ref())?;
@@ -657,6 +640,7 @@ impl DurableLedger {
                 ensure_unanchored_restore_intent_is_clean(
                     &destination,
                     destination_anchor.as_ref(),
+                    &target,
                 )?;
                 remove_authenticated_atomic_temporaries(
                     &destination.join(LEDGER_FILE_NAME),
@@ -892,6 +876,30 @@ impl DurableLedger {
     }
 }
 
+fn validated_restore_payloads(
+    source: &Path,
+    verified: &DurableLedger,
+) -> Result<(Vec<u8>, Vec<u8>), LedgerError> {
+    let snapshot_payload = read_optional(&source.join(SNAPSHOT_FILE_NAME))?;
+    if snapshot_payload.is_empty() {
+        return Err(LedgerError::MissingSnapshot);
+    }
+    let snapshot = decode_snapshot(&snapshot_payload)?;
+    if snapshot.record_count
+        != u64::try_from(verified.records.len())
+            .map_err(|_| LedgerError::CorruptLedger("record count overflowed".into()))?
+        || snapshot.head_hash != verified.head_hash()
+        || snapshot.state != verified.state
+    {
+        return Err(LedgerError::StaleSnapshot);
+    }
+    let ledger_payload = read_optional(&source.join(LEDGER_FILE_NAME))?;
+    if load_records(&ledger_payload)? != verified.records {
+        return Err(LedgerError::ConcurrentModification);
+    }
+    Ok((ledger_payload, snapshot_payload))
+}
+
 fn replay(events: &[LedgerEvent]) -> Result<ReplayState, LedgerError> {
     let mut state = ReplayState::default();
     let mut event_ids = BTreeSet::new();
@@ -1089,16 +1097,24 @@ fn record_capital_settlement(
     commitment_id: &str,
     debited_usdc: UsdcMicros,
 ) -> Result<(), LedgerError> {
-    let (recorded_costs, decision_commitment, latest_cost_at) = match state
+    let (recorded_costs, decision_commitment, latest_linked_at) = match state
         .purchase_decisions
-        .values()
-        .find(|decision| decision.commitment_id == commitment_id)
+        .iter()
+        .find(|(_, decision)| decision.commitment_id == commitment_id)
     {
-        Some(decision) => (
-            checked_add(decision.filled_usdc, decision.fee_usdc)?,
-            Some(decision.committed_usdc),
-            decision.latest_cost_at,
-        ),
+        Some((decision_id, decision)) => {
+            let latest_order_at = state
+                .orders
+                .values()
+                .filter(|order| order.decision_id == *decision_id)
+                .map(|order| order.occurred_at)
+                .max();
+            (
+                checked_add(decision.filled_usdc, decision.fee_usdc)?,
+                Some(decision.committed_usdc),
+                decision.latest_cost_at.max(latest_order_at),
+            )
+        }
         None => (UsdcMicros::default(), None, None),
     };
     let commitment = state
@@ -1111,10 +1127,10 @@ fn record_capital_settlement(
         ));
     }
     if occurred_at < commitment.occurred_at
-        || latest_cost_at.is_some_and(|latest| occurred_at < latest)
+        || latest_linked_at.is_some_and(|latest| occurred_at < latest)
     {
         return Err(LedgerError::InvalidEvent(
-            "settlement predates its commitment or recorded execution costs".into(),
+            "settlement predates its commitment or linked activity".into(),
         ));
     }
     if debited_usdc > commitment.committed_usdc
@@ -2635,24 +2651,46 @@ fn remove_durable(directory: &Path, file_name: &str) -> Result<(), LedgerError> 
 fn ensure_unanchored_restore_intent_is_clean(
     directory: &Path,
     destination_anchor: Option<&ProtectedHeadAnchor>,
+    target: &RestoreTarget,
 ) -> Result<(), LedgerError> {
-    if destination_anchor.is_none() && !has_only_unanchored_restore_intent_entries(directory)? {
+    if destination_anchor.is_none()
+        && !has_only_unanchored_restore_intent_entries(directory, target)?
+    {
         return Err(LedgerError::RestoreDestinationNotEmpty);
     }
     Ok(())
 }
 
-fn has_only_unanchored_restore_intent_entries(directory: &Path) -> Result<bool, LedgerError> {
+fn has_only_unanchored_restore_intent_entries(
+    directory: &Path,
+    target: &RestoreTarget,
+) -> Result<bool, LedgerError> {
     let mut has_pending = false;
     for entry in fs::read_dir(directory).map_err(LedgerError::io)? {
-        let name = entry.map_err(LedgerError::io)?.file_name();
+        let entry = entry.map_err(LedgerError::io)?;
+        let name = entry.file_name();
         if name == LOCK_FILE_NAME {
             continue;
         }
-        if name != RESTORE_PENDING_FILE_NAME || has_pending {
+        if name == RESTORE_PENDING_FILE_NAME && !has_pending {
+            has_pending = true;
+            continue;
+        }
+        let expected_payload = if target.anchor.is_none() && name == LEDGER_FILE_NAME {
+            Some(target.ledger_payload.as_slice())
+        } else if target.anchor.is_none() && name == SNAPSHOT_FILE_NAME {
+            Some(target.snapshot_payload.as_slice())
+        } else {
+            None
+        };
+        let Some(expected_payload) = expected_payload else {
+            return Ok(false);
+        };
+        if read_single_linked_regular(&entry.path())?
+            .is_none_or(|payload| payload != expected_payload)
+        {
             return Ok(false);
         }
-        has_pending = true;
     }
     Ok(has_pending)
 }
@@ -3404,6 +3442,53 @@ mod transaction_tests {
         .expect("accept exact completed restore retry");
         assert_eq!(retried.records, verified.records);
         assert_eq!(retried.state, verified.state);
+    }
+
+    #[test]
+    fn empty_restore_recovers_after_either_payload_is_published() {
+        for published_name in [LEDGER_FILE_NAME, SNAPSHOT_FILE_NAME] {
+            let source = tempfile::tempdir().expect("source directory");
+            let container = tempfile::tempdir().expect("destination container");
+            let destination = container.path().join("restored");
+            let source_anchor = anchor_store();
+            let destination_anchor = anchor_store();
+            let empty = open(source.path(), &source_anchor).expect("open empty source");
+            empty.checkpoint().expect("checkpoint empty source");
+            let ledger_payload =
+                fs::read(source.path().join(LEDGER_FILE_NAME)).expect("read empty journal");
+            let snapshot_payload =
+                fs::read(source.path().join(SNAPSHOT_FILE_NAME)).expect("read empty snapshot");
+            let pending = build_pending_restore(&ledger_payload, &snapshot_payload, &empty)
+                .expect("build empty restore intent");
+            drop(empty);
+
+            canonical_directory(&destination).expect("durably create destination directory");
+            {
+                let _lock = LedgerLock::acquire(&destination).expect("acquire destination lock");
+                write_pending_restore(&destination, &pending).expect("persist restore intent");
+                let payload = if published_name == LEDGER_FILE_NAME {
+                    ledger_payload.as_slice()
+                } else {
+                    snapshot_payload.as_slice()
+                };
+                write_atomic(&destination.join(published_name), payload)
+                    .expect("publish one empty target payload");
+            }
+
+            let restored = DurableLedger::restore_clean(
+                source.path(),
+                &destination,
+                source_anchor,
+                destination_anchor.clone(),
+            )
+            .expect("resume interrupted empty restore");
+            assert_eq!(restored.record_count(), 0);
+            assert!(!destination.join(RESTORE_PENDING_FILE_NAME).exists());
+            assert!(destination_anchor
+                .load()
+                .expect("load destination anchor")
+                .is_none());
+        }
     }
 
     #[test]
