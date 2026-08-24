@@ -28,6 +28,11 @@ paths. `config/example.toml` is safe and non-routable.
 The live adapter and persistent ledger backend are intentionally outside this
 bootstrap. The crate pins tagged `dex-connector` with `hyperliquid-sdk` only.
 
+The read-only status observer therefore treats HYPE attribution as unavailable:
+it reports zero HYPE with degraded health until an authoritative accumulator
+ledger supplies reconciled holdings and last-trade identity. Raw account HYPE
+and account-wide fills are never presented as accumulator activity.
+
 ## Dashboard status contract
 
 The accumulator publishes a nested `accumulator` status block for
@@ -40,8 +45,19 @@ configured account (spot plus staking/delegated), excluding unattributed
 external changes.
 
 The payload deliberately excludes account addresses, signing material,
-ciphertext, signed requests, and production topology. S3 emission and live
-account reconciliation remain gated by the ledger/observability work.
+ciphertext, signed requests, and production topology. The read-only
+`hype-status` binary queries spot balances, the HYPE mark, and staking
+summary/delegations without constructing a signer, then atomically writes one
+local status snapshot. Last-trade identity remains unavailable until supplied
+by the authoritative accumulator ledger:
+
+```text
+HYPE_ACCOUNT_ID=0x... cargo run --locked --bin hype-status -- config.local.toml status.json
+```
+
+This networked one-shot path is suitable for signer-free, read-only DRY_RUN
+verification. S3 emission and deployed scheduling remain gated by the
+observability rollout.
 
 ## Local development
 

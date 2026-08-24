@@ -85,6 +85,8 @@ pub enum ConfigError {
     Invalid(String),
     #[error("live mode requires environment variable {0}")]
     MissingLiveSecret(String),
+    #[error("status observation requires environment variable {0}")]
+    MissingObservationAccount(String),
 }
 
 impl Config {
@@ -141,6 +143,35 @@ impl Config {
         {
             return Err(ConfigError::Invalid("order limits are inconsistent".into()));
         }
+        self.validate_observation_inputs()?;
+        if !self.dry_run {
+            self.validate_live(env)?;
+        }
+        Ok(())
+    }
+
+    /// Resolves the public account identity used by the read-only status probe.
+    /// This path never reads or validates the signing-key environment variable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] when the observation endpoint, schedule, account
+    /// environment name, or account environment value is invalid.
+    pub fn observation_account<E: Environment>(&self, env: &E) -> Result<String, ConfigError> {
+        self.validate_observation_inputs()?;
+        let name = self.hyperliquid.account_env.trim();
+        if name.is_empty() {
+            return Err(ConfigError::Invalid(
+                "Hyperliquid account environment name is empty".into(),
+            ));
+        }
+        env.get(name)
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| ConfigError::MissingObservationAccount(name.to_owned()))
+    }
+
+    fn validate_observation_inputs(&self) -> Result<(), ConfigError> {
         if self.schedule.utc_hour > 23
             || self.schedule.utc_minute > 59
             || self.schedule.weekdays.is_empty()
@@ -156,9 +187,6 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "Hyperliquid endpoint must use HTTPS".into(),
             ));
-        }
-        if !self.dry_run {
-            self.validate_live(env)?;
         }
         Ok(())
     }

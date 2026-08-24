@@ -6,8 +6,10 @@ pub mod exchange;
 pub mod execution;
 pub mod ledger;
 pub mod metrics;
+pub mod monitor;
 pub mod signal;
 pub mod status;
+pub mod status_io;
 
 use config::{Config, ConfigError, Environment};
 use exchange::{DryRunExchange, Exchange};

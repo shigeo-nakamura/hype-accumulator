@@ -180,3 +180,20 @@ fn dry_run_exchange_only_simulates() {
     assert_eq!(exchange.submit(&intent), Ok(Submission::Simulated));
     assert_eq!(exchange.simulated(), &[intent]);
 }
+
+#[test]
+fn dry_run_observation_requires_only_the_public_account_identity() {
+    let config = fixture();
+    assert!(matches!(
+        config.observation_account(&HashMap::new()),
+        Err(ConfigError::MissingObservationAccount(_))
+    ));
+    let env = HashMap::from([(
+        config.hyperliquid.account_env.clone(),
+        "0x0000000000000000000000000000000000000001".to_owned(),
+    )]);
+    assert_eq!(
+        config.observation_account(&env).unwrap(),
+        "0x0000000000000000000000000000000000000001"
+    );
+}
