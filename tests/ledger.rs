@@ -436,9 +436,10 @@ fn clean_directory_restore_round_trips_exact_checkpoint() {
                 .into_owned()
         })
         .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(file_names.len(), 3);
+    assert_eq!(file_names.len(), 4);
     assert!(file_names.contains(LEDGER_FILE_NAME));
     assert!(file_names.contains(SNAPSHOT_FILE_NAME));
+    assert!(file_names.contains(".initialized"));
     assert!(file_names.contains(".ledger.lock"));
     assert_eq!(
         DurableLedger::open(&destination)
@@ -446,6 +447,24 @@ fn clean_directory_restore_round_trips_exact_checkpoint() {
             .state(),
         &expected_state
     );
+}
+
+#[test]
+fn initialized_marker_rejects_complete_ledger_and_snapshot_loss() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let mut ledger = DurableLedger::open(directory.path()).expect("open ledger");
+    ledger
+        .append(deposit("deposit-before-paired-loss", 1, 100))
+        .expect("append deposit");
+    drop(ledger);
+
+    fs::remove_file(directory.path().join(LEDGER_FILE_NAME)).expect("remove ledger fixture");
+    fs::remove_file(directory.path().join(SNAPSHOT_FILE_NAME)).expect("remove snapshot fixture");
+
+    assert!(matches!(
+        DurableLedger::open(directory.path()),
+        Err(LedgerError::TruncatedLedger)
+    ));
 }
 
 #[test]

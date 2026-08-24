@@ -26,6 +26,10 @@ pub const SNAPSHOT_FILE_NAME: &str = "snapshot.json";
 const LOCK_FILE_NAME: &str = ".ledger.lock";
 const PENDING_FILE_NAME: &str = ".pending-append.json";
 const PENDING_SCHEMA_VERSION: u8 = 1;
+const INITIALIZED_FILE_NAME: &str = ".initialized";
+const INITIALIZED_PAYLOAD: &[u8] = b"hype-accumulator-ledger-v1\n";
+const RESTORE_PENDING_FILE_NAME: &str = ".pending-restore.json";
+const RESTORE_PENDING_SCHEMA_VERSION: u8 = 1;
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Legacy in-memory observation retained for callers that have not migrated
@@ -272,6 +276,18 @@ struct PendingAppend {
     checksum: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PendingRestore {
+    schema_version: u8,
+    ledger_digest: String,
+    snapshot_digest: String,
+    record_count: u64,
+    head_hash: String,
+    initialized: bool,
+    checksum: String,
+}
+
 #[derive(Serialize)]
 struct RecordHashInput<'a> {
     schema_version: u8,
@@ -294,6 +310,16 @@ struct PendingHashInput<'a> {
     prior_head_hash: &'a str,
     record: &'a LedgerEnvelope,
     snapshot: &'a LedgerSnapshot,
+}
+
+#[derive(Serialize)]
+struct RestorePendingHashInput<'a> {
+    schema_version: u8,
+    ledger_digest: &'a str,
+    snapshot_digest: &'a str,
+    record_count: u64,
+    head_hash: &'a str,
+    initialized: bool,
 }
 
 pub struct DurableLedger {
@@ -328,6 +354,7 @@ impl DurableLedger {
     fn open_unlocked(directory: PathBuf) -> Result<Self, LedgerError> {
         let payload = read_optional(&directory.join(LEDGER_FILE_NAME))?;
         let records = load_records(&payload)?;
+        validate_initialization_marker(&directory, &records)?;
         let events = records
             .iter()
             .map(|record| record.event.clone())
@@ -394,6 +421,7 @@ impl DurableLedger {
         write_pending(&self.directory, &prepared.pending)?;
         let next_file_len = self.write_record(&prepared.record)?;
         write_snapshot(&self.directory, &prepared.snapshot)?;
+        write_initialization_marker(&self.directory)?;
         clear_pending(&self.directory)?;
         self.events_by_id.insert(
             prepared.record.event.event_id.clone(),
@@ -467,15 +495,41 @@ impl DurableLedger {
         if source_records != verified.records {
             return Err(LedgerError::ConcurrentModification);
         }
-        ensure_clean_directory(destination)?;
         let _destination_lock = LedgerLock::acquire(destination)?;
-        ensure_clean_directory(destination)?;
+        let pending = build_pending_restore(&ledger_payload, &snapshot_payload, &verified)?;
+        match load_pending_restore(destination)? {
+            Some(existing) => {
+                if existing != pending || !has_only_restore_entries(destination, true)? {
+                    return Err(LedgerError::CorruptRestorePending);
+                }
+            }
+            None if has_only_restore_entries(destination, false)? => {
+                write_pending_restore(destination, &pending)?;
+            }
+            None if restore_is_complete(
+                destination,
+                &ledger_payload,
+                &snapshot_payload,
+                &verified,
+            )? =>
+            {
+                return Self::open_unlocked(destination.to_path_buf());
+            }
+            None => return Err(LedgerError::RestoreDestinationNotEmpty),
+        }
         write_atomic(&destination.join(LEDGER_FILE_NAME), &ledger_payload)?;
         write_atomic(&destination.join(SNAPSHOT_FILE_NAME), &snapshot_payload)?;
+        if pending.initialized {
+            write_initialization_marker(destination)?;
+        }
         let restored = Self::open_unlocked(destination.to_path_buf())?;
-        if restored.records != verified.records || restored.state != verified.state {
+        if restored.records != verified.records
+            || restored.state != verified.state
+            || restored.head_hash() != verified.head_hash()
+        {
             return Err(LedgerError::SnapshotMismatch);
         }
+        clear_pending_restore(destination)?;
         Ok(restored)
     }
 
@@ -925,11 +979,7 @@ fn write_pending(directory: &Path, pending: &PendingAppend) -> Result<(), Ledger
 }
 
 fn clear_pending(directory: &Path) -> Result<(), LedgerError> {
-    match fs::remove_file(directory.join(PENDING_FILE_NAME)) {
-        Ok(()) => sync_directory(directory),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(LedgerError::io(error)),
-    }
+    remove_durable(directory, PENDING_FILE_NAME)
 }
 
 fn recover_pending(directory: &Path) -> Result<bool, LedgerError> {
@@ -949,6 +999,7 @@ fn recover_pending(directory: &Path) -> Result<bool, LedgerError> {
     {
         return Err(LedgerError::CorruptPending);
     }
+    validate_initialization_marker(directory, &prior_records)?;
     let current_snapshot = load_snapshot(&directory.join(SNAPSHOT_FILE_NAME))?;
     let line = record_line(&pending.record)?;
     let tail = &payload[prior_len..];
@@ -985,6 +1036,7 @@ fn recover_pending(directory: &Path) -> Result<bool, LedgerError> {
             write_snapshot(directory, &pending.snapshot)?;
         }
     }
+    write_initialization_marker(directory)?;
     clear_pending(directory)?;
     Ok(true)
 }
@@ -1056,6 +1108,92 @@ fn pending_checksum(pending: &PendingAppend) -> Result<String, LedgerError> {
     })
     .map_err(LedgerError::json)?;
     Ok(digest_hex(&payload))
+}
+
+fn build_pending_restore(
+    ledger_payload: &[u8],
+    snapshot_payload: &[u8],
+    verified: &DurableLedger,
+) -> Result<PendingRestore, LedgerError> {
+    let mut pending = PendingRestore {
+        schema_version: RESTORE_PENDING_SCHEMA_VERSION,
+        ledger_digest: digest_hex(ledger_payload),
+        snapshot_digest: digest_hex(snapshot_payload),
+        record_count: u64::try_from(verified.records.len())
+            .map_err(|_| LedgerError::CorruptLedger("record count overflowed".into()))?,
+        head_hash: verified.head_hash().to_owned(),
+        initialized: !verified.records.is_empty(),
+        checksum: String::new(),
+    };
+    pending.checksum = restore_pending_checksum(&pending)?;
+    Ok(pending)
+}
+
+fn load_pending_restore(directory: &Path) -> Result<Option<PendingRestore>, LedgerError> {
+    match fs::read(directory.join(RESTORE_PENDING_FILE_NAME)) {
+        Ok(payload) if payload.is_empty() => Err(LedgerError::CorruptRestorePending),
+        Ok(payload) => decode_pending_restore(&payload).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(LedgerError::io(error)),
+    }
+}
+
+fn decode_pending_restore(payload: &[u8]) -> Result<PendingRestore, LedgerError> {
+    let pending: PendingRestore =
+        serde_json::from_slice(payload).map_err(|_| LedgerError::CorruptRestorePending)?;
+    if pending.schema_version != RESTORE_PENDING_SCHEMA_VERSION
+        || pending.checksum != restore_pending_checksum(&pending)?
+        || pending.initialized != (pending.record_count > 0)
+        || (pending.record_count == 0 && pending.head_hash != GENESIS_HASH)
+    {
+        return Err(LedgerError::CorruptRestorePending);
+    }
+    Ok(pending)
+}
+
+fn restore_pending_checksum(pending: &PendingRestore) -> Result<String, LedgerError> {
+    let payload = serde_json::to_vec(&RestorePendingHashInput {
+        schema_version: pending.schema_version,
+        ledger_digest: &pending.ledger_digest,
+        snapshot_digest: &pending.snapshot_digest,
+        record_count: pending.record_count,
+        head_hash: &pending.head_hash,
+        initialized: pending.initialized,
+    })
+    .map_err(LedgerError::json)?;
+    Ok(digest_hex(&payload))
+}
+
+fn write_pending_restore(directory: &Path, pending: &PendingRestore) -> Result<(), LedgerError> {
+    let mut payload = serde_json::to_vec(pending).map_err(LedgerError::json)?;
+    payload.push(b'\n');
+    write_atomic(&directory.join(RESTORE_PENDING_FILE_NAME), &payload)
+}
+
+fn clear_pending_restore(directory: &Path) -> Result<(), LedgerError> {
+    remove_durable(directory, RESTORE_PENDING_FILE_NAME)
+}
+
+fn write_initialization_marker(directory: &Path) -> Result<(), LedgerError> {
+    write_atomic(&directory.join(INITIALIZED_FILE_NAME), INITIALIZED_PAYLOAD)
+}
+
+fn validate_initialization_marker(
+    directory: &Path,
+    records: &[LedgerEnvelope],
+) -> Result<(), LedgerError> {
+    match fs::read(directory.join(INITIALIZED_FILE_NAME)) {
+        Ok(payload) if payload != INITIALIZED_PAYLOAD => {
+            Err(LedgerError::CorruptInitializationMarker)
+        }
+        Ok(_) if records.is_empty() => Err(LedgerError::TruncatedLedger),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound && records.is_empty() => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Err(LedgerError::MissingInitializationMarker)
+        }
+        Err(error) => Err(LedgerError::io(error)),
+    }
 }
 
 fn write_snapshot(directory: &Path, snapshot: &LedgerSnapshot) -> Result<(), LedgerError> {
@@ -1207,18 +1345,66 @@ impl LedgerLock {
     }
 }
 
-fn ensure_clean_directory(path: &Path) -> Result<(), LedgerError> {
-    if path.exists() {
-        for entry in fs::read_dir(path).map_err(LedgerError::io)? {
-            let entry = entry.map_err(LedgerError::io)?;
-            if entry.file_name() != LOCK_FILE_NAME {
-                return Err(LedgerError::RestoreDestinationNotEmpty);
-            }
-        }
-    } else {
-        fs::create_dir_all(path).map_err(LedgerError::io)?;
+fn remove_durable(directory: &Path, file_name: &str) -> Result<(), LedgerError> {
+    match fs::remove_file(directory.join(file_name)) {
+        Ok(()) => sync_directory(directory),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(LedgerError::io(error)),
     }
-    Ok(())
+}
+
+fn has_only_restore_entries(directory: &Path, pending: bool) -> Result<bool, LedgerError> {
+    for entry in fs::read_dir(directory).map_err(LedgerError::io)? {
+        let name = entry.map_err(LedgerError::io)?.file_name();
+        if name != LOCK_FILE_NAME
+            && (!pending
+                || (name != RESTORE_PENDING_FILE_NAME
+                    && name != LEDGER_FILE_NAME
+                    && name != SNAPSHOT_FILE_NAME
+                    && name != INITIALIZED_FILE_NAME))
+        {
+            return Ok(false);
+        }
+    }
+    if pending && !directory.join(RESTORE_PENDING_FILE_NAME).exists() {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn restore_is_complete(
+    directory: &Path,
+    ledger_payload: &[u8],
+    snapshot_payload: &[u8],
+    verified: &DurableLedger,
+) -> Result<bool, LedgerError> {
+    for entry in fs::read_dir(directory).map_err(LedgerError::io)? {
+        let name = entry.map_err(LedgerError::io)?.file_name();
+        if name != LOCK_FILE_NAME
+            && name != LEDGER_FILE_NAME
+            && name != SNAPSHOT_FILE_NAME
+            && name != INITIALIZED_FILE_NAME
+        {
+            return Ok(false);
+        }
+    }
+    if read_optional(&directory.join(LEDGER_FILE_NAME))? != ledger_payload
+        || read_optional(&directory.join(SNAPSHOT_FILE_NAME))? != snapshot_payload
+    {
+        return Ok(false);
+    }
+    let marker = read_optional(&directory.join(INITIALIZED_FILE_NAME))?;
+    if (!verified.records.is_empty() && marker != INITIALIZED_PAYLOAD)
+        || (verified.records.is_empty() && !marker.is_empty())
+    {
+        return Ok(false);
+    }
+    match DurableLedger::open_unlocked(directory.to_path_buf()) {
+        Ok(restored) => Ok(restored.records == verified.records
+            && restored.state == verified.state
+            && restored.head_hash() == verified.head_hash()),
+        Err(_) => Ok(false),
+    }
 }
 
 fn sync_directory(path: &Path) -> Result<(), LedgerError> {
@@ -1261,6 +1447,12 @@ pub enum LedgerError {
     StaleSnapshot,
     #[error("pending append transaction is corrupt")]
     CorruptPending,
+    #[error("initialized ledger marker is missing")]
+    MissingInitializationMarker,
+    #[error("initialized ledger marker is corrupt")]
+    CorruptInitializationMarker,
+    #[error("pending restore transaction is corrupt or belongs to another source")]
+    CorruptRestorePending,
     #[error("restore destination is not empty")]
     RestoreDestinationNotEmpty,
     #[error("ledger changed since it was opened")]
@@ -1430,5 +1622,43 @@ mod transaction_tests {
             AppendOutcome::Appended
         );
         assert_eq!(ledger.record_count(), 2);
+    }
+
+    #[test]
+    fn restore_resumes_after_journal_publication_and_is_idempotent() {
+        let source = tempfile::tempdir().expect("source directory");
+        let container = tempfile::tempdir().expect("destination container");
+        let destination = container.path().join("restored");
+        let mut ledger = DurableLedger::open(source.path()).expect("open source ledger");
+        ledger
+            .append(deposit("deposit-before-restore", 1))
+            .expect("append deposit");
+        drop(ledger);
+
+        let verified = DurableLedger::open(source.path()).expect("verify source ledger");
+        let ledger_payload =
+            fs::read(source.path().join(LEDGER_FILE_NAME)).expect("read source journal");
+        let snapshot_payload =
+            fs::read(source.path().join(SNAPSHOT_FILE_NAME)).expect("read source snapshot");
+        let pending = build_pending_restore(&ledger_payload, &snapshot_payload, &verified)
+            .expect("build restore intent");
+        {
+            let _lock = LedgerLock::acquire(&destination).expect("acquire destination lock");
+            write_pending_restore(&destination, &pending).expect("persist restore intent");
+            write_atomic(&destination.join(LEDGER_FILE_NAME), &ledger_payload)
+                .expect("publish journal before interruption");
+        }
+
+        let restored = DurableLedger::restore_clean(source.path(), &destination)
+            .expect("resume interrupted restore");
+        assert_eq!(restored.records, verified.records);
+        assert_eq!(restored.state, verified.state);
+        assert!(destination.join(INITIALIZED_FILE_NAME).exists());
+        assert!(!destination.join(RESTORE_PENDING_FILE_NAME).exists());
+
+        let retried = DurableLedger::restore_clean(source.path(), &destination)
+            .expect("accept exact completed restore retry");
+        assert_eq!(retried.records, verified.records);
+        assert_eq!(retried.state, verified.state);
     }
 }
