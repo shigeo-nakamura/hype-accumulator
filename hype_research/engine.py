@@ -5,7 +5,7 @@ from datetime import date, datetime
 from math import sqrt
 from typing import Any
 
-from .contracts import CapitalEvent, PointInTimeView, PriceBar
+from .contracts import CapitalEvent, PointInTimeView, PriceBar, capital_event_sort_key
 
 
 @dataclass
@@ -76,7 +76,10 @@ def run_backtest(
     as_of: datetime,
 ) -> dict[str, Any]:
     ledger = Ledger()
-    pending = [event for event in events if event.first_usable_at <= as_of]
+    pending = sorted(
+        (event for event in events if event.first_usable_at <= as_of),
+        key=capital_event_sort_key,
+    )
     event_index = 0
     units = spend = fees = turnover = 0.0
     peak_value = max_drawdown = 0.0

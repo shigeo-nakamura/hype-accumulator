@@ -149,6 +149,37 @@ class EngineInvariantTests(unittest.TestCase):
         self.assertEqual([row["event_id"] for row in result["capital_cohorts"]], ["initial"])
         self.assertEqual(result["ending_inventory_usd"], 100.0)
 
+    def test_simultaneous_deposit_precedes_withdrawal_regardless_of_id(self) -> None:
+        utc = timezone.utc
+        at = datetime(2025, 1, 1, 12, tzinfo=utc)
+        events = [
+            CapitalEvent("a-withdrawal", "withdrawal", 40.0, at, at, at),
+            CapitalEvent("z-deposit", "deposit", 100.0, at, at, at),
+        ]
+        result = run_backtest(
+            [PriceBar(at, 10.0)],
+            events,
+            PointInTimeView([], at),
+            {
+                "name": "daily",
+                "kind": "fixed",
+                "cadence": "daily",
+                "horizon": "2025-01-01",
+                "features": [],
+            },
+            {
+                "min_trade_usd": 1.0,
+                "max_trade_usd": 100.0,
+                "fee_bps": 0.0,
+                "half_spread_bps": 0.0,
+                "slippage_bps": 0.0,
+            },
+            at,
+        )
+
+        self.assertEqual(result["invested_usd"], 60.0)
+        self.assertEqual(result["capital_cohorts"][0]["withdrawn_usd"], 40.0)
+
     def test_stale_fixed_fallback_disables_adaptive_multiplier(self) -> None:
         utc = timezone.utc
         revisions = [

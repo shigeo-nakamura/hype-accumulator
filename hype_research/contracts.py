@@ -72,6 +72,12 @@ class CapitalEvent:
     first_usable_at: datetime
 
 
+def capital_event_sort_key(event: CapitalEvent) -> tuple[datetime, int, str]:
+    """Order simultaneous deposits before withdrawals, then use ID for stability."""
+    kind_order = 0 if event.kind == "deposit" else 1
+    return event.first_usable_at, kind_order, event.event_id
+
+
 def load_dataset(manifest_path: Path) -> tuple[list[PriceBar], list[Revision], dict[str, Any]]:
     manifest = resolve_manifest(manifest_path)
     root = manifest["_root"]
@@ -91,6 +97,12 @@ def load_dataset(manifest_path: Path) -> tuple[list[PriceBar], list[Revision], d
         raise ValueError("prices must be positive")
     if any(not isfinite(item.value) for item in revisions):
         raise ValueError("observations must be finite")
+    revision_slots = [
+        (item.series, item.observation_date, item.available_at)
+        for item in revisions
+    ]
+    if len(set(revision_slots)) != len(revision_slots):
+        raise ValueError("revision availability timestamps must be unambiguous")
     return prices, revisions, manifest
 
 
@@ -108,7 +120,7 @@ def load_capital_events(manifest_path: Path) -> tuple[list[CapitalEvent], dict[s
             events.append(event)
     if len({e.event_id for e in events}) != len(events):
         raise ValueError("capital event IDs must be unique and authoritative")
-    return sorted(events, key=lambda item: (item.first_usable_at, item.event_id)), manifest
+    return sorted(events, key=capital_event_sort_key), manifest
 
 
 class PointInTimeView:
