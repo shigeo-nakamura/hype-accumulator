@@ -510,6 +510,87 @@ fn stable_fill_ids_are_idempotent_and_cannot_change_ownership() {
 }
 
 #[test]
+fn order_linked_costs_respect_event_time_causality() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let anchor = anchor_store();
+    let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+    let date = at(0).date_naive();
+    ledger
+        .append(daily_outcome(
+            "daily-causal-order",
+            "decision-causal-order",
+            date,
+            "decision",
+        ))
+        .expect("append decision");
+    append_decision_backing(&mut ledger, "decision-causal-order", date, 10);
+
+    assert_eq!(
+        ledger.append(dated_event(
+            "order-before-decision",
+            date,
+            0,
+            LedgerEventKind::OrderRecorded {
+                order_id: "order-before-decision".into(),
+                decision_id: "decision-causal-order".into(),
+            },
+        )),
+        Err(LedgerError::InvalidEvent(
+            "order predates its owning decision".into()
+        ))
+    );
+
+    ledger
+        .append(dated_event(
+            "causal-order",
+            date,
+            5,
+            LedgerEventKind::OrderRecorded {
+                order_id: "causal-order".into(),
+                decision_id: "decision-causal-order".into(),
+            },
+        ))
+        .expect("append causal order");
+    let durable_before = fs::read(ledger_path(directory.path())).expect("read ledger");
+
+    assert_eq!(
+        ledger.append(dated_event(
+            "fill-before-order",
+            date,
+            4,
+            LedgerEventKind::FillRecorded {
+                fill_id: "fill-before-order".into(),
+                order_id: "causal-order".into(),
+                filled_usdc: usd(5),
+                received_hype_atoms: 1,
+            },
+        )),
+        Err(LedgerError::InvalidEvent(
+            "fill predates its owning order or decision".into()
+        ))
+    );
+    assert_eq!(
+        ledger.append(dated_event(
+            "fee-before-order",
+            date,
+            4,
+            LedgerEventKind::FeeRecorded {
+                fee_id: "fee-before-order".into(),
+                order_id: "causal-order".into(),
+                fee_usdc: usd(1),
+            },
+        )),
+        Err(LedgerError::InvalidEvent(
+            "fee predates its owning order or decision".into()
+        ))
+    );
+    assert_eq!(
+        fs::read(ledger_path(directory.path())).expect("read unchanged ledger"),
+        durable_before
+    );
+}
+
+#[test]
 fn stable_fee_ids_are_idempotent_and_cannot_change_ownership() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let anchor = anchor_store();

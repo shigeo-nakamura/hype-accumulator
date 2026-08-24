@@ -176,11 +176,19 @@ struct CommitmentReplay {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PurchaseDecisionReplay {
+    occurred_at: DateTime<Utc>,
     commitment_id: String,
     planned_usdc: UsdcMicros,
     committed_usdc: UsdcMicros,
     filled_usdc: UsdcMicros,
     fee_usdc: UsdcMicros,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OrderReplay {
+    occurred_at: DateTime<Utc>,
+    decision_id: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -192,7 +200,7 @@ pub struct ReplayState {
     decision_ids: BTreeSet<String>,
     purchase_decisions: BTreeMap<String, PurchaseDecisionReplay>,
     decision_commitment_ids: BTreeSet<String>,
-    orders: BTreeMap<String, String>,
+    orders: BTreeMap<String, OrderReplay>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     fills: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -634,6 +642,10 @@ impl DurableLedger {
                 } else {
                     restore_target_from_pending(&existing, &verified.records)?
                 };
+                ensure_unanchored_restore_intent_is_clean(
+                    &destination,
+                    destination_anchor.as_ref(),
+                )?;
                 remove_authenticated_atomic_temporaries(
                     &destination.join(LEDGER_FILE_NAME),
                     &target.ledger_payload,
@@ -958,7 +970,7 @@ fn apply_event(state: &mut ReplayState, event: &LedgerEvent) -> Result<(), Ledge
             committed_usdc,
         } => record_purchase_decision(
             state,
-            event.occurred_at.date_naive(),
+            event.occurred_at,
             *decision_date,
             decision_id,
             commitment_id,
@@ -978,19 +990,19 @@ fn apply_event(state: &mut ReplayState, event: &LedgerEvent) -> Result<(), Ledge
         LedgerEventKind::OrderRecorded {
             order_id,
             decision_id,
-        } => record_order(state, order_id, decision_id)?,
+        } => record_order(state, event.occurred_at, order_id, decision_id)?,
         LedgerEventKind::FillRecorded {
             fill_id,
             order_id,
             filled_usdc,
             ..
-        } => record_fill(state, fill_id, order_id, *filled_usdc)?,
+        } => record_fill(state, event.occurred_at, fill_id, order_id, *filled_usdc)?,
         LedgerEventKind::FeeRecorded {
             fee_id,
             order_id,
             fee_usdc,
         } => {
-            record_fee(state, fee_id, order_id, *fee_usdc)?;
+            record_fee(state, event.occurred_at, fee_id, order_id, *fee_usdc)?;
         }
         LedgerEventKind::StakingDepositRecorded { .. }
         | LedgerEventKind::DelegationRecorded { .. }
@@ -1128,14 +1140,14 @@ fn record_daily_outcome(
 
 fn record_purchase_decision(
     state: &mut ReplayState,
-    occurred_date: NaiveDate,
+    occurred_at: DateTime<Utc>,
     decision_date: NaiveDate,
     decision_id: &str,
     commitment_id: &str,
     planned_usdc: UsdcMicros,
     committed_usdc: UsdcMicros,
 ) -> Result<(), LedgerError> {
-    record_daily_outcome(state, occurred_date, decision_date, decision_id)?;
+    record_daily_outcome(state, occurred_at.date_naive(), decision_date, decision_id)?;
     if state.decision_commitment_ids.contains(commitment_id) {
         return Err(LedgerError::DecisionCommitmentCollision(
             commitment_id.to_owned(),
@@ -1147,6 +1159,7 @@ fn record_purchase_decision(
     state.purchase_decisions.insert(
         decision_id.to_owned(),
         PurchaseDecisionReplay {
+            occurred_at,
             commitment_id: commitment_id.to_owned(),
             planned_usdc,
             committed_usdc,
@@ -1159,6 +1172,7 @@ fn record_purchase_decision(
 
 fn record_order(
     state: &mut ReplayState,
+    occurred_at: DateTime<Utc>,
     order_id: &str,
     decision_id: &str,
 ) -> Result<(), LedgerError> {
@@ -1166,6 +1180,11 @@ fn record_order(
         .purchase_decisions
         .get(decision_id)
         .ok_or_else(|| LedgerError::UnknownDecision(decision_id.to_owned()))?;
+    if occurred_at < decision.occurred_at {
+        return Err(LedgerError::InvalidEvent(
+            "order predates its owning decision".into(),
+        ));
+    }
     let commitment = state.commitments.get(&decision.commitment_id);
     if !commitment.is_some_and(|commitment| {
         !commitment.settled && commitment.committed_usdc >= decision.committed_usdc
@@ -1177,19 +1196,34 @@ fn record_order(
     if state.orders.contains_key(order_id) {
         return Err(LedgerError::OrderIdCollision(order_id.to_owned()));
     }
-    state
-        .orders
-        .insert(order_id.to_owned(), decision_id.to_owned());
+    state.orders.insert(
+        order_id.to_owned(),
+        OrderReplay {
+            occurred_at,
+            decision_id: decision_id.to_owned(),
+        },
+    );
     Ok(())
 }
 
 fn record_fill(
     state: &mut ReplayState,
+    occurred_at: DateTime<Utc>,
     fill_id: &str,
     order_id: &str,
     filled_usdc: UsdcMicros,
 ) -> Result<(), LedgerError> {
-    let decision_id = decision_id_for_order(state, order_id)?;
+    let (decision_id, order_occurred_at) = order_context(state, order_id)?;
+    let decision_occurred_at = state
+        .purchase_decisions
+        .get(&decision_id)
+        .ok_or_else(|| LedgerError::UnknownDecision(decision_id.clone()))?
+        .occurred_at;
+    if occurred_at < order_occurred_at || occurred_at < decision_occurred_at {
+        return Err(LedgerError::InvalidEvent(
+            "fill predates its owning order or decision".into(),
+        ));
+    }
     if state.fills.contains_key(fill_id) {
         return Err(LedgerError::FillIdCollision(fill_id.to_owned()));
     }
@@ -1212,11 +1246,22 @@ fn record_fill(
 
 fn record_fee(
     state: &mut ReplayState,
+    occurred_at: DateTime<Utc>,
     fee_id: &str,
     order_id: &str,
     fee_usdc: UsdcMicros,
 ) -> Result<(), LedgerError> {
-    let decision_id = decision_id_for_order(state, order_id)?;
+    let (decision_id, order_occurred_at) = order_context(state, order_id)?;
+    let decision_occurred_at = state
+        .purchase_decisions
+        .get(&decision_id)
+        .ok_or_else(|| LedgerError::UnknownDecision(decision_id.clone()))?
+        .occurred_at;
+    if occurred_at < order_occurred_at || occurred_at < decision_occurred_at {
+        return Err(LedgerError::InvalidEvent(
+            "fee predates its owning order or decision".into(),
+        ));
+    }
     if state.fees.contains_key(fee_id) {
         return Err(LedgerError::FeeIdCollision(fee_id.to_owned()));
     }
@@ -1234,12 +1279,15 @@ fn record_fee(
     Ok(())
 }
 
-fn decision_id_for_order(state: &ReplayState, order_id: &str) -> Result<String, LedgerError> {
-    state
+fn order_context(
+    state: &ReplayState,
+    order_id: &str,
+) -> Result<(String, DateTime<Utc>), LedgerError> {
+    let order = state
         .orders
         .get(order_id)
-        .cloned()
-        .ok_or_else(|| LedgerError::UnknownOrder(order_id.to_owned()))
+        .ok_or_else(|| LedgerError::UnknownOrder(order_id.to_owned()))?;
+    Ok((order.decision_id.clone(), order.occurred_at))
 }
 
 fn require_unsettled_decision_backing(
@@ -2415,6 +2463,31 @@ fn remove_durable(directory: &Path, file_name: &str) -> Result<(), LedgerError> 
     }
 }
 
+fn ensure_unanchored_restore_intent_is_clean(
+    directory: &Path,
+    destination_anchor: Option<&ProtectedHeadAnchor>,
+) -> Result<(), LedgerError> {
+    if destination_anchor.is_none() && !has_only_unanchored_restore_intent_entries(directory)? {
+        return Err(LedgerError::RestoreDestinationNotEmpty);
+    }
+    Ok(())
+}
+
+fn has_only_unanchored_restore_intent_entries(directory: &Path) -> Result<bool, LedgerError> {
+    let mut has_pending = false;
+    for entry in fs::read_dir(directory).map_err(LedgerError::io)? {
+        let name = entry.map_err(LedgerError::io)?.file_name();
+        if name == LOCK_FILE_NAME {
+            continue;
+        }
+        if name != RESTORE_PENDING_FILE_NAME || has_pending {
+            return Ok(false);
+        }
+        has_pending = true;
+    }
+    Ok(has_pending)
+}
+
 fn has_only_restore_entries(directory: &Path, pending: bool) -> Result<bool, LedgerError> {
     for entry in fs::read_dir(directory).map_err(LedgerError::io)? {
         let name = entry.map_err(LedgerError::io)?.file_name();
@@ -3136,6 +3209,8 @@ mod transaction_tests {
             canonical_directory(&destination).expect("durably create destination directory");
             let _lock = LedgerLock::acquire(&destination).expect("acquire destination lock");
             write_pending_restore(&destination, &pending).expect("persist restore intent");
+            ensure_restore_anchor(destination_anchor.as_ref(), None, verified.anchor.as_ref())
+                .expect("advance destination anchor before payload publication");
             write_atomic(&destination.join(LEDGER_FILE_NAME), &ledger_payload)
                 .expect("publish journal before interruption");
         }
@@ -3160,6 +3235,59 @@ mod transaction_tests {
         .expect("accept exact completed restore retry");
         assert_eq!(retried.records, verified.records);
         assert_eq!(retried.state, verified.state);
+    }
+
+    #[test]
+    fn unanchored_restore_intent_cannot_claim_preexisting_payloads() {
+        let source = tempfile::tempdir().expect("source directory");
+        let container = tempfile::tempdir().expect("destination container");
+        let destination = container.path().join("restored");
+        let source_anchor = anchor_store();
+        let destination_anchor = anchor_store();
+        let mut ledger = open(source.path(), &source_anchor).expect("open source ledger");
+        ledger
+            .append(deposit("deposit-before-unanchored-copy", 1))
+            .expect("append deposit");
+        drop(ledger);
+
+        let verified = open(source.path(), &source_anchor).expect("verify source ledger");
+        let ledger_payload =
+            fs::read(source.path().join(LEDGER_FILE_NAME)).expect("read source journal");
+        let snapshot_payload =
+            fs::read(source.path().join(SNAPSHOT_FILE_NAME)).expect("read source snapshot");
+        let pending = build_pending_restore(&ledger_payload, &snapshot_payload, &verified)
+            .expect("build copied restore intent");
+        canonical_directory(&destination).expect("durably create destination directory");
+        {
+            let _lock = LedgerLock::acquire(&destination).expect("acquire destination lock");
+            write_pending_restore(&destination, &pending).expect("copy restore intent");
+            write_atomic(&destination.join(LEDGER_FILE_NAME), &ledger_payload)
+                .expect("copy journal payload");
+            write_atomic(&destination.join(SNAPSHOT_FILE_NAME), &snapshot_payload)
+                .expect("copy snapshot payload");
+        }
+
+        assert!(matches!(
+            DurableLedger::restore_clean(
+                source.path(),
+                &destination,
+                source_anchor,
+                destination_anchor.clone(),
+            ),
+            Err(LedgerError::RestoreDestinationNotEmpty)
+        ));
+        assert_eq!(
+            fs::read(destination.join(LEDGER_FILE_NAME)).expect("read unchanged journal"),
+            ledger_payload
+        );
+        assert_eq!(
+            fs::read(destination.join(SNAPSHOT_FILE_NAME)).expect("read unchanged snapshot"),
+            snapshot_payload
+        );
+        assert!(destination_anchor
+            .load()
+            .expect("load destination anchor")
+            .is_none());
     }
 
     #[test]
@@ -3232,6 +3360,8 @@ mod transaction_tests {
         {
             let _lock = LedgerLock::acquire(&destination).expect("acquire destination lock");
             write_pending_restore(&destination, &pending).expect("persist restore intent");
+            ensure_restore_anchor(destination_anchor.as_ref(), None, verified.anchor.as_ref())
+                .expect("advance destination anchor before payload temporaries");
             for (name, payload) in [
                 ("ledger.jsonl.123.456.tmp", ledger_payload.as_slice()),
                 ("snapshot.json.123.456.tmp", snapshot_payload.as_slice()),
