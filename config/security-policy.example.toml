@@ -1,0 +1,117 @@
+# Non-production shape only. Zero disables a capability; it never means unlimited.
+[capital]
+max_auto_deposit_microusd = 0
+max_daily_notional_microusd = 0
+# These ceilings are consumed exactly once when confirmed external capital moves
+# into an admitted-uncommitted allocation. Purchase commitments transfer within
+# that allocation and never charge these ceilings again.
+max_yearly_deployable_microusd = 0
+max_cumulative_deployable_microusd = 0
+reserve_microusd = 0
+# These exact v1 schemes are the only live values. They use half-open UTC periods,
+# are bound into the policy digest, and reject local-time or rolling alternatives.
+# The yearly scheme applies to admission allocation; daily applies to purchases.
+daily_limit_period = "utc_calendar_day_v1"
+yearly_limit_period = "utc_calendar_year_v1"
+
+[custody]
+# Service-side order limits do not constrain a leaked API wallet.
+api_wallet_authority = "full_assigned_account_trading"
+require_dedicated_execution_account = true
+# Required in live mode: "dedicated_master", "subaccount", or "vault". This field
+# classifies the isolated trading account only; no account kind enables automatic
+# staking under this model. "unapproved" and unknown values fail closed.
+execution_account_kind = "unapproved"
+# Operational halt/alert while enforcement is unapproved. With approved external
+# enforcement, this is the acknowledged hard maximum.
+max_hot_trading_balance_microusd = 0
+# Safe default. Live mode rejects this. Any externally enforced or explicitly
+# accepted uncapped-authority mode requires separate evidence and must be bound
+# into the effective-policy acknowledgement.
+hot_balance_enforcement = "unapproved"
+# Zero disables external enforcement; it never means unlimited. An approved
+# bounded mode requires threshold + worst-case headroom <= hard maximum.
+hot_balance_sweep_threshold_microusd = 0
+hot_balance_worst_case_headroom_microusd = 0
+# Exactly 64 lowercase hexadecimal SHA-256 characters for the reviewed
+# enforcement evidence plus an opaque private change-record reference. Do not
+# place credentials, addresses, or paths here.
+hot_balance_enforcement_evidence_sha256 = ""
+hot_balance_enforcement_change_ref = ""
+# Safe default: only direct external deposits can originate admitted capital.
+# The only alternative is "traced_parent_transfer" with explicit approval.
+funding_mode = "external_deposit_only"
+allow_traced_parent_transfer_admission = false
+# Empty disables inheritance; never place an account address in this file. In
+# live mode the named variable must resolve at startup to a valid canonical
+# account address. The resolved value (not only this name) is included in the
+# effective-policy digest covered by the live acknowledgement.
+admitted_parent_account_env = ""
+
+[execution]
+max_slippage_bps = 0
+# Aggregate venue, builder, and other proportional purchase-fee ceiling. Zero
+# permits live purchase only when independently verified authoritative fees are 0.
+max_purchase_fee_bps = 0
+# Only IOC is approved. GTC, ALO, and unknown/resting values fail live validation.
+authorized_order_tif = "ioc"
+# Live mode rejects false. The exact Hyperliquid expiresAfter millisecond is part
+# of the signed request hash and equals effective expiry minus the verified
+# maximum venue-clock lag below, minus one millisecond.
+require_signed_request_expiry = true
+# Required positive in live mode and bound into the acknowledgement. Independent
+# fresh venue-clock evidence must prove a conservative lag no greater than this,
+# including measurement uncertainty and maximum drift through effective expiry.
+max_venue_clock_lag_ms = 0
+# Required positive in live mode. Missing, future, or age-at-limit clock evidence
+# fails closed; an unbounded or above-bound observation halts live authorization.
+venue_clock_evidence_stale_after_seconds = 0
+book_stale_after_seconds = 0
+account_history_stale_after_seconds = 0
+# Required positive in live mode; missing, future, or age-at-limit fee data fails.
+fee_schedule_stale_after_seconds = 0
+# Live mode rejects false. The independent signer-side authorizer must commit the
+# exact decision-chain quantity/notional caps and one active slot, CLOID, unsigned
+# request including nonce/expiresAfter, fee-capped cash debit, ledger limits,
+# venue-clock evidence and lag bound, and expiry before submission.
+require_prepurchase_authorization = true
+# Required positive in live mode. Signal age must be non-negative and strictly
+# below this threshold; a missing, malformed, or future timestamp fails closed.
+signal_stale_after_seconds = 0
+# Required in live mode. During halt_draining and halted, only exact open-order IDs
+# independently returned by authoritative queries may be cancelled. halted cannot
+# be reported until all pre-cutoff claims expire/reconcile and no open orders remain.
+cancel_known_open_orders_while_halted = true
+
+[staking]
+# The only accepted value in dry-run or live configuration. cDeposit and
+# tokenDelegate lack a venue-enforced acceptance deadline, so true, missing, or
+# unknown values fail startup and no runtime master signer is installed.
+enabled = false
+# Advisory inputs for unsigned eligibility research and offline manual review.
+validator_allowlist = []
+# Dormant bookkeeping reserves any deficit from a purchase; it never authorizes
+# an automatic staking action.
+residual_hype_wei = 0
+# Zero disables dormant eligibility. Candidate fills must be registered by the
+# independent reconciler within this period after first authoritative observation.
+fill_registration_deadline_seconds = 0
+# Non-workflow sales and transfers consume lots in ascending
+# (authoritative fill time, order ID, fill ID, residual-before-eligible) order.
+# Unknown policies fail.
+lot_consumption_policy = "oldest_authoritative_fill_first"
+# Zero makes every lot ineligible in dormant bookkeeping; it is never unlimited.
+lot_eligibility_max_age_seconds = 0
+# The only accepted value. No continuation policy may authorize cDeposit.
+no_eligible_validator_policy = "hold_in_spot"
+
+[operator]
+dry_run = true
+# A request enters halt_draining. It is not halted until all pre-cutoff claims
+# expire or reconcile and authoritative queries prove no open orders.
+manual_halt = true
+# Versioned acknowledgement of the effective-policy digest, which excludes this
+# value itself and includes startup-resolved identities such as the admitted
+# parent account.
+live_acknowledgement = ""
+live_acknowledgement_expires_at = ""
