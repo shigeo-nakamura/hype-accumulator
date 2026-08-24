@@ -110,6 +110,25 @@ fn observed(id: &str, hour: u32, usdc: u64, hype_atoms: u64) -> LedgerEvent {
     )
 }
 
+fn daily_outcome(event_id: &str, decision_id: &str, outcome: &str) -> LedgerEvent {
+    let decision_date = at(0).date_naive();
+    let kind = match outcome {
+        "decision" => LedgerEventKind::DailyDecision {
+            decision_id: decision_id.to_owned(),
+            decision_date,
+            planned_usdc: usd(10),
+            committed_usdc: usd(10),
+        },
+        "skip" => LedgerEventKind::DailySkip {
+            decision_id: decision_id.to_owned(),
+            decision_date,
+            reason: "no eligible daily capital".to_owned(),
+        },
+        _ => unreachable!("complete daily outcome fixture"),
+    };
+    event(event_id, 1, kind)
+}
+
 fn ledger_path(directory: &Path) -> std::path::PathBuf {
     directory.join(LEDGER_FILE_NAME)
 }
@@ -155,6 +174,35 @@ fn duplicate_event_is_idempotent_and_id_collision_fails_closed() {
         fs::read(ledger_path(directory.path())).expect("read ledger"),
         durable_before
     );
+}
+
+#[test]
+fn one_daily_decision_or_skip_outcome_is_allowed_per_date() {
+    for (first, second) in [
+        ("decision", "decision"),
+        ("decision", "skip"),
+        ("skip", "decision"),
+        ("skip", "skip"),
+    ] {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let anchor = anchor_store();
+        let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+        ledger
+            .append(daily_outcome("daily-first", "decision-first", first))
+            .expect("first daily outcome appends");
+        let durable_before = fs::read(ledger_path(directory.path())).expect("read ledger");
+
+        assert_eq!(
+            ledger.append(daily_outcome("daily-second", "decision-second", second)),
+            Err(LedgerError::DecisionDateCollision(at(0).date_naive())),
+            "{first} followed by {second} must fail closed"
+        );
+        assert_eq!(ledger.record_count(), 1);
+        assert_eq!(
+            fs::read(ledger_path(directory.path())).expect("read unchanged ledger"),
+            durable_before
+        );
+    }
 }
 
 #[test]

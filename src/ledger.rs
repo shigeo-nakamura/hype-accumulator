@@ -176,6 +176,7 @@ struct CommitmentReplay {
 pub struct ReplayState {
     deposits: BTreeMap<String, DepositReplay>,
     commitments: BTreeMap<String, CommitmentReplay>,
+    decision_outcomes: BTreeMap<NaiveDate, String>,
     admitted_usdc: UsdcMicros,
     withdrawn_usdc: UsdcMicros,
     committed_usdc: UsdcMicros,
@@ -826,15 +827,37 @@ fn apply_event(state: &mut ReplayState, event: &LedgerEvent) -> Result<(), Ledge
             state.observed_usdc = *observed_usdc;
             state.observed_hype_atoms = *observed_hype_atoms;
         }
-        LedgerEventKind::DailyDecision { .. }
-        | LedgerEventKind::DailySkip { .. }
-        | LedgerEventKind::OrderRecorded { .. }
+        LedgerEventKind::DailyDecision {
+            decision_id,
+            decision_date,
+            ..
+        }
+        | LedgerEventKind::DailySkip {
+            decision_id,
+            decision_date,
+            ..
+        } => record_daily_outcome(state, *decision_date, decision_id)?,
+        LedgerEventKind::OrderRecorded { .. }
         | LedgerEventKind::FillRecorded { .. }
         | LedgerEventKind::FeeRecorded { .. }
         | LedgerEventKind::StakingDepositRecorded { .. }
         | LedgerEventKind::DelegationRecorded { .. }
         | LedgerEventKind::RewardRecorded { .. } => {}
     }
+    Ok(())
+}
+
+fn record_daily_outcome(
+    state: &mut ReplayState,
+    decision_date: NaiveDate,
+    decision_id: &str,
+) -> Result<(), LedgerError> {
+    if state.decision_outcomes.contains_key(&decision_date) {
+        return Err(LedgerError::DecisionDateCollision(decision_date));
+    }
+    state
+        .decision_outcomes
+        .insert(decision_date, decision_id.to_owned());
     Ok(())
 }
 
@@ -1935,6 +1958,8 @@ pub enum LedgerError {
     InsufficientDeployableCapital,
     #[error("commitment ID collision: {0}")]
     CommitmentCollision(String),
+    #[error("daily decision outcome already exists for {0}")]
+    DecisionDateCollision(NaiveDate),
     #[error("unknown commitment: {0}")]
     UnknownCommitment(String),
     #[error("commitment already settled: {0}")]
