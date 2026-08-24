@@ -800,18 +800,70 @@ impl WorkflowState {
         )
     }
 
-    fn late_order_evidence_reason(&self, transition: &WorkflowTransition) -> Option<&'static str> {
+    fn invalid_transition_contradiction_reason(
+        &self,
+        transition: &WorkflowTransition,
+    ) -> Option<String> {
         match transition {
             WorkflowTransition::OrderSubmissionObserved { .. } if self.order_is_terminal() => {
-                Some("accepted order appeared after terminal reconciliation")
+                Some("accepted order appeared after terminal reconciliation".into())
             }
             WorkflowTransition::OrderSubmissionAbsent { .. }
                 if self.exchange_order_id.is_some() =>
             {
-                Some("order absence contradicted an accepted order")
+                Some("order absence contradicted an accepted order".into())
             }
             WorkflowTransition::OrderFillObserved { .. } if self.order_is_terminal() => {
-                Some("new fill appeared after terminal reconciliation")
+                Some("new fill appeared after terminal reconciliation".into())
+            }
+            WorkflowTransition::OrderFillObserved {
+                cumulative_hype,
+                cumulative_filled_usdc,
+                cumulative_debited_usdc,
+                fully_filled,
+                ..
+            } if matches!(
+                self.stage,
+                WorkflowStage::OrderSubmitted
+                    | WorkflowStage::PartiallyFilled
+                    | WorkflowStage::Filled
+            ) =>
+            {
+                if let Err(WorkflowError::ContradictoryObservation(reason)) = self
+                    .validate_cumulative_fill(
+                        *cumulative_hype,
+                        *cumulative_filled_usdc,
+                        *cumulative_debited_usdc,
+                        false,
+                    )
+                {
+                    return Some(reason);
+                }
+                (self.stage == WorkflowStage::Filled && !fully_filled)
+                    .then(|| "a fully filled order regressed to partial".into())
+            }
+            WorkflowTransition::OrderFinalized {
+                cumulative_hype,
+                cumulative_filled_usdc,
+                cumulative_debited_usdc,
+                finality,
+                ..
+            } if matches!(
+                self.stage,
+                WorkflowStage::OrderSubmitted
+                    | WorkflowStage::PartiallyFilled
+                    | WorkflowStage::Filled
+            ) =>
+            {
+                match self.validate_cumulative_fill(
+                    *cumulative_hype,
+                    *cumulative_filled_usdc,
+                    *cumulative_debited_usdc,
+                    matches!(finality, OrderFinality::Canceled | OrderFinality::Expired),
+                ) {
+                    Err(WorkflowError::ContradictoryObservation(reason)) => Some(reason),
+                    _ => None,
+                }
             }
             _ => None,
         }
@@ -1326,17 +1378,16 @@ impl DurableWorkflow {
         at: DateTime<Utc>,
         transition: WorkflowTransition,
     ) -> Result<AppendOutcome, WorkflowError> {
-        let late_order_evidence = self
+        let invalid_transition_contradiction = self
             .state
-            .late_order_evidence_reason(&transition)
-            .map(str::to_owned);
+            .invalid_transition_contradiction_reason(&transition);
         let result = self.append_transition(event_id, at, transition);
         let reason = match &result {
             Err(WorkflowError::ContradictoryObservation(reason)) => Some(reason.clone()),
             Err(WorkflowError::EventCollision(event_id)) => {
                 Some(format!("conflicting replay for event {event_id}"))
             }
-            Err(WorkflowError::InvalidTransition(_)) => late_order_evidence,
+            Err(WorkflowError::InvalidTransition(_)) => invalid_transition_contradiction,
             _ => None,
         };
         if let Some(reason) = reason {

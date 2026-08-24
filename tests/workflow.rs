@@ -670,6 +670,77 @@ fn fresh_late_order_evidence_durably_invalidates_terminal_results() {
 }
 
 #[test]
+fn stale_contradictory_cumulative_evidence_durably_halts_before_completion() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let binding = binding();
+
+    let fill_path = temp.path().join("stale-contradictory-fill.jsonl");
+    let mut fill = reopen(&fill_path, &binding);
+    ready(fill.prepare_order(at(1)).expect("order prepared"));
+    fill.observe_order_submission("exchange-order-1", at(2))
+        .expect("submission observed");
+    fill.observe_order_fill(
+        "partial-fill",
+        hype(100),
+        usdc(20_000_000),
+        usdc(20_200_000),
+        false,
+        at(4),
+    )
+    .expect("partial fill observed");
+    assert!(matches!(
+        fill.observe_order_fill(
+            "fresh-but-stale-contradiction",
+            hype(150),
+            usdc(30_000_000),
+            usdc(51_000_001),
+            false,
+            at(3),
+        ),
+        Err(WorkflowError::InvalidTransition(_))
+    ));
+    assert_eq!(fill.state().stage(), WorkflowStage::ManualReview);
+    drop(fill);
+    assert_eq!(
+        reopen(&fill_path, &binding).state().stage(),
+        WorkflowStage::ManualReview
+    );
+
+    let final_path = temp.path().join("stale-contradictory-finalization.jsonl");
+    let mut finalization = reopen(&final_path, &binding);
+    ready(finalization.prepare_order(at(1)).expect("order prepared"));
+    finalization
+        .observe_order_submission("exchange-order-1", at(2))
+        .expect("submission observed");
+    finalization
+        .observe_order_fill(
+            "partial-fill",
+            hype(100),
+            usdc(20_000_000),
+            usdc(20_200_000),
+            false,
+            at(4),
+        )
+        .expect("partial fill observed");
+    assert!(matches!(
+        finalization.finalize_order(
+            hype(150),
+            usdc(30_000_000),
+            usdc(51_000_001),
+            OrderFinality::Canceled,
+            at(3),
+        ),
+        Err(WorkflowError::InvalidTransition(_))
+    ));
+    assert_eq!(finalization.state().stage(), WorkflowStage::ManualReview);
+    drop(finalization);
+    assert_eq!(
+        reopen(&final_path, &binding).state().stage(),
+        WorkflowStage::ManualReview
+    );
+}
+
+#[test]
 fn contradictory_authoritative_debits_fail_closed() {
     let temp = tempfile::tempdir().expect("temp directory");
     let binding = binding();
