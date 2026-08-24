@@ -55,8 +55,9 @@ by the authoritative accumulator ledger:
 HYPE_ACCOUNT_ID=0x... cargo run --locked --bin hype-status -- config.local.toml status.json
 ```
 
-This one-shot path is suitable for offline/DRY_RUN verification. S3 emission
-and deployed scheduling remain gated by the observability rollout.
+This networked one-shot path is suitable for signer-free, read-only DRY_RUN
+verification. S3 emission and deployed scheduling remain gated by the
+observability rollout.
 
 ## Local development
 
