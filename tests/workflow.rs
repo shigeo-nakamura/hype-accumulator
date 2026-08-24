@@ -21,6 +21,8 @@ use std::{
 #[derive(Default)]
 struct MemoryProtectedHeadStore {
     head: Mutex<Option<ProtectedWorkflowHead>>,
+    reject_next_compare_and_swap: Mutex<bool>,
+    lose_next_compare_and_swap_response: Mutex<bool>,
 }
 
 impl ProtectedWorkflowHeadStore for MemoryProtectedHeadStore {
@@ -36,12 +38,45 @@ impl ProtectedWorkflowHeadStore for MemoryProtectedHeadStore {
         expected: Option<&ProtectedWorkflowHead>,
         next: &ProtectedWorkflowHead,
     ) -> Result<bool, String> {
+        let mut reject = self
+            .reject_next_compare_and_swap
+            .lock()
+            .map_err(|error| error.to_string())?;
+        if *reject {
+            *reject = false;
+            return Err("injected protected-head rejection".into());
+        }
+        drop(reject);
+        let mut lose_response = self
+            .lose_next_compare_and_swap_response
+            .lock()
+            .map_err(|error| error.to_string())?;
         let mut head = self.head.lock().map_err(|error| error.to_string())?;
         if head.as_ref() != expected {
             return Ok(false);
         }
         *head = Some(next.clone());
+        if *lose_response {
+            *lose_response = false;
+            return Err("injected protected-head response loss".into());
+        }
         Ok(true)
+    }
+}
+
+impl MemoryProtectedHeadStore {
+    fn reject_next_compare_and_swap(&self) {
+        *self
+            .reject_next_compare_and_swap
+            .lock()
+            .expect("protected-head rejection flag locks") = true;
+    }
+
+    fn lose_next_compare_and_swap_response(&self) {
+        *self
+            .lose_next_compare_and_swap_response
+            .lock()
+            .expect("protected-head response-loss flag locks") = true;
     }
 }
 
@@ -1967,6 +2002,148 @@ fn stale_invalid_eligibility_evidence_cannot_be_replaced() {
         reopen(&path, &binding).state().stage(),
         WorkflowStage::ManualReview
     );
+}
+
+#[test]
+fn cumulative_fill_notional_cannot_exceed_quantity_at_limit() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("proportional-fill-cap.jsonl");
+    let binding = binding();
+    let mut workflow = reopen(&path, &binding);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    workflow
+        .observe_order_submission("exchange-order-limit", at(2))
+        .expect("order submission observed");
+
+    assert!(matches!(
+        workflow.observe_order_fill(
+            "fill-above-limit",
+            hype(1),
+            usdc(49_000_000),
+            usdc(49_000_000),
+            false,
+            at(3),
+        ),
+        Err(WorkflowError::ContradictoryObservation(_))
+    ));
+    assert_eq!(workflow.state().stage(), WorkflowStage::ManualReview);
+    drop(workflow);
+    assert_eq!(
+        reopen(&path, &binding).state().stage(),
+        WorkflowStage::ManualReview
+    );
+}
+
+#[test]
+fn expired_residual_fill_does_not_invalidate_fresh_eligible_allocation() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("residual-fill-age.jsonl");
+    let mut binding = binding();
+    binding.inventory_before.unconsumed_residual_spot_hype_atoms = hype(0);
+    binding.eligibility_policy.lot_eligibility_max_age_seconds = 90;
+    let mut workflow = reopen(&path, &binding);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    workflow
+        .observe_order_submission("exchange-order-residual", at(2))
+        .expect("order submission observed");
+    workflow
+        .observe_order_fill(
+            "residual-fill",
+            hype(10),
+            usdc(2_000_000),
+            usdc(2_000_000),
+            false,
+            at(3),
+        )
+        .expect("residual fill observed");
+    workflow
+        .observe_order_fill(
+            "eligible-fill",
+            hype(20),
+            usdc(4_000_000),
+            usdc(4_000_000),
+            false,
+            at(4),
+        )
+        .expect("eligible fill observed");
+    workflow
+        .finalize_order(
+            hype(20),
+            usdc(4_000_000),
+            usdc(4_000_000),
+            OrderFinality::Canceled,
+            at(5),
+        )
+        .expect("partial order finalized");
+    let evidence = bound_evidence(
+        &workflow,
+        &[("residual-fill", 10, 3), ("eligible-fill", 10, 4)],
+        at(5),
+    );
+
+    let eligibility = workflow
+        .record_staking_eligibility(Some(evidence), at(5))
+        .expect("fresh eligible allocation recorded");
+    assert_eq!(eligibility.residual_hype, hype(10));
+    assert_eq!(eligibility.eligible_hype, hype(10));
+}
+
+#[test]
+fn protected_head_response_loss_recovers_committed_append_on_reopen() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("protected-head-recovery.jsonl");
+    let binding = binding();
+    let store = protected_head_store(&path);
+    let mut workflow = DurableWorkflow::open_or_create(&path, &binding, store.clone())
+        .expect("initial workflow opens");
+    store.lose_next_compare_and_swap_response();
+
+    assert!(matches!(
+        workflow.prepare_order(at(1)),
+        Err(WorkflowError::ProtectedHead(_))
+    ));
+    let mut pending_path = path.as_os_str().to_os_string();
+    pending_path.push(".pending-append.json");
+    let pending_path = PathBuf::from(pending_path);
+    assert!(pending_path.exists());
+    drop(workflow);
+
+    let mut restarted = DurableWorkflow::open_or_create(&path, &binding, store)
+        .expect("protected pending append restores its local journal on reopen");
+    assert_eq!(restarted.record_count(), 2);
+    assert!(!pending_path.exists());
+    assert!(matches!(
+        restarted.prepare_order(at(2)),
+        Ok(PrepareOutcome::ReconcileOnly {
+            kind: ActionKind::SubmitOrder,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn rejected_protected_head_does_not_commit_a_local_pending_append() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("protected-head-rejection.jsonl");
+    let binding = binding();
+    let store = protected_head_store(&path);
+    let mut workflow = DurableWorkflow::open_or_create(&path, &binding, store.clone())
+        .expect("initial workflow opens");
+    store.reject_next_compare_and_swap();
+
+    assert!(matches!(
+        workflow.prepare_order(at(1)),
+        Err(WorkflowError::ProtectedHead(_))
+    ));
+    drop(workflow);
+
+    let mut restarted = DurableWorkflow::open_or_create(&path, &binding, store)
+        .expect("uncommitted local pending append is discarded on reopen");
+    assert_eq!(restarted.record_count(), 1);
+    assert!(matches!(
+        restarted.prepare_order(at(2)),
+        Ok(PrepareOutcome::Ready(_))
+    ));
 }
 
 #[test]

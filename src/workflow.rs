@@ -25,6 +25,7 @@ use thiserror::Error;
 const JOURNAL_SCHEMA_VERSION: u8 = 1;
 const CHECKPOINT_SCHEMA_VERSION: u8 = 1;
 const PROTECTED_HEAD_SCHEMA_VERSION: u8 = 1;
+const PENDING_APPEND_SCHEMA_VERSION: u8 = 1;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -1149,6 +1150,7 @@ impl WorkflowState {
         let mut registration_record_ids = BTreeSet::new();
         let mut registration_cursors = BTreeSet::new();
         let mut purchased = 0_u64;
+        let mut residual_remaining = evidence.residual_reservation_hype.as_atoms();
         let mut previous: Option<(DateTime<Utc>, &str)> = None;
         for fill in &evidence.fills {
             let key = (fill.executed_at, fill.fill_id.as_str());
@@ -1160,14 +1162,21 @@ impl WorkflowState {
                         "fill registration deadline overflowed".into(),
                     )
                 })?;
-            let eligibility_expires_at = fill
-                .executed_at
-                .checked_add_signed(lot_max_age)
-                .ok_or_else(|| {
-                    WorkflowError::ContradictoryObservation(
-                        "lot eligibility deadline overflowed".into(),
-                    )
-                })?;
+            let residual_for_fill = residual_remaining.min(fill.purchased_hype.as_atoms());
+            let has_eligible_allocation = residual_for_fill < fill.purchased_hype.as_atoms();
+            let eligibility_expired = if has_eligible_allocation {
+                let eligibility_expires_at = fill
+                    .executed_at
+                    .checked_add_signed(lot_max_age)
+                    .ok_or_else(|| {
+                        WorkflowError::ContradictoryObservation(
+                            "lot eligibility deadline overflowed".into(),
+                        )
+                    })?;
+                recorded_at >= eligibility_expires_at
+            } else {
+                false
+            };
             if fill.fill_id.trim().is_empty()
                 || fill.authorization_id != evidence.authorization_id
                 || fill.authorization_record_hash != evidence.authorization_record_hash
@@ -1192,7 +1201,7 @@ impl WorkflowState {
                 || fill.registration_deadline_at != registration_deadline_at
                 || fill.registration_deadline_at < fill.first_observed_at
                 || recorded_at < fill.first_observed_at
-                || recorded_at >= eligibility_expires_at
+                || eligibility_expired
             {
                 return Err(WorkflowError::ContradictoryObservation(
                     "fill evidence is late, duplicated, unsorted, or outside the authorized order window"
@@ -1206,6 +1215,7 @@ impl WorkflowState {
                         "authorized fill quantity overflowed".into(),
                     )
                 })?;
+            residual_remaining = residual_remaining.saturating_sub(fill.purchased_hype.as_atoms());
             previous = Some(key);
         }
         if purchased != self.purchased_hype.as_atoms() {
@@ -1267,6 +1277,14 @@ impl WorkflowState {
         cumulative_debited_usdc: UsdcMicros,
         allow_zero: bool,
     ) -> Result<(), WorkflowError> {
+        let proportional_fill_cap =
+            max_fill_notional_usdc(cumulative_hype, &self.binding.order_envelope).ok_or_else(
+                || {
+                    WorkflowError::ContradictoryObservation(
+                        "cumulative quantity-at-limit notional overflowed".into(),
+                    )
+                },
+            )?;
         if (cumulative_hype.is_zero() && !allow_zero)
             || cumulative_hype.is_zero() != cumulative_filled_usdc.is_zero()
             || cumulative_hype < self.purchased_hype
@@ -1274,6 +1292,7 @@ impl WorkflowState {
             || cumulative_debited_usdc < self.debited_usdc
             || cumulative_debited_usdc < cumulative_filled_usdc
             || cumulative_filled_usdc > self.binding.planned_usdc
+            || cumulative_filled_usdc > proportional_fill_cap
             || cumulative_debited_usdc > self.binding.committed_usdc
             || cumulative_hype > self.binding.order_envelope.original_quantity_hype
         {
@@ -1428,6 +1447,17 @@ struct JournalCheckpoint {
     journal_len: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PendingWorkflowAppend {
+    schema_version: u8,
+    workflow_id: String,
+    prior_head: Option<ProtectedWorkflowHead>,
+    prior_journal_len: u64,
+    record: JournalRecord,
+    next_head: ProtectedWorkflowHead,
+}
+
 /// Latest workflow journal head retained outside the journal rollback domain.
 ///
 /// Implementations of [`ProtectedWorkflowHeadStore`] must durably persist this
@@ -1498,8 +1528,9 @@ impl DurableWorkflow {
     ) -> Result<Self, WorkflowError> {
         binding.validate()?;
         let path = path.as_ref().to_path_buf();
-        let records = load_records(&path)?;
         let workflow_id = workflow_id_for(binding)?;
+        recover_pending_append(&path, &workflow_id, protected_head_store.as_ref())?;
+        let records = load_records(&path)?;
         if records.is_empty() {
             if protected_head_store
                 .load()
@@ -2110,6 +2141,36 @@ impl DurableWorkflow {
         }
         let mut line = serde_json::to_vec(record).map_err(WorkflowError::json)?;
         line.push(b'\n');
+        let new_file_len = self
+            .file_len
+            .checked_add(
+                u64::try_from(line.len())
+                    .map_err(|_| WorkflowError::CorruptJournal("file length overflowed".into()))?,
+            )
+            .ok_or_else(|| WorkflowError::CorruptJournal("file length overflowed".into()))?;
+        let next_protected_head = protected_head_for(record, &self.state.workflow_id, new_file_len);
+        write_pending_append(
+            &self.path,
+            &PendingWorkflowAppend {
+                schema_version: PENDING_APPEND_SCHEMA_VERSION,
+                workflow_id: self.state.workflow_id.clone(),
+                prior_head: self.protected_head.clone(),
+                prior_journal_len: self.file_len,
+                record: record.clone(),
+                next_head: next_protected_head.clone(),
+            },
+        )?;
+        // Protect the exact record hash before publishing mutable local state.
+        // On an ambiguous response, recovery may materialize only that head.
+        let advanced = self
+            .protected_head_store
+            .compare_and_swap(self.protected_head.as_ref(), &next_protected_head)
+            .map_err(WorkflowError::protected_head)?;
+        if !advanced {
+            return Err(WorkflowError::RollbackDetected(
+                "protected workflow head compare-and-swap failed".into(),
+            ));
+        }
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -2122,13 +2183,6 @@ impl DurableWorkflow {
                 .and_then(|directory| directory.sync_all())
                 .map_err(WorkflowError::io)?;
         }
-        let new_file_len = self
-            .file_len
-            .checked_add(
-                u64::try_from(line.len())
-                    .map_err(|_| WorkflowError::CorruptJournal("file length overflowed".into()))?,
-            )
-            .ok_or_else(|| WorkflowError::CorruptJournal("file length overflowed".into()))?;
         write_checkpoint(
             &self.path,
             &JournalCheckpoint {
@@ -2139,16 +2193,7 @@ impl DurableWorkflow {
                 journal_len: new_file_len,
             },
         )?;
-        let next_protected_head = protected_head_for(record, &self.state.workflow_id, new_file_len);
-        let advanced = self
-            .protected_head_store
-            .compare_and_swap(self.protected_head.as_ref(), &next_protected_head)
-            .map_err(WorkflowError::protected_head)?;
-        if !advanced {
-            return Err(WorkflowError::RollbackDetected(
-                "protected workflow head compare-and-swap failed".into(),
-            ));
-        }
+        clear_pending_append(&self.path)?;
         self.protected_head = Some(next_protected_head);
         self.file_len = new_file_len;
         Ok(())
@@ -2242,13 +2287,21 @@ fn independent_history_watermarks(
 }
 
 fn max_order_notional_usdc(envelope: &OrderEnvelopeBinding) -> Option<UsdcMicros> {
+    let notional = max_fill_notional_usdc(envelope.original_quantity_hype, envelope)?;
+    (!notional.is_zero()).then_some(notional)
+}
+
+fn max_fill_notional_usdc(
+    cumulative_hype: HypeAtoms,
+    envelope: &OrderEnvelopeBinding,
+) -> Option<UsdcMicros> {
     let scale = u128::from(envelope.hype_atoms_per_hype);
     let rounding = scale.checked_sub(1)?;
-    let numerator = u128::from(envelope.original_quantity_hype.as_atoms())
+    let numerator = u128::from(cumulative_hype.as_atoms())
         .checked_mul(u128::from(envelope.limit_price_usdc_per_hype.as_micros()))?;
     let rounded_micros = numerator.checked_add(rounding)?.checked_div(scale)?;
     let rounded_micros = u64::try_from(rounded_micros).ok()?;
-    (rounded_micros > 0).then(|| UsdcMicros::from_micros(rounded_micros))
+    Some(UsdcMicros::from_micros(rounded_micros))
 }
 
 fn policy_time_delta(seconds: u64) -> Option<TimeDelta> {
@@ -2507,6 +2560,212 @@ fn checkpoint_temp_path(path: &Path) -> PathBuf {
     let mut checkpoint = path.as_os_str().to_os_string();
     checkpoint.push(".head.tmp");
     PathBuf::from(checkpoint)
+}
+
+fn pending_append_path(path: &Path) -> PathBuf {
+    let mut pending = path.as_os_str().to_os_string();
+    pending.push(".pending-append.json");
+    PathBuf::from(pending)
+}
+
+fn pending_append_temp_path(path: &Path) -> PathBuf {
+    let mut pending = path.as_os_str().to_os_string();
+    pending.push(".pending-append.tmp");
+    PathBuf::from(pending)
+}
+
+fn write_pending_append(path: &Path, pending: &PendingWorkflowAppend) -> Result<(), WorkflowError> {
+    let parent = normalized_parent(path);
+    fs::create_dir_all(parent).map_err(WorkflowError::io)?;
+    let pending_path = pending_append_path(path);
+    let temp_path = pending_append_temp_path(path);
+    let mut encoded = serde_json::to_vec(pending).map_err(WorkflowError::json)?;
+    encoded.push(b'\n');
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temp_path)
+        .map_err(WorkflowError::io)?;
+    file.write_all(&encoded).map_err(WorkflowError::io)?;
+    file.sync_all().map_err(WorkflowError::io)?;
+    fs::rename(temp_path, pending_path).map_err(WorkflowError::io)?;
+    sync_parent(path)
+}
+
+fn read_pending_append(path: &Path) -> Result<Option<PendingWorkflowAppend>, WorkflowError> {
+    let pending_path = pending_append_path(path);
+    let payload = match fs::read(pending_path) {
+        Ok(payload) => payload,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(WorkflowError::io(error)),
+    };
+    let encoded = payload.strip_suffix(b"\n").ok_or_else(|| {
+        WorkflowError::RollbackDetected("pending workflow append is incomplete".into())
+    })?;
+    serde_json::from_slice(encoded).map(Some).map_err(|error| {
+        WorkflowError::RollbackDetected(format!("pending workflow append is malformed: {error}"))
+    })
+}
+
+fn clear_pending_append(path: &Path) -> Result<(), WorkflowError> {
+    match fs::remove_file(pending_append_path(path)) {
+        Ok(()) => sync_parent(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(WorkflowError::io(error)),
+    }
+}
+
+fn sync_parent(path: &Path) -> Result<(), WorkflowError> {
+    File::open(normalized_parent(path))
+        .and_then(|directory| directory.sync_all())
+        .map_err(WorkflowError::io)
+}
+
+fn recover_pending_append(
+    path: &Path,
+    workflow_id: &str,
+    protected_head_store: &dyn ProtectedWorkflowHeadStore,
+) -> Result<(), WorkflowError> {
+    let Some(pending) = read_pending_append(path)? else {
+        return Ok(());
+    };
+    validate_pending_append(&pending, workflow_id)?;
+    let mut line = serde_json::to_vec(&pending.record).map_err(WorkflowError::json)?;
+    line.push(b'\n');
+    let payload = match fs::read(path) {
+        Ok(payload) => payload,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(WorkflowError::io(error)),
+    };
+    let prior_len = usize::try_from(pending.prior_journal_len).map_err(|_| {
+        WorkflowError::RollbackDetected("pending prior length is out of range".into())
+    })?;
+    let Some(tail) = payload.get(prior_len..) else {
+        return Err(WorkflowError::RollbackDetected(
+            "journal is shorter than its pending append prefix".into(),
+        ));
+    };
+    let actual_head = protected_head_store
+        .load()
+        .map_err(WorkflowError::protected_head)?;
+    if actual_head == pending.prior_head {
+        if !tail.is_empty() {
+            return Err(WorkflowError::RollbackDetected(
+                "unprotected journal tail exists beside an uncommitted pending append".into(),
+            ));
+        }
+        write_checkpoint(
+            path,
+            &checkpoint_for_head(workflow_id, pending.prior_head.as_ref()),
+        )?;
+        return clear_pending_append(path);
+    }
+    if actual_head.as_ref() != Some(&pending.next_head) {
+        return Err(WorkflowError::RollbackDetected(
+            "pending append does not match the protected workflow head".into(),
+        ));
+    }
+    if tail != line {
+        if !line.starts_with(tail) {
+            return Err(WorkflowError::RollbackDetected(
+                "journal tail does not match its protected pending append".into(),
+            ));
+        }
+        if !tail.is_empty() {
+            let file = OpenOptions::new()
+                .write(true)
+                .open(path)
+                .map_err(WorkflowError::io)?;
+            file.set_len(pending.prior_journal_len)
+                .map_err(WorkflowError::io)?;
+            file.sync_all().map_err(WorkflowError::io)?;
+        }
+        append_pending_line(path, &line)?;
+    }
+    write_checkpoint(
+        path,
+        &checkpoint_for_head(workflow_id, Some(&pending.next_head)),
+    )?;
+    clear_pending_append(path)
+}
+
+fn append_pending_line(path: &Path, line: &[u8]) -> Result<(), WorkflowError> {
+    let created = !path.exists();
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(WorkflowError::io)?;
+    file.write_all(line).map_err(WorkflowError::io)?;
+    file.sync_all().map_err(WorkflowError::io)?;
+    if created {
+        sync_parent(path)?;
+    }
+    Ok(())
+}
+
+fn validate_pending_append(
+    pending: &PendingWorkflowAppend,
+    workflow_id: &str,
+) -> Result<(), WorkflowError> {
+    let expected_sequence = pending
+        .prior_head
+        .as_ref()
+        .map_or(Some(0), |head| head.sequence.checked_add(1));
+    let expected_previous_hash = pending
+        .prior_head
+        .as_ref()
+        .map_or("", |head| head.record_hash.as_str());
+    let mut line = serde_json::to_vec(&pending.record).map_err(WorkflowError::json)?;
+    line.push(b'\n');
+    let expected_len = pending
+        .prior_journal_len
+        .checked_add(u64::try_from(line.len()).map_err(|_| {
+            WorkflowError::RollbackDetected("pending record length is out of range".into())
+        })?)
+        .ok_or_else(|| WorkflowError::RollbackDetected("pending length overflowed".into()))?;
+    let expected_next = protected_head_for(&pending.record, workflow_id, expected_len);
+    if pending.schema_version != PENDING_APPEND_SCHEMA_VERSION
+        || pending.workflow_id != workflow_id
+        || pending.record.schema_version != JOURNAL_SCHEMA_VERSION
+        || Some(pending.record.sequence) != expected_sequence
+        || pending.record.previous_hash != expected_previous_hash
+        || pending.record.record_hash
+            != record_hash(
+                pending.record.sequence,
+                &pending.record.previous_hash,
+                &pending.record.event,
+            )?
+        || pending.prior_head.as_ref().is_some_and(|head| {
+            head.schema_version != PROTECTED_HEAD_SCHEMA_VERSION
+                || head.workflow_id != workflow_id
+                || head.journal_len != pending.prior_journal_len
+        })
+        || (pending.prior_head.is_none() && pending.prior_journal_len != 0)
+        || pending.next_head != expected_next
+    {
+        return Err(WorkflowError::RollbackDetected(
+            "pending workflow append is inconsistent".into(),
+        ));
+    }
+    validate_event_id(workflow_id, &pending.record.event)
+}
+
+fn checkpoint_for_head(
+    workflow_id: &str,
+    head: Option<&ProtectedWorkflowHead>,
+) -> JournalCheckpoint {
+    head.map_or_else(
+        || bootstrap_checkpoint(workflow_id),
+        |head| JournalCheckpoint {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            workflow_id: workflow_id.to_owned(),
+            sequence: Some(head.sequence),
+            record_hash: head.record_hash.clone(),
+            journal_len: head.journal_len,
+        },
+    )
 }
 
 fn read_checkpoint(path: &Path) -> Result<JournalCheckpoint, WorkflowError> {
