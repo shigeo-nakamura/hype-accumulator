@@ -222,85 +222,26 @@ fn every_transition_survives_a_restart_without_double_counting() {
     workflow = reopen(&path, &binding);
     assert_eq!(workflow.state().stage(), WorkflowStage::OrderFinalized);
 
-    let staking = ready(
-        workflow
-            .prepare_staking_deposit(at(6))
-            .expect("staking deposit prepared"),
-    );
-    assert!(matches!(
-        staking,
-        ExternalAction::DepositToStaking {
-            amount_hype,
-            ..
-        } if amount_hype == hype(240)
-    ));
-    drop(workflow);
-    workflow = reopen(&path, &binding);
-    assert_eq!(workflow.state().pending_action(), Some(&staking));
-
-    workflow
-        .observe_staking_deposit(ExternalReceipt::Ambiguous, at(7))
-        .expect("ambiguous staking response persisted");
+    let eligibility = workflow
+        .record_staking_eligibility(at(6))
+        .expect("unsigned eligibility recorded");
+    assert_eq!(eligibility.residual_hype, hype(10));
+    assert_eq!(eligibility.eligible_hype, hype(240));
     drop(workflow);
     workflow = reopen(&path, &binding);
     assert_eq!(
         workflow.state().stage(),
-        WorkflowStage::StakingDepositSubmitted
+        WorkflowStage::StakingEligibilityRecorded
     );
+    assert_eq!(workflow.state().staking_eligibility(), eligibility);
 
-    assert!(matches!(
-        workflow.confirm_staking_balance("stale", hype(240), at(6)),
-        Err(WorkflowError::StaleObservation)
-    ));
-    workflow
-        .confirm_staking_balance("staking-balance-1", hype(240), at(8))
-        .expect("staking balance reconciled");
-    drop(workflow);
-    workflow = reopen(&path, &binding);
-    assert_eq!(
-        workflow.state().stage(),
-        WorkflowStage::StakingBalanceConfirmed
-    );
-
-    let delegation = ready(
-        workflow
-            .prepare_delegation(at(9))
-            .expect("delegation prepared"),
-    );
-    assert!(matches!(
-        delegation,
-        ExternalAction::Delegate { amount_hype, .. } if amount_hype == hype(240)
-    ));
-    drop(workflow);
-    workflow = reopen(&path, &binding);
-    assert_eq!(workflow.state().pending_action(), Some(&delegation));
-
-    workflow
-        .observe_delegation(
-            ExternalReceipt::Confirmed("delegation-receipt-1".to_owned()),
-            at(10),
-        )
-        .expect("delegation response reconciled");
-    drop(workflow);
-    workflow = reopen(&path, &binding);
-    assert_eq!(workflow.state().stage(), WorkflowStage::DelegationSubmitted);
-
-    workflow
-        .confirm_delegated_balance("delegation-balance-1", hype(240), at(11))
-        .expect("delegated balance reconciled");
-    drop(workflow);
-    workflow = reopen(&path, &binding);
-    assert_eq!(workflow.state().stage(), WorkflowStage::DelegatedConfirmed);
-
-    workflow.complete(at(12)).expect("workflow completed");
+    workflow.complete(at(7)).expect("workflow completed");
     drop(workflow);
     workflow = reopen(&path, &binding);
     assert_eq!(workflow.state().stage(), WorkflowStage::Complete);
     assert_eq!(workflow.state().purchased_hype(), hype(250));
     assert_eq!(workflow.state().filled_usdc(), usdc(50_000_000));
     assert_eq!(workflow.state().debited_usdc(), usdc(50_500_000));
-    assert_eq!(workflow.state().staking_target_hype(), hype(240));
-    assert_eq!(workflow.state().delegated_hype(), hype(240));
     assert_eq!(
         workflow.state().binding().inventory_before.spot_hype_atoms,
         hype(10_000)
@@ -405,17 +346,134 @@ fn partial_fill_cancel_race_uses_one_final_cumulative_fill_and_never_rebuys() {
         workflow.prepare_order(at(6)),
         Err(WorkflowError::InvalidTransition(_))
     ));
+    let eligibility = workflow
+        .record_staking_eligibility(at(7))
+        .expect("unsigned eligibility recorded from final cumulative fill");
+    assert_eq!(eligibility.residual_hype, hype(10));
+    assert_eq!(eligibility.eligible_hype, hype(140));
+}
+
+#[test]
+fn zero_fill_terminal_orders_complete_without_staking_intent() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let binding = binding();
+    for (name, finality) in [
+        ("canceled", OrderFinality::Canceled),
+        ("expired", OrderFinality::Expired),
+    ] {
+        let path = temp.path().join(format!("{name}.jsonl"));
+        let mut workflow = reopen(&path, &binding);
+        ready(workflow.prepare_order(at(1)).expect("order prepared"));
+        workflow
+            .observe_order_submission("exchange-order-1", at(2))
+            .expect("submission observed");
+        workflow
+            .finalize_order(hype(0), usdc(0), usdc(0), finality, at(3))
+            .expect("zero-fill terminal order finalized");
+        let eligibility = workflow
+            .record_staking_eligibility(at(4))
+            .expect("zero eligibility recorded");
+        assert_eq!(eligibility.residual_hype, hype(0));
+        assert_eq!(eligibility.eligible_hype, hype(0));
+        workflow
+            .complete(at(5))
+            .expect("zero-fill workflow completed");
+        drop(workflow);
+        assert_eq!(
+            reopen(&path, &binding).state().stage(),
+            WorkflowStage::Complete
+        );
+    }
+}
+
+#[test]
+fn residual_only_fill_records_zero_eligibility_and_completes() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("residual-only.jsonl");
+    let binding = binding();
+    let mut workflow = reopen(&path, &binding);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    workflow
+        .observe_order_submission("exchange-order-1", at(2))
+        .expect("submission observed");
+    workflow
+        .observe_order_fill(
+            "residual-fill",
+            hype(5),
+            usdc(1_000_000),
+            usdc(1_010_000),
+            false,
+            at(3),
+        )
+        .expect("residual fill observed");
+    workflow
+        .finalize_order(
+            hype(5),
+            usdc(1_000_000),
+            usdc(1_010_000),
+            OrderFinality::Canceled,
+            at(4),
+        )
+        .expect("residual-only order finalized");
+    let eligibility = workflow
+        .record_staking_eligibility(at(5))
+        .expect("residual-only eligibility recorded");
+    assert_eq!(eligibility.residual_hype, hype(5));
+    assert_eq!(eligibility.eligible_hype, hype(0));
+    workflow
+        .complete(at(6))
+        .expect("residual-only workflow completed");
+    assert_eq!(workflow.state().stage(), WorkflowStage::Complete);
+}
+
+#[test]
+fn late_event_collision_persists_manual_review_at_a_monotonic_time() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("late-collision.jsonl");
+    let binding = binding();
+    let mut workflow = reopen(&path, &binding);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    workflow
+        .observe_order_submission("exchange-order-1", at(2))
+        .expect("submission observed");
+    workflow
+        .observe_order_fill(
+            "fill-1",
+            hype(100),
+            usdc(20_000_000),
+            usdc(20_200_000),
+            false,
+            at(3),
+        )
+        .expect("first fill observed");
+    workflow
+        .observe_order_fill(
+            "fill-2",
+            hype(150),
+            usdc(30_000_000),
+            usdc(30_300_000),
+            false,
+            at(5),
+        )
+        .expect("newer fill observed");
+
     assert!(matches!(
-        ready(
-            workflow
-                .prepare_staking_deposit(at(7))
-                .expect("staking prepared from final cumulative fill")
+        workflow.observe_order_fill(
+            "fill-1",
+            hype(101),
+            usdc(20_100_000),
+            usdc(20_301_000),
+            false,
+            at(3),
         ),
-        ExternalAction::DepositToStaking {
-            amount_hype,
-            ..
-        } if amount_hype == hype(140)
+        Err(WorkflowError::EventCollision(_))
     ));
+    assert_eq!(workflow.state().stage(), WorkflowStage::ManualReview);
+    drop(workflow);
+    assert_eq!(
+        reopen(&path, &binding).state().stage(),
+        WorkflowStage::ManualReview
+    );
 }
 
 #[test]
@@ -491,7 +549,7 @@ fn later_capital_never_resizes_a_decided_or_ambiguous_order() {
 }
 
 #[test]
-fn contradictory_staking_balance_enters_manual_review_without_guessing() {
+fn staking_and_delegation_actions_remain_hard_disabled() {
     let temp = tempfile::tempdir().expect("temp directory");
     let path = temp.path().join("workflow.jsonl");
     let binding = binding();
@@ -519,33 +577,24 @@ fn contradictory_staking_balance_enters_manual_review_without_guessing() {
             at(4),
         )
         .expect("order finalized");
-    ready(
-        workflow
-            .prepare_staking_deposit(at(5))
-            .expect("staking prepared"),
-    );
-    workflow
-        .observe_staking_deposit(
-            ExternalReceipt::Confirmed("staking-receipt-1".to_owned()),
-            at(6),
-        )
-        .expect("staking observed");
-
     assert!(matches!(
-        workflow.confirm_staking_balance("wrong-balance", hype(1_240), at(7)),
-        Err(WorkflowError::ContradictoryObservation(_))
+        workflow.prepare_staking_deposit(at(5)),
+        Err(WorkflowError::AutomaticStakingDisabled)
     ));
-    assert_eq!(workflow.state().stage(), WorkflowStage::ManualReview);
-    assert!(workflow.state().manual_review_reason().is_some());
     assert!(matches!(
-        workflow.prepare_delegation(at(8)),
+        workflow.prepare_delegation(at(5)),
+        Err(WorkflowError::AutomaticStakingDisabled)
+    ));
+    assert!(matches!(
+        workflow.observe_staking_deposit(ExternalReceipt::Ambiguous, at(6)),
         Err(WorkflowError::InvalidTransition(_))
     ));
-    drop(workflow);
-    assert_eq!(
-        reopen(&path, &binding).state().stage(),
-        WorkflowStage::ManualReview
-    );
+    assert_eq!(workflow.state().stage(), WorkflowStage::OrderFinalized);
+    assert!(workflow.state().pending_action().is_none());
+    let eligibility = workflow
+        .record_staking_eligibility(at(7))
+        .expect("unsigned eligibility recorded");
+    assert_eq!(eligibility.eligible_hype, hype(240));
 }
 
 #[test]

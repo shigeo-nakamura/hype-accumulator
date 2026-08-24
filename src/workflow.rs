@@ -181,6 +181,7 @@ pub enum WorkflowStage {
     PartiallyFilled,
     Filled,
     OrderFinalized,
+    StakingEligibilityRecorded,
     StakingDepositSubmitted,
     StakingBalanceConfirmed,
     DelegationSubmitted,
@@ -257,6 +258,12 @@ pub enum OrderFinality {
     Expired,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StakingEligibility {
+    pub residual_hype: HypeAtoms,
+    pub eligible_hype: HypeAtoms,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkflowTransition {
@@ -284,6 +291,10 @@ pub enum WorkflowTransition {
         cumulative_filled_usdc: UsdcMicros,
         cumulative_debited_usdc: UsdcMicros,
         finality: OrderFinality,
+    },
+    StakingEligibilityRecorded {
+        residual_hype: HypeAtoms,
+        eligible_hype: HypeAtoms,
     },
     StakingDepositObserved {
         action_id: String,
@@ -324,6 +335,8 @@ pub struct WorkflowState {
     purchased_hype: HypeAtoms,
     filled_usdc: UsdcMicros,
     debited_usdc: UsdcMicros,
+    residual_hype: HypeAtoms,
+    staking_eligible_hype: HypeAtoms,
     staking_target_hype: HypeAtoms,
     delegated_hype: HypeAtoms,
     staking_submitted_at: Option<DateTime<Utc>>,
@@ -366,6 +379,14 @@ impl WorkflowState {
     #[must_use]
     pub const fn debited_usdc(&self) -> UsdcMicros {
         self.debited_usdc
+    }
+
+    #[must_use]
+    pub const fn staking_eligibility(&self) -> StakingEligibility {
+        StakingEligibility {
+            residual_hype: self.residual_hype,
+            eligible_hype: self.staking_eligible_hype,
+        }
     }
 
     #[must_use]
@@ -415,6 +436,8 @@ impl WorkflowState {
             purchased_hype: HypeAtoms::default(),
             filled_usdc: UsdcMicros::from_micros(0),
             debited_usdc: UsdcMicros::from_micros(0),
+            residual_hype: HypeAtoms::default(),
+            staking_eligible_hype: HypeAtoms::default(),
             staking_target_hype: HypeAtoms::default(),
             delegated_hype: HypeAtoms::default(),
             staking_submitted_at: None,
@@ -494,6 +517,7 @@ impl WorkflowState {
                     *cumulative_hype,
                     *cumulative_filled_usdc,
                     *cumulative_debited_usdc,
+                    false,
                 )?;
                 if self.stage == WorkflowStage::Filled && !fully_filled {
                     return Err(WorkflowError::ContradictoryObservation(
@@ -514,7 +538,7 @@ impl WorkflowState {
                 cumulative_hype,
                 cumulative_filled_usdc,
                 cumulative_debited_usdc,
-                ..
+                finality,
             } => {
                 if action_id != &action_id_for(&self.workflow_id, ActionKind::SubmitOrder)
                     || !matches!(
@@ -532,11 +556,39 @@ impl WorkflowState {
                     *cumulative_hype,
                     *cumulative_filled_usdc,
                     *cumulative_debited_usdc,
+                    matches!(finality, OrderFinality::Canceled | OrderFinality::Expired),
                 )?;
                 self.purchased_hype = *cumulative_hype;
                 self.filled_usdc = *cumulative_filled_usdc;
                 self.debited_usdc = *cumulative_debited_usdc;
                 self.stage = WorkflowStage::OrderFinalized;
+            }
+            WorkflowTransition::StakingEligibilityRecorded {
+                residual_hype,
+                eligible_hype,
+            } => {
+                if self.stage != WorkflowStage::OrderFinalized {
+                    return Err(WorkflowError::InvalidTransition(
+                        "staking eligibility is invalid for current state".into(),
+                    ));
+                }
+                let expected_residual = self
+                    .purchased_hype
+                    .min(self.binding.inventory_before.configured_residual_hype_atoms);
+                let expected_eligible = self
+                    .purchased_hype
+                    .checked_sub(expected_residual)
+                    .ok_or_else(|| {
+                        WorkflowError::CorruptJournal("HYPE split underflowed".into())
+                    })?;
+                if *residual_hype != expected_residual || *eligible_hype != expected_eligible {
+                    return Err(WorkflowError::ContradictoryObservation(
+                        "unsigned staking eligibility does not conserve purchased HYPE".into(),
+                    ));
+                }
+                self.residual_hype = *residual_hype;
+                self.staking_eligible_hype = *eligible_hype;
+                self.stage = WorkflowStage::StakingEligibilityRecorded;
             }
             WorkflowTransition::StakingDepositObserved { action_id, receipt } => {
                 self.require_pending(ActionKind::DepositToStaking, action_id)?;
@@ -588,11 +640,14 @@ impl WorkflowState {
                 self.stage = WorkflowStage::DelegatedConfirmed;
             }
             WorkflowTransition::Completed => {
-                if self.stage != WorkflowStage::DelegatedConfirmed
-                    || self.delegated_hype != self.staking_target_hype
-                {
+                let unsigned_eligibility_complete =
+                    self.stage == WorkflowStage::StakingEligibilityRecorded;
+                let future_staking_complete = self.stage == WorkflowStage::DelegatedConfirmed
+                    && self.delegated_hype == self.staking_target_hype;
+                if !unsigned_eligibility_complete && !future_staking_complete {
                     return Err(WorkflowError::InvalidTransition(
-                        "workflow cannot complete before exact delegation reconciliation".into(),
+                        "workflow cannot complete before terminal eligibility reconciliation"
+                            .into(),
                     ));
                 }
                 self.stage = WorkflowStage::Complete;
@@ -660,8 +715,10 @@ impl WorkflowState {
         cumulative_hype: HypeAtoms,
         cumulative_filled_usdc: UsdcMicros,
         cumulative_debited_usdc: UsdcMicros,
+        allow_zero: bool,
     ) -> Result<(), WorkflowError> {
-        if cumulative_hype.is_zero()
+        if (cumulative_hype.is_zero() && !allow_zero)
+            || cumulative_hype.is_zero() != cumulative_filled_usdc.is_zero()
             || cumulative_hype < self.purchased_hype
             || cumulative_filled_usdc < self.filled_usdc
             || cumulative_debited_usdc < self.debited_usdc
@@ -888,17 +945,66 @@ impl DurableWorkflow {
         )
     }
 
-    /// Durably prepares staking of only decision-attributed HYPE.
+    /// Records the unsigned residual/eligible split without creating an action.
+    ///
+    /// Automatic staking remains unavailable under the current custody policy;
+    /// an eligible amount is audit information only and stays in spot.
     ///
     /// # Errors
     ///
-    /// Returns an error when the order is not final, the attributed amount is
-    /// empty, or the intent cannot be persisted.
-    pub fn prepare_staking_deposit(
+    /// Returns an error unless the order is terminal or the audit event cannot
+    /// be persisted.
+    pub fn record_staking_eligibility(
         &mut self,
         at: DateTime<Utc>,
+    ) -> Result<StakingEligibility, WorkflowError> {
+        if self.state.stage == WorkflowStage::StakingEligibilityRecorded {
+            return Ok(self.state.staking_eligibility());
+        }
+        if self.state.stage != WorkflowStage::OrderFinalized {
+            return Err(WorkflowError::InvalidTransition(
+                "staking eligibility requires a terminal order".into(),
+            ));
+        }
+        let residual_hype = self.state.purchased_hype.min(
+            self.state
+                .binding
+                .inventory_before
+                .configured_residual_hype_atoms,
+        );
+        let eligible_hype = self
+            .state
+            .purchased_hype
+            .checked_sub(residual_hype)
+            .ok_or_else(|| WorkflowError::CorruptJournal("HYPE split underflowed".into()))?;
+        let eligibility = StakingEligibility {
+            residual_hype,
+            eligible_hype,
+        };
+        self.append_transition(
+            stable_id(
+                "event/staking_eligibility/v1",
+                &[self.state.workflow_id(), "disabled"],
+            ),
+            at,
+            WorkflowTransition::StakingEligibilityRecorded {
+                residual_hype,
+                eligible_hype,
+            },
+        )?;
+        Ok(eligibility)
+    }
+
+    /// Rejects automatic staking under the mandatory disabled policy.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`WorkflowError::AutomaticStakingDisabled`].
+    pub fn prepare_staking_deposit(
+        &mut self,
+        _at: DateTime<Utc>,
     ) -> Result<PrepareOutcome, WorkflowError> {
-        self.prepare_action(ActionKind::DepositToStaking, at)
+        Err(WorkflowError::AutomaticStakingDisabled)
     }
 
     /// Records the staking submission response, including ambiguity.
@@ -959,17 +1065,16 @@ impl DurableWorkflow {
         )
     }
 
-    /// Durably prepares delegation of the reconciled staking amount.
+    /// Rejects automatic delegation under the mandatory disabled policy.
     ///
     /// # Errors
     ///
-    /// Returns an error when staking is not confirmed or the intent cannot be
-    /// persisted.
+    /// Always returns [`WorkflowError::AutomaticStakingDisabled`].
     pub fn prepare_delegation(
         &mut self,
-        at: DateTime<Utc>,
+        _at: DateTime<Utc>,
     ) -> Result<PrepareOutcome, WorkflowError> {
-        self.prepare_action(ActionKind::Delegate, at)
+        Err(WorkflowError::AutomaticStakingDisabled)
     }
 
     /// Records the delegation submission response, including ambiguity.
@@ -1129,7 +1234,8 @@ impl DurableWorkflow {
                 self.state.stage,
                 WorkflowStage::Complete | WorkflowStage::ManualReview
             ) {
-                self.mark_manual_review(reason, at)?;
+                let detected_at = at.max(self.state.last_transition_at);
+                self.mark_manual_review(reason, detected_at)?;
             }
         }
         result
@@ -1303,6 +1409,9 @@ fn validate_event_id(workflow_id: &str, event: &WorkflowEvent) -> Result<(), Wor
         WorkflowTransition::OrderFinalized { action_id, .. } => {
             stable_id("event/order_finalized/v1", &[workflow_id, action_id])
         }
+        WorkflowTransition::StakingEligibilityRecorded { .. } => {
+            stable_id("event/staking_eligibility/v1", &[workflow_id, "disabled"])
+        }
         WorkflowTransition::StakingDepositObserved { action_id, .. } => {
             stable_id("event/staking_submitted/v1", &[workflow_id, action_id])
         }
@@ -1428,6 +1537,8 @@ pub enum WorkflowError {
     ContradictoryObservation(String),
     #[error("observation predates the corresponding external action")]
     StaleObservation,
+    #[error("automatic staking and delegation are disabled by custody policy")]
+    AutomaticStakingDisabled,
     #[error("journal changed since it was opened")]
     ConcurrentModification,
     #[error("journal I/O failed: {0}")]
