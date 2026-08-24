@@ -178,6 +178,8 @@ pub struct ReplayState {
     commitments: BTreeMap<String, CommitmentReplay>,
     decision_outcomes: BTreeMap<NaiveDate, String>,
     decision_ids: BTreeSet<String>,
+    purchase_decision_ids: BTreeSet<String>,
+    orders: BTreeMap<String, String>,
     admitted_usdc: UsdcMicros,
     withdrawn_usdc: UsdcMicros,
     committed_usdc: UsdcMicros,
@@ -824,34 +826,44 @@ fn apply_event(state: &mut ReplayState, event: &LedgerEvent) -> Result<(), Ledge
             observed_usdc,
             observed_hype_atoms,
             ..
-        } => {
-            state.observed_usdc = *observed_usdc;
-            state.observed_hype_atoms = *observed_hype_atoms;
-        }
+        } => record_observed_balance(state, *observed_usdc, *observed_hype_atoms),
         LedgerEventKind::DailyDecision {
             decision_id,
             decision_date,
             ..
-        }
-        | LedgerEventKind::DailySkip {
+        } => record_daily_outcome(state, *decision_date, decision_id, true)?,
+        LedgerEventKind::DailySkip {
             decision_id,
             decision_date,
             ..
-        } => record_daily_outcome(state, *decision_date, decision_id)?,
-        LedgerEventKind::OrderRecorded { .. }
-        | LedgerEventKind::FillRecorded { .. }
-        | LedgerEventKind::FeeRecorded { .. }
-        | LedgerEventKind::StakingDepositRecorded { .. }
+        } => record_daily_outcome(state, *decision_date, decision_id, false)?,
+        LedgerEventKind::OrderRecorded {
+            order_id,
+            decision_id,
+        } => record_order(state, order_id, decision_id)?,
+        LedgerEventKind::FillRecorded { order_id, .. }
+        | LedgerEventKind::FeeRecorded { order_id, .. } => require_order(state, order_id)?,
+        LedgerEventKind::StakingDepositRecorded { .. }
         | LedgerEventKind::DelegationRecorded { .. }
         | LedgerEventKind::RewardRecorded { .. } => {}
     }
     Ok(())
 }
 
+fn record_observed_balance(
+    state: &mut ReplayState,
+    observed_usdc: UsdcMicros,
+    observed_hype_atoms: u64,
+) {
+    state.observed_usdc = observed_usdc;
+    state.observed_hype_atoms = observed_hype_atoms;
+}
+
 fn record_daily_outcome(
     state: &mut ReplayState,
     decision_date: NaiveDate,
     decision_id: &str,
+    is_purchase: bool,
 ) -> Result<(), LedgerError> {
     if state.decision_outcomes.contains_key(&decision_date) {
         return Err(LedgerError::DecisionDateCollision(decision_date));
@@ -863,7 +875,35 @@ fn record_daily_outcome(
         .decision_outcomes
         .insert(decision_date, decision_id.to_owned());
     state.decision_ids.insert(decision_id.to_owned());
+    if is_purchase {
+        state.purchase_decision_ids.insert(decision_id.to_owned());
+    }
     Ok(())
+}
+
+fn record_order(
+    state: &mut ReplayState,
+    order_id: &str,
+    decision_id: &str,
+) -> Result<(), LedgerError> {
+    if !state.purchase_decision_ids.contains(decision_id) {
+        return Err(LedgerError::UnknownDecision(decision_id.to_owned()));
+    }
+    if state.orders.contains_key(order_id) {
+        return Err(LedgerError::OrderIdCollision(order_id.to_owned()));
+    }
+    state
+        .orders
+        .insert(order_id.to_owned(), decision_id.to_owned());
+    Ok(())
+}
+
+fn require_order(state: &ReplayState, order_id: &str) -> Result<(), LedgerError> {
+    if state.orders.contains_key(order_id) {
+        Ok(())
+    } else {
+        Err(LedgerError::UnknownOrder(order_id.to_owned()))
+    }
 }
 
 fn validate_event(event: &LedgerEvent) -> Result<(), LedgerError> {
@@ -1159,9 +1199,15 @@ fn recover_pending(
     let target_anchor = protected_anchor_for_snapshot(&pending.snapshot)?;
     let actual_anchor = load_protected_anchor(anchor_store)?;
     if actual_anchor.as_ref() == prior_anchor.as_ref() {
-        rollback_uncommitted_pending(directory, &payload[..prior_len], &prior_records)?;
+        let journal_replaced = !tail.is_empty();
+        rollback_uncommitted_pending(
+            directory,
+            &payload[..prior_len],
+            &prior_records,
+            journal_replaced,
+        )?;
         clear_pending(directory)?;
-        return Ok(false);
+        return Ok(journal_replaced);
     }
     if actual_anchor.as_ref() != Some(&target_anchor) {
         return Err(LedgerError::ProtectedAnchorMismatch);
@@ -1182,8 +1228,11 @@ fn rollback_uncommitted_pending(
     directory: &Path,
     prior_payload: &[u8],
     prior_records: &[LedgerEnvelope],
+    replace_journal: bool,
 ) -> Result<(), LedgerError> {
-    write_atomic(&directory.join(LEDGER_FILE_NAME), prior_payload)?;
+    if replace_journal {
+        write_atomic(&directory.join(LEDGER_FILE_NAME), prior_payload)?;
+    }
     if prior_records.is_empty() {
         remove_durable(directory, SNAPSHOT_FILE_NAME)
     } else {
@@ -1967,6 +2016,12 @@ pub enum LedgerError {
     DecisionDateCollision(NaiveDate),
     #[error("daily decision ID already exists: {0}")]
     DecisionIdCollision(String),
+    #[error("unknown purchase decision: {0}")]
+    UnknownDecision(String),
+    #[error("order ID collision: {0}")]
+    OrderIdCollision(String),
+    #[error("unknown order: {0}")]
+    UnknownOrder(String),
     #[error("unknown commitment: {0}")]
     UnknownCommitment(String),
     #[error("commitment already settled: {0}")]
@@ -2134,6 +2189,74 @@ mod transaction_tests {
         assert_eq!(
             ledger.append(interrupted).expect("retry append"),
             AppendOutcome::Appended
+        );
+    }
+
+    #[test]
+    fn checkpoint_keeps_its_journal_handle_when_rollback_has_no_tail() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let anchor = anchor_store();
+        let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+        ledger
+            .append(deposit("deposit-before-intent", 1))
+            .expect("append deposit");
+        let interrupted = observation("observation-after-intent", 2);
+        {
+            let _lock = LedgerLock::acquire(directory.path()).expect("acquire lock");
+            ledger.ensure_current().expect("current ledger");
+            let prepared = ledger
+                .prepare_append(interrupted.clone())
+                .expect("prepare append");
+            write_pending(directory.path(), &prepared.pending).expect("persist intent");
+        }
+
+        assert_eq!(
+            ledger
+                .checkpoint()
+                .expect("checkpoint after intent-only rollback")
+                .record_count,
+            1
+        );
+        assert!(!directory.path().join(PENDING_FILE_NAME).exists());
+        assert_eq!(
+            ledger.append(interrupted).expect("same handle appends"),
+            AppendOutcome::Appended
+        );
+    }
+
+    #[test]
+    fn checkpoint_requires_reopen_after_partial_tail_rollback_replaces_journal() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let anchor = anchor_store();
+        let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+        ledger
+            .append(deposit("deposit-before-partial", 1))
+            .expect("append deposit");
+        let interrupted = observation("observation-partial", 2);
+        {
+            let _lock = LedgerLock::acquire(directory.path()).expect("acquire lock");
+            ledger.ensure_current().expect("current ledger");
+            let prepared = ledger.prepare_append(interrupted).expect("prepare append");
+            write_pending(directory.path(), &prepared.pending).expect("persist intent");
+            let line = record_line(&prepared.record).expect("encode record");
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(directory.path().join(LEDGER_FILE_NAME))
+                .expect("open journal");
+            file.write_all(&line[..line.len() / 2])
+                .expect("write partial tail");
+            file.sync_all().expect("fsync partial tail");
+        }
+
+        assert_eq!(
+            ledger.checkpoint(),
+            Err(LedgerError::ConcurrentModification)
+        );
+        assert_eq!(
+            open(directory.path(), &anchor)
+                .expect("reopen after inode replacement")
+                .record_count(),
+            1
         );
     }
 

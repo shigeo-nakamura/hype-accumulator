@@ -269,6 +269,157 @@ fn daily_decision_ids_cannot_be_reused_across_dates() {
 }
 
 #[test]
+// Intentionally linear: ownership is established once before every linked-event guard.
+#[allow(clippy::too_many_lines)]
+fn order_linked_events_require_a_unique_owned_purchase_order() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let anchor = anchor_store();
+    let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+    let first_date = at(0).date_naive();
+    let purchase_date = first_date.succ_opt().expect("fixture date has a successor");
+    let second_purchase_date = purchase_date
+        .succ_opt()
+        .expect("fixture date has a second successor");
+
+    assert_eq!(
+        ledger.append(LedgerEvent {
+            event_id: "unknown-decision-order".into(),
+            occurred_at: at(1),
+            kind: LedgerEventKind::OrderRecorded {
+                order_id: "order-unknown-decision".into(),
+                decision_id: "decision-missing".into(),
+            },
+        }),
+        Err(LedgerError::UnknownDecision("decision-missing".into()))
+    );
+
+    ledger
+        .append(daily_outcome(
+            "daily-skip",
+            "decision-skip",
+            first_date,
+            "skip",
+        ))
+        .expect("daily skip appends");
+    assert_eq!(
+        ledger.append(LedgerEvent {
+            event_id: "skip-order".into(),
+            occurred_at: first_date
+                .and_hms_opt(2, 0, 0)
+                .expect("valid order time")
+                .and_utc(),
+            kind: LedgerEventKind::OrderRecorded {
+                order_id: "order-for-skip".into(),
+                decision_id: "decision-skip".into(),
+            },
+        }),
+        Err(LedgerError::UnknownDecision("decision-skip".into()))
+    );
+
+    ledger
+        .append(daily_outcome(
+            "daily-purchase",
+            "decision-purchase",
+            purchase_date,
+            "decision",
+        ))
+        .expect("purchase decision appends");
+    ledger
+        .append(LedgerEvent {
+            event_id: "owned-order".into(),
+            occurred_at: purchase_date
+                .and_hms_opt(2, 0, 0)
+                .expect("valid order time")
+                .and_utc(),
+            kind: LedgerEventKind::OrderRecorded {
+                order_id: "order-owned".into(),
+                decision_id: "decision-purchase".into(),
+            },
+        })
+        .expect("owned order appends");
+    ledger
+        .append(daily_outcome(
+            "daily-purchase-second",
+            "decision-purchase-second",
+            second_purchase_date,
+            "decision",
+        ))
+        .expect("second purchase decision appends");
+    assert_eq!(
+        ledger.append(LedgerEvent {
+            event_id: "conflicting-order-owner".into(),
+            occurred_at: second_purchase_date
+                .and_hms_opt(2, 0, 0)
+                .expect("valid order time")
+                .and_utc(),
+            kind: LedgerEventKind::OrderRecorded {
+                order_id: "order-owned".into(),
+                decision_id: "decision-purchase-second".into(),
+            },
+        }),
+        Err(LedgerError::OrderIdCollision("order-owned".into()))
+    );
+
+    for (event_id, kind) in [
+        (
+            "unknown-order-fill",
+            LedgerEventKind::FillRecorded {
+                order_id: "order-missing".into(),
+                filled_usdc: usd(1),
+                received_hype_atoms: 1,
+            },
+        ),
+        (
+            "unknown-order-fee",
+            LedgerEventKind::FeeRecorded {
+                order_id: "order-missing".into(),
+                fee_usdc: usd(1),
+            },
+        ),
+    ] {
+        assert_eq!(
+            ledger.append(LedgerEvent {
+                event_id: event_id.into(),
+                occurred_at: second_purchase_date
+                    .and_hms_opt(3, 0, 0)
+                    .expect("valid linked-event time")
+                    .and_utc(),
+                kind,
+            }),
+            Err(LedgerError::UnknownOrder("order-missing".into()))
+        );
+    }
+
+    ledger
+        .append(LedgerEvent {
+            event_id: "owned-order-fill".into(),
+            occurred_at: second_purchase_date
+                .and_hms_opt(4, 0, 0)
+                .expect("valid fill time")
+                .and_utc(),
+            kind: LedgerEventKind::FillRecorded {
+                order_id: "order-owned".into(),
+                filled_usdc: usd(5),
+                received_hype_atoms: 2,
+            },
+        })
+        .expect("owned fill appends");
+    ledger
+        .append(LedgerEvent {
+            event_id: "owned-order-fee".into(),
+            occurred_at: second_purchase_date
+                .and_hms_opt(5, 0, 0)
+                .expect("valid fee time")
+                .and_utc(),
+            kind: LedgerEventKind::FeeRecorded {
+                order_id: "order-owned".into(),
+                fee_usdc: usd(1),
+            },
+        })
+        .expect("owned fee appends");
+}
+
+#[test]
 fn open_durably_creates_a_missing_nested_ledger_directory() {
     let container = tempfile::tempdir().expect("ledger container");
     let directory = container.path().join("first/second/ledger");
