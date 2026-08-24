@@ -177,6 +177,7 @@ pub struct ReplayState {
     deposits: BTreeMap<String, DepositReplay>,
     commitments: BTreeMap<String, CommitmentReplay>,
     decision_outcomes: BTreeMap<NaiveDate, String>,
+    decision_ids: BTreeSet<String>,
     admitted_usdc: UsdcMicros,
     withdrawn_usdc: UsdcMicros,
     committed_usdc: UsdcMicros,
@@ -855,9 +856,13 @@ fn record_daily_outcome(
     if state.decision_outcomes.contains_key(&decision_date) {
         return Err(LedgerError::DecisionDateCollision(decision_date));
     }
+    if state.decision_ids.contains(decision_id) {
+        return Err(LedgerError::DecisionIdCollision(decision_id.to_owned()));
+    }
     state
         .decision_outcomes
         .insert(decision_date, decision_id.to_owned());
+    state.decision_ids.insert(decision_id.to_owned());
     Ok(())
 }
 
@@ -1960,6 +1965,8 @@ pub enum LedgerError {
     CommitmentCollision(String),
     #[error("daily decision outcome already exists for {0}")]
     DecisionDateCollision(NaiveDate),
+    #[error("daily decision ID already exists: {0}")]
+    DecisionIdCollision(String),
     #[error("unknown commitment: {0}")]
     UnknownCommitment(String),
     #[error("commitment already settled: {0}")]

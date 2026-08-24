@@ -110,8 +110,12 @@ fn observed(id: &str, hour: u32, usdc: u64, hype_atoms: u64) -> LedgerEvent {
     )
 }
 
-fn daily_outcome(event_id: &str, decision_id: &str, outcome: &str) -> LedgerEvent {
-    let decision_date = at(0).date_naive();
+fn daily_outcome(
+    event_id: &str,
+    decision_id: &str,
+    decision_date: chrono::NaiveDate,
+    outcome: &str,
+) -> LedgerEvent {
     let kind = match outcome {
         "decision" => LedgerEventKind::DailyDecision {
             decision_id: decision_id.to_owned(),
@@ -126,7 +130,14 @@ fn daily_outcome(event_id: &str, decision_id: &str, outcome: &str) -> LedgerEven
         },
         _ => unreachable!("complete daily outcome fixture"),
     };
-    event(event_id, 1, kind)
+    LedgerEvent {
+        event_id: event_id.to_owned(),
+        occurred_at: decision_date
+            .and_hms_opt(1, 0, 0)
+            .expect("valid daily outcome time")
+            .and_utc(),
+        kind,
+    }
 }
 
 fn ledger_path(directory: &Path) -> std::path::PathBuf {
@@ -187,15 +198,67 @@ fn one_daily_decision_or_skip_outcome_is_allowed_per_date() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let anchor = anchor_store();
         let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+        let decision_date = at(0).date_naive();
         ledger
-            .append(daily_outcome("daily-first", "decision-first", first))
+            .append(daily_outcome(
+                "daily-first",
+                "decision-first",
+                decision_date,
+                first,
+            ))
             .expect("first daily outcome appends");
         let durable_before = fs::read(ledger_path(directory.path())).expect("read ledger");
 
         assert_eq!(
-            ledger.append(daily_outcome("daily-second", "decision-second", second)),
+            ledger.append(daily_outcome(
+                "daily-second",
+                "decision-second",
+                decision_date,
+                second,
+            )),
             Err(LedgerError::DecisionDateCollision(at(0).date_naive())),
             "{first} followed by {second} must fail closed"
+        );
+        assert_eq!(ledger.record_count(), 1);
+        assert_eq!(
+            fs::read(ledger_path(directory.path())).expect("read unchanged ledger"),
+            durable_before
+        );
+    }
+}
+
+#[test]
+fn daily_decision_ids_cannot_be_reused_across_dates() {
+    for (first, second) in [
+        ("decision", "decision"),
+        ("decision", "skip"),
+        ("skip", "decision"),
+        ("skip", "skip"),
+    ] {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let anchor = anchor_store();
+        let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+        let first_date = at(0).date_naive();
+        let second_date = first_date.succ_opt().expect("fixture date has a successor");
+        ledger
+            .append(daily_outcome(
+                "daily-first",
+                "decision-reused",
+                first_date,
+                first,
+            ))
+            .expect("first daily outcome appends");
+        let durable_before = fs::read(ledger_path(directory.path())).expect("read ledger");
+
+        assert_eq!(
+            ledger.append(daily_outcome(
+                "daily-second",
+                "decision-reused",
+                second_date,
+                second,
+            )),
+            Err(LedgerError::DecisionIdCollision("decision-reused".into())),
+            "{first} followed by {second} must reject a reused decision ID"
         );
         assert_eq!(ledger.record_count(), 1);
         assert_eq!(
