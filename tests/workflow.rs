@@ -2,10 +2,10 @@ use chrono::{DateTime, TimeZone, Utc};
 use hype_accumulator::{
     pacing::{DailyDecision, DecisionAllocation, DecisionReason, PacingExplanation, UsdcMicros},
     workflow::{
-        ActionKind, AppendOutcome, BoundFillEvidence, DecisionBinding, DurableWorkflow,
-        ExternalAction, ExternalReceipt, HypeAtoms, InventoryBaseline,
-        OrderBoundEligibilityEvidence, OrderEnvelopeBinding, OrderFinality, PrepareOutcome,
-        WorkflowError, WorkflowStage,
+        ActionKind, AppendOutcome, BoundFillEvidence, ConclusiveAbsenceEvidence, DecisionBinding,
+        DurableWorkflow, ExternalAction, ExternalReceipt, GapFreeHistoryWatermark, HypeAtoms,
+        InventoryBaseline, OrderBoundEligibilityEvidence, OrderEnvelopeBinding, OrderFinality,
+        PrepareOutcome, WorkflowError, WorkflowStage,
     },
 };
 use std::{
@@ -87,7 +87,8 @@ fn binding() -> DecisionBinding {
             original_quantity_hype: hype(500),
             limit_price_usdc_per_hype: usdc(200_000),
             l1_nonce: 7,
-            signed_expiry_at: at(30),
+            signed_expiry_at: at(29),
+            effective_expiry_at: at(30),
         },
     )
     .expect("valid workflow binding")
@@ -126,7 +127,7 @@ fn bound_evidence(
             .to_owned(),
         accepted_at: state.order_accepted_at().expect("accepted order timestamp"),
         order_bound_at: state.order_accepted_at().expect("accepted order timestamp"),
-        effective_expiry_at: at(30),
+        effective_expiry_at: binding.order_envelope.effective_expiry_at,
         residual_reservation_hype: hype(residual_reservation),
         policy_version: "custody-policy-v1".to_owned(),
         fills: fills
@@ -139,6 +140,35 @@ fn bound_evidence(
                 registration_deadline_at: at(30),
             })
             .collect(),
+    }
+}
+
+fn absence_evidence(workflow: &DurableWorkflow, observation_id: &str) -> ConclusiveAbsenceEvidence {
+    let state = workflow.state();
+    let gap_free_from_at = state.binding().decided_at;
+    ConclusiveAbsenceEvidence {
+        observation_id: observation_id.to_owned(),
+        execution_identity_hash: state
+            .binding()
+            .inventory_before
+            .execution_identity_hash
+            .clone(),
+        client_order_id: state.client_order_id(),
+        effective_expiry_at: state.binding().order_envelope.effective_expiry_at,
+        order_history: GapFreeHistoryWatermark {
+            watermark_id: "order-history-watermark-a".to_owned(),
+            cursor: 101,
+            gap_free_from_at,
+            through_at: at(31),
+            evidence_hash: "order-history-evidence-hash-a".to_owned(),
+        },
+        fill_history: GapFreeHistoryWatermark {
+            watermark_id: "fill-history-watermark-a".to_owned(),
+            cursor: 202,
+            gap_free_from_at,
+            through_at: at(31),
+            evidence_hash: "fill-history-evidence-hash-a".to_owned(),
+        },
     }
 }
 
@@ -202,7 +232,7 @@ fn deterministic_identity_is_independent_of_allocation_input_order() {
             && original_quantity_hype == hype(500)
             && limit_price_usdc_per_hype == usdc(200_000)
             && l1_nonce == 7
-            && signed_expiry_at == at(30)
+            && signed_expiry_at == at(29)
     ));
 }
 
@@ -441,16 +471,17 @@ fn conclusively_absent_submission_releases_pending_intent_and_completes() {
             ..
         })
     ));
+    let absence = absence_evidence(&workflow, "post-expiry-cloid-not-found");
     assert_eq!(
         workflow
-            .record_order_submission_absent("post-expiry-cloid-not-found", at(3))
+            .record_order_submission_absent(absence.clone(), at(31))
             .expect("authoritative absence recorded"),
         AppendOutcome::Appended
     );
     let terminal_count = workflow.record_count();
     assert_eq!(
         workflow
-            .record_order_submission_absent("post-expiry-cloid-not-found", at(4))
+            .record_order_submission_absent(absence, at(32))
             .expect("absence replay is idempotent"),
         AppendOutcome::Duplicate
     );
@@ -458,7 +489,7 @@ fn conclusively_absent_submission_releases_pending_intent_and_completes() {
     assert_eq!(workflow.state().stage(), WorkflowStage::OrderFinalized);
     assert!(workflow.state().pending_action().is_none());
     assert!(matches!(
-        workflow.prepare_order(at(4)),
+        workflow.prepare_order(at(32)),
         Err(WorkflowError::InvalidTransition(_))
     ));
     drop(workflow);
@@ -468,19 +499,54 @@ fn conclusively_absent_submission_releases_pending_intent_and_completes() {
     assert!(workflow.state().pending_action().is_none());
     assert_eq!(
         workflow
-            .record_staking_eligibility(None, at(5))
+            .record_staking_eligibility(None, at(32))
             .expect("zero-fill eligibility recorded"),
         hype_accumulator::workflow::StakingEligibility {
             residual_hype: hype(0),
             eligible_hype: hype(0),
         }
     );
-    workflow.complete(at(6)).expect("workflow completed");
+    workflow.complete(at(33)).expect("workflow completed");
     drop(workflow);
     assert_eq!(
         reopen(&path, &binding).state().stage(),
         WorkflowStage::Complete
     );
+}
+
+#[test]
+fn absence_requires_effective_expiry_and_both_gap_free_watermarks() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let binding = binding();
+    for invalid in ["before-expiry", "order-gap", "fill-gap"] {
+        let path = temp.path().join(format!("invalid-absence-{invalid}.jsonl"));
+        let mut workflow = reopen(&path, &binding);
+        ready(workflow.prepare_order(at(1)).expect("order prepared"));
+        let mut evidence = absence_evidence(&workflow, "cloid-not-found");
+        let recorded_at = match invalid {
+            "before-expiry" => at(29),
+            "order-gap" => {
+                evidence.order_history.through_at = at(30);
+                at(31)
+            }
+            "fill-gap" => {
+                evidence.fill_history.gap_free_from_at = at(1);
+                at(31)
+            }
+            _ => unreachable!("complete fixture set"),
+        };
+
+        assert!(matches!(
+            workflow.record_order_submission_absent(evidence, recorded_at),
+            Err(WorkflowError::ContradictoryObservation(_))
+        ));
+        assert_eq!(workflow.state().stage(), WorkflowStage::ManualReview);
+        drop(workflow);
+        assert_eq!(
+            reopen(&path, &binding).state().stage(),
+            WorkflowStage::ManualReview
+        );
+    }
 }
 
 #[test]
@@ -704,11 +770,12 @@ fn fresh_late_order_evidence_durably_invalidates_terminal_results() {
     let absent_path = temp.path().join("accepted-after-absence.jsonl");
     let mut absent = reopen(&absent_path, &binding);
     ready(absent.prepare_order(at(1)).expect("order prepared"));
+    let absence = absence_evidence(&absent, "post-expiry-cloid-not-found");
     absent
-        .record_order_submission_absent("post-expiry-cloid-not-found", at(2))
+        .record_order_submission_absent(absence, at(31))
         .expect("authoritative absence recorded");
     assert!(matches!(
-        absent.observe_order_submission("late-accepted-order", at(3)),
+        absent.observe_order_submission("late-accepted-order", at(32)),
         Err(WorkflowError::ContradictoryObservation(_))
     ));
     assert_eq!(absent.state().stage(), WorkflowStage::ManualReview);
@@ -1032,13 +1099,14 @@ fn late_terminal_finalization_after_absence_durably_halts() {
     let binding = binding();
     let mut workflow = reopen(&path, &binding);
     ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    let absence = absence_evidence(&workflow, "post-expiry-cloid-not-found");
     workflow
-        .record_order_submission_absent("post-expiry-cloid-not-found", at(2))
+        .record_order_submission_absent(absence, at(31))
         .expect("authoritative absence recorded");
     workflow
-        .record_staking_eligibility(None, at(3))
+        .record_staking_eligibility(None, at(32))
         .expect("absence-only eligibility recorded");
-    workflow.complete(at(4)).expect("workflow completed");
+    workflow.complete(at(33)).expect("workflow completed");
 
     assert!(matches!(
         workflow.finalize_order(
@@ -1046,7 +1114,7 @@ fn late_terminal_finalization_after_absence_durably_halts() {
             usdc(100_000),
             usdc(101_000),
             OrderFinality::Filled,
-            at(5),
+            at(34),
         ),
         Err(WorkflowError::InvalidTransition(_))
     ));
@@ -1117,7 +1185,7 @@ fn every_signed_order_field_must_match_for_eligibility() {
             "quantity" => evidence.original_quantity_hype = hype(501),
             "limit" => evidence.limit_price_usdc_per_hype = usdc(200_001),
             "nonce" => evidence.l1_nonce = 8,
-            "expiry" => evidence.signed_expiry_at = at(29),
+            "expiry" => evidence.signed_expiry_at = at(28),
             _ => unreachable!("complete fixture set"),
         }
 

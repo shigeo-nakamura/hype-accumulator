@@ -72,6 +72,7 @@ pub struct OrderEnvelopeBinding {
     pub limit_price_usdc_per_hype: UsdcMicros,
     pub l1_nonce: u64,
     pub signed_expiry_at: DateTime<Utc>,
+    pub effective_expiry_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -163,6 +164,7 @@ impl DecisionBinding {
             || self.order_envelope.original_quantity_hype.is_zero()
             || self.order_envelope.limit_price_usdc_per_hype.is_zero()
             || self.order_envelope.signed_expiry_at <= self.decided_at
+            || self.order_envelope.effective_expiry_at <= self.order_envelope.signed_expiry_at
             || self.capital_commitments.is_empty()
             || self.decided_at.date_naive() != self.decision_date
         {
@@ -338,6 +340,27 @@ pub struct OrderBoundEligibilityEvidence {
     pub fills: Vec<BoundFillEvidence>,
 }
 
+/// Gap-free authoritative history coverage used for conclusive absence.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GapFreeHistoryWatermark {
+    pub watermark_id: String,
+    pub cursor: u64,
+    pub gap_free_from_at: DateTime<Utc>,
+    pub through_at: DateTime<Utc>,
+    pub evidence_hash: String,
+}
+
+/// Evidence that an ambiguous claimed order can no longer appear or fill.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ConclusiveAbsenceEvidence {
+    pub observation_id: String,
+    pub execution_identity_hash: String,
+    pub client_order_id: String,
+    pub effective_expiry_at: DateTime<Utc>,
+    pub order_history: GapFreeHistoryWatermark,
+    pub fill_history: GapFreeHistoryWatermark,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkflowTransition {
@@ -354,7 +377,7 @@ pub enum WorkflowTransition {
     },
     OrderSubmissionAbsent {
         action_id: String,
-        observation_id: String,
+        evidence: ConclusiveAbsenceEvidence,
     },
     OrderFillObserved {
         observation_id: String,
@@ -617,7 +640,7 @@ impl WorkflowState {
             }
             WorkflowTransition::OrderSubmissionAbsent {
                 action_id,
-                observation_id,
+                evidence,
             } => {
                 if self.exchange_order_id.is_some() {
                     return Err(WorkflowError::ContradictoryObservation(
@@ -625,11 +648,12 @@ impl WorkflowState {
                     ));
                 }
                 self.require_pending(ActionKind::SubmitOrder, action_id)?;
-                if self.stage != WorkflowStage::Decided || observation_id.trim().is_empty() {
+                if self.stage != WorkflowStage::Decided {
                     return Err(WorkflowError::InvalidTransition(
                         "absent order submission evidence is invalid for current state".into(),
                     ));
                 }
+                self.validate_conclusive_absence(evidence, event.at)?;
                 self.pending_action = None;
                 self.stage = WorkflowStage::OrderFinalized;
             }
@@ -882,6 +906,38 @@ impl WorkflowState {
         }
     }
 
+    fn validate_conclusive_absence(
+        &self,
+        evidence: &ConclusiveAbsenceEvidence,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<(), WorkflowError> {
+        let effective_expiry_at = self.binding.order_envelope.effective_expiry_at;
+        if evidence.observation_id.trim().is_empty()
+            || evidence.execution_identity_hash
+                != self.binding.inventory_before.execution_identity_hash
+            || evidence.client_order_id != client_order_id_for(&self.workflow_id)
+            || evidence.effective_expiry_at != effective_expiry_at
+            || recorded_at <= effective_expiry_at
+            || !valid_gap_free_watermark(
+                &evidence.order_history,
+                self.binding.decided_at,
+                effective_expiry_at,
+                recorded_at,
+            )
+            || !valid_gap_free_watermark(
+                &evidence.fill_history,
+                self.binding.decided_at,
+                effective_expiry_at,
+                recorded_at,
+            )
+        {
+            return Err(WorkflowError::ContradictoryObservation(
+                "conclusive absence lacks post-expiry gap-free order/fill history".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_eligibility_evidence(
         &self,
         evidence: Option<&OrderBoundEligibilityEvidence>,
@@ -918,6 +974,7 @@ impl WorkflowState {
                 != self.binding.order_envelope.limit_price_usdc_per_hype
             || evidence.l1_nonce != self.binding.order_envelope.l1_nonce
             || evidence.signed_expiry_at != self.binding.order_envelope.signed_expiry_at
+            || evidence.effective_expiry_at != self.binding.order_envelope.effective_expiry_at
             || evidence.order_id != order_id
             || evidence.accepted_at != accepted_at
             || evidence.authorized_at < self.binding.decided_at
@@ -925,7 +982,7 @@ impl WorkflowState {
             || evidence.order_bound_at < accepted_at
             || evidence.order_bound_at > recorded_at
             || evidence.effective_expiry_at <= accepted_at
-            || evidence.effective_expiry_at > evidence.signed_expiry_at
+            || evidence.effective_expiry_at <= evidence.signed_expiry_at
             || recorded_at >= evidence.effective_expiry_at
             || evidence.residual_reservation_hype
                 != self.binding.inventory_before.residual_hype_deficit()
@@ -1032,6 +1089,17 @@ impl WorkflowState {
                 if self.exchange_order_id.is_some() =>
             {
                 Some("order absence contradicted an accepted order".into())
+            }
+            WorkflowTransition::OrderSubmissionAbsent { evidence, .. }
+                if self.stage == WorkflowStage::Decided =>
+            {
+                if at < self.last_transition_at {
+                    return Some("absence evidence predates the prepared order".into());
+                }
+                match self.validate_conclusive_absence(evidence, at) {
+                    Err(WorkflowError::ContradictoryObservation(reason)) => Some(reason),
+                    _ => None,
+                }
             }
             WorkflowTransition::OrderFillObserved { .. } if self.order_is_terminal() => {
                 Some("new fill appeared after terminal reconciliation".into())
@@ -1267,24 +1335,27 @@ impl DurableWorkflow {
     ///
     /// # Errors
     ///
-    /// Returns an error for empty evidence, an invalid stage, replay conflict,
-    /// or write failure.
+    /// Returns an error unless the ledger clock and both gap-free authoritative
+    /// history watermarks are strictly beyond the bound effective expiry.
     pub fn record_order_submission_absent(
         &mut self,
-        observation_id: impl Into<String>,
+        evidence: ConclusiveAbsenceEvidence,
         at: DateTime<Utc>,
     ) -> Result<AppendOutcome, WorkflowError> {
         let action_id = action_id_for(self.state.workflow_id(), ActionKind::SubmitOrder);
-        let observation_id = observation_id.into();
         self.append_observation(
             stable_id(
                 "event/order_submission_absent/v1",
-                &[self.state.workflow_id(), &action_id, &observation_id],
+                &[
+                    self.state.workflow_id(),
+                    &action_id,
+                    &evidence.observation_id,
+                ],
             ),
             at,
             WorkflowTransition::OrderSubmissionAbsent {
                 action_id,
-                observation_id,
+                evidence,
             },
         )
     }
@@ -1819,6 +1890,20 @@ fn validate_receipt(receipt: &ExternalReceipt) -> Result<(), WorkflowError> {
     Ok(())
 }
 
+fn valid_gap_free_watermark(
+    watermark: &GapFreeHistoryWatermark,
+    required_from_at: DateTime<Utc>,
+    effective_expiry_at: DateTime<Utc>,
+    recorded_at: DateTime<Utc>,
+) -> bool {
+    !watermark.watermark_id.trim().is_empty()
+        && watermark.cursor > 0
+        && !watermark.evidence_hash.trim().is_empty()
+        && watermark.gap_free_from_at <= required_from_at
+        && watermark.through_at > effective_expiry_at
+        && watermark.through_at <= recorded_at
+}
+
 fn workflow_id_for(binding: &DecisionBinding) -> Result<String, WorkflowError> {
     let encoded = serde_json::to_vec(binding).map_err(WorkflowError::json)?;
     Ok(format!("wf_{}", digest_hex(&encoded)))
@@ -1835,6 +1920,7 @@ struct CanonicalOrderEnvelope<'a> {
     limit_price_usdc_per_hype: UsdcMicros,
     l1_nonce: u64,
     signed_expiry_at: DateTime<Utc>,
+    effective_expiry_at: DateTime<Utc>,
     market: &'static str,
     side: &'static str,
     time_in_force: &'static str,
@@ -1851,6 +1937,7 @@ fn canonical_order_envelope_hash(state: &WorkflowState) -> Result<String, Workfl
         limit_price_usdc_per_hype: state.binding.order_envelope.limit_price_usdc_per_hype,
         l1_nonce: state.binding.order_envelope.l1_nonce,
         signed_expiry_at: state.binding.order_envelope.signed_expiry_at,
+        effective_expiry_at: state.binding.order_envelope.effective_expiry_at,
         market: "HYPE/USDC",
         side: "buy",
         time_in_force: "IOC",
@@ -1915,10 +2002,10 @@ fn validate_event_id(workflow_id: &str, event: &WorkflowEvent) -> Result<(), Wor
         }
         WorkflowTransition::OrderSubmissionAbsent {
             action_id,
-            observation_id,
+            evidence,
         } => stable_id(
             "event/order_submission_absent/v1",
-            &[workflow_id, action_id, observation_id],
+            &[workflow_id, action_id, &evidence.observation_id],
         ),
         WorkflowTransition::OrderFillObserved { observation_id, .. } => {
             stable_id("event/order_fill/v1", &[workflow_id, observation_id])
