@@ -155,6 +155,21 @@ class ExperimentContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "exactly one adaptive policy"):
                 run_experiment(manifest)
 
+    def test_experiment_requires_unique_nonempty_policy_names(self) -> None:
+        for name in ("deposit-aware-equal-daily", ""):
+            with self.subTest(name=name):
+                experiment = json.loads(
+                    (FIXTURES / "experiment.json").read_text(encoding="utf-8")
+                )
+                experiment["policies"][-1]["name"] = name
+
+                with tempfile.TemporaryDirectory() as directory:
+                    manifest = Path(directory) / "experiment.json"
+                    manifest.write_text(json.dumps(experiment), encoding="utf-8")
+
+                    with self.assertRaisesRegex(ValueError, "policy names must be"):
+                        run_experiment(manifest)
+
     def test_analysis_capital_path_is_named_and_order_independent(self) -> None:
         experiment = json.loads((FIXTURES / "experiment.json").read_text(encoding="utf-8"))
         self.make_paths_absolute(experiment)

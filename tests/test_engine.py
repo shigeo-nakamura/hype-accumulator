@@ -239,6 +239,37 @@ class EngineInvariantTests(unittest.TestCase):
         self.assertFalse(result["horizon_complete"])
         self.assertFalse(result["horizon_infeasible"])
 
+    def test_horizon_day_before_capital_admission_is_still_in_progress(self) -> None:
+        utc = timezone.utc
+        decision = datetime(2025, 1, 2, 16, tzinfo=utc)
+        before_admission = datetime(2025, 1, 2, 17, tzinfo=utc)
+        admission = datetime(2025, 1, 2, 18, tzinfo=utc)
+        result = run_backtest(
+            [PriceBar(decision, 10.0)],
+            [CapitalEvent("late", "deposit", 50.0, admission, admission, admission)],
+            PointInTimeView([], before_admission),
+            {
+                "name": "daily",
+                "kind": "fixed",
+                "cadence": "daily",
+                "horizon": "2025-01-02",
+                "features": [],
+            },
+            {
+                "min_trade_usd": 1.0,
+                "max_trade_usd": 100.0,
+                "fee_bps": 0.0,
+                "half_spread_bps": 0.0,
+                "slippage_bps": 0.0,
+            },
+            before_admission,
+        )
+
+        self.assertEqual(result["horizon_status"], "in_progress")
+        self.assertFalse(result["horizon_complete"])
+        self.assertFalse(result["horizon_infeasible"])
+        self.assertEqual(result["capital_cohorts"], [])
+
     def test_simultaneous_deposit_precedes_withdrawal_regardless_of_id(self) -> None:
         utc = timezone.utc
         at = datetime(2025, 1, 1, 12, tzinfo=utc)

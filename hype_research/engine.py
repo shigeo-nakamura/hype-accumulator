@@ -158,8 +158,14 @@ def run_backtest(
         and (cadence != "weekly" or bar.decision_at.weekday() == 0)
         for bar in bars
     )
+    future_horizon_capital = any(
+        event.first_usable_at.date() == horizon and event.first_usable_at > as_of
+        for event in events
+    )
     horizon_reached = as_of.date() > horizon or (
-        as_of.date() == horizon and not future_horizon_decision
+        as_of.date() == horizon
+        and not future_horizon_decision
+        and not future_horizon_capital
     )
     infeasible = horizon_reached and ledger.cash > 1e-8
     horizon_status = "infeasible" if infeasible else "complete" if horizon_reached else "in_progress"

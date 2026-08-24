@@ -28,6 +28,11 @@ def require_valid_execution(execution: dict) -> None:
 
 
 def require_supported_policy_values(experiment: dict) -> None:
+    policy_names = [policy.get("name") for policy in experiment["policies"]]
+    if any(not isinstance(name, str) or not name for name in policy_names):
+        raise ValueError("policy names must be nonempty strings")
+    if len(set(policy_names)) != len(policy_names):
+        raise ValueError("policy names must be unique")
     adaptive_count = 0
     for index, policy in enumerate(experiment["policies"]):
         kind = policy.get("kind")
