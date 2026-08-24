@@ -11,6 +11,7 @@
 
 use crate::pacing::{DailyDecision, DecisionReason, UsdcMicros};
 use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
+use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -61,7 +62,7 @@ impl HypeAtoms {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct InventoryBaseline {
-    /// Opaque digest of the signer-side execution identity authorized for this workflow.
+    /// Opaque digest of the master account, subaccount, or vault being traded.
     pub execution_identity_hash: String,
     pub spot_hype_atoms: HypeAtoms,
     pub staking_hype_atoms: HypeAtoms,
@@ -116,6 +117,8 @@ pub struct EligibilityPolicyBinding {
 /// Immutable fields of the signer-authorized IOC order envelope.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OrderEnvelopeBinding {
+    /// Opaque digest of the dedicated API-wallet signer authorized for this order.
+    pub signer_identity_hash: String,
     pub original_quantity_hype: HypeAtoms,
     pub hype_atoms_per_hype: u64,
     pub market_metadata_digest: String,
@@ -221,6 +224,9 @@ impl DecisionBinding {
                 .is_empty()
             || self.inventory_before.execution_identity_hash
                 != self.inventory_before.execution_identity_hash.trim()
+            || self.order_envelope.signer_identity_hash.trim().is_empty()
+            || self.order_envelope.signer_identity_hash
+                != self.order_envelope.signer_identity_hash.trim()
             || self.inventory_before.unconsumed_residual_spot_hype_atoms
                 > self.inventory_before.spot_hype_atoms
             || self.inventory_before.unconsumed_residual_spot_hype_atoms
@@ -312,6 +318,8 @@ pub enum ExternalAction {
     SubmitOrder {
         action_id: String,
         client_order_id: String,
+        execution_identity_hash: String,
+        signer_identity_hash: String,
         notional_usdc: UsdcMicros,
         max_debit_usdc: UsdcMicros,
         original_quantity_hype: HypeAtoms,
@@ -415,6 +423,7 @@ pub struct OrderBoundEligibilityEvidence {
     pub authorization_record_hash: String,
     pub decision_id: String,
     pub execution_identity_hash: String,
+    pub signer_identity_hash: String,
     pub client_order_id: String,
     pub canonical_order_envelope_hash: String,
     pub authorized_planned_usdc: UsdcMicros,
@@ -1002,6 +1011,8 @@ impl WorkflowState {
         match action {
             ExternalAction::SubmitOrder {
                 client_order_id,
+                execution_identity_hash,
+                signer_identity_hash,
                 notional_usdc,
                 max_debit_usdc,
                 original_quantity_hype,
@@ -1013,6 +1024,9 @@ impl WorkflowState {
                 ..
             } if self.stage == WorkflowStage::Decided
                 && client_order_id == &client_order_id_for(&self.workflow_id)
+                && execution_identity_hash
+                    == &self.binding.inventory_before.execution_identity_hash
+                && signer_identity_hash == &self.binding.order_envelope.signer_identity_hash
                 && *notional_usdc == self.binding.planned_usdc
                 && *max_debit_usdc == self.binding.committed_usdc
                 && *original_quantity_hype
@@ -1113,6 +1127,7 @@ impl WorkflowState {
             || evidence.decision_id != self.binding.decision_id
             || evidence.execution_identity_hash
                 != self.binding.inventory_before.execution_identity_hash
+            || evidence.signer_identity_hash != self.binding.order_envelope.signer_identity_hash
             || evidence.client_order_id != client_order_id_for(&self.workflow_id)
             || evidence.canonical_order_envelope_hash != canonical_order_envelope_hash(self)?
             || evidence.authorized_planned_usdc != self.binding.planned_usdc
@@ -1306,7 +1321,7 @@ impl WorkflowState {
             || evidence.exchange_order_id.trim().is_empty()
             || evidence.exchange_order_id != evidence.exchange_order_id.trim()
             || evidence.execution_identity_hash != *execution_identity_hash
-            || evidence.signer_identity_hash != *execution_identity_hash
+            || evidence.signer_identity_hash != envelope.signer_identity_hash
             || evidence.decision_id != self.binding.decision_id
             || evidence.client_order_id != self.client_order_id()
             || evidence.canonical_order_envelope_hash != canonical_order_envelope_hash(self)?
@@ -1323,7 +1338,7 @@ impl WorkflowState {
             || evidence.side != "buy"
             || evidence.time_in_force != "IOC"
             || evidence.accepted_at < self.last_transition_at
-            || evidence.accepted_at >= envelope.effective_expiry_at
+            || evidence.accepted_at >= envelope.signed_expiry_at
             || evidence.accepted_at > recorded_at
         {
             return Err(WorkflowError::ContradictoryObservation(
@@ -1423,9 +1438,9 @@ impl WorkflowState {
                 Some("accepted order predates the durable order preparation".into())
             }
             WorkflowTransition::OrderSubmissionObserved { evidence, .. }
-                if evidence.accepted_at >= self.binding.order_envelope.effective_expiry_at =>
+                if evidence.accepted_at >= self.binding.order_envelope.signed_expiry_at =>
             {
-                Some("order acceptance reached its effective expiry horizon".into())
+                Some("order acceptance reached its signed expiry horizon".into())
             }
             WorkflowTransition::OrderSubmissionObserved { .. } if self.order_is_terminal() => {
                 Some("accepted order appeared after terminal reconciliation".into())
@@ -1724,7 +1739,9 @@ impl DurableWorkflow {
         binding.validate()?;
         let path = path.as_ref().to_path_buf();
         let workflow_id = workflow_id_for(binding);
+        let recovery_lock = acquire_journal_append_lock(&path)?;
         recover_pending_append(&path, &workflow_id, protected_head_store.as_ref())?;
+        drop(recovery_lock);
         let records = load_records(&path)?;
         if records.is_empty() {
             if protected_head_store
@@ -1955,8 +1972,8 @@ impl DurableWorkflow {
         evidence: &AuthenticatedOrderSubmission,
         recorded_at: DateTime<Utc>,
     ) -> Result<AppendOutcome, WorkflowError> {
-        if evidence.accepted_at >= self.state.binding.order_envelope.effective_expiry_at {
-            let reason = "order acceptance reached its effective expiry horizon";
+        if evidence.accepted_at >= self.state.binding.order_envelope.signed_expiry_at {
+            let reason = "order acceptance reached its signed expiry horizon";
             if self.state.stage != WorkflowStage::ManualReview {
                 self.mark_manual_review(reason, recorded_at.max(self.state.last_transition_at))?;
             }
@@ -2533,6 +2550,7 @@ impl DurableWorkflow {
     fn write_record(&mut self, record: &JournalRecord) -> Result<(), WorkflowError> {
         let parent = normalized_parent(&self.path);
         fs::create_dir_all(parent).map_err(WorkflowError::io)?;
+        let _append_lock = acquire_journal_append_lock(&self.path)?;
         let created = !self.path.exists();
         let current_len = fs::metadata(&self.path)
             .map(|metadata| metadata.len())
@@ -2625,6 +2643,12 @@ fn external_action_for(
             Ok(ExternalAction::SubmitOrder {
                 action_id,
                 client_order_id: client_order_id_for(state.workflow_id()),
+                execution_identity_hash: state
+                    .binding
+                    .inventory_before
+                    .execution_identity_hash
+                    .clone(),
+                signer_identity_hash: state.binding.order_envelope.signer_identity_hash.clone(),
                 notional_usdc: state.binding.planned_usdc,
                 max_debit_usdc: state.binding.committed_usdc,
                 original_quantity_hype: state.binding.order_envelope.original_quantity_hype,
@@ -2779,6 +2803,7 @@ fn workflow_id_for(binding: &DecisionBinding) -> String {
 #[derive(Serialize)]
 struct CanonicalOrderEnvelope<'a> {
     execution_identity_hash: &'a str,
+    signer_identity_hash: &'a str,
     decision_id: &'a str,
     client_order_id: String,
     planned_usdc: UsdcMicros,
@@ -2803,6 +2828,7 @@ struct CanonicalOrderEnvelope<'a> {
 fn canonical_order_envelope_hash(state: &WorkflowState) -> Result<String, WorkflowError> {
     let encoded = serde_json::to_vec(&CanonicalOrderEnvelope {
         execution_identity_hash: &state.binding.inventory_before.execution_identity_hash,
+        signer_identity_hash: &state.binding.order_envelope.signer_identity_hash,
         decision_id: &state.binding.decision_id,
         client_order_id: client_order_id_for(&state.workflow_id),
         planned_usdc: state.binding.planned_usdc,
@@ -2983,6 +3009,30 @@ fn pending_append_path(path: &Path) -> PathBuf {
     let mut pending = path.as_os_str().to_os_string();
     pending.push(".pending-append.json");
     PathBuf::from(pending)
+}
+
+fn journal_append_lock_path(path: &Path) -> PathBuf {
+    let mut lock = path.as_os_str().to_os_string();
+    lock.push(".append.lock");
+    PathBuf::from(lock)
+}
+
+fn acquire_journal_append_lock(path: &Path) -> Result<File, WorkflowError> {
+    fs::create_dir_all(normalized_parent(path)).map_err(WorkflowError::io)?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(journal_append_lock_path(path))
+        .map_err(WorkflowError::io)?;
+    match lock.try_lock_exclusive() {
+        Ok(()) => Ok(lock),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(WorkflowError::ConcurrentModification)
+        }
+        Err(error) => Err(WorkflowError::io(error)),
+    }
 }
 
 fn pending_append_temp_path(path: &Path) -> PathBuf {

@@ -1,4 +1,5 @@
 use chrono::{DateTime, TimeDelta, TimeZone, Utc};
+use fs2::FileExt as _;
 use hype_accumulator::{
     pacing::{DailyDecision, DecisionAllocation, DecisionReason, PacingExplanation, UsdcMicros},
     workflow::{
@@ -310,6 +311,7 @@ fn binding() -> DecisionBinding {
             unconsumed_residual_spot_hype_atoms: hype(10),
         },
         OrderEnvelopeBinding {
+            signer_identity_hash: "api-wallet-identity-hash-a".to_owned(),
             original_quantity_hype: hype(250),
             hype_atoms_per_hype: 1,
             market_metadata_digest: "hype-market-metadata-a".to_owned(),
@@ -341,13 +343,12 @@ fn submission_evidence(
     accepted_at: DateTime<Utc>,
 ) -> AuthenticatedOrderSubmission {
     let binding = workflow.state().binding();
-    let execution_identity_hash = binding.inventory_before.execution_identity_hash.clone();
     AuthenticatedOrderSubmission {
         observation_id: format!("venue-order-observation-{exchange_order_id}"),
         account_scope_evidence_hash: format!("account-scope-evidence-{exchange_order_id}"),
         order_envelope_evidence_hash: format!("order-envelope-evidence-{exchange_order_id}"),
-        execution_identity_hash: execution_identity_hash.clone(),
-        signer_identity_hash: execution_identity_hash,
+        execution_identity_hash: binding.inventory_before.execution_identity_hash.clone(),
+        signer_identity_hash: binding.order_envelope.signer_identity_hash.clone(),
         decision_id: binding.decision_id.clone(),
         client_order_id: workflow.state().client_order_id(),
         exchange_order_id: exchange_order_id.to_owned(),
@@ -412,6 +413,7 @@ fn bound_evidence(
         authorization_record_hash: "authorization-record-hash-a".to_owned(),
         decision_id: binding.decision_id.clone(),
         execution_identity_hash: binding.inventory_before.execution_identity_hash.clone(),
+        signer_identity_hash: binding.order_envelope.signer_identity_hash.clone(),
         client_order_id: state.client_order_id(),
         canonical_order_envelope_hash: state
             .canonical_order_envelope_hash()
@@ -605,6 +607,54 @@ fn execution_identity_hash_must_be_canonical() {
             Err(WorkflowError::InvalidBinding(_))
         ));
     }
+}
+
+#[test]
+fn api_wallet_signer_identity_hash_must_be_canonical() {
+    for invalid_identity in [
+        "",
+        " ",
+        " api-wallet-identity-hash-a",
+        "api-wallet-identity-hash-a ",
+    ] {
+        let valid = binding();
+        let mut envelope = valid.order_envelope;
+        envelope.signer_identity_hash = invalid_identity.to_owned();
+        assert!(matches!(
+            DecisionBinding::from_pacing_decision(
+                &decision(),
+                valid.inventory_before,
+                envelope,
+                valid.eligibility_policy,
+            ),
+            Err(WorkflowError::InvalidBinding(_))
+        ));
+    }
+}
+
+#[test]
+fn api_wallet_signer_is_bound_separately_from_the_execution_account() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("separate-signer-account.jsonl");
+    let binding = binding();
+    assert_ne!(
+        binding.inventory_before.execution_identity_hash,
+        binding.order_envelope.signer_identity_hash,
+    );
+    let mut workflow = reopen(&path, &binding);
+    let action = ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    assert!(matches!(
+        action,
+        ExternalAction::SubmitOrder {
+            execution_identity_hash,
+            signer_identity_hash,
+            ..
+        } if execution_identity_hash == binding.inventory_before.execution_identity_hash
+            && signer_identity_hash == binding.order_envelope.signer_identity_hash
+    ));
+    observe_submission(&mut workflow, "separately-signed-order", at(2))
+        .expect("separate signer submission binds");
+    assert_eq!(workflow.state().stage(), WorkflowStage::OrderSubmitted);
 }
 
 #[test]
@@ -852,6 +902,38 @@ fn losing_journal_commit_does_not_retain_an_order_claim() {
 }
 
 #[test]
+fn append_lock_prevents_replacing_a_pending_recovery_intent() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("serialized-pending-append.jsonl");
+    let binding = binding();
+    let mut workflow = reopen(&path, &binding);
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".append.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(PathBuf::from(lock_path))
+        .expect("append lock opens");
+    lock.try_lock_exclusive().expect("append lock acquired");
+
+    assert!(matches!(
+        workflow.prepare_order(at(1)),
+        Err(WorkflowError::ConcurrentModification)
+    ));
+    let mut pending_path = path.as_os_str().to_os_string();
+    pending_path.push(".pending-append.json");
+    assert!(!PathBuf::from(pending_path).exists());
+
+    drop(lock);
+    assert!(matches!(
+        workflow.prepare_order(at(1)),
+        Ok(PrepareOutcome::Ready(_))
+    ));
+}
+
+#[test]
 fn losing_journal_commit_does_not_retain_fill_claims() {
     let temp = tempfile::tempdir().expect("temp directory");
     let path = temp.path().join("concurrent-fill-claim.jsonl");
@@ -910,36 +992,43 @@ fn losing_journal_commit_does_not_retain_fill_claims() {
 }
 
 #[test]
-fn acceptance_at_effective_expiry_halts_before_claiming_the_order() {
+fn acceptance_at_signed_expiry_halts_before_claiming_the_order() {
     let temp = tempfile::tempdir().expect("temp directory");
     let path = temp.path().join("acceptance-at-expiry.jsonl");
     let binding = binding();
-    let mut workflow = reopen(&path, &binding);
+    let head_store = Arc::new(MemoryProtectedHeadStore::default());
+    let owner_store = Arc::new(MemoryExchangeOrderOwnerStore::default());
+    let mut workflow =
+        DurableWorkflow::open_or_create(&path, &binding, head_store.clone(), owner_store.clone())
+            .expect("workflow opens");
     ready(workflow.prepare_order(at(1)).expect("order prepared"));
 
     assert!(matches!(
         observe_submission(
             &mut workflow,
             "late-exchange-order",
-            binding.order_envelope.effective_expiry_at,
+            binding.order_envelope.signed_expiry_at,
         ),
         Err(WorkflowError::ContradictoryObservation(_))
     ));
     assert_eq!(workflow.state().stage(), WorkflowStage::ManualReview);
     assert!(workflow.state().exchange_order_id().is_none());
+    assert!(!owner_store.has_order_owner(
+        &binding.inventory_before.execution_identity_hash,
+        "late-exchange-order",
+    ));
     assert!(workflow
         .state()
         .manual_review_reason()
-        .is_some_and(|reason| reason.contains("effective expiry horizon")));
+        .is_some_and(|reason| reason.contains("signed expiry horizon")));
     drop(workflow);
-    assert_eq!(
-        reopen(&path, &binding).state().stage(),
-        WorkflowStage::ManualReview
-    );
+    let reopened = DurableWorkflow::open_or_create(&path, &binding, head_store, owner_store)
+        .expect("manual review reopens");
+    assert_eq!(reopened.state().stage(), WorkflowStage::ManualReview);
 }
 
 #[test]
-fn duplicate_acceptance_at_effective_expiry_durably_halts() {
+fn duplicate_acceptance_at_signed_expiry_durably_halts() {
     let temp = tempfile::tempdir().expect("temp directory");
     let path = temp.path().join("duplicate-acceptance-at-expiry.jsonl");
     let binding = binding();
@@ -952,7 +1041,7 @@ fn duplicate_acceptance_at_effective_expiry_durably_halts() {
         observe_submission(
             &mut workflow,
             "exchange-order-1",
-            binding.order_envelope.effective_expiry_at,
+            binding.order_envelope.signed_expiry_at,
         ),
         Err(WorkflowError::ContradictoryObservation(_))
     ));
@@ -960,7 +1049,7 @@ fn duplicate_acceptance_at_effective_expiry_durably_halts() {
     assert!(workflow
         .state()
         .manual_review_reason()
-        .is_some_and(|reason| reason.contains("effective expiry horizon")));
+        .is_some_and(|reason| reason.contains("signed expiry horizon")));
     drop(workflow);
     assert_eq!(
         reopen(&path, &binding).state().stage(),
