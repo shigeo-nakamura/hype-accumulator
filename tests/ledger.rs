@@ -120,6 +120,7 @@ fn daily_outcome(
         "decision" => LedgerEventKind::DailyDecision {
             decision_id: decision_id.to_owned(),
             decision_date,
+            commitment_id: format!("commitment-{decision_id}"),
             planned_usdc: usd(10),
             committed_usdc: usd(10),
         },
@@ -138,6 +139,63 @@ fn daily_outcome(
             .and_utc(),
         kind,
     }
+}
+
+fn dated_event(
+    event_id: impl Into<String>,
+    date: chrono::NaiveDate,
+    hour: u32,
+    kind: LedgerEventKind,
+) -> LedgerEvent {
+    LedgerEvent {
+        event_id: event_id.into(),
+        occurred_at: date
+            .and_hms_opt(hour, 0, 0)
+            .expect("valid dated fixture time")
+            .and_utc(),
+        kind,
+    }
+}
+
+fn append_decision_backing(
+    ledger: &mut DurableLedger,
+    decision_id: &str,
+    date: chrono::NaiveDate,
+    amount: u64,
+) {
+    let deposit_id = format!("deposit-{decision_id}");
+    ledger
+        .append(dated_event(
+            deposit_id.clone(),
+            date,
+            2,
+            LedgerEventKind::AuthoritativeDeposit {
+                amount_usdc: usd(amount),
+            },
+        ))
+        .expect("append decision deposit");
+    ledger
+        .append(dated_event(
+            format!("admission-{decision_id}"),
+            date,
+            3,
+            LedgerEventKind::DepositAdmission {
+                deposit_event_id: deposit_id,
+                amount_usdc: usd(amount),
+            },
+        ))
+        .expect("append decision admission");
+    ledger
+        .append(dated_event(
+            format!("capital-{decision_id}"),
+            date,
+            4,
+            LedgerEventKind::CapitalCommitted {
+                commitment_id: format!("commitment-{decision_id}"),
+                amount_usdc: usd(amount),
+            },
+        ))
+        .expect("append decision commitment");
 }
 
 fn ledger_path(directory: &Path) -> std::path::PathBuf {
@@ -269,6 +327,29 @@ fn daily_decision_ids_cannot_be_reused_across_dates() {
 }
 
 #[test]
+fn daily_outcome_date_must_match_its_occurrence_date() {
+    for outcome in ["decision", "skip"] {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let anchor = anchor_store();
+        let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+        let declared = at(0).date_naive();
+        let occurred = declared.succ_opt().expect("fixture date has a successor");
+        let mut event = daily_outcome("mismatched-date", "decision-date", declared, outcome);
+        event.occurred_at = occurred
+            .and_hms_opt(1, 0, 0)
+            .expect("valid mismatched occurrence")
+            .and_utc();
+
+        assert_eq!(
+            ledger.append(event),
+            Err(LedgerError::DecisionDateMismatch { declared, occurred }),
+            "{outcome} must use the occurrence UTC date"
+        );
+        assert_eq!(ledger.record_count(), 0);
+    }
+}
+
+#[test]
 // Intentionally linear: ownership is established once before every linked-event guard.
 #[allow(clippy::too_many_lines)]
 fn order_linked_events_require_a_unique_owned_purchase_order() {
@@ -324,11 +405,26 @@ fn order_linked_events_require_a_unique_owned_purchase_order() {
             "decision",
         ))
         .expect("purchase decision appends");
+    assert_eq!(
+        ledger.append(dated_event(
+            "order-before-backing",
+            purchase_date,
+            2,
+            LedgerEventKind::OrderRecorded {
+                order_id: "order-before-backing".into(),
+                decision_id: "decision-purchase".into(),
+            },
+        )),
+        Err(LedgerError::InsufficientDecisionBacking(
+            "decision-purchase".into()
+        ))
+    );
+    append_decision_backing(&mut ledger, "decision-purchase", purchase_date, 10);
     ledger
         .append(LedgerEvent {
             event_id: "owned-order".into(),
             occurred_at: purchase_date
-                .and_hms_opt(2, 0, 0)
+                .and_hms_opt(5, 0, 0)
                 .expect("valid order time")
                 .and_utc(),
             kind: LedgerEventKind::OrderRecorded {
@@ -345,11 +441,17 @@ fn order_linked_events_require_a_unique_owned_purchase_order() {
             "decision",
         ))
         .expect("second purchase decision appends");
+    append_decision_backing(
+        &mut ledger,
+        "decision-purchase-second",
+        second_purchase_date,
+        10,
+    );
     assert_eq!(
         ledger.append(LedgerEvent {
             event_id: "conflicting-order-owner".into(),
             occurred_at: second_purchase_date
-                .and_hms_opt(2, 0, 0)
+                .and_hms_opt(5, 0, 0)
                 .expect("valid order time")
                 .and_utc(),
             kind: LedgerEventKind::OrderRecorded {
@@ -381,7 +483,7 @@ fn order_linked_events_require_a_unique_owned_purchase_order() {
             ledger.append(LedgerEvent {
                 event_id: event_id.into(),
                 occurred_at: second_purchase_date
-                    .and_hms_opt(3, 0, 0)
+                    .and_hms_opt(6, 0, 0)
                     .expect("valid linked-event time")
                     .and_utc(),
                 kind,
@@ -394,7 +496,7 @@ fn order_linked_events_require_a_unique_owned_purchase_order() {
         .append(LedgerEvent {
             event_id: "owned-order-fill".into(),
             occurred_at: second_purchase_date
-                .and_hms_opt(4, 0, 0)
+                .and_hms_opt(7, 0, 0)
                 .expect("valid fill time")
                 .and_utc(),
             kind: LedgerEventKind::FillRecorded {
@@ -408,7 +510,7 @@ fn order_linked_events_require_a_unique_owned_purchase_order() {
         .append(LedgerEvent {
             event_id: "owned-order-fee".into(),
             occurred_at: second_purchase_date
-                .and_hms_opt(5, 0, 0)
+                .and_hms_opt(8, 0, 0)
                 .expect("valid fee time")
                 .and_utc(),
             kind: LedgerEventKind::FeeRecorded {
@@ -417,6 +519,125 @@ fn order_linked_events_require_a_unique_owned_purchase_order() {
             },
         })
         .expect("owned fee appends");
+}
+
+#[test]
+fn fills_are_capped_across_all_orders_for_one_decision() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let anchor = anchor_store();
+    let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+    let date = at(0).date_naive();
+    ledger
+        .append(daily_outcome(
+            "daily-capped",
+            "decision-capped",
+            date,
+            "decision",
+        ))
+        .expect("append capped decision");
+    append_decision_backing(&mut ledger, "decision-capped", date, 10);
+    for (hour, order_id) in [(5, "order-cap-a"), (6, "order-cap-b")] {
+        ledger
+            .append(dated_event(
+                format!("record-{order_id}"),
+                date,
+                hour,
+                LedgerEventKind::OrderRecorded {
+                    order_id: order_id.into(),
+                    decision_id: "decision-capped".into(),
+                },
+            ))
+            .expect("append decision order");
+    }
+    for (hour, event_id, order_id, amount) in [
+        (7, "fill-cap-a", "order-cap-a", 6),
+        (8, "fill-cap-b", "order-cap-b", 4),
+    ] {
+        ledger
+            .append(dated_event(
+                event_id,
+                date,
+                hour,
+                LedgerEventKind::FillRecorded {
+                    order_id: order_id.into(),
+                    filled_usdc: usd(amount),
+                    received_hype_atoms: 1,
+                },
+            ))
+            .expect("append fill within decision plan");
+    }
+    let durable_before = fs::read(ledger_path(directory.path())).expect("read capped ledger");
+    assert_eq!(
+        ledger.append(dated_event(
+            "fill-over-plan",
+            date,
+            9,
+            LedgerEventKind::FillRecorded {
+                order_id: "order-cap-b".into(),
+                filled_usdc: usd(1),
+                received_hype_atoms: 1,
+            },
+        )),
+        Err(LedgerError::FillExceedsDecisionPlan(
+            "decision-capped".into()
+        ))
+    );
+    assert_eq!(
+        fs::read(ledger_path(directory.path())).expect("read unchanged capped ledger"),
+        durable_before
+    );
+    assert_eq!(
+        open(directory.path(), &anchor)
+            .expect("replay capped ledger")
+            .state(),
+        ledger.state()
+    );
+}
+
+#[test]
+fn purchase_order_requires_sufficient_unsettled_backing() {
+    for (case, backing, settle) in [("insufficient", 9, false), ("settled", 10, true)] {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let anchor = anchor_store();
+        let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+        let date = at(0).date_naive();
+        let decision_id = format!("decision-{case}");
+        ledger
+            .append(daily_outcome(
+                &format!("daily-{case}"),
+                &decision_id,
+                date,
+                "decision",
+            ))
+            .expect("append decision");
+        append_decision_backing(&mut ledger, &decision_id, date, backing);
+        if settle {
+            ledger
+                .append(dated_event(
+                    "settle-before-order",
+                    date,
+                    5,
+                    LedgerEventKind::CapitalSettled {
+                        commitment_id: format!("commitment-{decision_id}"),
+                        debited_usdc: usd(10),
+                    },
+                ))
+                .expect("settle backing before order");
+        }
+
+        assert_eq!(
+            ledger.append(dated_event(
+                format!("order-{case}"),
+                date,
+                6,
+                LedgerEventKind::OrderRecorded {
+                    order_id: format!("order-{case}"),
+                    decision_id: decision_id.clone(),
+                },
+            )),
+            Err(LedgerError::InsufficientDecisionBacking(decision_id))
+        );
+    }
 }
 
 #[test]

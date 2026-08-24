@@ -98,6 +98,7 @@ pub enum LedgerEventKind {
     DailyDecision {
         decision_id: String,
         decision_date: NaiveDate,
+        commitment_id: String,
         planned_usdc: UsdcMicros,
         committed_usdc: UsdcMicros,
     },
@@ -171,6 +172,15 @@ struct CommitmentReplay {
     settled: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PurchaseDecisionReplay {
+    commitment_id: String,
+    planned_usdc: UsdcMicros,
+    committed_usdc: UsdcMicros,
+    filled_usdc: UsdcMicros,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReplayState {
@@ -178,7 +188,8 @@ pub struct ReplayState {
     commitments: BTreeMap<String, CommitmentReplay>,
     decision_outcomes: BTreeMap<NaiveDate, String>,
     decision_ids: BTreeSet<String>,
-    purchase_decision_ids: BTreeSet<String>,
+    purchase_decisions: BTreeMap<String, PurchaseDecisionReplay>,
+    decision_commitment_ids: BTreeSet<String>,
     orders: BTreeMap<String, String>,
     admitted_usdc: UsdcMicros,
     withdrawn_usdc: UsdcMicros,
@@ -763,20 +774,7 @@ fn apply_event(state: &mut ReplayState, event: &LedgerEvent) -> Result<(), Ledge
         LedgerEventKind::DepositAdmission {
             deposit_event_id,
             amount_usdc,
-        } => {
-            let deposit = state
-                .deposits
-                .get_mut(deposit_event_id)
-                .ok_or_else(|| LedgerError::UnknownDeposit(deposit_event_id.clone()))?;
-            let next_admitted = checked_add(deposit.admitted_usdc, *amount_usdc)?;
-            if next_admitted > deposit.authoritative_usdc {
-                return Err(LedgerError::AdmissionExceedsDeposit(
-                    deposit_event_id.clone(),
-                ));
-            }
-            deposit.admitted_usdc = next_admitted;
-            state.admitted_usdc = checked_add(state.admitted_usdc, *amount_usdc)?;
-        }
+        } => record_deposit_admission(state, deposit_event_id, *amount_usdc)?,
         LedgerEventKind::AuthoritativeWithdrawal { amount_usdc } => {
             require_deployable(state, *amount_usdc)?;
             state.withdrawn_usdc = checked_add(state.withdrawn_usdc, *amount_usdc)?;
@@ -784,40 +782,11 @@ fn apply_event(state: &mut ReplayState, event: &LedgerEvent) -> Result<(), Ledge
         LedgerEventKind::CapitalCommitted {
             commitment_id,
             amount_usdc,
-        } => {
-            if state.commitments.contains_key(commitment_id) {
-                return Err(LedgerError::CommitmentCollision(commitment_id.clone()));
-            }
-            require_deployable(state, *amount_usdc)?;
-            state.committed_usdc = checked_add(state.committed_usdc, *amount_usdc)?;
-            state.commitments.insert(
-                commitment_id.clone(),
-                CommitmentReplay {
-                    committed_usdc: *amount_usdc,
-                    debited_usdc: UsdcMicros::default(),
-                    settled: false,
-                },
-            );
-        }
+        } => record_capital_commitment(state, commitment_id, *amount_usdc)?,
         LedgerEventKind::CapitalSettled {
             commitment_id,
             debited_usdc,
-        } => {
-            let commitment = state
-                .commitments
-                .get_mut(commitment_id)
-                .ok_or_else(|| LedgerError::UnknownCommitment(commitment_id.clone()))?;
-            if commitment.settled {
-                return Err(LedgerError::CommitmentAlreadySettled(commitment_id.clone()));
-            }
-            if *debited_usdc > commitment.committed_usdc {
-                return Err(LedgerError::DebitExceedsCommitment(commitment_id.clone()));
-            }
-            state.committed_usdc = checked_sub(state.committed_usdc, commitment.committed_usdc)?;
-            state.spent_usdc = checked_add(state.spent_usdc, *debited_usdc)?;
-            commitment.debited_usdc = *debited_usdc;
-            commitment.settled = true;
-        }
+        } => record_capital_settlement(state, commitment_id, *debited_usdc)?,
         LedgerEventKind::BalanceObserved {
             observed_usdc,
             observed_hype_atoms,
@@ -830,23 +799,109 @@ fn apply_event(state: &mut ReplayState, event: &LedgerEvent) -> Result<(), Ledge
         LedgerEventKind::DailyDecision {
             decision_id,
             decision_date,
-            ..
-        } => record_daily_outcome(state, *decision_date, decision_id, true)?,
+            commitment_id,
+            planned_usdc,
+            committed_usdc,
+        } => record_purchase_decision(
+            state,
+            event.occurred_at.date_naive(),
+            *decision_date,
+            decision_id,
+            commitment_id,
+            *planned_usdc,
+            *committed_usdc,
+        )?,
         LedgerEventKind::DailySkip {
             decision_id,
             decision_date,
             ..
-        } => record_daily_outcome(state, *decision_date, decision_id, false)?,
+        } => record_daily_outcome(
+            state,
+            event.occurred_at.date_naive(),
+            *decision_date,
+            decision_id,
+        )?,
         LedgerEventKind::OrderRecorded {
             order_id,
             decision_id,
         } => record_order(state, order_id, decision_id)?,
-        LedgerEventKind::FillRecorded { order_id, .. }
-        | LedgerEventKind::FeeRecorded { order_id, .. } => require_order(state, order_id)?,
+        LedgerEventKind::FillRecorded {
+            order_id,
+            filled_usdc,
+            ..
+        } => record_fill(state, order_id, *filled_usdc)?,
+        LedgerEventKind::FeeRecorded { order_id, .. } => require_order(state, order_id)?,
         LedgerEventKind::StakingDepositRecorded { .. }
         | LedgerEventKind::DelegationRecorded { .. }
         | LedgerEventKind::RewardRecorded { .. } => {}
     }
+    Ok(())
+}
+
+fn record_deposit_admission(
+    state: &mut ReplayState,
+    deposit_event_id: &str,
+    amount_usdc: UsdcMicros,
+) -> Result<(), LedgerError> {
+    let deposit = state
+        .deposits
+        .get_mut(deposit_event_id)
+        .ok_or_else(|| LedgerError::UnknownDeposit(deposit_event_id.to_owned()))?;
+    let next_admitted = checked_add(deposit.admitted_usdc, amount_usdc)?;
+    if next_admitted > deposit.authoritative_usdc {
+        return Err(LedgerError::AdmissionExceedsDeposit(
+            deposit_event_id.to_owned(),
+        ));
+    }
+    deposit.admitted_usdc = next_admitted;
+    state.admitted_usdc = checked_add(state.admitted_usdc, amount_usdc)?;
+    Ok(())
+}
+
+fn record_capital_commitment(
+    state: &mut ReplayState,
+    commitment_id: &str,
+    amount_usdc: UsdcMicros,
+) -> Result<(), LedgerError> {
+    if state.commitments.contains_key(commitment_id) {
+        return Err(LedgerError::CommitmentCollision(commitment_id.to_owned()));
+    }
+    require_deployable(state, amount_usdc)?;
+    state.committed_usdc = checked_add(state.committed_usdc, amount_usdc)?;
+    state.commitments.insert(
+        commitment_id.to_owned(),
+        CommitmentReplay {
+            committed_usdc: amount_usdc,
+            debited_usdc: UsdcMicros::default(),
+            settled: false,
+        },
+    );
+    Ok(())
+}
+
+fn record_capital_settlement(
+    state: &mut ReplayState,
+    commitment_id: &str,
+    debited_usdc: UsdcMicros,
+) -> Result<(), LedgerError> {
+    let commitment = state
+        .commitments
+        .get_mut(commitment_id)
+        .ok_or_else(|| LedgerError::UnknownCommitment(commitment_id.to_owned()))?;
+    if commitment.settled {
+        return Err(LedgerError::CommitmentAlreadySettled(
+            commitment_id.to_owned(),
+        ));
+    }
+    if debited_usdc > commitment.committed_usdc {
+        return Err(LedgerError::DebitExceedsCommitment(
+            commitment_id.to_owned(),
+        ));
+    }
+    state.committed_usdc = checked_sub(state.committed_usdc, commitment.committed_usdc)?;
+    state.spent_usdc = checked_add(state.spent_usdc, debited_usdc)?;
+    commitment.debited_usdc = debited_usdc;
+    commitment.settled = true;
     Ok(())
 }
 
@@ -861,10 +916,16 @@ fn record_observed_balance(
 
 fn record_daily_outcome(
     state: &mut ReplayState,
+    occurred_date: NaiveDate,
     decision_date: NaiveDate,
     decision_id: &str,
-    is_purchase: bool,
 ) -> Result<(), LedgerError> {
+    if decision_date != occurred_date {
+        return Err(LedgerError::DecisionDateMismatch {
+            declared: decision_date,
+            occurred: occurred_date,
+        });
+    }
     if state.decision_outcomes.contains_key(&decision_date) {
         return Err(LedgerError::DecisionDateCollision(decision_date));
     }
@@ -875,9 +936,36 @@ fn record_daily_outcome(
         .decision_outcomes
         .insert(decision_date, decision_id.to_owned());
     state.decision_ids.insert(decision_id.to_owned());
-    if is_purchase {
-        state.purchase_decision_ids.insert(decision_id.to_owned());
+    Ok(())
+}
+
+fn record_purchase_decision(
+    state: &mut ReplayState,
+    occurred_date: NaiveDate,
+    decision_date: NaiveDate,
+    decision_id: &str,
+    commitment_id: &str,
+    planned_usdc: UsdcMicros,
+    committed_usdc: UsdcMicros,
+) -> Result<(), LedgerError> {
+    record_daily_outcome(state, occurred_date, decision_date, decision_id)?;
+    if state.decision_commitment_ids.contains(commitment_id) {
+        return Err(LedgerError::DecisionCommitmentCollision(
+            commitment_id.to_owned(),
+        ));
     }
+    state
+        .decision_commitment_ids
+        .insert(commitment_id.to_owned());
+    state.purchase_decisions.insert(
+        decision_id.to_owned(),
+        PurchaseDecisionReplay {
+            commitment_id: commitment_id.to_owned(),
+            planned_usdc,
+            committed_usdc,
+            filled_usdc: UsdcMicros::default(),
+        },
+    );
     Ok(())
 }
 
@@ -886,8 +974,17 @@ fn record_order(
     order_id: &str,
     decision_id: &str,
 ) -> Result<(), LedgerError> {
-    if !state.purchase_decision_ids.contains(decision_id) {
-        return Err(LedgerError::UnknownDecision(decision_id.to_owned()));
+    let decision = state
+        .purchase_decisions
+        .get(decision_id)
+        .ok_or_else(|| LedgerError::UnknownDecision(decision_id.to_owned()))?;
+    let commitment = state.commitments.get(&decision.commitment_id);
+    if !commitment.is_some_and(|commitment| {
+        !commitment.settled && commitment.committed_usdc >= decision.committed_usdc
+    }) {
+        return Err(LedgerError::InsufficientDecisionBacking(
+            decision_id.to_owned(),
+        ));
     }
     if state.orders.contains_key(order_id) {
         return Err(LedgerError::OrderIdCollision(order_id.to_owned()));
@@ -895,6 +992,28 @@ fn record_order(
     state
         .orders
         .insert(order_id.to_owned(), decision_id.to_owned());
+    Ok(())
+}
+
+fn record_fill(
+    state: &mut ReplayState,
+    order_id: &str,
+    filled_usdc: UsdcMicros,
+) -> Result<(), LedgerError> {
+    let decision_id = state
+        .orders
+        .get(order_id)
+        .ok_or_else(|| LedgerError::UnknownOrder(order_id.to_owned()))?
+        .clone();
+    let decision = state
+        .purchase_decisions
+        .get_mut(&decision_id)
+        .ok_or_else(|| LedgerError::UnknownDecision(decision_id.clone()))?;
+    let next_filled = checked_add(decision.filled_usdc, filled_usdc)?;
+    if next_filled > decision.planned_usdc {
+        return Err(LedgerError::FillExceedsDecisionPlan(decision_id));
+    }
+    decision.filled_usdc = next_filled;
     Ok(())
 }
 
@@ -933,18 +1052,11 @@ fn validate_event(event: &LedgerEvent) -> Result<(), LedgerError> {
         LedgerEventKind::BalanceObserved { .. } => {}
         LedgerEventKind::DailyDecision {
             decision_id,
+            commitment_id,
             planned_usdc,
             committed_usdc,
             ..
-        } => {
-            validate_id("decision_id", decision_id)?;
-            require_nonzero(*planned_usdc)?;
-            if *committed_usdc < *planned_usdc {
-                return Err(LedgerError::InvalidEvent(
-                    "decision commitment is below planned notional".into(),
-                ));
-            }
-        }
+        } => validate_daily_decision(decision_id, commitment_id, *planned_usdc, *committed_usdc)?,
         LedgerEventKind::DailySkip {
             decision_id,
             reason,
@@ -1004,6 +1116,23 @@ fn validate_event(event: &LedgerEvent) -> Result<(), LedgerError> {
             validate_id("correction_id", correction_id)?;
             validate_text("reason", reason)?;
         }
+    }
+    Ok(())
+}
+
+fn validate_daily_decision(
+    decision_id: &str,
+    commitment_id: &str,
+    planned_usdc: UsdcMicros,
+    committed_usdc: UsdcMicros,
+) -> Result<(), LedgerError> {
+    validate_id("decision_id", decision_id)?;
+    validate_id("commitment_id", commitment_id)?;
+    require_nonzero(planned_usdc)?;
+    if committed_usdc < planned_usdc {
+        return Err(LedgerError::InvalidEvent(
+            "decision commitment is below planned notional".into(),
+        ));
     }
     Ok(())
 }
@@ -2016,12 +2145,23 @@ pub enum LedgerError {
     DecisionDateCollision(NaiveDate),
     #[error("daily decision ID already exists: {0}")]
     DecisionIdCollision(String),
+    #[error("daily decision date {declared} does not match occurrence date {occurred}")]
+    DecisionDateMismatch {
+        declared: NaiveDate,
+        occurred: NaiveDate,
+    },
+    #[error("capital commitment is already linked to a decision: {0}")]
+    DecisionCommitmentCollision(String),
     #[error("unknown purchase decision: {0}")]
     UnknownDecision(String),
+    #[error("purchase decision lacks sufficient unsettled capital backing: {0}")]
+    InsufficientDecisionBacking(String),
     #[error("order ID collision: {0}")]
     OrderIdCollision(String),
     #[error("unknown order: {0}")]
     UnknownOrder(String),
+    #[error("fills exceed the purchase decision plan: {0}")]
+    FillExceedsDecisionPlan(String),
     #[error("unknown commitment: {0}")]
     UnknownCommitment(String),
     #[error("commitment already settled: {0}")]
