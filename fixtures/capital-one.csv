@@ -1,0 +1,2 @@
+event_id,kind,amount_usd,occurred_at,confirmed_at,first_usable_at
+dep-one,deposit,120,2025-12-19T10:00:00Z,2025-12-19T10:01:00Z,2025-12-20T00:00:00Z

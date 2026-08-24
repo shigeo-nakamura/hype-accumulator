@@ -1,0 +1,1 @@
+{"schema_version":1,"capital_path_id":"none","as_of":"2026-01-01T00:00:00Z","files":{"events":{"path":"capital-none.csv","sha256":"4375e431b0c6a6d355d9d3ca57d15303a7fad92eb55e0969c26d2b053d9153fa"}},"contract":"Only unique event_id rows with first_usable_at <= decision_at are admitted."}

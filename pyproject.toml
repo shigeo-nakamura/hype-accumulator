@@ -1,0 +1,11 @@
+[project]
+name = "hype-accumulator-research"
+version = "0.1.0"
+requires-python = ">=3.11"
+description = "Point-in-time, deposit-aware HYPE accumulation research harness"
+
+[project.scripts]
+hype-research = "hype_research.cli:main"
+
+[tool.unittest]
+start-directory = "tests"

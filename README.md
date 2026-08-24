@@ -71,3 +71,9 @@ cargo build --locked
 ```
 
 The first command reports `mode=dry-run ready`. CI runs the same gates.
+
+## Research
+
+The standard-library-only point-in-time research harness compares deposit-aware daily and weekly DCA with explicitly bounded adaptive pacing. It enforces capital admission times, one purchase per UTC day, execution limits, and data revision/publication rules.
+
+Run `make test` and `make research`. The reproducible report is written to `build/research-report.json`. Committed inputs are synthetic fixtures, so the report deliberately returns `no-go` rather than claiming an economic timing edge. See `docs/data-contract.md` and `docs/research-method.md`.
