@@ -271,6 +271,7 @@ pub struct PacingExplanation {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DecisionAllocation {
     pub tranche_id: String,
+    pub planned_usdc: UsdcMicros,
     pub committed_usdc: UsdcMicros,
     pub filled_usdc: UsdcMicros,
 }
@@ -283,6 +284,7 @@ pub struct DailyDecision {
     pub capital_snapshot_hash: String,
     pub input_snapshot_hash: String,
     pub planned_usdc: UsdcMicros,
+    pub committed_usdc: UsdcMicros,
     pub filled_usdc: UsdcMicros,
     pub settled: bool,
     pub reason: DecisionReason,
@@ -503,7 +505,7 @@ impl PacingState {
         let mut fill_remaining = final_filled_usdc.0;
         let mut filled_by_tranche = Vec::with_capacity(allocations.len());
         for allocation in &allocations {
-            let filled = allocation.committed_usdc.0.min(fill_remaining);
+            let filled = allocation.planned_usdc.0.min(fill_remaining);
             fill_remaining -= filled;
             filled_by_tranche.push(filled);
             let tranche = next
@@ -602,8 +604,13 @@ impl PacingState {
 
         let admitted_total =
             checked_sum(self.deposits.values().map(|tranche| tranche.admitted_usdc))?;
-        if admitted_total > limits.max_automatically_admitted_usdc
-            || admitted_total > limits.cumulative_admission_cap_usdc
+        if admitted_total > limits.cumulative_admission_cap_usdc {
+            return Err(PacingError::CorruptState);
+        }
+        if self
+            .deposits
+            .values()
+            .any(|tranche| tranche.admitted_usdc > limits.max_automatically_admitted_usdc)
         {
             return Err(PacingError::CorruptState);
         }
@@ -676,6 +683,12 @@ impl PacingState {
         let mut expected_committed = BTreeMap::<&str, UsdcMicros>::new();
         let mut expected_invested = BTreeMap::<&str, UsdcMicros>::new();
         for (date, decision) in &self.decisions {
+            let planned = checked_sum(
+                decision
+                    .allocations
+                    .iter()
+                    .map(|allocation| allocation.planned_usdc),
+            )?;
             let committed = checked_sum(
                 decision
                     .allocations
@@ -691,17 +704,21 @@ impl PacingState {
             if date != &decision.decision_date
                 || decision.decision_id != format!("fixed-dca:{date}")
                 || !decision_ids.insert(&decision.decision_id)
-                || committed != decision.planned_usdc
+                || planned != decision.planned_usdc
+                || committed != decision.committed_usdc
+                || decision.committed_usdc < decision.planned_usdc
                 || filled != decision.filled_usdc
-                || filled > committed
+                || filled > planned
                 || (!decision.settled && !filled.is_zero())
-                || (decision.planned_usdc.is_zero() && !decision.allocations.is_empty())
+                || (decision.planned_usdc.is_zero()
+                    && (!decision.committed_usdc.is_zero() || !decision.allocations.is_empty()))
             {
                 return Err(PacingError::CorruptState);
             }
             for allocation in &decision.allocations {
                 if !self.deposits.contains_key(&allocation.tranche_id)
-                    || allocation.filled_usdc > allocation.committed_usdc
+                    || allocation.filled_usdc > allocation.planned_usdc
+                    || allocation.planned_usdc > allocation.committed_usdc
                 {
                     return Err(PacingError::CorruptState);
                 }
@@ -865,8 +882,11 @@ impl PacingState {
             .values()
             .map(|tranche| tranche.received_at.year())
             .collect::<BTreeSet<_>>();
-        if reserved_total > limits.max_automatically_admitted_usdc
-            || reserved_total > limits.cumulative_admission_cap_usdc
+        if reserved_total > limits.cumulative_admission_cap_usdc
+            || self
+                .deposits
+                .values()
+                .any(|tranche| tranche.admitted_usdc > limits.max_automatically_admitted_usdc)
         {
             return Err(PacingError::CorruptState);
         }
@@ -915,7 +935,10 @@ impl PacingState {
         let tranche = self.deposits.get_mut(id).ok_or(PacingError::CorruptState)?;
         let unadmitted = tranche.unadmitted_usdc();
         let capacity = [
-            checked_sub_floor(limits.max_automatically_admitted_usdc, admitted_total),
+            checked_sub_floor(
+                limits.max_automatically_admitted_usdc,
+                tranche.admitted_usdc,
+            ),
             checked_sub_floor(limits.cumulative_admission_cap_usdc, admitted_total),
             checked_sub_floor(limits.yearly_admission_cap_usdc, admitted_year),
         ]
@@ -1090,7 +1113,8 @@ impl PacingState {
             }
         }
 
-        let allocations = self.commit_plan(planned, &due_rows)?;
+        let allocations = self.commit_plan(planned, &due_rows, limits.fee_spread_reserve_bps)?;
+        let committed = allocation_commitment_total(&allocations)?;
         let explanation = PacingExplanation {
             admitted_unspent_usdc: admitted_unspent,
             unadmitted_usdc: unadmitted,
@@ -1113,6 +1137,7 @@ impl PacingState {
             capital_snapshot_hash,
             input_snapshot_hash,
             planned_usdc: planned,
+            committed_usdc: committed,
             filled_usdc: UsdcMicros::default(),
             settled: false,
             reason,
@@ -1197,11 +1222,12 @@ impl PacingState {
         &mut self,
         planned: UsdcMicros,
         due_rows: &[DueRow],
+        reserve_bps: u16,
     ) -> Result<Vec<DecisionAllocation>, PacingError> {
         if planned.is_zero() {
             return Ok(Vec::new());
         }
-        let mut amounts = BTreeMap::<String, u64>::new();
+        let mut planned_amounts = BTreeMap::<String, u64>::new();
         let mut remaining = planned.0;
         for row in due_rows {
             if remaining == 0 {
@@ -1209,7 +1235,7 @@ impl PacingState {
             }
             let amount = row.4 .0.min(row.3 .0).min(remaining);
             if amount != 0 {
-                amounts.insert(row.2.clone(), amount);
+                planned_amounts.insert(row.2.clone(), amount);
                 remaining -= amount;
             }
         }
@@ -1218,10 +1244,10 @@ impl PacingState {
                 if remaining == 0 {
                     break;
                 }
-                let already = amounts.get(&row.2).copied().unwrap_or_default();
+                let already = planned_amounts.get(&row.2).copied().unwrap_or_default();
                 let extra = row.3 .0.saturating_sub(already).min(remaining);
                 if extra != 0 {
-                    *amounts.entry(row.2.clone()).or_default() += extra;
+                    *planned_amounts.entry(row.2.clone()).or_default() += extra;
                     remaining -= extra;
                 }
             }
@@ -1229,21 +1255,38 @@ impl PacingState {
         if remaining != 0 {
             return Err(PacingError::CorruptState);
         }
-        let mut allocations = Vec::with_capacity(amounts.len());
+        let committed_total = gross_up_reserve(planned, reserve_bps)?;
+        let mut reserve_remaining = checked_sub(committed_total, planned)?.0;
+        let mut allocations = Vec::with_capacity(due_rows.len());
         for row in due_rows {
-            let Some(amount) = amounts.remove(&row.2) else {
+            let planned_amount = planned_amounts.remove(&row.2).unwrap_or_default();
+            let reserve_amount = row
+                .3
+                 .0
+                .saturating_sub(planned_amount)
+                .min(reserve_remaining);
+            reserve_remaining -= reserve_amount;
+            let committed_amount = planned_amount
+                .checked_add(reserve_amount)
+                .ok_or(PacingError::ArithmeticOverflow)?;
+            if committed_amount == 0 {
                 continue;
-            };
+            }
             let tranche = self
                 .deposits
                 .get_mut(&row.2)
                 .ok_or(PacingError::CorruptState)?;
-            tranche.committed_usdc = checked_add(tranche.committed_usdc, UsdcMicros(amount))?;
+            tranche.committed_usdc =
+                checked_add(tranche.committed_usdc, UsdcMicros(committed_amount))?;
             allocations.push(DecisionAllocation {
                 tranche_id: row.2.clone(),
-                committed_usdc: UsdcMicros(amount),
+                planned_usdc: UsdcMicros(planned_amount),
+                committed_usdc: UsdcMicros(committed_amount),
                 filled_usdc: UsdcMicros::default(),
             });
+        }
+        if !planned_amounts.is_empty() || reserve_remaining != 0 {
+            return Err(PacingError::CorruptState);
         }
         Ok(allocations)
     }
@@ -1406,6 +1449,35 @@ fn apply_reserve(value: UsdcMicros, reserve_bps: u16) -> Result<UsdcMicros, Paci
     Ok(UsdcMicros(
         u64::try_from(value).map_err(|_| PacingError::ArithmeticOverflow)?,
     ))
+}
+
+fn gross_up_reserve(value: UsdcMicros, reserve_bps: u16) -> Result<UsdcMicros, PacingError> {
+    let denominator = BPS_DENOMINATOR
+        .checked_sub(u64::from(reserve_bps))
+        .ok_or(PacingError::ArithmeticOverflow)?;
+    if denominator == 0 {
+        return Err(PacingError::ArithmeticOverflow);
+    }
+    let numerator = u128::from(value.0)
+        .checked_mul(u128::from(BPS_DENOMINATOR))
+        .ok_or(PacingError::ArithmeticOverflow)?;
+    let rounded = numerator
+        .checked_add(u128::from(denominator - 1))
+        .ok_or(PacingError::ArithmeticOverflow)?
+        / u128::from(denominator);
+    Ok(UsdcMicros(
+        u64::try_from(rounded).map_err(|_| PacingError::ArithmeticOverflow)?,
+    ))
+}
+
+fn allocation_commitment_total(
+    allocations: &[DecisionAllocation],
+) -> Result<UsdcMicros, PacingError> {
+    checked_sum(
+        allocations
+            .iter()
+            .map(|allocation| allocation.committed_usdc),
+    )
 }
 
 fn div_ceil(value: u64, divisor: u64) -> u64 {

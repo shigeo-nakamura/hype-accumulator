@@ -514,6 +514,114 @@ fn admission_minimum_daily_cap_and_reserve_are_enforced() {
 }
 
 #[test]
+fn automatic_admission_limit_is_per_deposit() {
+    let mut limits = limits();
+    limits.max_automatically_admitted_usdc = usd(100);
+    limits.yearly_admission_cap_usdc = usd(500);
+    limits.cumulative_admission_cap_usdc = usd(1_000);
+    let mut state = PacingState::default();
+    state
+        .reconcile_capital(
+            &[
+                deposit("first", 60, at(2026, 1, 1, 8)),
+                deposit("second", 60, at(2026, 1, 1, 9)),
+            ],
+            at(2026, 1, 1, 10),
+            &limits,
+        )
+        .expect("both sub-limit deposits admitted");
+    assert_eq!(state.deposits()["first"].admitted_usdc, usd(60));
+    assert_eq!(state.deposits()["second"].admitted_usdc, usd(60));
+    assert_eq!(
+        state
+            .deposits()
+            .values()
+            .map(|tranche| tranche.admitted_usdc.as_micros())
+            .sum::<u64>(),
+        usd(120).as_micros()
+    );
+}
+
+#[test]
+fn unsettled_commitment_encumbers_fee_spread_reserve() {
+    let mut limits = limits();
+    limits.max_daily_notional_usdc = usd(100);
+    limits.fee_spread_reserve_bps = 1_000;
+    let mut state = PacingState::default();
+    state
+        .reconcile_capital(
+            &[deposit("reserved", 100, at(2026, 12, 31, 8))],
+            at(2026, 12, 31, 10),
+            &limits,
+        )
+        .expect("deposit admitted");
+    let decision = state
+        .decide(&input(at(2026, 12, 31, 12), 1_000), &limits)
+        .expect("reserve-aware decision");
+    assert_eq!(decision.decision().planned_usdc, usd(90));
+    assert_eq!(decision.decision().committed_usdc, usd(100));
+    assert_eq!(state.deposits()["reserved"].committed_usdc, usd(100));
+
+    let before = state.clone();
+    let withdrawal = CapitalEvent::Withdrawal(WithdrawalEvent {
+        event_id: "blocked-withdrawal".to_owned(),
+        amount_usdc: usd(1),
+        occurred_at: at(2026, 12, 31, 13),
+        reconciled_at: at(2026, 12, 31, 14),
+    });
+    assert!(matches!(
+        state.reconcile_capital(&[withdrawal], at(2026, 12, 31, 14), &limits),
+        Err(hype_accumulator::pacing::PacingError::WithdrawalExceedsFreeCapital(id))
+            if id == "blocked-withdrawal"
+    ));
+    assert_eq!(state, before);
+
+    state
+        .settle_decision(&decision.decision().decision_id, usd(90))
+        .expect("settlement releases unused reserve headroom");
+    assert_eq!(state.deposits()["reserved"].invested_usdc, usd(90));
+    assert_eq!(state.deposits()["reserved"].committed_usdc, usd(0));
+    assert_eq!(state.deposits()["reserved"].residual_usdc(), usd(10));
+}
+
+#[test]
+fn reserve_commitment_can_span_tranches_without_changing_fill_attribution() {
+    let mut limits = limits();
+    limits.max_daily_notional_usdc = usd(50);
+    limits.fee_spread_reserve_bps = 1_000;
+    let mut state = PacingState::default();
+    state
+        .reconcile_capital(
+            &[
+                deposit("first", 50, at(2026, 12, 31, 8)),
+                deposit("second", 50, at(2026, 12, 31, 9)),
+            ],
+            at(2026, 12, 31, 10),
+            &limits,
+        )
+        .expect("both tranches admitted");
+    let decision = state
+        .decide(&input(at(2026, 12, 31, 12), 1_000), &limits)
+        .expect("reserve spans the active tranches");
+    assert_eq!(decision.decision().planned_usdc, usd(50));
+    assert!(decision.decision().committed_usdc > usd(50));
+    assert!(decision
+        .decision()
+        .allocations
+        .iter()
+        .any(
+            |allocation| allocation.planned_usdc.is_zero() && !allocation.committed_usdc.is_zero()
+        ));
+
+    state
+        .settle_decision(&decision.decision().decision_id, usd(50))
+        .expect("settlement releases reserve-only tranche slice");
+    assert_eq!(state.deposits()["first"].invested_usdc, usd(50));
+    assert_eq!(state.deposits()["second"].invested_usdc, usd(0));
+    assert_eq!(state.deposits()["second"].committed_usdc, usd(0));
+}
+
+#[test]
 fn late_year_infeasibility_holds_residual_across_rollover() {
     let limits = limits();
     let mut state = PacingState::default();
@@ -843,7 +951,10 @@ proptest! {
             })
             .sum::<u64>();
         prop_assert!(used <= admitted);
-        prop_assert!(admitted <= limits.max_automatically_admitted_usdc.as_micros());
+        prop_assert!(admitted <= limits.cumulative_admission_cap_usdc.as_micros());
+        prop_assert!(state.deposits().values().all(|tranche|
+            tranche.admitted_usdc <= limits.max_automatically_admitted_usdc
+        ));
         let economic_days = state
             .decisions()
             .values()

@@ -24,11 +24,5 @@ pub fn automatically_deployable(snapshot: &CapitalSnapshot, limits: &CapitalConf
     let yearly = (limits.yearly_deployment_cap_usdc - snapshot.deployed_this_year_usdc).max(0.0);
     let cumulative =
         (limits.cumulative_deployment_cap_usdc - snapshot.deployed_cumulative_usdc).max(0.0);
-    let automatic =
-        (limits.max_automatically_deployable_usdc - snapshot.deployed_cumulative_usdc).max(0.0);
-    admitted_remaining
-        .min(yearly)
-        .min(cumulative)
-        .min(automatic)
-        .max(0.0)
+    admitted_remaining.min(yearly).min(cumulative).max(0.0)
 }

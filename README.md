@@ -33,8 +33,10 @@ bootstrap. The crate pins tagged `dex-connector` with `hyperliquid-sdk` only.
 
 The `pacing` state machine is an offline planner. It accepts uniquely identified
 authoritative deposit and withdrawal events, admits deposits only after the
-configured confirmations, cooldown, explicit admission approval, and cumulative
-caps, then assigns each admitted tranche a 31 December receipt-year horizon.
+configured confirmations, cooldown, explicit admission approval, and admission
+caps. The automatic limit applies independently to each deposit; yearly and
+cumulative limits aggregate all admissions. Each admitted tranche receives a 31
+December receipt-year horizon.
 Unmatched balance changes and unadmitted deposit residual never become
 deployable capital.
 
@@ -42,9 +44,10 @@ Each eligible UTC date produces one durable decision ID. A skip is durable too;
 same-day replay after a restart or an after-decision deposit returns the existing
 audit record and no new economic intent. Plans use exact USDC microunits, preserve
 per-tranche committed/filled/withdrawn attribution, reserve fee/spread capacity,
-respect exchange minimum and daily caps, and hold an infeasible horizon residual
-for explicit approval. The configured final catch-up window adds daily eligible
-slots but never relaxes the daily cap.
+and encumber that reserve as part of the unsettled maximum cash commitment.
+Plans respect exchange minimum and daily caps and hold an infeasible horizon
+residual for explicit approval. The configured final catch-up window adds daily
+eligible slots but never relaxes the daily cap.
 
 This fallback deliberately has no market-signal multiplier, signer, exchange
 submission, state-file backend, or live configuration. The caller must durably
