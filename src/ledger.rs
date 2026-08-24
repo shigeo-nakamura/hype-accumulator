@@ -561,17 +561,17 @@ impl DurableLedger {
             self.anchor.as_ref(),
             &next_anchor,
         )?;
-        let next_file_len = self.write_record(&prepared.record)?;
-        write_snapshot(&self.directory, &prepared.snapshot)?;
-        clear_pending(&self.directory)?;
         self.events_by_id.insert(
             prepared.record.event.event_id.clone(),
             prepared.record.event.clone(),
         );
-        self.records.push(prepared.record);
+        self.records.push(prepared.record.clone());
         self.state = prepared.next_state;
-        self.file_len = next_file_len;
         self.anchor = Some(next_anchor);
+        let next_file_len = self.write_record(&prepared.record)?;
+        self.file_len = next_file_len;
+        write_snapshot(&self.directory, &prepared.snapshot)?;
+        clear_pending(&self.directory)?;
         Ok(AppendOutcome::Appended)
     }
 
@@ -1112,7 +1112,10 @@ fn record_capital_settlement(
             (
                 checked_add(decision.filled_usdc, decision.fee_usdc)?,
                 Some(decision.committed_usdc),
-                decision.latest_cost_at.max(latest_order_at),
+                decision
+                    .latest_cost_at
+                    .max(latest_order_at)
+                    .max(Some(decision.occurred_at)),
             )
         }
         None => (UsdcMicros::default(), None, None),
@@ -2900,6 +2903,8 @@ impl From<serde_json::Error> for LedgerError {
 mod transaction_tests {
     use super::*;
     use chrono::TimeZone;
+    #[cfg(unix)]
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -2926,6 +2931,59 @@ mod transaction_tests {
                 return Ok(false);
             }
             *anchor = Some(next.clone());
+            Ok(true)
+        }
+    }
+
+    #[cfg(unix)]
+    struct SabotagingAnchorStore {
+        anchor: Mutex<Option<ProtectedHeadAnchor>>,
+        directory: PathBuf,
+        armed: AtomicBool,
+    }
+
+    #[cfg(unix)]
+    impl SabotagingAnchorStore {
+        fn new(directory: PathBuf) -> Self {
+            Self {
+                anchor: Mutex::new(None),
+                directory,
+                armed: AtomicBool::new(false),
+            }
+        }
+
+        fn arm(&self) {
+            self.armed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(unix)]
+    impl ProtectedAnchorStore for SabotagingAnchorStore {
+        fn load(&self) -> Result<Option<ProtectedHeadAnchor>, String> {
+            self.anchor
+                .lock()
+                .map(|anchor| anchor.clone())
+                .map_err(|_| "protected anchor lock poisoned".into())
+        }
+
+        fn compare_and_swap(
+            &self,
+            expected: Option<&ProtectedHeadAnchor>,
+            next: &ProtectedHeadAnchor,
+        ) -> Result<bool, String> {
+            let mut anchor = self
+                .anchor
+                .lock()
+                .map_err(|_| "protected anchor lock poisoned".to_owned())?;
+            if anchor.as_ref() != expected {
+                return Ok(false);
+            }
+            *anchor = Some(next.clone());
+            if self.armed.swap(false, Ordering::SeqCst) {
+                let path = self.directory.join(LEDGER_FILE_NAME);
+                fs::remove_file(&path).map_err(|error| error.to_string())?;
+                fs::create_dir(path).map_err(|error| error.to_string())?;
+            }
             Ok(true)
         }
     }
@@ -3120,6 +3178,33 @@ mod transaction_tests {
 
         assert_ne!(directory.path(), alias);
         assert!(same_directory_identity(directory.path(), &alias).expect("compare identities"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_anchor_write_failure_keeps_the_committed_state_visible() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let anchor = Arc::new(SabotagingAnchorStore::new(directory.path().to_path_buf()));
+        let mut ledger = DurableLedger::open(directory.path(), anchor.clone())
+            .expect("open ledger with sabotaging anchor");
+        anchor.arm();
+
+        assert!(matches!(
+            ledger.append(deposit("committed-before-write-failure", 1)),
+            Err(LedgerError::UnsafeJournalFile)
+        ));
+        assert_eq!(ledger.record_count(), 1);
+        assert_ne!(ledger.head_hash(), GENESIS_HASH);
+        assert_eq!(ledger.state().last_event_at(), Some(&at(1)));
+        assert_eq!(
+            anchor
+                .load()
+                .expect("load committed protected anchor")
+                .expect("protected anchor advanced")
+                .record_count,
+            1
+        );
+        assert!(directory.path().join(PENDING_FILE_NAME).exists());
     }
 
     #[test]
@@ -3374,6 +3459,20 @@ mod transaction_tests {
         ] {
             ledger.append(event).expect("append settlement fixture");
         }
+
+        assert_eq!(
+            ledger.append(LedgerEvent {
+                event_id: "settlement-before-decision".into(),
+                occurred_at: at(3),
+                kind: LedgerEventKind::CapitalSettled {
+                    commitment_id: "commitment-settlement-cap".into(),
+                    debited_usdc: UsdcMicros::default(),
+                },
+            }),
+            Err(LedgerError::InvalidEvent(
+                "settlement predates its commitment or linked activity".into()
+            ))
+        );
 
         assert_eq!(
             ledger.append(LedgerEvent {
