@@ -188,12 +188,16 @@ current-day row can authorize a new purchase or claim an older authorization,
 the serializable transaction locks active records in stable authorization-ID
 order. It terminalizes expired `authorized` records and materializes a full-`N`
 `mirrored_encumbrance` keyed by `(authorization ID, current period ID)` for every
-unexpired `authorized`, `submission_claimed`, or `order_bound` record whose
-originating day is earlier. Existing entries are verified, not added twice. These
-carry-forward entries commit even when the requested new authorization is denied;
-they are existing obligations, not a partial reservation for the rejected
-request. Concurrent authorization, claim, expiry, and reconciliation transactions
-serialize on the same rows.
+unexpired `authorized` record and every unresolved `submission_claimed` or
+`order_bound` record whose originating day is earlier, regardless of whether its
+acceptance expiry has passed. Existing entries are verified, not added twice.
+These carry-forward entries commit even when the requested new authorization is
+denied; they are existing obligations, not a partial reservation for the rejected
+request. Expiry alone can terminalize only a never-claimed `authorized` record. A
+claimed or bound record keeps its full-`N` encumbrance in every newly prepared day
+until authoritative terminal reconciliation proves and settles all fills or proves
+conclusive absence. Concurrent authorization, claim, expiry, period opening, and
+reconciliation transactions serialize on the same rows.
 The same schemes assign authoritative fill timestamps to execution periods.
 
 The record is committed before the API wallet signs the canonical unsigned
@@ -296,13 +300,17 @@ supplying a fresh approval wrapper cannot create a new decision chain. A
 caller-supplied decision, authorization record, or policy snapshot is correlation
 data only.
 
-An unexpired `authorized` or unresolved `submission_claimed` or `order_bound`
+An unexpired `authorized` or any unresolved `submission_claimed` or `order_bound`
 reservation never disappears at a daily or yearly boundary. Its `N` remains
 charged to its originating daily period and is also deducted as the conservative
-authorization-ID-keyed encumbrance from every later daily row prepared before
-expiry or terminal reconciliation. Thus a pre-midnight authorization competes
-for next-day room before either a next-day authorization or its own claim can
-commit. Its `C` remains `committed` inside the same admission allocations, whose
+authorization-ID-keyed encumbrance from every later daily row prepared before its
+terminal reconciliation. For a claimed or bound record this continues after
+`expiresAfter_ms` and `effective_expiry_ms` while authoritative order/fill history
+is unavailable, stale, or lacks the required gap-free watermark. Thus a
+pre-midnight authorization competes for next-day room before either a next-day
+authorization or its own claim can commit, and an expired ambiguous claim cannot
+open room before a delayed fill is discovered. Its `C` remains `committed` inside
+the same admission allocations, whose
 originating yearly and lifetime ceiling charges never roll over or repeat; an old
 admitted slice can be committed after a year boundary without consuming the new
 year's admission room. There is no independent process-local rollover job.
@@ -746,12 +754,18 @@ Before production secrets or funds are present, attach evidence for:
   effective horizon and prove venue rejection with no fill;
 - TIF and rollover tests proving GTC/ALO/resting envelopes are rejected, IOC fills
   cannot be accepted at or beyond effective expiry, and every unexpired
-  `authorized`, `submission_claimed`, or `order_bound` record reduces each later
-  daily period before a new authorization or later-day claim can commit. Race a
+  `authorized` plus every unresolved `submission_claimed` or `order_bound` record,
+  even after expiry, reduces each later daily period before a new authorization or
+  later-day claim can commit. Race a
   pre-midnight `authorized` record's claim against a full-limit next-day
   authorization and prove their authorization-ID-keyed mirrors serialize without
   omission or duplication, including when the new request is denied, across
-  restart and restore. Ambiguous `C` remains in its originating commitment
+  restart and restore. Also claim an authorization before midnight, accept and fill
+  it after midnight but before expiry, delay authoritative fill history until
+  after expiry, and prove its full `N` continues to mirror into every prepared day
+  and blocks a full-limit purchase until one atomic terminal reconciliation
+  replaces all mirrors with exact execution-day spend. Ambiguous `C` remains in
+  its originating commitment
   without consuming a later year's admission room. Terminal settlement must
   convert the originating reservation and every mirror to actual execution-day
   spend in one transaction, leaving no unused `N - N_f` charged;
