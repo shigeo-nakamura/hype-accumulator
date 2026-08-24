@@ -103,6 +103,28 @@ class ExperimentContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "stale_after_days"):
                 run_experiment(manifest)
 
+    def test_experiment_rejects_unknown_policy_and_ablation_features(self) -> None:
+        for location in ("policy", "ablation"):
+            with self.subTest(location=location):
+                experiment = json.loads((FIXTURES / "experiment.json").read_text(encoding="utf-8"))
+                if location == "policy":
+                    adaptive = next(
+                        policy for policy in experiment["policies"] if policy["kind"] == "adaptive"
+                    )
+                    adaptive["features"] = ["hype_trned"]
+                else:
+                    experiment["ablations"] = [["hype_trned"]]
+                experiment["dataset_manifest"] = str(FIXTURES / "dataset-manifest.json")
+                for capital_path in experiment["capital_paths"]:
+                    capital_path["manifest"] = str(FIXTURES / capital_path["manifest"])
+
+                with tempfile.TemporaryDirectory() as directory:
+                    manifest = Path(directory) / "experiment.json"
+                    manifest.write_text(json.dumps(experiment), encoding="utf-8")
+
+                    with self.assertRaisesRegex(ValueError, "unknown feature names"):
+                        run_experiment(manifest)
+
     def test_experiment_cannot_advance_past_dataset_snapshot(self) -> None:
         experiment = json.loads((FIXTURES / "experiment.json").read_text(encoding="utf-8"))
         experiment["as_of"] = "2026-01-01T00:00:00Z"

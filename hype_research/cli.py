@@ -71,6 +71,26 @@ def require_snapshot_at_least(child_manifest: dict, experiment_as_of: datetime, 
         )
 
 
+def require_known_feature_names(experiment: dict, available_series: set[str]) -> None:
+    feature_sets = [
+        (f"policies[{index}]", policy.get("features", []))
+        for index, policy in enumerate(experiment["policies"])
+        if policy["kind"] == "adaptive"
+    ]
+    feature_sets.extend(
+        (f"ablations[{index}]", features)
+        for index, features in enumerate(experiment["ablations"])
+    )
+    for label, features in feature_sets:
+        if not isinstance(features, list) or any(
+            not isinstance(feature, str) or not feature for feature in features
+        ):
+            raise ValueError(f"feature names at {label} must be nonempty strings")
+        unknown = sorted(set(features) - available_series)
+        if unknown:
+            raise ValueError(f"unknown feature names at {label}: {unknown!r}")
+
+
 def run_experiment(path: Path) -> dict:
     experiment = resolve_manifest(path)
     require_supported_policy_values(experiment)
@@ -78,6 +98,7 @@ def run_experiment(path: Path) -> dict:
     root = experiment["_root"]
     as_of = timestamp(experiment["as_of"])
     prices, revisions, dataset_manifest = load_dataset((root / experiment["dataset_manifest"]).resolve())
+    require_known_feature_names(experiment, {revision.series for revision in revisions})
     require_snapshot_at_least(dataset_manifest, as_of, "dataset")
     view = PointInTimeView(revisions, as_of)
     results = []
