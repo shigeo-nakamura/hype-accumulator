@@ -134,6 +134,7 @@ def run_backtest(
         ledger.take(order, "purchase")
         acquired = order / (bar.price_usd * (1 + cost_rate))
         units += acquired
+        peak_value = max(peak_value, units * bar.price_usd)
         spend += order
         cost = order * cost_rate / (1 + cost_rate)
         fees += cost

@@ -180,6 +180,36 @@ class EngineInvariantTests(unittest.TestCase):
         self.assertEqual(result["invested_usd"], 60.0)
         self.assertEqual(result["capital_cohorts"][0]["withdrawn_usd"], 40.0)
 
+    def test_inventory_peak_includes_units_acquired_by_prior_purchases(self) -> None:
+        utc = timezone.utc
+        first = datetime(2025, 1, 1, 12, tzinfo=utc)
+        second = datetime(2025, 1, 2, 12, tzinfo=utc)
+        third = datetime(2025, 1, 3, 12, tzinfo=utc)
+        deposit = CapitalEvent("deposit", "deposit", 200.0, first, first, first)
+        result = run_backtest(
+            [PriceBar(first, 100.0), PriceBar(second, 100.0), PriceBar(third, 50.0)],
+            [deposit],
+            PointInTimeView([], third),
+            {
+                "name": "daily",
+                "kind": "fixed",
+                "cadence": "daily",
+                "horizon": "2025-01-03",
+                "features": [],
+            },
+            {
+                "min_trade_usd": 1.0,
+                "max_trade_usd": 100.0,
+                "fee_bps": 0.0,
+                "half_spread_bps": 0.0,
+                "slippage_bps": 0.0,
+            },
+            third,
+        )
+
+        self.assertEqual(result["trade_count"], 3)
+        self.assertEqual(result["max_inventory_drawdown"], 0.5)
+
     def test_stale_fixed_fallback_disables_adaptive_multiplier(self) -> None:
         utc = timezone.utc
         revisions = [
