@@ -31,6 +31,8 @@ struct MemoryProtectedHeadStore {
 struct MemoryExchangeOrderOwnerStore {
     order_owners: Mutex<BTreeMap<(String, String), ExchangeOrderOwner>>,
     fill_owners: Mutex<BTreeMap<(String, String), ExchangeFillOwner>>,
+    lose_next_order_commit_response: Mutex<bool>,
+    lose_next_fill_commit_response: Mutex<bool>,
 }
 
 struct InitializationLockCheckingHeadStore {
@@ -129,10 +131,22 @@ impl ExchangeOrderOwnerStore for MemoryExchangeOrderOwnerStore {
         if owners.get(&key).is_some_and(|existing| existing != owner) {
             return Ok(OwnershipCommitOutcome::Conflict);
         }
+        let inserted = !owners.contains_key(&key);
+        owners.entry(key.clone()).or_insert_with(|| owner.clone());
         if !commit() {
+            if inserted {
+                owners.remove(&key);
+            }
             return Ok(OwnershipCommitOutcome::CommitRejected);
         }
-        owners.entry(key).or_insert_with(|| owner.clone());
+        let mut lose_response = self
+            .lose_next_order_commit_response
+            .lock()
+            .map_err(|error| error.to_string())?;
+        if *lose_response {
+            *lose_response = false;
+            return Err("injected post-commit order-owner response loss".into());
+        }
         Ok(OwnershipCommitOutcome::Committed)
     }
 
@@ -168,17 +182,47 @@ impl ExchangeOrderOwnerStore for MemoryExchangeOrderOwnerStore {
         {
             return Ok(OwnershipCommitOutcome::Conflict);
         }
+        let inserted_keys = claims
+            .keys()
+            .filter(|key| !owners.contains_key(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for (key, owner) in &claims {
+            owners.entry(key.clone()).or_insert_with(|| owner.clone());
+        }
         if !commit() {
+            for key in inserted_keys {
+                owners.remove(&key);
+            }
             return Ok(OwnershipCommitOutcome::CommitRejected);
         }
-        for (key, owner) in claims {
-            owners.entry(key).or_insert(owner);
+        let mut lose_response = self
+            .lose_next_fill_commit_response
+            .lock()
+            .map_err(|error| error.to_string())?;
+        if *lose_response {
+            *lose_response = false;
+            return Err("injected post-commit fill-owner response loss".into());
         }
         Ok(OwnershipCommitOutcome::Committed)
     }
 }
 
 impl MemoryExchangeOrderOwnerStore {
+    fn lose_next_order_commit_response(&self) {
+        *self
+            .lose_next_order_commit_response
+            .lock()
+            .expect("order-owner response-loss flag locks") = true;
+    }
+
+    fn lose_next_fill_commit_response(&self) {
+        *self
+            .lose_next_fill_commit_response
+            .lock()
+            .expect("fill-owner response-loss flag locks") = true;
+    }
+
     fn fill_claims(
         owners: &[ExchangeFillOwner],
     ) -> Option<BTreeMap<(String, String), ExchangeFillOwner>> {
@@ -964,6 +1008,47 @@ fn losing_journal_commit_does_not_retain_an_order_claim() {
 }
 
 #[test]
+fn order_owner_intent_survives_post_commit_response_loss() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("order-owner-post-commit-loss.jsonl");
+    let binding = binding();
+    let head_store = Arc::new(MemoryProtectedHeadStore::default());
+    let owner_store = Arc::new(MemoryExchangeOrderOwnerStore::default());
+    let mut workflow =
+        DurableWorkflow::open_or_create(&path, &binding, head_store.clone(), owner_store.clone())
+            .expect("workflow opens");
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    owner_store.lose_next_order_commit_response();
+
+    assert!(matches!(
+        observe_submission(&mut workflow, "reserved-order", at(2)),
+        Err(WorkflowError::ExchangeOrderOwner(_))
+    ));
+    assert_eq!(workflow.state().stage(), WorkflowStage::OrderSubmitted);
+    assert!(owner_store.has_order_owner(
+        &binding.inventory_before.execution_identity_hash,
+        "reserved-order",
+    ));
+    let conflicting_owner = ExchangeOrderOwner {
+        schema_version: 1,
+        execution_identity_hash: binding.inventory_before.execution_identity_hash.clone(),
+        exchange_order_id: "reserved-order".to_owned(),
+        decision_id: "competing-decision".to_owned(),
+        workflow_id: "competing-workflow".to_owned(),
+        client_order_id: "competing-cloid".to_owned(),
+        canonical_order_envelope_hash: "competing-envelope".to_owned(),
+    };
+    assert!(!owner_store
+        .claim(&conflicting_owner)
+        .expect("conflicting claim is checked"));
+    drop(workflow);
+
+    let reopened = DurableWorkflow::open_or_create(&path, &binding, head_store, owner_store)
+        .expect("journal and owner intent reconcile");
+    assert_eq!(reopened.state().stage(), WorkflowStage::OrderSubmitted);
+}
+
+#[test]
 fn append_lock_prevents_replacing_a_pending_recovery_intent() {
     let temp = tempfile::tempdir().expect("temp directory");
     let path = temp.path().join("serialized-pending-append.jsonl");
@@ -1073,6 +1158,77 @@ fn losing_journal_commit_does_not_retain_fill_claims() {
         &binding.inventory_before.execution_identity_hash,
         "losing-fill",
     ));
+}
+
+#[test]
+fn fill_owner_intent_survives_post_commit_response_loss() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("fill-owner-post-commit-loss.jsonl");
+    let binding = binding();
+    let head_store = Arc::new(MemoryProtectedHeadStore::default());
+    let owner_store = Arc::new(MemoryExchangeOrderOwnerStore::default());
+    let mut workflow =
+        DurableWorkflow::open_or_create(&path, &binding, head_store.clone(), owner_store.clone())
+            .expect("workflow opens");
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
+    workflow
+        .observe_order_fill(
+            "fill-observation",
+            hype(250),
+            usdc(50_000_000),
+            usdc(50_500_000),
+            true,
+            at(3),
+        )
+        .expect("fill observed");
+    workflow
+        .finalize_order(
+            hype(250),
+            usdc(50_000_000),
+            usdc(50_500_000),
+            OrderFinality::Filled,
+            at(4),
+        )
+        .expect("order finalized");
+    let evidence = bound_evidence(&workflow, &[("reserved-fill", 250, 3)], at(5));
+    owner_store.lose_next_fill_commit_response();
+
+    assert!(matches!(
+        workflow.record_staking_eligibility(Some(evidence), at(5)),
+        Err(WorkflowError::ExchangeFillOwner(_))
+    ));
+    assert_eq!(
+        workflow.state().stage(),
+        WorkflowStage::StakingEligibilityRecorded
+    );
+    assert!(owner_store.has_fill_owner(
+        &binding.inventory_before.execution_identity_hash,
+        "reserved-fill",
+    ));
+    let conflicting_owner = ExchangeFillOwner {
+        schema_version: 1,
+        execution_identity_hash: binding.inventory_before.execution_identity_hash.clone(),
+        fill_id: "reserved-fill".to_owned(),
+        decision_id: "competing-decision".to_owned(),
+        workflow_id: "competing-workflow".to_owned(),
+        authorization_id: "competing-authorization".to_owned(),
+        authorization_record_hash: "competing-authorization-record".to_owned(),
+        exchange_order_id: "competing-order".to_owned(),
+        client_order_id: "competing-cloid".to_owned(),
+        canonical_order_envelope_hash: "competing-envelope".to_owned(),
+    };
+    assert!(!owner_store
+        .claim_fills(&[conflicting_owner])
+        .expect("conflicting fill claim is checked"));
+    drop(workflow);
+
+    let reopened = DurableWorkflow::open_or_create(&path, &binding, head_store, owner_store)
+        .expect("journal and fill intent reconcile");
+    assert_eq!(
+        reopened.state().stage(),
+        WorkflowStage::StakingEligibilityRecorded
+    );
 }
 
 #[test]
@@ -2576,6 +2732,56 @@ fn eligibility_requires_durable_timely_fill_registration() {
             WorkflowStage::ManualReview
         );
     }
+}
+
+#[test]
+fn order_binding_at_effective_expiry_halts_before_claiming_fills() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("expired-order-binding.jsonl");
+    let binding = binding();
+    let head_store = Arc::new(MemoryProtectedHeadStore::default());
+    let owner_store = Arc::new(MemoryExchangeOrderOwnerStore::default());
+    let mut workflow =
+        DurableWorkflow::open_or_create(&path, &binding, head_store.clone(), owner_store.clone())
+            .expect("workflow opens");
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
+    workflow
+        .observe_order_fill(
+            "fill-1",
+            hype(250),
+            usdc(50_000_000),
+            usdc(50_500_000),
+            true,
+            at(3),
+        )
+        .expect("fill observed");
+    workflow
+        .finalize_order(
+            hype(250),
+            usdc(50_000_000),
+            usdc(50_500_000),
+            OrderFinality::Filled,
+            at(4),
+        )
+        .expect("order finalized");
+    let mut evidence = bound_evidence(&workflow, &[("expired-bound-fill", 250, 3)], at(31));
+    evidence.order_bound_at = binding.order_envelope.effective_expiry_at;
+
+    assert!(matches!(
+        workflow.record_staking_eligibility(Some(evidence), at(31)),
+        Err(WorkflowError::ContradictoryObservation(_))
+    ));
+    assert_eq!(workflow.state().stage(), WorkflowStage::ManualReview);
+    assert!(!owner_store.has_fill_owner(
+        &binding.inventory_before.execution_identity_hash,
+        "expired-bound-fill",
+    ));
+    drop(workflow);
+
+    let reopened = DurableWorkflow::open_or_create(&path, &binding, head_store, owner_store)
+        .expect("manual review reopens");
+    assert_eq!(reopened.state().stage(), WorkflowStage::ManualReview);
 }
 
 #[test]

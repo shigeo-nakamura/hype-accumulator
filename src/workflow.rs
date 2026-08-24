@@ -1145,6 +1145,7 @@ impl WorkflowState {
             || evidence.authorized_at < self.binding.decided_at
             || evidence.authorized_at > accepted_at
             || evidence.order_bound_at < accepted_at
+            || evidence.order_bound_at >= evidence.effective_expiry_at
             || evidence.order_bound_at > recorded_at
             || evidence.effective_expiry_at <= accepted_at
             || evidence.effective_expiry_at <= evidence.signed_expiry_at
@@ -1644,12 +1645,14 @@ pub struct ExchangeFillOwner {
     pub canonical_order_envelope_hash: String,
 }
 
-/// Shared append-only ownership storage for exchange order and fill identities.
+/// Shared durable ownership storage for exchange order and fill identities.
 ///
 /// One store must cover every workflow for the execution identities it serves;
 /// it must not be scoped to a decision or journal path. `claim` must atomically
 /// and durably insert a missing key, return `true` for an exact existing owner,
 /// and return `false` without mutation when the key belongs to another owner.
+/// Commit-coupled claims use recoverable pre-commit intents as documented below;
+/// once committed, ownership remains immutable and append-only.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OwnershipCommitOutcome {
     Committed,
@@ -1668,8 +1671,12 @@ pub trait ExchangeOrderOwnerStore: Send + Sync {
     /// Serializes an order claim with its durable workflow commit.
     ///
     /// The store must hold one execution-identity-wide serialization boundary
-    /// while invoking `commit`, and insert a missing owner only when `commit`
-    /// returns `true`. A rejected commit must leave ownership unchanged.
+    /// while invoking `commit`. Before invoking it, the store must atomically
+    /// and durably insert a missing owner as a recoverable intent. If `commit`
+    /// returns `false`, the store must atomically remove only an intent inserted
+    /// by this call before returning. An exact intent left by process failure is
+    /// retained and allows the same workflow to retry, while conflicting owners
+    /// remain excluded throughout the journal commit crash window.
     ///
     /// # Errors
     ///
@@ -1692,7 +1699,11 @@ pub trait ExchangeOrderOwnerStore: Send + Sync {
 
     /// Serializes an atomic fill-bundle claim with its durable workflow commit.
     ///
-    /// The complete bundle must remain unchanged when `commit` returns `false`.
+    /// Before invoking `commit`, the store must atomically and durably insert
+    /// every missing owner in the bundle as one recoverable intent. If `commit`
+    /// returns `false`, it must atomically remove only the owners inserted by
+    /// this call. A process failure may leave the complete exact bundle for the
+    /// same workflow to retry, but must never expose a partial bundle.
     ///
     /// # Errors
     ///
