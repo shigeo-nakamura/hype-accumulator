@@ -376,6 +376,34 @@ struct PreparedAppend {
     pending: PendingAppend,
 }
 
+struct RestoreTarget {
+    ledger_payload: Vec<u8>,
+    snapshot_payload: Vec<u8>,
+    records: Vec<LedgerEnvelope>,
+    state: ReplayState,
+    anchor: Option<ProtectedHeadAnchor>,
+}
+
+impl RestoreTarget {
+    fn from_verified(
+        ledger_payload: Vec<u8>,
+        snapshot_payload: Vec<u8>,
+        verified: &DurableLedger,
+    ) -> Self {
+        Self {
+            ledger_payload,
+            snapshot_payload,
+            records: verified.records.clone(),
+            state: verified.state.clone(),
+            anchor: verified.anchor.clone(),
+        }
+    }
+
+    fn head_hash(&self) -> &str {
+        records_head(&self.records)
+    }
+}
+
 impl DurableLedger {
     /// Opens a ledger and verifies its journal and snapshot against the
     /// independently protected latest-head anchor.
@@ -572,18 +600,34 @@ impl DurableLedger {
         if source_records != verified.records {
             return Err(LedgerError::ConcurrentModification);
         }
-        let pending = build_pending_restore(&ledger_payload, &snapshot_payload, &verified)?;
+        let current_pending = build_pending_restore(&ledger_payload, &snapshot_payload, &verified)?;
         let destination_anchor = load_protected_anchor(destination_anchor_store.as_ref())?;
-        match load_pending_restore(&destination)? {
+        let target = match load_pending_restore(&destination)? {
             Some(existing) => {
-                if existing != pending || !has_only_restore_entries(&destination, true)? {
+                if !has_only_restore_entries(&destination, true)? {
                     return Err(LedgerError::CorruptRestorePending);
                 }
+                let target = if existing == current_pending {
+                    RestoreTarget::from_verified(ledger_payload, snapshot_payload, &verified)
+                } else {
+                    restore_target_from_pending(&existing, &verified.records)?
+                };
+                // A stale local intent is authoritative only after the
+                // independently protected destination scope accepted that
+                // exact prefix. The current protected source head and its
+                // verified hash chain separately prove the prefix ancestry.
+                if target.anchor != verified.anchor
+                    && destination_anchor.as_ref() != target.anchor.as_ref()
+                {
+                    return Err(LedgerError::ProtectedAnchorMismatch);
+                }
+                target
             }
             None if has_only_restore_entries(&destination, false)?
                 && destination_anchor.is_none() =>
             {
-                write_pending_restore(&destination, &pending)?;
+                write_pending_restore(&destination, &current_pending)?;
+                RestoreTarget::from_verified(ledger_payload, snapshot_payload, &verified)
             }
             None if restore_is_complete(
                 &destination,
@@ -596,18 +640,21 @@ impl DurableLedger {
                 return Self::open_unlocked(destination, destination_anchor_store);
             }
             None => return Err(LedgerError::RestoreDestinationNotEmpty),
-        }
+        };
         ensure_restore_anchor(
             destination_anchor_store.as_ref(),
             destination_anchor.as_ref(),
-            verified.anchor.as_ref(),
+            target.anchor.as_ref(),
         )?;
-        write_atomic(&destination.join(LEDGER_FILE_NAME), &ledger_payload)?;
-        write_atomic(&destination.join(SNAPSHOT_FILE_NAME), &snapshot_payload)?;
+        write_atomic(&destination.join(LEDGER_FILE_NAME), &target.ledger_payload)?;
+        write_atomic(
+            &destination.join(SNAPSHOT_FILE_NAME),
+            &target.snapshot_payload,
+        )?;
         let restored = Self::open_unlocked(destination.clone(), destination_anchor_store)?;
-        if restored.records != verified.records
-            || restored.state != verified.state
-            || restored.head_hash() != verified.head_hash()
+        if restored.records != target.records
+            || restored.state != target.state
+            || restored.head_hash() != target.head_hash()
         {
             return Err(LedgerError::SnapshotMismatch);
         }
@@ -1212,6 +1259,41 @@ fn build_pending_restore(
     Ok(pending)
 }
 
+fn restore_target_from_pending(
+    pending: &PendingRestore,
+    current_records: &[LedgerEnvelope],
+) -> Result<RestoreTarget, LedgerError> {
+    let record_count =
+        usize::try_from(pending.record_count).map_err(|_| LedgerError::CorruptRestorePending)?;
+    let records = current_records
+        .get(..record_count)
+        .ok_or(LedgerError::CorruptRestorePending)?
+        .to_vec();
+    if records_head(&records) != pending.head_hash {
+        return Err(LedgerError::CorruptRestorePending);
+    }
+
+    let mut ledger_payload = Vec::new();
+    for record in &records {
+        ledger_payload.extend(record_line(record)?);
+    }
+    let snapshot = snapshot_for_records(&records)?;
+    let snapshot_payload = encode_snapshot(&snapshot)?;
+    if digest_hex(&ledger_payload) != pending.ledger_digest
+        || digest_hex(&snapshot_payload) != pending.snapshot_digest
+    {
+        return Err(LedgerError::CorruptRestorePending);
+    }
+
+    Ok(RestoreTarget {
+        ledger_payload,
+        snapshot_payload,
+        state: snapshot.state,
+        anchor: protected_anchor_for_records(&records)?,
+        records,
+    })
+}
+
 fn load_pending_restore(directory: &Path) -> Result<Option<PendingRestore>, LedgerError> {
     match fs::read(directory.join(RESTORE_PENDING_FILE_NAME)) {
         Ok(payload) if payload.is_empty() => Err(LedgerError::CorruptRestorePending),
@@ -1337,6 +1419,11 @@ fn ensure_restore_anchor(
 }
 
 fn write_snapshot(directory: &Path, snapshot: &LedgerSnapshot) -> Result<(), LedgerError> {
+    let payload = encode_snapshot(snapshot)?;
+    write_atomic(&directory.join(SNAPSHOT_FILE_NAME), &payload)
+}
+
+fn encode_snapshot(snapshot: &LedgerSnapshot) -> Result<Vec<u8>, LedgerError> {
     let envelope = SnapshotEnvelope {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
         checksum: snapshot_checksum(snapshot)?,
@@ -1344,7 +1431,7 @@ fn write_snapshot(directory: &Path, snapshot: &LedgerSnapshot) -> Result<(), Led
     };
     let mut payload = serde_json::to_vec(&envelope).map_err(LedgerError::json)?;
     payload.push(b'\n');
-    write_atomic(&directory.join(SNAPSHOT_FILE_NAME), &payload)
+    Ok(payload)
 }
 
 fn digest_hex(payload: &[u8]) -> String {
@@ -2073,5 +2160,176 @@ mod transaction_tests {
         .expect("accept exact completed restore retry");
         assert_eq!(retried.records, verified.records);
         assert_eq!(retried.state, verified.state);
+    }
+
+    #[test]
+    fn restore_completes_an_anchored_prefix_after_the_source_advances() {
+        let source = tempfile::tempdir().expect("source directory");
+        let container = tempfile::tempdir().expect("destination container");
+        let destination = container.path().join("restored-prefix");
+        let latest_destination = container.path().join("restored-latest");
+        let source_anchor = anchor_store();
+        let destination_anchor = anchor_store();
+        let latest_destination_anchor = anchor_store();
+        let mut ledger = open(source.path(), &source_anchor).expect("open source ledger");
+        ledger
+            .append(deposit("deposit-before-restore", 1))
+            .expect("append deposit");
+        drop(ledger);
+
+        let verified_prefix = open(source.path(), &source_anchor).expect("verify source prefix");
+        let prefix_head = verified_prefix.head_hash().to_owned();
+        let prefix_state = verified_prefix.state.clone();
+        let ledger_payload =
+            fs::read(source.path().join(LEDGER_FILE_NAME)).expect("read source journal");
+        let snapshot_payload =
+            fs::read(source.path().join(SNAPSHOT_FILE_NAME)).expect("read source snapshot");
+        let pending = build_pending_restore(&ledger_payload, &snapshot_payload, &verified_prefix)
+            .expect("build restore intent");
+        {
+            canonical_directory(&destination).expect("durably create destination directory");
+            let _lock = LedgerLock::acquire(&destination).expect("acquire destination lock");
+            write_pending_restore(&destination, &pending).expect("persist restore intent");
+            ensure_restore_anchor(
+                destination_anchor.as_ref(),
+                None,
+                verified_prefix.anchor.as_ref(),
+            )
+            .expect("advance destination anchor");
+            write_atomic(&destination.join(LEDGER_FILE_NAME), &ledger_payload)
+                .expect("publish journal before interruption");
+        }
+
+        let mut advanced = open(source.path(), &source_anchor).expect("reopen source ledger");
+        advanced
+            .append(observation("observation-after-restore-crash", 2))
+            .expect("advance source after restore crash");
+        let latest_head = advanced.head_hash().to_owned();
+        let latest_state = advanced.state.clone();
+        drop(advanced);
+
+        let restored_prefix = DurableLedger::restore_clean(
+            source.path(),
+            &destination,
+            source_anchor.clone(),
+            destination_anchor,
+        )
+        .expect("complete the independently authorized prefix restore");
+        assert_eq!(restored_prefix.record_count(), 1);
+        assert_eq!(restored_prefix.head_hash(), prefix_head);
+        assert_eq!(restored_prefix.state, prefix_state);
+        assert!(!destination.join(RESTORE_PENDING_FILE_NAME).exists());
+
+        let restored_latest = DurableLedger::restore_clean(
+            source.path(),
+            &latest_destination,
+            source_anchor,
+            latest_destination_anchor,
+        )
+        .expect("restore the latest source head separately");
+        assert_eq!(restored_latest.record_count(), 2);
+        assert_eq!(restored_latest.head_hash(), latest_head);
+        assert_eq!(restored_latest.state, latest_state);
+    }
+
+    #[test]
+    fn stale_restore_intent_without_a_destination_anchor_fails_closed() {
+        let source = tempfile::tempdir().expect("source directory");
+        let container = tempfile::tempdir().expect("destination container");
+        let destination = container.path().join("restored");
+        let source_anchor = anchor_store();
+        let destination_anchor = anchor_store();
+        let mut ledger = open(source.path(), &source_anchor).expect("open source ledger");
+        ledger
+            .append(deposit("deposit-before-restore", 1))
+            .expect("append deposit");
+        drop(ledger);
+
+        let verified_prefix = open(source.path(), &source_anchor).expect("verify source prefix");
+        let ledger_payload =
+            fs::read(source.path().join(LEDGER_FILE_NAME)).expect("read source journal");
+        let snapshot_payload =
+            fs::read(source.path().join(SNAPSHOT_FILE_NAME)).expect("read source snapshot");
+        let pending = build_pending_restore(&ledger_payload, &snapshot_payload, &verified_prefix)
+            .expect("build restore intent");
+        canonical_directory(&destination).expect("durably create destination directory");
+        {
+            let _lock = LedgerLock::acquire(&destination).expect("acquire destination lock");
+            write_pending_restore(&destination, &pending).expect("persist restore intent");
+        }
+
+        let mut advanced = open(source.path(), &source_anchor).expect("reopen source ledger");
+        advanced
+            .append(observation("observation-after-unanchored-intent", 2))
+            .expect("advance source after unanchored intent");
+        drop(advanced);
+
+        assert!(matches!(
+            DurableLedger::restore_clean(
+                source.path(),
+                &destination,
+                source_anchor,
+                destination_anchor,
+            ),
+            Err(LedgerError::ProtectedAnchorMismatch)
+        ));
+        assert!(destination.join(RESTORE_PENDING_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn anchored_restore_intent_for_a_different_source_chain_fails_closed() {
+        let original_source = tempfile::tempdir().expect("original source directory");
+        let current_source = tempfile::tempdir().expect("current source directory");
+        let container = tempfile::tempdir().expect("destination container");
+        let destination = container.path().join("restored");
+        let original_source_anchor = anchor_store();
+        let current_source_anchor = anchor_store();
+        let destination_anchor = anchor_store();
+
+        let mut original =
+            open(original_source.path(), &original_source_anchor).expect("open original source");
+        original
+            .append(deposit("deposit-original-chain", 1))
+            .expect("append original deposit");
+        drop(original);
+        let verified_original =
+            open(original_source.path(), &original_source_anchor).expect("verify original source");
+        let original_ledger =
+            fs::read(original_source.path().join(LEDGER_FILE_NAME)).expect("read original journal");
+        let original_snapshot = fs::read(original_source.path().join(SNAPSHOT_FILE_NAME))
+            .expect("read original snapshot");
+        let pending =
+            build_pending_restore(&original_ledger, &original_snapshot, &verified_original)
+                .expect("build original restore intent");
+
+        canonical_directory(&destination).expect("durably create destination directory");
+        {
+            let _lock = LedgerLock::acquire(&destination).expect("acquire destination lock");
+            write_pending_restore(&destination, &pending).expect("persist restore intent");
+            ensure_restore_anchor(
+                destination_anchor.as_ref(),
+                None,
+                verified_original.anchor.as_ref(),
+            )
+            .expect("advance destination anchor");
+        }
+
+        let mut current =
+            open(current_source.path(), &current_source_anchor).expect("open current source");
+        current
+            .append(deposit("deposit-different-chain", 1))
+            .expect("append different deposit");
+        drop(current);
+
+        assert!(matches!(
+            DurableLedger::restore_clean(
+                current_source.path(),
+                &destination,
+                current_source_anchor,
+                destination_anchor,
+            ),
+            Err(LedgerError::CorruptRestorePending)
+        ));
+        assert!(destination.join(RESTORE_PENDING_FILE_NAME).exists());
     }
 }
