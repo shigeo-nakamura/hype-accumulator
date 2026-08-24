@@ -305,6 +305,50 @@ fn duplicate_responses_are_idempotent_even_when_redelivered_later() {
 }
 
 #[test]
+fn blank_fill_observation_ids_never_advance_the_journal() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("blank-fill-id.jsonl");
+    let binding = binding();
+    let mut workflow = reopen(&path, &binding);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    workflow
+        .observe_order_submission("exchange-order-1", at(2))
+        .expect("submission observed");
+    let count = workflow.record_count();
+
+    for observation_id in ["", "   "] {
+        assert!(matches!(
+            workflow.observe_order_fill(
+                observation_id,
+                hype(100),
+                usdc(20_000_000),
+                usdc(20_200_000),
+                false,
+                at(3),
+            ),
+            Err(WorkflowError::InvalidTransition(_))
+        ));
+        assert_eq!(workflow.record_count(), count);
+        assert_eq!(workflow.state().stage(), WorkflowStage::OrderSubmitted);
+    }
+
+    workflow
+        .observe_order_fill(
+            "  stable-fill-id  ",
+            hype(100),
+            usdc(20_000_000),
+            usdc(20_200_000),
+            false,
+            at(3),
+        )
+        .expect("trimmed stable fill ID accepted");
+    drop(workflow);
+    let restarted = reopen(&path, &binding);
+    assert_eq!(restarted.state().stage(), WorkflowStage::PartiallyFilled);
+    assert_eq!(restarted.state().purchased_hype(), hype(100));
+}
+
+#[test]
 fn conclusively_absent_submission_releases_pending_intent_and_completes() {
     let temp = tempfile::tempdir().expect("temp directory");
     let path = temp.path().join("absent-order.jsonl");

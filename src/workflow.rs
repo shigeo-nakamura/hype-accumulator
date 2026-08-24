@@ -532,12 +532,17 @@ impl WorkflowState {
                 self.stage = WorkflowStage::OrderFinalized;
             }
             WorkflowTransition::OrderFillObserved {
+                observation_id,
                 cumulative_hype,
                 cumulative_filled_usdc,
                 cumulative_debited_usdc,
                 fully_filled,
-                ..
             } => {
+                if observation_id.trim().is_empty() {
+                    return Err(WorkflowError::InvalidTransition(
+                        "fill observation ID is empty".into(),
+                    ));
+                }
                 if self.order_is_terminal() {
                     return Err(WorkflowError::ContradictoryObservation(
                         "new fill appeared after terminal reconciliation".into(),
@@ -996,7 +1001,12 @@ impl DurableWorkflow {
         fully_filled: bool,
         at: DateTime<Utc>,
     ) -> Result<AppendOutcome, WorkflowError> {
-        let observation_id = observation_id.into();
+        let observation_id = observation_id.into().trim().to_owned();
+        if observation_id.is_empty() {
+            return Err(WorkflowError::InvalidTransition(
+                "fill observation ID is empty".into(),
+            ));
+        }
         self.append_observation(
             stable_id(
                 "event/order_fill/v1",
