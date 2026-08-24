@@ -7,9 +7,10 @@ use hype_accumulator::{
         BoundFillEvidence, BoundMovementEvidence, ConclusiveAbsenceEvidence, DecisionBinding,
         DurableWorkflow, EligibilityPolicyBinding, ExchangeFillOwner, ExchangeOrderOwner,
         ExchangeOrderOwnerStore, ExternalAction, ExternalReceipt, GapFreeHistoryWatermark,
-        HistoryDomain, HypeAtoms, InventoryBaseline, OrderBoundEligibilityEvidence,
-        OrderEnvelopeBinding, OrderFinality, OwnershipCommitOutcome, PrepareOutcome,
-        ProtectedWorkflowHead, ProtectedWorkflowHeadStore, WorkflowError, WorkflowStage,
+        HistoryDomain, HypeAtoms, InventoryBaseline, JournalCommitStatus,
+        OrderBoundEligibilityEvidence, OrderEnvelopeBinding, OrderFinality, OwnershipCommitOutcome,
+        PrepareOutcome, ProtectedWorkflowHead, ProtectedWorkflowHeadStore, WorkflowError,
+        WorkflowStage,
     },
 };
 use std::{
@@ -31,8 +32,6 @@ struct MemoryProtectedHeadStore {
 struct MemoryExchangeOrderOwnerStore {
     order_owners: Mutex<BTreeMap<(String, String), ExchangeOrderOwner>>,
     fill_owners: Mutex<BTreeMap<(String, String), ExchangeFillOwner>>,
-    lose_next_order_commit_response: Mutex<bool>,
-    lose_next_fill_commit_response: Mutex<bool>,
 }
 
 struct InitializationLockCheckingHeadStore {
@@ -118,7 +117,7 @@ impl ExchangeOrderOwnerStore for MemoryExchangeOrderOwnerStore {
     fn claim_and_commit(
         &self,
         owner: &ExchangeOrderOwner,
-        commit: &mut dyn FnMut() -> bool,
+        commit: &mut dyn FnMut() -> JournalCommitStatus,
     ) -> Result<OwnershipCommitOutcome, String> {
         let key = (
             owner.execution_identity_hash.clone(),
@@ -133,21 +132,16 @@ impl ExchangeOrderOwnerStore for MemoryExchangeOrderOwnerStore {
         }
         let inserted = !owners.contains_key(&key);
         owners.entry(key.clone()).or_insert_with(|| owner.clone());
-        if !commit() {
-            if inserted {
-                owners.remove(&key);
+        match commit() {
+            JournalCommitStatus::Committed => Ok(OwnershipCommitOutcome::Committed),
+            JournalCommitStatus::Ambiguous => Ok(OwnershipCommitOutcome::CommitAmbiguous),
+            JournalCommitStatus::Rejected => {
+                if inserted {
+                    owners.remove(&key);
+                }
+                Ok(OwnershipCommitOutcome::CommitRejected)
             }
-            return Ok(OwnershipCommitOutcome::CommitRejected);
         }
-        let mut lose_response = self
-            .lose_next_order_commit_response
-            .lock()
-            .map_err(|error| error.to_string())?;
-        if *lose_response {
-            *lose_response = false;
-            return Err("injected post-commit order-owner response loss".into());
-        }
-        Ok(OwnershipCommitOutcome::Committed)
     }
 
     fn claim_fills(&self, owners: &[ExchangeFillOwner]) -> Result<bool, String> {
@@ -170,7 +164,7 @@ impl ExchangeOrderOwnerStore for MemoryExchangeOrderOwnerStore {
     fn claim_fills_and_commit(
         &self,
         owners: &[ExchangeFillOwner],
-        commit: &mut dyn FnMut() -> bool,
+        commit: &mut dyn FnMut() -> JournalCommitStatus,
     ) -> Result<OwnershipCommitOutcome, String> {
         let Some(claims) = Self::fill_claims(owners) else {
             return Ok(OwnershipCommitOutcome::Conflict);
@@ -190,39 +184,20 @@ impl ExchangeOrderOwnerStore for MemoryExchangeOrderOwnerStore {
         for (key, owner) in &claims {
             owners.entry(key.clone()).or_insert_with(|| owner.clone());
         }
-        if !commit() {
-            for key in inserted_keys {
-                owners.remove(&key);
+        match commit() {
+            JournalCommitStatus::Committed => Ok(OwnershipCommitOutcome::Committed),
+            JournalCommitStatus::Ambiguous => Ok(OwnershipCommitOutcome::CommitAmbiguous),
+            JournalCommitStatus::Rejected => {
+                for key in inserted_keys {
+                    owners.remove(&key);
+                }
+                Ok(OwnershipCommitOutcome::CommitRejected)
             }
-            return Ok(OwnershipCommitOutcome::CommitRejected);
         }
-        let mut lose_response = self
-            .lose_next_fill_commit_response
-            .lock()
-            .map_err(|error| error.to_string())?;
-        if *lose_response {
-            *lose_response = false;
-            return Err("injected post-commit fill-owner response loss".into());
-        }
-        Ok(OwnershipCommitOutcome::Committed)
     }
 }
 
 impl MemoryExchangeOrderOwnerStore {
-    fn lose_next_order_commit_response(&self) {
-        *self
-            .lose_next_order_commit_response
-            .lock()
-            .expect("order-owner response-loss flag locks") = true;
-    }
-
-    fn lose_next_fill_commit_response(&self) {
-        *self
-            .lose_next_fill_commit_response
-            .lock()
-            .expect("fill-owner response-loss flag locks") = true;
-    }
-
     fn fill_claims(
         owners: &[ExchangeFillOwner],
     ) -> Option<BTreeMap<(String, String), ExchangeFillOwner>> {
@@ -1008,7 +983,7 @@ fn losing_journal_commit_does_not_retain_an_order_claim() {
 }
 
 #[test]
-fn order_owner_intent_survives_post_commit_response_loss() {
+fn order_owner_intent_survives_an_ambiguous_journal_commit() {
     let temp = tempfile::tempdir().expect("temp directory");
     let path = temp.path().join("order-owner-post-commit-loss.jsonl");
     let binding = binding();
@@ -1018,13 +993,13 @@ fn order_owner_intent_survives_post_commit_response_loss() {
         DurableWorkflow::open_or_create(&path, &binding, head_store.clone(), owner_store.clone())
             .expect("workflow opens");
     ready(workflow.prepare_order(at(1)).expect("order prepared"));
-    owner_store.lose_next_order_commit_response();
+    head_store.lose_next_compare_and_swap_response();
 
     assert!(matches!(
         observe_submission(&mut workflow, "reserved-order", at(2)),
-        Err(WorkflowError::ExchangeOrderOwner(_))
+        Err(WorkflowError::ProtectedHead(_))
     ));
-    assert_eq!(workflow.state().stage(), WorkflowStage::OrderSubmitted);
+    assert_eq!(workflow.state().stage(), WorkflowStage::Decided);
     assert!(owner_store.has_order_owner(
         &binding.inventory_before.execution_identity_hash,
         "reserved-order",
@@ -1161,7 +1136,7 @@ fn losing_journal_commit_does_not_retain_fill_claims() {
 }
 
 #[test]
-fn fill_owner_intent_survives_post_commit_response_loss() {
+fn fill_owner_intent_survives_an_ambiguous_journal_commit() {
     let temp = tempfile::tempdir().expect("temp directory");
     let path = temp.path().join("fill-owner-post-commit-loss.jsonl");
     let binding = binding();
@@ -1192,16 +1167,13 @@ fn fill_owner_intent_survives_post_commit_response_loss() {
         )
         .expect("order finalized");
     let evidence = bound_evidence(&workflow, &[("reserved-fill", 250, 3)], at(5));
-    owner_store.lose_next_fill_commit_response();
+    head_store.lose_next_compare_and_swap_response();
 
     assert!(matches!(
         workflow.record_staking_eligibility(Some(evidence), at(5)),
-        Err(WorkflowError::ExchangeFillOwner(_))
+        Err(WorkflowError::ProtectedHead(_))
     ));
-    assert_eq!(
-        workflow.state().stage(),
-        WorkflowStage::StakingEligibilityRecorded
-    );
+    assert_eq!(workflow.state().stage(), WorkflowStage::OrderFinalized);
     assert!(owner_store.has_fill_owner(
         &binding.inventory_before.execution_identity_hash,
         "reserved-fill",
@@ -2978,7 +2950,14 @@ fn every_signed_order_field_must_match_for_eligibility() {
     let temp = tempfile::tempdir().expect("temp directory");
     let binding = binding();
     for mismatch in [
-        "quantity", "scale", "metadata", "limit", "nonce", "expiry", "policy",
+        "quantity",
+        "scale",
+        "metadata",
+        "limit",
+        "nonce",
+        "expiry",
+        "policy",
+        "authorization-at-prepare",
     ] {
         let path = temp.path().join(format!("mismatched-{mismatch}.jsonl"));
         let mut workflow = reopen(&path, &binding);
@@ -2996,6 +2975,7 @@ fn every_signed_order_field_must_match_for_eligibility() {
             "nonce" => evidence.l1_nonce = 8,
             "expiry" => evidence.signed_expiry_at = at(28),
             "policy" => evidence.policy_version = "custody-policy-v2".to_owned(),
+            "authorization-at-prepare" => evidence.authorized_at = at(1),
             _ => unreachable!("complete fixture set"),
         }
 

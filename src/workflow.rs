@@ -581,6 +581,7 @@ pub struct WorkflowState {
     binding: DecisionBinding,
     stage: WorkflowStage,
     pending_action: Option<ExternalAction>,
+    order_prepared_at: Option<DateTime<Utc>>,
     exchange_order_id: Option<String>,
     order_accepted_at: Option<DateTime<Utc>>,
     purchased_hype: HypeAtoms,
@@ -713,6 +714,7 @@ impl WorkflowState {
             binding: binding.clone(),
             stage: WorkflowStage::Decided,
             pending_action: None,
+            order_prepared_at: None,
             exchange_order_id: None,
             order_accepted_at: None,
             purchased_hype: HypeAtoms::default(),
@@ -759,10 +761,13 @@ impl WorkflowState {
                 self.validate_prepared_action(action)?;
                 self.pending_action = Some(action.clone());
                 match action {
+                    ExternalAction::SubmitOrder { .. } => {
+                        self.order_prepared_at = Some(event.at);
+                    }
                     ExternalAction::DepositToStaking { amount_hype, .. } => {
                         self.staking_target_hype = *amount_hype;
                     }
-                    ExternalAction::SubmitOrder { .. } | ExternalAction::Delegate { .. } => {}
+                    ExternalAction::Delegate { .. } => {}
                 }
             }
             WorkflowTransition::OrderSubmissionObserved {
@@ -1120,6 +1125,9 @@ impl WorkflowState {
         let accepted_at = self.order_accepted_at.ok_or_else(|| {
             WorkflowError::CorruptJournal("accepted order timestamp is missing".into())
         })?;
+        let prepared_at = self.order_prepared_at.ok_or_else(|| {
+            WorkflowError::CorruptJournal("accepted order preparation timestamp is missing".into())
+        })?;
         if evidence.authorization_id.trim().is_empty()
             || evidence.authorization_record_hash.trim().is_empty()
             || evidence.policy_version.trim().is_empty()
@@ -1143,7 +1151,7 @@ impl WorkflowState {
             || evidence.order_id != order_id
             || evidence.accepted_at != accepted_at
             || evidence.authorized_at < self.binding.decided_at
-            || evidence.authorized_at > accepted_at
+            || evidence.authorized_at >= prepared_at
             || evidence.order_bound_at < accepted_at
             || evidence.order_bound_at >= evidence.effective_expiry_at
             || evidence.order_bound_at > recorded_at
@@ -1658,6 +1666,14 @@ pub enum OwnershipCommitOutcome {
     Committed,
     Conflict,
     CommitRejected,
+    CommitAmbiguous,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JournalCommitStatus {
+    Committed,
+    Rejected,
+    Ambiguous,
 }
 
 pub trait ExchangeOrderOwnerStore: Send + Sync {
@@ -1673,10 +1689,11 @@ pub trait ExchangeOrderOwnerStore: Send + Sync {
     /// The store must hold one execution-identity-wide serialization boundary
     /// while invoking `commit`. Before invoking it, the store must atomically
     /// and durably insert a missing owner as a recoverable intent. If `commit`
-    /// returns `false`, the store must atomically remove only an intent inserted
-    /// by this call before returning. An exact intent left by process failure is
-    /// retained and allows the same workflow to retry, while conflicting owners
-    /// remain excluded throughout the journal commit crash window.
+    /// returns [`JournalCommitStatus::Rejected`], the store must atomically
+    /// remove only an intent inserted by this call before returning. It must
+    /// retain the intent for `Committed` and `Ambiguous`. An exact intent left by
+    /// process failure is retained and allows the same workflow to retry, while
+    /// conflicting owners remain excluded throughout the commit crash window.
     ///
     /// # Errors
     ///
@@ -1684,7 +1701,7 @@ pub trait ExchangeOrderOwnerStore: Send + Sync {
     fn claim_and_commit(
         &self,
         owner: &ExchangeOrderOwner,
-        commit: &mut dyn FnMut() -> bool,
+        commit: &mut dyn FnMut() -> JournalCommitStatus,
     ) -> Result<OwnershipCommitOutcome, String>;
 
     /// Atomically claims a venue fill bundle for exactly one authorization and order.
@@ -1701,9 +1718,10 @@ pub trait ExchangeOrderOwnerStore: Send + Sync {
     ///
     /// Before invoking `commit`, the store must atomically and durably insert
     /// every missing owner in the bundle as one recoverable intent. If `commit`
-    /// returns `false`, it must atomically remove only the owners inserted by
-    /// this call. A process failure may leave the complete exact bundle for the
-    /// same workflow to retry, but must never expose a partial bundle.
+    /// returns [`JournalCommitStatus::Rejected`], it must atomically remove only
+    /// the owners inserted by this call. It must retain the complete bundle for
+    /// `Committed` and `Ambiguous`. A process failure may leave that exact bundle
+    /// for the same workflow to retry, but must never expose a partial bundle.
     ///
     /// # Errors
     ///
@@ -1711,7 +1729,7 @@ pub trait ExchangeOrderOwnerStore: Send + Sync {
     fn claim_fills_and_commit(
         &self,
         owners: &[ExchangeFillOwner],
-        commit: &mut dyn FnMut() -> bool,
+        commit: &mut dyn FnMut() -> JournalCommitStatus,
     ) -> Result<OwnershipCommitOutcome, String>;
 }
 
@@ -2012,21 +2030,21 @@ impl DurableWorkflow {
         let mut append_result = None;
         let mut commit = || {
             let result = self.append_observation(event_id.clone(), recorded_at, transition.clone());
-            let committed = result.is_ok();
+            let status = append_result_commit_status(&result);
             append_result = Some(result);
-            committed
+            status
         };
         let outcome = owner_store
             .claim_and_commit(&owner, &mut commit)
             .map_err(WorkflowError::exchange_order_owner)?;
         match outcome {
-            OwnershipCommitOutcome::Committed | OwnershipCommitOutcome::CommitRejected => {
-                append_result.ok_or_else(|| {
-                    WorkflowError::ExchangeOrderOwner(
-                        "owner store did not invoke the journal commit".into(),
-                    )
-                })?
-            }
+            OwnershipCommitOutcome::Committed
+            | OwnershipCommitOutcome::CommitRejected
+            | OwnershipCommitOutcome::CommitAmbiguous => append_result.ok_or_else(|| {
+                WorkflowError::ExchangeOrderOwner(
+                    "owner store did not invoke the journal commit".into(),
+                )
+            })?,
             OwnershipCommitOutcome::Conflict => {
                 if self.state.stage != WorkflowStage::ManualReview {
                     self.mark_manual_review(
@@ -2222,15 +2240,17 @@ impl DurableWorkflow {
             let mut append_result = None;
             let mut commit = || {
                 let result = self.append_observation(event_id.clone(), at, transition.clone());
-                let committed = result.is_ok();
+                let status = append_result_commit_status(&result);
                 append_result = Some(result);
-                committed
+                status
             };
             let outcome = owner_store
                 .claim_fills_and_commit(&owners, &mut commit)
                 .map_err(WorkflowError::exchange_fill_owner)?;
             match outcome {
-                OwnershipCommitOutcome::Committed | OwnershipCommitOutcome::CommitRejected => {
+                OwnershipCommitOutcome::Committed
+                | OwnershipCommitOutcome::CommitRejected
+                | OwnershipCommitOutcome::CommitAmbiguous => {
                     append_result.ok_or_else(|| {
                         WorkflowError::ExchangeFillOwner(
                             "owner store did not invoke the journal commit".into(),
@@ -3539,7 +3559,23 @@ pub enum WorkflowError {
     Json(String),
 }
 
+fn append_result_commit_status(
+    result: &Result<AppendOutcome, WorkflowError>,
+) -> JournalCommitStatus {
+    match result {
+        Ok(_) => JournalCommitStatus::Committed,
+        Err(error) => error.journal_commit_status(),
+    }
+}
+
 impl WorkflowError {
+    fn journal_commit_status(&self) -> JournalCommitStatus {
+        match self {
+            Self::ProtectedHead(_) | Self::Io(_) => JournalCommitStatus::Ambiguous,
+            _ => JournalCommitStatus::Rejected,
+        }
+    }
+
     #[allow(clippy::needless_pass_by_value)]
     fn io(error: io::Error) -> Self {
         Self::Io(error.to_string())
