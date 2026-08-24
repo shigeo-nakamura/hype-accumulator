@@ -40,8 +40,17 @@ configured account (spot plus staking/delegated), excluding unattributed
 external changes.
 
 The payload deliberately excludes account addresses, signing material,
-ciphertext, signed requests, and production topology. S3 emission and live
-account reconciliation remain gated by the ledger/observability work.
+ciphertext, signed requests, and production topology. The read-only
+`hype-status` binary queries spot balances, the HYPE mark, recent HYPE fills,
+and staking summary/delegations without constructing a signer, then atomically
+writes one local status snapshot:
+
+```text
+HYPE_ACCOUNT_ID=0x... cargo run --locked --bin hype-status -- config.local.toml status.json
+```
+
+This one-shot path is suitable for offline/DRY_RUN verification. S3 emission
+and deployed scheduling remain gated by the observability rollout.
 
 ## Local development
 
