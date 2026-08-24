@@ -350,6 +350,63 @@ fn reconciliation_correction_ids_cannot_be_reused() {
 }
 
 #[test]
+fn stable_order_ids_are_idempotent_and_cannot_change_ownership() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let anchor = anchor_store();
+    let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+    let date = at(0).date_naive();
+    ledger
+        .append(daily_outcome(
+            "daily-order-identity",
+            "decision-order-identity",
+            date,
+            "decision",
+        ))
+        .expect("append decision");
+    append_decision_backing(&mut ledger, "decision-order-identity", date, 10);
+    let order = dated_event(
+        "order-envelope-first",
+        date,
+        5,
+        LedgerEventKind::OrderRecorded {
+            order_id: "venue-order-stable".into(),
+            decision_id: "decision-order-identity".into(),
+        },
+    );
+    ledger.append(order.clone()).expect("append venue order");
+    let durable_before_retry = fs::read(ledger_path(directory.path())).expect("read ledger");
+    let record_count = ledger.record_count();
+
+    assert_eq!(
+        ledger
+            .append(LedgerEvent {
+                event_id: "order-envelope-retry".into(),
+                ..order
+            })
+            .expect("identical order retry"),
+        AppendOutcome::Duplicate
+    );
+    assert_eq!(ledger.record_count(), record_count);
+    assert_eq!(
+        fs::read(ledger_path(directory.path())).expect("read unchanged retry ledger"),
+        durable_before_retry
+    );
+    assert_eq!(
+        ledger.append(dated_event(
+            "order-envelope-conflict",
+            date,
+            6,
+            LedgerEventKind::OrderRecorded {
+                order_id: "venue-order-stable".into(),
+                decision_id: "decision-order-identity".into(),
+            },
+        )),
+        Err(LedgerError::OrderIdCollision("venue-order-stable".into()))
+    );
+    assert_eq!(ledger.record_count(), record_count);
+}
+
+#[test]
 fn stable_fill_ids_are_idempotent_and_cannot_change_ownership() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let anchor = anchor_store();
@@ -1550,6 +1607,46 @@ fn restore_reconstructs_missing_files_when_protected_anchor_matches() {
     .expect("matching protected anchor permits reconstruction");
     assert_eq!(restored.state(), &expected_state);
     assert_eq!(restored.head_hash(), expected_head);
+}
+
+#[test]
+fn restore_accepts_initialized_empty_journal_when_protected_anchor_matches() {
+    let source = tempfile::tempdir().expect("source directory");
+    let destination = tempfile::tempdir().expect("destination directory");
+    let source_anchor = anchor_store();
+    let destination_anchor = anchor_store();
+    let mut ledger = open(source.path(), &source_anchor).expect("open source ledger");
+    ledger
+        .append(deposit("deposit-before-initialized-loss", 1, 100))
+        .expect("append deposit");
+    let expected_state = ledger.state().clone();
+    drop(ledger);
+
+    destination_anchor.replace_for_test(
+        source_anchor
+            .load()
+            .expect("load source anchor accepted by destination"),
+    );
+    assert!(matches!(
+        open(destination.path(), &destination_anchor),
+        Err(LedgerError::TruncatedLedger)
+    ));
+    assert_eq!(
+        fs::metadata(ledger_path(destination.path()))
+            .expect("initialized empty journal")
+            .len(),
+        0
+    );
+    assert!(!snapshot_path(destination.path()).exists());
+
+    let restored = restore(
+        source.path(),
+        destination.path(),
+        &source_anchor,
+        &destination_anchor,
+    )
+    .expect("matching protected anchor permits initialized recovery");
+    assert_eq!(restored.state(), &expected_state);
 }
 
 #[test]

@@ -522,6 +522,9 @@ impl DurableLedger {
                 Err(LedgerError::EventCollision(event.event_id))
             };
         }
+        if self.is_duplicate_order(&event)? {
+            return Ok(AppendOutcome::Duplicate);
+        }
         if self.is_duplicate_fill(&event)? {
             return Ok(AppendOutcome::Duplicate);
         }
@@ -652,9 +655,12 @@ impl DurableLedger {
                 }
                 target
             }
-            None if has_only_restore_entries(&destination, false)?
+            None if (has_only_restore_entries(&destination, false)?
                 && (destination_anchor.is_none()
-                    || destination_anchor.as_ref() == verified.anchor.as_ref()) =>
+                    || destination_anchor.as_ref() == verified.anchor.as_ref()))
+                || (destination_anchor.is_some()
+                    && destination_anchor.as_ref() == verified.anchor.as_ref()
+                    && has_only_initialized_empty_restore_entries(&destination)?) =>
             {
                 write_pending_restore(&destination, &current_pending)?;
                 RestoreTarget::from_verified(ledger_payload, snapshot_payload, &verified)
@@ -690,6 +696,34 @@ impl DurableLedger {
         }
         clear_pending_restore(&destination)?;
         Ok(restored)
+    }
+
+    fn is_duplicate_order(&self, candidate: &LedgerEvent) -> Result<bool, LedgerError> {
+        let LedgerEventKind::OrderRecorded {
+            order_id,
+            decision_id,
+        } = &candidate.kind
+        else {
+            return Ok(false);
+        };
+        for existing in self.events_by_id.values() {
+            let LedgerEventKind::OrderRecorded {
+                order_id: existing_order_id,
+                decision_id: existing_decision_id,
+            } = &existing.kind
+            else {
+                continue;
+            };
+            if existing_order_id != order_id {
+                continue;
+            }
+            if existing.occurred_at == candidate.occurred_at && existing_decision_id == decision_id
+            {
+                return Ok(true);
+            }
+            return Err(LedgerError::OrderIdCollision(order_id.clone()));
+        }
+        Ok(false)
     }
 
     fn is_duplicate_fill(&self, candidate: &LedgerEvent) -> Result<bool, LedgerError> {
@@ -2379,6 +2413,25 @@ fn has_only_restore_entries(directory: &Path, pending: bool) -> Result<bool, Led
         return Ok(false);
     }
     Ok(true)
+}
+
+fn has_only_initialized_empty_restore_entries(directory: &Path) -> Result<bool, LedgerError> {
+    let mut has_empty_journal = false;
+    for entry in fs::read_dir(directory).map_err(LedgerError::io)? {
+        let entry = entry.map_err(LedgerError::io)?;
+        let name = entry.file_name();
+        if name == LOCK_FILE_NAME {
+            continue;
+        }
+        if name != LEDGER_FILE_NAME || has_empty_journal {
+            return Ok(false);
+        }
+        if !read_single_linked_regular(&entry.path())?.is_some_and(|payload| payload.is_empty()) {
+            return Ok(false);
+        }
+        has_empty_journal = true;
+    }
+    Ok(has_empty_journal)
 }
 
 fn restore_is_complete(
