@@ -101,6 +101,20 @@ cargo build --locked
 
 The first command reports `mode=dry-run ready`. CI runs the same gates.
 
+## ARM64 release compatibility
+
+CI builds and tests release artifacts on a native ARM64 runner inside a
+versioned, digest-pinned Amazon Linux 2023 container. Before packaging, both
+binaries must resolve every shared library with `ldd` in that container. The
+main binary also validates the non-routable example configuration, while the
+status binary is exercised only through its argument-validation path so the
+check cannot contact an exchange or require a signer.
+
+Each archive includes checksummed build provenance and an `AL2023-ABI.txt`
+report containing the image digest, OS/libc identity, dynamic dependencies, and
+required glibc symbol versions. This artifact workflow does not deploy, start a
+service, install configuration or credentials, or enable live behavior.
+
 ## Research
 
 The standard-library-only point-in-time research harness compares deposit-aware daily and weekly DCA with explicitly bounded adaptive pacing. It enforces capital admission times, one purchase per UTC day, execution limits, and data revision/publication rules.

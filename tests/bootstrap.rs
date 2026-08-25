@@ -3,7 +3,7 @@ use hype_accumulator::{
     bootstrap,
     capital::automatically_deployable,
     config::{Config, ConfigError},
-    exchange::{DryRunExchange, Exchange, OrderIntent, Submission},
+    exchange::{DryRunExchange, Exchange, OrderIntent, OrderTimeInForce, Submission},
 };
 use std::{cell::Cell, collections::HashMap, rc::Rc};
 fn fixture() -> Config {
@@ -33,7 +33,9 @@ fn dry_run_never_constructs_live_exchange() {
     assert_eq!(
         exchange.submit(&OrderIntent {
             notional_usdc: 10.0,
-            max_slippage_bps: 10
+            max_slippage_bps: 10,
+            max_purchase_fee_bps: 0,
+            time_in_force: OrderTimeInForce::ImmediateOrCancel,
         }),
         Ok(Submission::Simulated)
     );
@@ -176,6 +178,8 @@ fn dry_run_exchange_only_simulates() {
     let intent = OrderIntent {
         notional_usdc: 12.0,
         max_slippage_bps: 5,
+        max_purchase_fee_bps: 0,
+        time_in_force: OrderTimeInForce::ImmediateOrCancel,
     };
     assert_eq!(exchange.submit(&intent), Ok(Submission::Simulated));
     assert_eq!(exchange.simulated(), &[intent]);

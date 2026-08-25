@@ -65,6 +65,7 @@ pub struct PacingLimits {
     pub deposit_cooldown_seconds: u64,
     pub min_order_usdc: UsdcMicros,
     pub max_daily_notional_usdc: UsdcMicros,
+    pub fixed_reserve_usdc: UsdcMicros,
     pub fee_spread_reserve_bps: u16,
     pub final_catch_up_days: u32,
     pub carry_over_policy: CarryOverPolicy,
@@ -83,6 +84,11 @@ impl PacingLimits {
     /// invariant is inconsistent. Call [`Config::validate`] first for the full
     /// startup validation path.
     pub fn from_config(config: &Config) -> Result<Self, PacingError> {
+        let fixed_reserve_microusd = match config.effective_security_reserve_microusd() {
+            Some(value) => value,
+            None if config.dry_run => 0,
+            None => return Err(PacingError::InvalidLimits),
+        };
         let limits = Self {
             min_deposit_confirmations: config.capital.min_deposit_confirmations,
             max_automatically_admitted_usdc: money_from_f64(
@@ -94,12 +100,8 @@ impl PacingLimits {
             )?,
             deposit_cooldown_seconds: config.pacing.deposit_cooldown_seconds,
             min_order_usdc: money_from_f64(config.pacing.min_order_usdc)?,
-            max_daily_notional_usdc: money_from_f64(
-                config
-                    .pacing
-                    .max_order_usdc
-                    .min(config.execution.max_order_usdc),
-            )?,
+            max_daily_notional_usdc: money_from_f64(config.effective_max_order_usdc())?,
+            fixed_reserve_usdc: UsdcMicros::from_micros(fixed_reserve_microusd),
             fee_spread_reserve_bps: config.pacing.fee_spread_reserve_bps,
             final_catch_up_days: config.pacing.final_catch_up_days,
             carry_over_policy: config.pacing.carry_over_policy,
@@ -127,6 +129,7 @@ impl PacingLimits {
             || self.cumulative_admission_cap_usdc.is_zero()
             || self.max_automatically_admitted_usdc > self.yearly_admission_cap_usdc
             || self.yearly_admission_cap_usdc > self.cumulative_admission_cap_usdc
+            || self.fixed_reserve_usdc >= self.max_automatically_admitted_usdc
             || self.fee_spread_reserve_bps >= 10_000
             || self.final_catch_up_days == 0
             || self.utc_hour > 23
@@ -137,6 +140,19 @@ impl PacingLimits {
             return Err(PacingError::InvalidLimits);
         }
         Ok(())
+    }
+
+    fn spendable_budget(
+        &self,
+        active: UsdcMicros,
+        aggregate: UsdcMicros,
+    ) -> Result<UsdcMicros, PacingError> {
+        apply_reserves(
+            active,
+            aggregate,
+            self.fixed_reserve_usdc,
+            self.fee_spread_reserve_bps,
+        )
     }
 }
 
@@ -370,8 +386,8 @@ impl PacingState {
     ///
     /// Deposit admission requires confirmations, cooldown, explicit approval,
     /// and available automatic/yearly/cumulative capacity. A reconciled
-    /// withdrawal consumes only free tranche residual and never creates a HYPE
-    /// sale intent.
+    /// withdrawal consumes only free tranche residual above the global fixed
+    /// reserve and never creates a HYPE sale intent.
     ///
     /// # Errors
     ///
@@ -671,6 +687,21 @@ impl PacingState {
                 return Err(PacingError::CorruptState);
             }
         }
+        let free_before_withdrawals = checked_sum(self.deposits.values().map(|tranche| {
+            UsdcMicros(
+                tranche
+                    .admitted_usdc
+                    .0
+                    .saturating_sub(tranche.invested_usdc.0)
+                    .saturating_sub(tranche.committed_usdc.0),
+            )
+        }))?;
+        let residual = checked_sum(self.deposits.values().map(DepositTranche::residual_usdc))?;
+        let required_reserve =
+            UsdcMicros(free_before_withdrawals.0.min(limits.fixed_reserve_usdc.0));
+        if residual < required_reserve {
+            return Err(PacingError::CorruptState);
+        }
         Ok(())
     }
 
@@ -943,7 +974,7 @@ impl PacingState {
             if kind == 0 {
                 self.admit_ready_deposit(&id, limits)?;
             } else {
-                self.apply_ready_withdrawal(&id)?;
+                self.apply_ready_withdrawal(&id, limits)?;
             }
         }
         Ok(())
@@ -994,10 +1025,15 @@ impl PacingState {
         Ok((admitted_total, admitted_year))
     }
 
-    fn apply_ready_withdrawal(&mut self, id: &str) -> Result<(), PacingError> {
+    fn apply_ready_withdrawal(
+        &mut self,
+        id: &str,
+        limits: &PacingLimits,
+    ) -> Result<(), PacingError> {
         let record = self.withdrawals.get(id).ok_or(PacingError::CorruptState)?;
         let free = checked_sum(self.deposits.values().map(DepositTranche::residual_usdc))?;
-        if record.event.amount_usdc > free {
+        let withdrawable = checked_sub_floor(free, limits.fixed_reserve_usdc);
+        if record.event.amount_usdc > withdrawable {
             return Err(PacingError::WithdrawalExceedsFreeCapital(id.to_owned()));
         }
         let target = record.event.amount_usdc;
@@ -1074,7 +1110,7 @@ impl PacingState {
             checked_sum(self.deposits.values().map(DepositTranche::residual_usdc))?;
         let unadmitted = checked_sum(self.deposits.values().map(DepositTranche::unadmitted_usdc))?;
         let observed_budget =
-            apply_reserve(input.observed_spot_usdc, limits.fee_spread_reserve_bps)?;
+            limits.spendable_budget(input.observed_spot_usdc, input.observed_spot_usdc)?;
         let mut alerts = Vec::new();
         if !unadmitted.is_zero() {
             alerts.push(PacingAlert::UnadmittedCapital {
@@ -1113,7 +1149,7 @@ impl PacingState {
             };
         } else {
             let active_residual = checked_sum(due_rows.iter().map(|row| row.3))?;
-            let admitted_budget = apply_reserve(active_residual, limits.fee_spread_reserve_bps)?;
+            let admitted_budget = limits.spendable_budget(active_residual, admitted_unspent)?;
             if active_residual < limits.min_order_usdc {
                 reason = DecisionReason::BelowExchangeMinimum;
             } else if admitted_budget < limits.min_order_usdc {
@@ -1144,10 +1180,8 @@ impl PacingState {
             unadmitted_usdc: unadmitted,
             fixed_required_usdc: fixed_required,
             observed_budget_after_reserve_usdc: observed_budget,
-            admitted_budget_after_reserve_usdc: apply_reserve(
-                admitted_unspent,
-                limits.fee_spread_reserve_bps,
-            )?,
+            admitted_budget_after_reserve_usdc: limits
+                .spendable_budget(admitted_unspent, admitted_unspent)?,
             exchange_minimum_usdc: limits.min_order_usdc,
             daily_cap_usdc: limits.max_daily_notional_usdc,
             fee_spread_reserve_bps: limits.fee_spread_reserve_bps,
@@ -1479,6 +1513,16 @@ fn apply_reserve(value: UsdcMicros, reserve_bps: u16) -> Result<UsdcMicros, Paci
     Ok(UsdcMicros(
         u64::try_from(value).map_err(|_| PacingError::ArithmeticOverflow)?,
     ))
+}
+
+fn apply_reserves(
+    active: UsdcMicros,
+    aggregate: UsdcMicros,
+    fixed_reserve: UsdcMicros,
+    reserve_bps: u16,
+) -> Result<UsdcMicros, PacingError> {
+    let aggregate_after_fixed = aggregate.0.checked_sub(fixed_reserve.0).unwrap_or_default();
+    apply_reserve(UsdcMicros(active.0.min(aggregate_after_fixed)), reserve_bps)
 }
 
 fn gross_up_reserve(value: UsdcMicros, reserve_bps: u16) -> Result<UsdcMicros, PacingError> {

@@ -11,9 +11,11 @@ pub mod pacing;
 pub mod signal;
 pub mod status;
 pub mod status_io;
+pub mod workflow;
 
+use clock::{Clock, SystemClock};
 use config::{Config, ConfigError, Environment};
-use exchange::{DryRunExchange, Exchange};
+use exchange::{DryRunExchange, Exchange, PolicyEnforcedExchange};
 
 /// Validates every safety boundary before constructing a network-capable exchange.
 ///
@@ -30,10 +32,34 @@ where
     E: Environment,
     F: FnOnce(&Config) -> Box<dyn Exchange>,
 {
-    config.validate(env)?;
+    bootstrap_with_clock(config, env, SystemClock, live_factory)
+}
+
+/// Validates safety boundaries and injects a clock for action-time policy checks.
+///
+/// # Errors
+///
+/// Returns [`ConfigError`] when configuration validation fails. The live
+/// factory is never called on an error or while `dry_run` is enabled.
+pub fn bootstrap_with_clock<E, F, C>(
+    config: &Config,
+    env: &E,
+    clock: C,
+    live_factory: F,
+) -> Result<Box<dyn Exchange>, ConfigError>
+where
+    E: Environment,
+    F: FnOnce(&Config) -> Box<dyn Exchange>,
+    C: Clock + 'static,
+{
+    let policy = config.runtime_action_policy_at(env, clock.now())?;
     if config.dry_run {
         Ok(Box::new(DryRunExchange::default()))
     } else {
-        Ok(live_factory(config))
+        Ok(Box::new(PolicyEnforcedExchange::new(
+            live_factory(config),
+            policy,
+            clock,
+        )))
     }
 }
