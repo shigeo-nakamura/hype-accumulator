@@ -498,6 +498,26 @@ class ReleaseInstallTests(unittest.TestCase):
                     )
             self.assertFalse((Path(args.install_root) / "current").exists())
 
+    def test_activation_rejects_special_permission_bits_before_preflight(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            commit = "a" * 40
+            archive, checksum = write_archive(root, commit)
+            args = stage_args(root, archive, checksum, commit)
+            with mock.patch.object(release_install, "verify_runtime"):
+                staged = release_install.stage_release(args)
+
+            release_dir = Path(args.install_root) / "releases" / staged["release_id"]
+            (release_dir / "hype-accumulator").chmod(0o4755)
+
+            with mock.patch.object(release_install, "verify_runtime") as runtime:
+                with self.assertRaisesRegex(release_install.InstallError, "unsafe mode"):
+                    release_install.select_release(
+                        select_args(args, staged["release_id"]), "activate"
+                    )
+            runtime.assert_not_called()
+            self.assertFalse((Path(args.install_root) / "current").exists())
+
     def test_failed_activation_preflight_preserves_the_current_release(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

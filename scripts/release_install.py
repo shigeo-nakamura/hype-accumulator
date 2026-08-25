@@ -483,7 +483,7 @@ def require_installed_member(path: Path, mode: int) -> None:
     status = path.stat()
     if status.st_uid != os.geteuid() or status.st_nlink != 1:
         raise InstallError(f"installed member {path.name} has unsafe ownership or links")
-    if status.st_mode & 0o777 != mode:
+    if status.st_mode & 0o7777 != mode:
         raise InstallError(f"installed member {path.name} has unsafe mode")
 
 
