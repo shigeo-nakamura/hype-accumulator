@@ -1,4 +1,8 @@
-use hype_accumulator::{bootstrap, config::Config, exchange::UnavailableLiveExchange};
+use hype_accumulator::{
+    bootstrap,
+    config::{Config, ProcessEnvironment},
+    exchange::UnavailableLiveExchange,
+};
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -13,29 +17,71 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let (config_path, security_policy_path) = config_paths(env::args().skip(1))?;
-    let config = load_config(&config_path, security_policy_path.as_deref())?;
-    let exchange = bootstrap(
-        &config,
-        &hype_accumulator::config::ProcessEnvironment,
-        |_| Box::new(UnavailableLiveExchange),
-    )?;
-    println!("mode={} ready", exchange.mode());
+    match invocation(env::args().skip(1))? {
+        Invocation::Startup {
+            config_path,
+            security_policy_path,
+        } => {
+            let config = load_config(&config_path, security_policy_path.as_deref())?;
+            let exchange = bootstrap(&config, &ProcessEnvironment, |_| {
+                Box::new(UnavailableLiveExchange)
+            })?;
+            println!("mode={} ready", exchange.mode());
+        }
+        Invocation::InstallPreflight {
+            config_path,
+            security_policy_path,
+        } => {
+            let config = load_config(&config_path, Some(&security_policy_path))?;
+            config.validate_offline_install(&ProcessEnvironment)?;
+            println!("mode=dry-run halted install-ready");
+        }
+    }
     Ok(())
 }
 
-fn config_paths<I>(mut args: I) -> Result<(PathBuf, Option<PathBuf>), &'static str>
+#[derive(Debug, Eq, PartialEq)]
+enum Invocation {
+    Startup {
+        config_path: PathBuf,
+        security_policy_path: Option<PathBuf>,
+    },
+    InstallPreflight {
+        config_path: PathBuf,
+        security_policy_path: PathBuf,
+    },
+}
+
+fn invocation<I>(args: I) -> Result<Invocation, &'static str>
 where
     I: Iterator<Item = String>,
 {
-    let config_path = args
-        .next()
-        .map_or_else(|| PathBuf::from("config.toml"), PathBuf::from);
-    let security_policy_path = args.next().map(PathBuf::from);
-    if args.next().is_some() {
-        return Err("usage: hype-accumulator [config.toml] [security-policy.toml]");
+    let args = args.collect::<Vec<_>>();
+    match args.as_slice() {
+        [] => Ok(Invocation::Startup {
+            config_path: PathBuf::from("config.toml"),
+            security_policy_path: None,
+        }),
+        [config_path] => Ok(Invocation::Startup {
+            config_path: PathBuf::from(config_path),
+            security_policy_path: None,
+        }),
+        [config_path, security_policy_path] if config_path != "--install-preflight" => {
+            Ok(Invocation::Startup {
+                config_path: PathBuf::from(config_path),
+                security_policy_path: Some(PathBuf::from(security_policy_path)),
+            })
+        }
+        [command, config_path, security_policy_path] if command == "--install-preflight" => {
+            Ok(Invocation::InstallPreflight {
+                config_path: PathBuf::from(config_path),
+                security_policy_path: PathBuf::from(security_policy_path),
+            })
+        }
+        _ => Err(
+            "usage: hype-accumulator [config.toml] [security-policy.toml] | --install-preflight config.toml security-policy.toml",
+        ),
     }
-    Ok((config_path, security_policy_path))
 }
 
 fn load_config(
@@ -54,8 +100,33 @@ fn load_config(
 
 #[cfg(test)]
 mod tests {
-    use super::load_config;
-    use std::fs;
+    use super::{invocation, load_config, Invocation};
+    use std::{fs, path::PathBuf};
+
+    #[test]
+    fn install_preflight_requires_both_explicit_documents() {
+        assert_eq!(
+            invocation(
+                [
+                    "--install-preflight",
+                    "runtime.toml",
+                    "security-policy.toml",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+            ),
+            Ok(Invocation::InstallPreflight {
+                config_path: PathBuf::from("runtime.toml"),
+                security_policy_path: PathBuf::from("security-policy.toml"),
+            })
+        );
+        assert!(invocation(
+            ["--install-preflight", "runtime.toml"]
+                .into_iter()
+                .map(str::to_owned)
+        )
+        .is_err());
+    }
 
     #[test]
     fn cli_loads_and_validates_the_explicit_security_policy_document() {
