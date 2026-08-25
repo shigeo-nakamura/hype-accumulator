@@ -48,6 +48,10 @@ def nested_keys(value: Any) -> set[str]:
 
 
 class Stage1EvidenceTests(unittest.TestCase):
+    def assert_cargo_command_is_offline(self, command: str) -> None:
+        if command.startswith("cargo ") and not command.startswith("cargo fmt "):
+            self.assertIn("--offline", command)
+
     def test_companion_digest_matches_exact_bytes(self) -> None:
         expected = hashlib.sha256(EVIDENCE.read_bytes()).hexdigest()
         self.assertEqual(
@@ -101,9 +105,12 @@ class Stage1EvidenceTests(unittest.TestCase):
             self.assertRegex(run["commit"], SHA_PATTERN)
             self.assertTrue(run["command"])
             self.assertTrue(run["result"])
+            self.assert_cargo_command_is_offline(run["command"])
 
         for gate in evidence["required_gates"]:
             for item in gate["evidence"]:
+                if item["kind"] == "verification_run":
+                    self.assert_cargo_command_is_offline(item["command"])
                 if item["kind"] != "github_pr":
                     continue
                 self.assertRegex(item["head_commit"], SHA_PATTERN)

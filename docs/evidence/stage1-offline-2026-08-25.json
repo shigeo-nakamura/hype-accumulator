@@ -57,7 +57,7 @@
     {
       "repository": "shigeo-nakamura/hype-accumulator",
       "commit": "8ab6f730e463d6c1bc1bda14ad9bbf7ae33f9756",
-      "command": "cargo test --all-targets --locked",
+      "command": "cargo test --offline --all-targets --locked",
       "status": "PASS",
       "result": "233 Rust tests passed"
     },
@@ -71,14 +71,14 @@
     {
       "repository": "shigeo-nakamura/hype-accumulator",
       "commit": "8ab6f730e463d6c1bc1bda14ad9bbf7ae33f9756",
-      "command": "cargo clippy --all-targets --locked -- -D warnings",
+      "command": "cargo clippy --offline --all-targets --locked -- -D warnings",
       "status": "PASS",
       "result": "Strict lint check passed"
     },
     {
       "repository": "shigeo-nakamura/hype-accumulator",
       "commit": "8ab6f730e463d6c1bc1bda14ad9bbf7ae33f9756",
-      "command": "cargo build --locked",
+      "command": "cargo build --offline --locked",
       "status": "PASS",
       "result": "Locked debug build passed"
     },
@@ -176,7 +176,7 @@
         },
         {
           "kind": "verification_run",
-          "command": "cargo test --all-targets --locked",
+          "command": "cargo test --offline --all-targets --locked",
           "result": "PASS"
         }
       ]
@@ -240,7 +240,7 @@
         },
         {
           "kind": "verification_run",
-          "command": "cargo test --test ledger --locked",
+          "command": "cargo test --offline --test ledger --locked",
           "result": "PASS"
         }
       ]
@@ -260,7 +260,7 @@
         },
         {
           "kind": "verification_run",
-          "command": "cargo test --test security_policy --locked",
+          "command": "cargo test --offline --test security_policy --locked",
           "result": "PASS"
         }
       ]
@@ -280,7 +280,7 @@
         },
         {
           "kind": "verification_run",
-          "command": "cargo test --test monitor --test status --test status_io --locked",
+          "command": "cargo test --offline --test monitor --test status --test status_io --locked",
           "result": "PASS"
         }
       ]
