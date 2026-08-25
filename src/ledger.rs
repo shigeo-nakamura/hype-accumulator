@@ -1897,12 +1897,18 @@ fn restore_target_from_pending(
 }
 
 fn load_pending_restore(directory: &Path) -> Result<Option<PendingRestore>, LedgerError> {
-    match fs::read(directory.join(RESTORE_PENDING_FILE_NAME)) {
-        Ok(payload) if payload.is_empty() => Err(LedgerError::CorruptRestorePending),
-        Ok(payload) => decode_pending_restore(&payload).map(Some),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(LedgerError::io(error)),
+    let path = directory.join(RESTORE_PENDING_FILE_NAME);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(LedgerError::io(error)),
     }
+    let payload =
+        read_single_linked_regular(&path)?.ok_or(LedgerError::RestoreDestinationNotEmpty)?;
+    if payload.is_empty() {
+        return Err(LedgerError::CorruptRestorePending);
+    }
+    decode_pending_restore(&payload).map(Some)
 }
 
 fn decode_pending_restore(payload: &[u8]) -> Result<PendingRestore, LedgerError> {
@@ -3725,6 +3731,60 @@ mod transaction_tests {
         assert_eq!(
             fs::read(destination.join(SNAPSHOT_FILE_NAME)).expect("read unchanged snapshot"),
             snapshot_payload
+        );
+        assert!(destination_anchor
+            .load()
+            .expect("load destination anchor")
+            .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_restore_intent_is_rejected_without_cleanup() {
+        use std::os::unix::fs::symlink;
+
+        let source = tempfile::tempdir().expect("source directory");
+        let container = tempfile::tempdir().expect("destination container");
+        let destination = container.path().join("restored");
+        let external_intent = container.path().join("external-restore-intent.json");
+        let source_anchor = anchor_store();
+        let destination_anchor = anchor_store();
+        let mut ledger = open(source.path(), &source_anchor).expect("open source ledger");
+        ledger
+            .append(deposit("deposit-before-symlinked-intent", 1))
+            .expect("append deposit");
+        drop(ledger);
+
+        let verified = open(source.path(), &source_anchor).expect("verify source ledger");
+        let ledger_payload =
+            fs::read(source.path().join(LEDGER_FILE_NAME)).expect("read source journal");
+        let snapshot_payload =
+            fs::read(source.path().join(SNAPSHOT_FILE_NAME)).expect("read source snapshot");
+        let pending = build_pending_restore(&ledger_payload, &snapshot_payload, &verified)
+            .expect("build restore intent");
+        let pending_payload = encode_pending_restore(&pending).expect("encode restore intent");
+        fs::write(&external_intent, &pending_payload).expect("write external restore intent");
+        canonical_directory(&destination).expect("durably create destination directory");
+        drop(LedgerLock::acquire(&destination).expect("create destination lock"));
+        symlink(
+            &external_intent,
+            destination.join(RESTORE_PENDING_FILE_NAME),
+        )
+        .expect("link external restore intent");
+
+        assert!(matches!(
+            DurableLedger::restore_clean(
+                source.path(),
+                &destination,
+                source_anchor,
+                destination_anchor.clone(),
+            ),
+            Err(LedgerError::RestoreDestinationNotEmpty)
+        ));
+        assert!(fs::symlink_metadata(destination.join(RESTORE_PENDING_FILE_NAME)).is_ok());
+        assert_eq!(
+            fs::read(&external_intent).expect("read unchanged external intent"),
+            pending_payload
         );
         assert!(destination_anchor
             .load()
