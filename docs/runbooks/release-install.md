@@ -69,8 +69,9 @@ mode=dry-run halted install-ready
 
 The verified source archive is retained read-only in the content-addressed
 release directory so later activation cannot trust a rewritten install manifest
-or substituted binary. The release directory itself must not be group- or
-world-writable, and installed file ownership, link count, and modes are checked
+or substituted binary. The release directory is exactly `0755`: non-writable by
+the service identity while remaining traversable when deployment and runtime
+use different UIDs. Installed file ownership, link count, and modes are checked
 again before every selection. A non-symlink, single-link local lock serializes
 stage and selection commands and rejects a concurrent invocation without
 waiting indefinitely.

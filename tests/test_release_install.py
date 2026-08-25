@@ -135,6 +135,7 @@ class ReleaseInstallTests(unittest.TestCase):
             )
             self.assertEqual(manifest["commit"], commit)
             self.assertEqual(manifest["archive_sha256"], first["archive_sha256"])
+            self.assertEqual(release_dir.stat().st_mode & 0o7777, 0o755)
             self.assertFalse((Path(args.install_root) / "current").exists())
 
     def test_external_checksum_and_closed_archive_fail_before_staging(self):

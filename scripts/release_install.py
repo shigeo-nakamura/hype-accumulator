@@ -390,8 +390,9 @@ def verify_staged_release(release_dir: Path, manifest: dict[str, object]) -> Non
     if release_dir.is_symlink() or not release_dir.is_dir():
         raise InstallError("staged release is not a regular directory")
     release_status = release_dir.stat()
-    if release_status.st_uid != os.geteuid() or release_status.st_mode & (
-        stat.S_IWGRP | stat.S_IWOTH
+    if (
+        release_status.st_uid != os.geteuid()
+        or release_status.st_mode & 0o7777 != 0o755
     ):
         raise InstallError("staged release directory has unsafe ownership or mode")
     expected_names = set(ARCHIVE_FILES) | {INSTALL_MANIFEST, SOURCE_ARCHIVE}
@@ -491,6 +492,7 @@ def stage_release_locked(
     final_release = releases / release_id
     with tempfile.TemporaryDirectory(prefix=".stage-", dir=releases) as temporary:
         temporary_release = Path(temporary)
+        temporary_release.chmod(0o755)
         extract_closed_archive(archive_path, temporary_release)
         checksums = parse_inner_checksums(temporary_release)
         verify_provenance(temporary_release, expected)
