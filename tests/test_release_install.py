@@ -99,7 +99,7 @@ def stage_args(
     policy.write_text("[operator]\ndry_run = true\nmanual_halt = true\n")
     return argparse.Namespace(
         archive=str(archive),
-        archive_sha256_file=str(checksum),
+        expected_archive_sha256=checksum.read_text().split()[0],
         expected_repository=REPOSITORY,
         expected_commit=commit,
         expected_target=TARGET,
@@ -282,14 +282,22 @@ class ReleaseInstallTests(unittest.TestCase):
             self.assertEqual(release_dir.stat().st_mode & 0o7777, 0o755)
             self.assertFalse((Path(args.install_root) / "current").exists())
 
-    def test_external_checksum_and_closed_archive_fail_before_staging(self):
+    def test_protected_archive_digest_and_closed_archive_fail_before_staging(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             commit = "a" * 40
             archive, checksum = write_archive(root, commit)
             args = stage_args(root, archive, checksum, commit)
-            checksum.write_text(f"{'0' * 64}  {archive.name}\n")
-            with self.assertRaisesRegex(release_install.InstallError, "external checksum"):
+            replacement_root = root / "replacement"
+            replacement_root.mkdir()
+            replacement_archive, replacement_checksum = write_archive(
+                replacement_root, commit, repository="other/repository"
+            )
+            os.replace(replacement_archive, archive)
+            checksum.write_text(replacement_checksum.read_text())
+            with self.assertRaisesRegex(
+                release_install.InstallError, "external checksum"
+            ):
                 release_install.stage_release(args)
 
             bad_root = root / "unexpected"
@@ -342,17 +350,36 @@ class ReleaseInstallTests(unittest.TestCase):
             self.assertEqual(release_install.sha256_file(retained_archive), original_digest)
             self.assertNotEqual(release_install.sha256_file(archive), original_digest)
 
-    def test_noncanonical_external_checksum_is_rejected(self):
+    def test_noncanonical_protected_archive_digest_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             commit = "a" * 40
             archive, checksum = write_archive(root, commit)
-            checksum.write_text(
-                f"{release_install.sha256_file(archive)}\t{archive.name}\n"
+            args = stage_args(root, archive, checksum, commit)
+            args.expected_archive_sha256 = args.expected_archive_sha256.upper()
+            with self.assertRaisesRegex(
+                release_install.InstallError, "expected release archive"
+            ):
+                release_install.stage_release(args)
+
+    def test_new_install_lock_is_normalized_under_a_restrictive_umask(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            Path(temporary).chmod(0o755)
+            install_root, _ = release_install.ensure_install_root(
+                Path(temporary) / "install"
             )
-            with self.assertRaisesRegex(release_install.InstallError, "exact archive"):
-                release_install.stage_release(
-                    stage_args(root, archive, checksum, commit)
+            previous_umask = os.umask(0o777)
+            try:
+                with release_install.install_lock(install_root):
+                    lock = install_root / ".release-install.lock"
+                    self.assertEqual(lock.stat().st_mode & 0o777, 0o600)
+            finally:
+                os.umask(previous_umask)
+
+            with release_install.install_lock(install_root):
+                self.assertEqual(
+                    (install_root / ".release-install.lock").stat().st_mode & 0o777,
+                    0o600,
                 )
 
     def test_symlinked_install_lock_is_rejected_without_touching_target(self):

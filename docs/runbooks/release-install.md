@@ -46,7 +46,7 @@ Use protected values for every placeholder:
 ```text
 python3 scripts/release_install.py stage \
   --archive <download-directory>/hype-accumulator-<commit>-aarch64-unknown-linux-gnu.tar.gz \
-  --archive-sha256-file <download-directory>/hype-accumulator-<commit>-aarch64-unknown-linux-gnu.tar.gz.sha256 \
+  --expected-archive-sha256 <independently-recorded-full-digest> \
   --expected-repository shigeo-nakamura/hype-accumulator \
   --expected-commit <full-commit> \
   --expected-target aarch64-unknown-linux-gnu \
@@ -57,7 +57,9 @@ python3 scripts/release_install.py stage \
   --install-root <dedicated-install-root>
 ```
 
-The archive is a closed set of five top-level regular files. `stage` rejects
+The expected archive digest must come from the protected operator record or
+workflow input, not from a checksum path in the archive's writable download
+directory. The archive is a closed set of five top-level regular files. `stage` rejects
 path traversal, links, duplicates, unexpected files, unsafe modes, size excess,
 outer or inner checksum mismatch, noncanonical commit/digest input, provenance
 mismatch, unresolved shared libraries, a non-ARM64 host/binary, or a non-AL2023

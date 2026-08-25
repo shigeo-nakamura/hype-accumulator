@@ -90,17 +90,6 @@ def require_regular_file(path: Path, label: str) -> None:
         raise InstallError(f"{label} must be a regular non-symlink file")
 
 
-def read_outer_checksum(checksum_path: Path, archive_path: Path) -> str:
-    require_regular_file(checksum_path, "archive checksum")
-    lines = checksum_path.read_text(encoding="utf-8").splitlines()
-    if len(lines) != 1:
-        raise InstallError("archive checksum must contain exactly one entry")
-    match = CHECKSUM_LINE_RE.fullmatch(lines[0])
-    if match is None or match.group(2) != archive_path.name:
-        raise InstallError("archive checksum does not bind the exact archive name")
-    return match.group(1)
-
-
 @contextmanager
 def verified_archive_copy(
     source_path: Path, expected_digest: str
@@ -407,12 +396,21 @@ def ensure_install_root(install_root: Path) -> tuple[Path, Path]:
 @contextmanager
 def install_lock(install_root: Path) -> Iterator[None]:
     lock_path = install_root / ".release-install.lock"
-    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW
+    flags = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
+    created = False
     try:
-        descriptor = os.open(lock_path, flags, 0o600)
+        descriptor = os.open(lock_path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+        created = True
+    except FileExistsError:
+        try:
+            descriptor = os.open(lock_path, flags)
+        except OSError as error:
+            raise InstallError(f"install lock cannot be safely opened: {error}") from error
     except OSError as error:
         raise InstallError(f"install lock cannot be safely opened: {error}") from error
     try:
+        if created:
+            os.fchmod(descriptor, 0o600)
         status = os.fstat(descriptor)
         if (
             not stat.S_ISREG(status.st_mode)
@@ -562,8 +560,8 @@ def stage_release(args: argparse.Namespace) -> dict[str, str]:
     expected_name = f"hype-accumulator-{expected.commit}-{expected.target}.tar.gz"
     if archive_path.name != expected_name:
         raise InstallError("release archive name does not match commit and target")
-    expected_archive_digest = read_outer_checksum(
-        Path(args.archive_sha256_file), archive_path
+    expected_archive_digest = require_digest(
+        args.expected_archive_sha256, "expected release archive"
     )
 
     with verified_archive_copy(
@@ -675,7 +673,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     stage = subparsers.add_parser("stage", help="verify and stage one immutable release")
     stage.add_argument("--archive", required=True)
-    stage.add_argument("--archive-sha256-file", required=True)
+    stage.add_argument("--expected-archive-sha256", required=True)
     stage.add_argument("--expected-repository", required=True)
     stage.add_argument("--expected-commit", required=True)
     stage.add_argument("--expected-target", default="aarch64-unknown-linux-gnu")
