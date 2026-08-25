@@ -801,6 +801,19 @@ impl SignalSnapshot {
         self.body.purchase_eligible
     }
 
+    /// Re-evaluates core freshness at a later observation time.
+    ///
+    /// Unlike the immutable decision-time health field, this method ages the
+    /// selected revision against `observed_at` for runtime monitoring.
+    #[must_use]
+    pub fn core_is_stale_at(&self, observed_at: DateTime<Utc>) -> bool {
+        self.body.core.as_ref().is_none_or(|revision| {
+            revision.timestamps().first_usable_at() > observed_at
+                || age_seconds(observed_at, revision.timestamps().observed_at())
+                    .is_none_or(|age| age >= self.body.core_stale_after_seconds)
+        })
+    }
+
     #[must_use]
     pub fn snapshot_hash(&self) -> &str {
         &self.snapshot_hash

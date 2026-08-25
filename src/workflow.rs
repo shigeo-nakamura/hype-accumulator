@@ -593,9 +593,13 @@ pub struct WorkflowState {
     staking_eligible_hype: HypeAtoms,
     eligibility_workflow_id: Option<String>,
     staking_target_hype: HypeAtoms,
+    #[serde(default)]
+    staking_confirmed_hype: HypeAtoms,
     delegated_hype: HypeAtoms,
     staking_submitted_at: Option<DateTime<Utc>>,
     delegation_submitted_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    last_fill_at: Option<DateTime<Utc>>,
     manual_review_reason: Option<String>,
     last_transition_at: DateTime<Utc>,
 }
@@ -679,8 +683,23 @@ impl WorkflowState {
     }
 
     #[must_use]
+    pub const fn staking_confirmed_hype(&self) -> HypeAtoms {
+        self.staking_confirmed_hype
+    }
+
+    #[must_use]
     pub const fn delegated_hype(&self) -> HypeAtoms {
         self.delegated_hype
+    }
+
+    #[must_use]
+    pub const fn last_fill_at(&self) -> Option<DateTime<Utc>> {
+        self.last_fill_at
+    }
+
+    #[must_use]
+    pub const fn last_transition_at(&self) -> DateTime<Utc> {
+        self.last_transition_at
     }
 
     #[must_use]
@@ -726,9 +745,11 @@ impl WorkflowState {
             staking_eligible_hype: HypeAtoms::default(),
             eligibility_workflow_id: None,
             staking_target_hype: HypeAtoms::default(),
+            staking_confirmed_hype: HypeAtoms::default(),
             delegated_hype: HypeAtoms::default(),
             staking_submitted_at: None,
             delegation_submitted_at: None,
+            last_fill_at: None,
             manual_review_reason: None,
             last_transition_at: first.at,
         };
@@ -850,9 +871,13 @@ impl WorkflowState {
                         "a fully filled order regressed to partial".into(),
                     ));
                 }
+                let new_fill_observed = *cumulative_hype > self.purchased_hype;
                 self.purchased_hype = *cumulative_hype;
                 self.filled_usdc = *cumulative_filled_usdc;
                 self.debited_usdc = *cumulative_debited_usdc;
+                if new_fill_observed {
+                    self.last_fill_at = Some(event.at);
+                }
                 self.stage = if *fully_filled {
                     WorkflowStage::Filled
                 } else {
@@ -878,6 +903,7 @@ impl WorkflowState {
                         "order finalization is invalid for current state".into(),
                     ));
                 }
+                let new_fill_observed = *cumulative_hype > self.purchased_hype;
                 self.validate_order_finalization(
                     *cumulative_hype,
                     *cumulative_filled_usdc,
@@ -887,6 +913,9 @@ impl WorkflowState {
                 self.purchased_hype = *cumulative_hype;
                 self.filled_usdc = *cumulative_filled_usdc;
                 self.debited_usdc = *cumulative_debited_usdc;
+                if new_fill_observed {
+                    self.last_fill_at = Some(event.at);
+                }
                 self.stage = WorkflowStage::OrderFinalized;
             }
             WorkflowTransition::StakingEligibilityRecorded {
@@ -953,6 +982,7 @@ impl WorkflowState {
                         "staking balance does not match decision-attributed HYPE".into(),
                     ));
                 }
+                self.staking_confirmed_hype = *attributable_hype;
                 self.stage = WorkflowStage::StakingBalanceConfirmed;
             }
             WorkflowTransition::DelegationObserved { action_id, receipt } => {

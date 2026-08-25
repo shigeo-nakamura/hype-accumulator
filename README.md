@@ -88,6 +88,18 @@ This networked one-shot path is suitable for signer-free, read-only DRY_RUN
 verification. S3 emission and deployed scheduling remain gated by the
 observability rollout.
 
+The optional `operations` block is derived from mutually consistent pacing and
+durable-ledger state plus identifier-free workflow observations. It reports
+confirmed/admitted/unallocated capital, deployable/committed/spent amounts,
+per-horizon pace, last activity timestamps, attributed unstaked/delegated HYPE,
+stale signals, API error counters, and pending workflow age. Projection fails
+closed if capital totals disagree or observation time regresses. The same typed
+snapshot renders Prometheus text and can be written atomically; no wallet,
+action, order, signing, or secret identifier is used as a field or label. A
+nonterminal workflow older than the configured threshold emits
+`hype_accumulator_workflow_stuck 1` and the stable `stuck_workflow` halt label.
+Alert routing and deployed scheduling remain rollout-gated.
+
 ## Local development
 
 ```text

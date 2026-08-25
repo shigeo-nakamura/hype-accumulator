@@ -22,13 +22,13 @@ use std::{
 use thiserror::Error;
 
 pub const LEDGER_SCHEMA_VERSION: u8 = 1;
-pub const SNAPSHOT_SCHEMA_VERSION: u8 = 1;
+pub const SNAPSHOT_SCHEMA_VERSION: u8 = 2;
 pub const PROTECTED_ANCHOR_SCHEMA_VERSION: u8 = 1;
 pub const LEDGER_FILE_NAME: &str = "ledger.jsonl";
 pub const SNAPSHOT_FILE_NAME: &str = "snapshot.json";
 const LOCK_FILE_NAME: &str = ".ledger.lock";
 const PENDING_FILE_NAME: &str = ".pending-append.json";
-const PENDING_SCHEMA_VERSION: u8 = 1;
+const PENDING_SCHEMA_VERSION: u8 = 2;
 const RESTORE_PENDING_FILE_NAME: &str = ".pending-restore.json";
 const RESTORE_PENDING_SCHEMA_VERSION: u8 = 1;
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -225,10 +225,22 @@ pub struct ReplayState {
     observed_hype_atoms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_observation_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_decision_at: Option<DateTime<Utc>>,
     last_event_at: Option<DateTime<Utc>>,
 }
 
 impl ReplayState {
+    #[must_use]
+    pub fn authoritative_deposits_usdc(&self) -> Option<UsdcMicros> {
+        self.deposits
+            .values()
+            .try_fold(0_u64, |total, deposit| {
+                total.checked_add(deposit.authoritative_usdc.as_micros())
+            })
+            .map(UsdcMicros::from_micros)
+    }
+
     #[must_use]
     pub const fn admitted_usdc(&self) -> UsdcMicros {
         self.admitted_usdc
@@ -262,6 +274,39 @@ impl ReplayState {
     #[must_use]
     pub const fn last_event_at(&self) -> Option<&DateTime<Utc>> {
         self.last_event_at.as_ref()
+    }
+
+    #[must_use]
+    pub fn last_capital_event_at(&self) -> Option<DateTime<Utc>> {
+        let mut unmatched_commitments = BTreeMap::<(DateTime<Utc>, UsdcMicros), usize>::new();
+        for commitment in self.commitments.values() {
+            *unmatched_commitments
+                .entry((commitment.occurred_at, commitment.committed_usdc))
+                .or_default() += 1;
+        }
+        let last_withdrawal = self.capital_timeline.iter().filter_map(|entry| {
+            if !entry.credit_usdc.is_zero() || entry.debit_usdc.is_zero() {
+                return None;
+            }
+            let key = (entry.occurred_at, entry.debit_usdc);
+            if let Some(count) = unmatched_commitments.get_mut(&key) {
+                if *count > 0 {
+                    *count -= 1;
+                    return None;
+                }
+            }
+            Some(entry.occurred_at)
+        });
+        self.deposits
+            .values()
+            .map(|deposit| deposit.occurred_at)
+            .chain(last_withdrawal)
+            .max()
+    }
+
+    #[must_use]
+    pub const fn last_decision_at(&self) -> Option<DateTime<Utc>> {
+        self.last_decision_at
     }
 
     #[must_use]
@@ -344,6 +389,11 @@ struct SnapshotEnvelope {
     schema_version: u8,
     snapshot: LedgerSnapshot,
     checksum: String,
+}
+
+struct DecodedSnapshot {
+    schema_version: u8,
+    snapshot: LedgerSnapshot,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -884,7 +934,7 @@ fn validated_restore_payloads(
     if snapshot_payload.is_empty() {
         return Err(LedgerError::MissingSnapshot);
     }
-    let snapshot = decode_snapshot(&snapshot_payload)?;
+    let snapshot = decode_snapshot(&snapshot_payload)?.snapshot;
     if snapshot.record_count
         != u64::try_from(verified.records.len())
             .map_err(|_| LedgerError::CorruptLedger("record count overflowed".into()))?
@@ -1007,12 +1057,7 @@ fn apply_event(state: &mut ReplayState, event: &LedgerEvent) -> Result<(), Ledge
             decision_id,
             decision_date,
             ..
-        } => record_daily_outcome(
-            state,
-            event.occurred_at.date_naive(),
-            *decision_date,
-            decision_id,
-        )?,
+        } => record_daily_outcome(state, event.occurred_at, *decision_date, decision_id)?,
         LedgerEventKind::OrderRecorded {
             order_id,
             decision_id,
@@ -1196,10 +1241,11 @@ fn record_observed_balance(
 
 fn record_daily_outcome(
     state: &mut ReplayState,
-    occurred_date: NaiveDate,
+    occurred_at: DateTime<Utc>,
     decision_date: NaiveDate,
     decision_id: &str,
 ) -> Result<(), LedgerError> {
+    let occurred_date = occurred_at.date_naive();
     if decision_date != occurred_date {
         return Err(LedgerError::DecisionDateMismatch {
             declared: decision_date,
@@ -1216,6 +1262,7 @@ fn record_daily_outcome(
         .decision_outcomes
         .insert(decision_date, decision_id.to_owned());
     state.decision_ids.insert(decision_id.to_owned());
+    state.last_decision_at = state.last_decision_at.max(Some(occurred_at));
     Ok(())
 }
 
@@ -1240,7 +1287,7 @@ fn record_purchase_decision(
             ));
         }
     }
-    record_daily_outcome(state, occurred_at.date_naive(), decision_date, decision_id)?;
+    record_daily_outcome(state, occurred_at, decision_date, decision_id)?;
     if state.decision_commitment_ids.contains(commitment_id) {
         return Err(LedgerError::DecisionCommitmentCollision(
             commitment_id.to_owned(),
@@ -1544,7 +1591,13 @@ fn validate_current_snapshot(
     records: &[LedgerEnvelope],
 ) -> Result<(), LedgerError> {
     match load_snapshot(&directory.join(SNAPSHOT_FILE_NAME))? {
-        Some(snapshot) => validate_snapshot_anchor(&snapshot, records),
+        Some(decoded) => {
+            validate_snapshot_anchor(&decoded.snapshot, records, decoded.schema_version)?;
+            if decoded.schema_version == 1 {
+                write_snapshot(directory, &snapshot_for_records(records)?)?;
+            }
+            Ok(())
+        }
         None if records.is_empty() => Ok(()),
         None => Err(LedgerError::MissingSnapshot),
     }
@@ -1553,6 +1606,7 @@ fn validate_current_snapshot(
 fn validate_snapshot_anchor(
     snapshot: &LedgerSnapshot,
     records: &[LedgerEnvelope],
+    snapshot_schema_version: u8,
 ) -> Result<(), LedgerError> {
     if snapshot.ledger_schema_version != LEDGER_SCHEMA_VERSION {
         return Err(LedgerError::SnapshotMismatch);
@@ -1577,7 +1631,15 @@ fn validate_snapshot_anchor(
         .iter()
         .map(|record| record.event.clone())
         .collect::<Vec<_>>();
-    if replay(&events)? != snapshot.state {
+    let replayed = replay(&events)?;
+    let mut compatible = snapshot.state.clone();
+    if snapshot_schema_version == 1 {
+        if compatible.last_decision_at.is_some() {
+            return Err(LedgerError::SnapshotMismatch);
+        }
+        compatible.last_decision_at = replayed.last_decision_at;
+    }
+    if replayed != compatible {
         return Err(LedgerError::SnapshotMismatch);
     }
     Ok(())
@@ -1623,7 +1685,7 @@ fn load_records(payload: &[u8]) -> Result<Vec<LedgerEnvelope>, LedgerError> {
     Ok(records)
 }
 
-fn load_snapshot(path: &Path) -> Result<Option<LedgerSnapshot>, LedgerError> {
+fn load_snapshot(path: &Path) -> Result<Option<DecodedSnapshot>, LedgerError> {
     match fs::read(path) {
         Ok(payload) if payload.is_empty() => Err(LedgerError::CorruptSnapshot),
         Ok(payload) => decode_snapshot(&payload).map(Some),
@@ -1632,15 +1694,19 @@ fn load_snapshot(path: &Path) -> Result<Option<LedgerSnapshot>, LedgerError> {
     }
 }
 
-fn decode_snapshot(payload: &[u8]) -> Result<LedgerSnapshot, LedgerError> {
+fn decode_snapshot(payload: &[u8]) -> Result<DecodedSnapshot, LedgerError> {
     let envelope: SnapshotEnvelope =
         serde_json::from_slice(payload).map_err(|_| LedgerError::CorruptSnapshot)?;
-    if envelope.schema_version != SNAPSHOT_SCHEMA_VERSION
-        || envelope.checksum != snapshot_checksum(&envelope.snapshot)?
+    if !matches!(envelope.schema_version, 1 | SNAPSHOT_SCHEMA_VERSION)
+        || envelope.checksum
+            != snapshot_checksum_for_version(&envelope.snapshot, envelope.schema_version)?
     {
         return Err(LedgerError::CorruptSnapshot);
     }
-    Ok(envelope.snapshot)
+    Ok(DecodedSnapshot {
+        schema_version: envelope.schema_version,
+        snapshot: envelope.snapshot,
+    })
 }
 
 fn build_pending(
@@ -1679,7 +1745,7 @@ fn decode_pending(payload: &[u8]) -> Result<PendingAppend, LedgerError> {
         .prior_record_count
         .checked_add(1)
         .ok_or(LedgerError::CorruptPending)?;
-    if pending.schema_version != PENDING_SCHEMA_VERSION
+    if !matches!(pending.schema_version, 1 | PENDING_SCHEMA_VERSION)
         || pending.checksum != pending_checksum(&pending)?
         || pending.record.schema_version != LEDGER_SCHEMA_VERSION
         || pending.record.sequence != pending.prior_record_count
@@ -1754,11 +1820,11 @@ fn recover_pending(
 
     let mut records = prior_records;
     records.push(pending.record.clone());
-    validate_snapshot_anchor(&pending.snapshot, &records)?;
+    validate_snapshot_anchor(&pending.snapshot, &records, pending.schema_version)?;
     let mut recovered_payload = payload[..prior_len].to_vec();
     recovered_payload.extend_from_slice(&line);
     write_atomic(&directory.join(LEDGER_FILE_NAME), &recovered_payload)?;
-    write_snapshot(directory, &pending.snapshot)?;
+    write_snapshot(directory, &snapshot_for_records(&records)?)?;
     clear_pending(directory)?;
     Ok(true)
 }
@@ -1822,8 +1888,15 @@ fn record_hash(
 }
 
 fn snapshot_checksum(snapshot: &LedgerSnapshot) -> Result<String, LedgerError> {
+    snapshot_checksum_for_version(snapshot, SNAPSHOT_SCHEMA_VERSION)
+}
+
+fn snapshot_checksum_for_version(
+    snapshot: &LedgerSnapshot,
+    schema_version: u8,
+) -> Result<String, LedgerError> {
     let payload = serde_json::to_vec(&SnapshotHashInput {
-        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        schema_version,
         snapshot,
     })
     .map_err(LedgerError::json)?;
@@ -4102,5 +4175,49 @@ mod transaction_tests {
             Err(LedgerError::CorruptRestorePending)
         ));
         assert!(destination.join(RESTORE_PENDING_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn version_one_snapshot_migrates_after_verified_replay() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let anchor = anchor_store();
+        let mut ledger = open(directory.path(), &anchor).expect("open ledger");
+        ledger
+            .append(LedgerEvent {
+                event_id: "legacy-daily-skip".into(),
+                occurred_at: at(8),
+                kind: LedgerEventKind::DailySkip {
+                    decision_id: "decision/legacy-skip".into(),
+                    decision_date: at(8).date_naive(),
+                    reason: "legacy fixture".into(),
+                },
+            })
+            .expect("append daily skip");
+        drop(ledger);
+
+        let snapshot_path = directory.path().join(SNAPSHOT_FILE_NAME);
+        let current_payload = fs::read(&snapshot_path).expect("read current snapshot");
+        let mut legacy = decode_snapshot(&current_payload)
+            .expect("decode current snapshot")
+            .snapshot;
+        legacy.state.last_decision_at = None;
+        let legacy_envelope = SnapshotEnvelope {
+            schema_version: 1,
+            checksum: snapshot_checksum_for_version(&legacy, 1).expect("legacy checksum"),
+            snapshot: legacy,
+        };
+        let mut legacy_payload =
+            serde_json::to_vec(&legacy_envelope).expect("serialize legacy snapshot");
+        legacy_payload.push(b'\n');
+        fs::write(&snapshot_path, legacy_payload).expect("install legacy snapshot");
+
+        let reopened = open(directory.path(), &anchor).expect("migrate and reopen legacy snapshot");
+        assert_eq!(reopened.state().last_decision_at(), Some(at(8)));
+        drop(reopened);
+
+        let migrated_payload = fs::read(snapshot_path).expect("read migrated snapshot");
+        let migrated = decode_snapshot(&migrated_payload).expect("decode migrated snapshot");
+        assert_eq!(migrated.schema_version, SNAPSHOT_SCHEMA_VERSION);
+        assert_eq!(migrated.snapshot.state.last_decision_at(), Some(at(8)));
     }
 }
