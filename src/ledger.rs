@@ -1087,9 +1087,9 @@ fn record_capital_commitment(
                 decision_id.to_owned(),
             ));
         }
-        if occurred_at < decision.occurred_at {
+        if occurred_at > decision.occurred_at {
             return Err(LedgerError::InvalidEvent(
-                "commitment predates its linked decision".into(),
+                "commitment postdates its linked decision".into(),
             ));
         }
     }

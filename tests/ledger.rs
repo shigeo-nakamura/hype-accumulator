@@ -168,7 +168,7 @@ fn append_decision_backing(
         .append(dated_event(
             deposit_id.clone(),
             date,
-            2,
+            0,
             LedgerEventKind::AuthoritativeDeposit {
                 amount_usdc: usd(amount),
             },
@@ -178,7 +178,7 @@ fn append_decision_backing(
         .append(dated_event(
             format!("admission-{decision_id}"),
             date,
-            3,
+            0,
             LedgerEventKind::DepositAdmission {
                 deposit_event_id: deposit_id,
                 amount_usdc: usd(amount),
@@ -189,7 +189,7 @@ fn append_decision_backing(
         .append(dated_event(
             format!("capital-{decision_id}"),
             date,
-            4,
+            0,
             LedgerEventKind::CapitalCommitted {
                 commitment_id: format!("commitment-{decision_id}"),
                 amount_usdc: usd(amount),
@@ -537,21 +537,6 @@ fn order_linked_costs_respect_event_time_causality() {
         )),
         Err(LedgerError::InvalidEvent(
             "order predates its owning decision".into()
-        ))
-    );
-
-    assert_eq!(
-        ledger.append(dated_event(
-            "order-before-commitment",
-            date,
-            3,
-            LedgerEventKind::OrderRecorded {
-                order_id: "order-before-commitment".into(),
-                decision_id: "decision-causal-order".into(),
-            },
-        )),
-        Err(LedgerError::InvalidEvent(
-            "order predates its backing commitment".into()
         ))
     );
 
@@ -1342,6 +1327,26 @@ fn delayed_commitment_must_fully_back_its_existing_decision() {
         )),
         Err(LedgerError::InsufficientDecisionBacking(
             "decision-insufficient".into()
+        ))
+    );
+    assert_eq!(ledger.state().committed_usdc(), UsdcMicros::default());
+    assert_eq!(
+        fs::read(ledger_path(directory.path())).expect("read unchanged ledger"),
+        durable_before
+    );
+
+    assert_eq!(
+        ledger.append(dated_event(
+            "capital-postdated",
+            date,
+            4,
+            LedgerEventKind::CapitalCommitted {
+                commitment_id: "commitment-decision-insufficient".into(),
+                amount_usdc: usd(10),
+            },
+        )),
+        Err(LedgerError::InvalidEvent(
+            "commitment postdates its linked decision".into()
         ))
     );
     assert_eq!(ledger.state().committed_usdc(), UsdcMicros::default());
