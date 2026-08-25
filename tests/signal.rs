@@ -43,6 +43,19 @@ fn live_snapshot(request: &SnapshotRequest) -> SignalSnapshot {
 }
 
 #[test]
+fn snapshot_freshness_is_recomputed_at_observation_time() {
+    let snapshot = live_snapshot(&request(
+        "2026-07-06T12:00:00Z",
+        "2026-07-06",
+        "2026-07-02",
+        60,
+        604_800,
+    ));
+    assert!(!snapshot.core_is_stale_at(at("2026-07-06T12:00:39Z")));
+    assert!(snapshot.core_is_stale_at(at("2026-07-06T12:00:40Z")));
+}
+
+#[test]
 fn raw_contract_rejects_bad_time_order_zero_prices_and_crossed_books() {
     assert_eq!(
         RevisionTimestamps::new(

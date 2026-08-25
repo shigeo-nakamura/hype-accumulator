@@ -1,10 +1,10 @@
 use crate::{
     ledger::ReplayState,
     pacing::{PacingError, PacingLimits, PacingState},
-    signal::{CoreHealth, SignalSnapshot},
+    signal::SignalSnapshot,
     workflow::{HypeAtoms, WorkflowStage, WorkflowState},
 };
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Days, NaiveDate, Utc};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -47,7 +47,7 @@ pub struct WorkflowObservation {
     stage: WorkflowStage,
     last_transition_at: DateTime<Utc>,
     last_fill_at: Option<DateTime<Utc>>,
-    staking_eligible_hype: HypeAtoms,
+    purchased_hype: HypeAtoms,
     staking_target_hype: HypeAtoms,
     delegated_hype: HypeAtoms,
 }
@@ -59,7 +59,7 @@ impl From<&WorkflowState> for WorkflowObservation {
             stage: state.stage(),
             last_transition_at: state.last_transition_at(),
             last_fill_at: state.last_fill_at(),
-            staking_eligible_hype: state.staking_eligibility().eligible_hype,
+            purchased_hype: state.purchased_hype(),
             staking_target_hype: state.staking_target_hype(),
             delegated_hype: state.delegated_hype(),
         }
@@ -100,6 +100,8 @@ pub enum MetricsError {
     InvalidStuckThreshold,
     #[error("workflow observation is after metrics observation time")]
     FutureWorkflowObservation,
+    #[error("runtime state is after metrics observation time")]
+    FutureRuntimeState,
     #[error("capital projections disagree between pacing and ledger state")]
     InconsistentCapitalState,
     #[error("metrics aggregation overflowed")]
@@ -132,6 +134,16 @@ impl MetricsSnapshot {
     ) -> Result<Self, MetricsError> {
         if stuck_after_seconds == 0 {
             return Err(MetricsError::InvalidStuckThreshold);
+        }
+        if pacing
+            .capital_reconciled_through()
+            .is_some_and(|watermark| watermark > observed_at)
+            || ledger
+                .last_event_at()
+                .is_some_and(|last_event| *last_event > observed_at)
+            || signal.is_some_and(|snapshot| snapshot.decision_at() > observed_at)
+        {
+            return Err(MetricsError::FutureRuntimeState);
         }
         let admitted = checked_sum(
             pacing
@@ -193,7 +205,15 @@ impl MetricsSnapshot {
                 .max(0);
             let days_remaining = u64::try_from(signed_days_remaining)
                 .map_err(|_| MetricsError::ArithmeticOverflow)?;
-            let slots = limits.remaining_purchase_slots(observed_at.date_naive(), horizon)?;
+            let slot_start = if pacing.decisions().contains_key(&observed_at.date_naive()) {
+                observed_at
+                    .date_naive()
+                    .checked_add_days(Days::new(1))
+                    .ok_or(MetricsError::ArithmeticOverflow)?
+            } else {
+                observed_at.date_naive()
+            };
+            let slots = limits.remaining_purchase_slots(slot_start, horizon)?;
             let required_micros = (slots > 0).then(|| residual.div_ceil(slots));
             horizons.push(HorizonMetrics {
                 horizon,
@@ -269,8 +289,7 @@ impl MetricsSnapshot {
             }
         }
 
-        let stale_signal = signal
-            .is_none_or(|snapshot| !matches!(snapshot.core_health(), CoreHealth::Healthy { .. }));
+        let stale_signal = signal.is_none_or(|snapshot| snapshot.core_is_stale_at(observed_at));
         let halt_reason = if manual_review_workflows > 0 {
             Some(HaltReason::ManualReview)
         } else if workflow_stuck {
@@ -513,6 +532,11 @@ impl MetricsSnapshot {
 
 impl WorkflowObservation {
     fn unstaked_hype_atoms(&self) -> Result<u64, MetricsError> {
+        if self.staking_target_hype.as_atoms() > self.purchased_hype.as_atoms()
+            || self.delegated_hype.as_atoms() > self.staking_target_hype.as_atoms()
+        {
+            return Err(MetricsError::InconsistentCapitalState);
+        }
         let staking_confirmed = self.staking_target_hype.as_atoms() > 0
             && matches!(
                 self.stage,
@@ -522,12 +546,12 @@ impl WorkflowObservation {
                     | WorkflowStage::Complete
             );
         if staking_confirmed {
-            self.staking_eligible_hype
+            self.purchased_hype
                 .as_atoms()
                 .checked_sub(self.staking_target_hype.as_atoms())
                 .ok_or(MetricsError::InconsistentCapitalState)
         } else {
-            Ok(self.staking_eligible_hype.as_atoms())
+            Ok(self.purchased_hype.as_atoms())
         }
     }
 }
@@ -553,7 +577,7 @@ mod tests {
         ledger::{
             DurableLedger, LedgerEvent, LedgerEventKind, ProtectedAnchorStore, ProtectedHeadAnchor,
         },
-        pacing::{CapitalEvent, DepositEvent, UsdcMicros},
+        pacing::{CapitalEvent, DecisionInput, DepositEvent, UsdcMicros},
         status::{AccumulatorStatus, DashboardStatus},
         status_io::write_metrics_atomic,
     };
@@ -626,7 +650,7 @@ mod tests {
             stage: WorkflowStage::Decided,
             last_transition_at: at(10),
             last_fill_at: None,
-            staking_eligible_hype: HypeAtoms::from_atoms(0),
+            purchased_hype: HypeAtoms::from_atoms(0),
             staking_target_hype: HypeAtoms::from_atoms(0),
             delegated_hype: HypeAtoms::from_atoms(0),
         }
@@ -669,6 +693,36 @@ mod tests {
     }
 
     #[test]
+    fn filled_hype_remains_unstaked_before_eligibility_reconciliation() {
+        let filled = WorkflowObservation {
+            workflow_key: "workflow-filled".into(),
+            stage: WorkflowStage::Filled,
+            last_transition_at: at(11),
+            last_fill_at: Some(at(11)),
+            purchased_hype: HypeAtoms::from_atoms(250),
+            staking_target_hype: HypeAtoms::from_atoms(0),
+            delegated_hype: HypeAtoms::from_atoms(0),
+        };
+        let snapshot = MetricsSnapshot::from_runtime(
+            at(12),
+            &PacingState::default(),
+            &limits(),
+            &ReplayState::default(),
+            &[filled],
+            None,
+            0,
+            0,
+            0,
+            7_200,
+        )
+        .expect("filled workflow projection");
+
+        assert_eq!(snapshot.unstaked_hype_atoms, 250);
+        assert_eq!(snapshot.last_fill_at, Some(at(11)));
+        assert!(!snapshot.workflow_stuck);
+    }
+
+    #[test]
     fn operations_are_optional_and_attach_to_dashboard_status() {
         let snapshot = MetricsSnapshot::from_runtime(
             at(12),
@@ -706,6 +760,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn admitted_capital_and_horizon_are_projected_from_consistent_states() {
         let limits = limits();
         let deposit = DepositEvent {
@@ -779,6 +834,62 @@ mod tests {
         );
         assert!(prometheus
             .contains("hype_accumulator_horizon_required_pace_usdc{horizon=\"2026-12-31\"}"));
+
+        let previous_slots = snapshot.horizons[0].purchase_slots_remaining;
+        let decision = pacing
+            .decide(
+                &DecisionInput {
+                    at: at(12),
+                    observed_spot_usdc: usd(100),
+                    capital_history_complete: true,
+                    manual_pause: false,
+                },
+                &limits,
+            )
+            .expect("daily decision")
+            .decision()
+            .clone();
+        let commitment_id = "commitment-1";
+        ledger
+            .append(LedgerEvent {
+                event_id: "commitment-event-1".into(),
+                occurred_at: at(12),
+                kind: LedgerEventKind::CapitalCommitted {
+                    commitment_id: commitment_id.into(),
+                    amount_usdc: decision.committed_usdc,
+                },
+            })
+            .expect("commitment recorded");
+        ledger
+            .append(LedgerEvent {
+                event_id: "decision-event-1".into(),
+                occurred_at: at(12),
+                kind: LedgerEventKind::DailyDecision {
+                    decision_id: decision.decision_id.clone(),
+                    decision_date: decision.decision_date,
+                    commitment_id: commitment_id.into(),
+                    planned_usdc: decision.planned_usdc,
+                    committed_usdc: decision.committed_usdc,
+                },
+            })
+            .expect("decision recorded");
+        let after_decision = MetricsSnapshot::from_runtime(
+            at(12),
+            &pacing,
+            &limits,
+            ledger.state(),
+            &[],
+            None,
+            0,
+            0,
+            0,
+            3_600,
+        )
+        .expect("post-decision projection");
+        assert_eq!(
+            after_decision.horizons[0].purchase_slots_remaining,
+            previous_slots - 1
+        );
     }
 
     #[test]
@@ -797,6 +908,56 @@ mod tests {
                 0,
             ),
             Err(MetricsError::InvalidStuckThreshold)
+        ));
+
+        let mut future_pacing = PacingState::default();
+        future_pacing
+            .reconcile_capital(&[], at(13), &limits())
+            .expect("future watermark fixture");
+        assert!(matches!(
+            MetricsSnapshot::from_runtime(
+                at(12),
+                &future_pacing,
+                &limits(),
+                &ReplayState::default(),
+                &[],
+                None,
+                0,
+                0,
+                0,
+                3_600,
+            ),
+            Err(MetricsError::FutureRuntimeState)
+        ));
+
+        let directory = tempfile::tempdir().expect("future ledger directory");
+        let mut future_ledger =
+            DurableLedger::open(directory.path(), Arc::new(MemoryAnchor::default()))
+                .expect("future ledger opens");
+        future_ledger
+            .append(LedgerEvent {
+                event_id: "future-observation".into(),
+                occurred_at: at(13),
+                kind: LedgerEventKind::BalanceObserved {
+                    observed_usdc: UsdcMicros::from_micros(0),
+                    observed_hype_atoms: 0,
+                },
+            })
+            .expect("future event recorded");
+        assert!(matches!(
+            MetricsSnapshot::from_runtime(
+                at(12),
+                &PacingState::default(),
+                &limits(),
+                future_ledger.state(),
+                &[],
+                None,
+                0,
+                0,
+                0,
+                3_600,
+            ),
+            Err(MetricsError::FutureRuntimeState)
         ));
 
         let duplicate = stuck_observation();
