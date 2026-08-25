@@ -11,6 +11,7 @@ pub mod pacing;
 pub mod signal;
 pub mod status;
 pub mod status_io;
+pub mod workflow;
 
 use config::{Config, ConfigError, Environment};
 use exchange::{DryRunExchange, Exchange};
