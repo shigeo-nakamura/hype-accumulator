@@ -28,6 +28,7 @@ fn limits() -> PacingLimits {
         deposit_cooldown_seconds: 1,
         min_order_usdc: usd(1),
         max_daily_notional_usdc: usd(25),
+        fixed_reserve_usdc: usd(0),
         fee_spread_reserve_bps: 0,
         final_catch_up_days: 7,
         carry_over_policy: CarryOverPolicy::HoldForApproval,
@@ -515,6 +516,125 @@ fn admission_minimum_daily_cap_and_reserve_are_enforced() {
 }
 
 #[test]
+fn fixed_reserve_is_deducted_before_proportional_reserve() {
+    let mut reserved = limits();
+    reserved.max_daily_notional_usdc = usd(100);
+    reserved.fixed_reserve_usdc = usd(10);
+    reserved.fee_spread_reserve_bps = 1_000;
+    let received = at(2026, 12, 31, 8);
+    let mut state = PacingState::default();
+    state
+        .reconcile_capital(
+            &[deposit("fixed-reserve", 100, received)],
+            at(2026, 12, 31, 10),
+            &reserved,
+        )
+        .expect("reserve deposit");
+
+    let decision = state
+        .decide(&input(at(2026, 12, 31, 12), 100), &reserved)
+        .expect("reserve-aware decision");
+    assert_eq!(decision.decision().planned_usdc, usd(81));
+    assert_eq!(decision.decision().committed_usdc, usd(90));
+    assert_eq!(state.deposits()["fixed-reserve"].residual_usdc(), usd(10));
+
+    let mut blocked = PacingState::default();
+    blocked
+        .reconcile_capital(
+            &[deposit("observed-floor", 100, received)],
+            at(2026, 12, 31, 10),
+            &reserved,
+        )
+        .expect("reserve deposit");
+    let blocked_decision = blocked
+        .decide(&input(at(2026, 12, 31, 12), 10), &reserved)
+        .expect("balance at reserve fails closed");
+    assert_eq!(blocked_decision.decision().planned_usdc, usd(0));
+    assert_eq!(
+        blocked_decision.decision().reason,
+        DecisionReason::InsufficientObservedBalance
+    );
+}
+
+#[test]
+fn fixed_reserve_is_unavailable_to_withdrawals() {
+    let mut reserved = limits();
+    reserved.max_daily_notional_usdc = usd(100);
+    reserved.fixed_reserve_usdc = usd(10);
+    let received = at(2026, 12, 31, 8);
+    let mut state = PacingState::default();
+    state
+        .reconcile_capital(
+            &[deposit("withdrawal-reserve", 100, received)],
+            at(2026, 12, 31, 10),
+            &reserved,
+        )
+        .expect("reserve deposit");
+    let decision = state
+        .decide(&input(at(2026, 12, 31, 12), 100), &reserved)
+        .expect("reserve-aware decision");
+    assert_eq!(decision.decision().planned_usdc, usd(90));
+    state
+        .settle_decision(&decision.decision().decision_id, usd(90), usd(90))
+        .expect("purchase settles above reserve");
+
+    let before = state.clone();
+    assert!(matches!(
+        state.reconcile_capital(
+            &[withdrawal("reserve-withdrawal", 10, at(2026, 12, 31, 15))],
+            at(2026, 12, 31, 16),
+            &reserved,
+        ),
+        Err(hype_accumulator::pacing::PacingError::WithdrawalExceedsFreeCapital(id))
+            if id == "reserve-withdrawal"
+    ));
+    assert_eq!(state, before);
+    assert_eq!(
+        state.deposits()["withdrawal-reserve"].residual_usdc(),
+        usd(10)
+    );
+
+    reserved.fixed_reserve_usdc = reserved.max_automatically_admitted_usdc;
+    assert_eq!(
+        reserved.validate(),
+        Err(hype_accumulator::pacing::PacingError::InvalidLimits)
+    );
+}
+
+#[test]
+fn fixed_reserve_is_global_across_expired_and_active_horizons() {
+    let mut reserved = limits();
+    reserved.max_daily_notional_usdc = usd(100);
+    reserved.fixed_reserve_usdc = usd(10);
+    let mut state = PacingState::default();
+    state
+        .reconcile_capital(
+            &[deposit("prior-reserve", 10, at(2026, 12, 31, 8))],
+            at(2026, 12, 31, 10),
+            &reserved,
+        )
+        .expect("prior reserve admitted");
+    let prior = state
+        .decide(&input(at(2026, 12, 31, 12), 10), &reserved)
+        .expect("prior reserve held");
+    assert_eq!(prior.decision().planned_usdc, usd(0));
+
+    state
+        .reconcile_capital(
+            &[deposit("new-horizon", 100, at(2027, 12, 31, 8))],
+            at(2027, 12, 31, 10),
+            &reserved,
+        )
+        .expect("new horizon admitted");
+    let next = state
+        .decide(&input(at(2027, 12, 31, 12), 110), &reserved)
+        .expect("existing reserve applies globally");
+    assert_eq!(next.decision().planned_usdc, usd(100));
+    assert_eq!(state.deposits()["prior-reserve"].residual_usdc(), usd(10));
+    assert_eq!(state.deposits()["new-horizon"].committed_usdc, usd(100));
+}
+
+#[test]
 fn automatic_admission_limit_is_per_deposit() {
     let mut limits = limits();
     limits.max_automatically_admitted_usdc = usd(100);
@@ -874,6 +994,40 @@ fn unsafe_caps_and_impossible_schedule_are_rejected_by_config() {
     assert!(matches!(
         impossible.validate(&HashMap::new()),
         Err(ConfigError::Invalid(message)) if message.contains("cannot fit")
+    ));
+}
+
+#[test]
+fn exact_microunit_schedule_capacity_avoids_float_drift() {
+    let mut config = Config::from_toml(include_str!("fixtures/safe.toml")).expect("fixture");
+    config.capital.max_automatically_deployable_usdc = 8_199.571_2;
+    config.capital.yearly_deployment_cap_usdc = 8_199.571_2;
+    config.capital.cumulative_deployment_cap_usdc = 8_199.571_2;
+    config.pacing.max_order_usdc = 22.403_2;
+    config.execution.max_order_usdc = 22.403_2;
+    config.pacing.target_horizon_days = 366;
+    config.schedule.weekdays = vec![1, 2, 3, 4, 5, 6, 7];
+    config
+        .validate(&HashMap::new())
+        .expect("366 slots exactly fit an integer-microunit capital cap");
+}
+
+#[test]
+fn six_decimal_monetary_values_use_decimal_conversion() {
+    let mut config = Config::from_toml(include_str!("fixtures/safe.toml")).expect("fixture");
+    config.capital.max_automatically_deployable_usdc = 16_890.122_169;
+    config.capital.yearly_deployment_cap_usdc = 16_890.122_169;
+    config.capital.cumulative_deployment_cap_usdc = 16_890.122_169;
+    config.pacing.max_order_usdc = 200.0;
+    config.execution.max_order_usdc = 200.0;
+    config
+        .validate(&HashMap::new())
+        .expect("valid six-decimal microunit value is accepted");
+
+    config.capital.max_automatically_deployable_usdc = 100.000_000_1;
+    assert!(matches!(
+        config.validate(&HashMap::new()),
+        Err(ConfigError::SecurityPolicy(_))
     ));
 }
 

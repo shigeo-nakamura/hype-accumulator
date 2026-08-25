@@ -1,4 +1,6 @@
 # Non-production shape only. Zero disables a capability; it never means unlimited.
+schema_version = 1
+
 [capital]
 max_auto_deposit_microusd = 0
 max_daily_notional_microusd = 0
@@ -17,6 +19,9 @@ yearly_limit_period = "utc_calendar_year_v1"
 [custody]
 # Service-side order limits do not constrain a leaked API wallet.
 api_wallet_authority = "full_assigned_account_trading"
+# Runtime authorization is limited to the named API wallet's spot-order surface.
+# A master/user signer is never installed by this policy.
+signer_mode = "dedicated_api_wallet_spot_only"
 require_dedicated_execution_account = true
 # Required in live mode: "dedicated_master", "subaccount", or "vault". This field
 # classifies the isolated trading account only; no account kind enables automatic
@@ -112,6 +117,8 @@ dry_run = true
 manual_halt = true
 # Versioned acknowledgement of the effective-policy digest, which excludes this
 # value itself and includes startup-resolved identities such as the admitted
-# parent account.
+# parent account. The only accepted format is "v1:sha256:<64 lowercase hex>".
 live_acknowledgement = ""
+# Non-empty live values use canonical UTC seconds, for example
+# "2026-09-01T00:00:00Z". The exact timestamp is included in the digest.
 live_acknowledgement_expires_at = ""
