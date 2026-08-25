@@ -35,6 +35,7 @@
     "pairtrade": {
       "repository": "shigeo-nakamura/pairtrade",
       "ref": "master",
+      "commit": "92991dfdf3d1bd43d42f4be1faebbb567fe95ef6",
       "dex_connector_ref": "v4.7.13"
     }
   },

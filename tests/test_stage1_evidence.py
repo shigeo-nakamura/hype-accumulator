@@ -76,6 +76,13 @@ class Stage1EvidenceTests(unittest.TestCase):
         source = evidence["source_state"]
         release = source["dex_connector"]["release_candidate"]
 
+        for commit in (
+            source["hype_accumulator"]["commit"],
+            source["dex_connector"]["master_commit"],
+            release["version_commit"],
+            source["pairtrade"]["commit"],
+        ):
+            self.assertRegex(commit, SHA_PATTERN)
         self.assertEqual(release["version"], "4.7.14")
         self.assertFalse(release["tag_present"])
         self.assertEqual(source["hype_accumulator"]["dex_connector_ref"], "v4.7.12")
