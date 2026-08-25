@@ -272,6 +272,29 @@ def fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def make_staged_release_traversable(path: Path) -> None:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise InstallError(f"staged release cannot be safely opened: {error}") from error
+    try:
+        status = os.fstat(descriptor)
+        if status.st_uid != os.geteuid() or status.st_mode & 0o7777 != 0o700:
+            raise InstallError(
+                "private staged release directory has unsafe ownership or mode"
+            )
+        os.fchmod(descriptor, 0o755)
+        status = os.fstat(descriptor)
+        if status.st_uid != os.geteuid() or status.st_mode & 0o7777 != 0o755:
+            raise InstallError(
+                "published staged release directory has unsafe ownership or mode"
+            )
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def ensure_owned_traversable_directory(path: Path, label: str) -> Path:
     if path.is_symlink():
         raise InstallError(f"{label} must not be a symlink")
@@ -528,7 +551,6 @@ def stage_release_locked(
     final_release = releases / release_id
     with tempfile.TemporaryDirectory(prefix=".stage-", dir=releases) as temporary:
         temporary_release = Path(temporary)
-        temporary_release.chmod(0o755)
         extract_closed_archive(archive_path, temporary_release)
         checksums = parse_inner_checksums(temporary_release)
         verify_provenance(temporary_release, expected)
@@ -542,6 +564,7 @@ def stage_release_locked(
         manifest = install_manifest(expected, archive_digest, checksums)
         write_manifest(temporary_release / INSTALL_MANIFEST, manifest)
         fsync_directory(temporary_release)
+        make_staged_release_traversable(temporary_release)
         verify_staged_release(temporary_release, manifest)
         if final_release.exists():
             if read_manifest(final_release) != manifest:

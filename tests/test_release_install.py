@@ -164,11 +164,53 @@ class ReleaseInstallTests(unittest.TestCase):
             root = Path(temporary)
             root.chmod(0o755)
             foreign_uid = os.geteuid() + 1
-            with mock.patch.object(release_install.os, "geteuid", return_value=foreign_uid):
+            real_stat = Path.stat
+
+            def stat_with_foreign_owner(path, *args, **kwargs):
+                status = real_stat(path, *args, **kwargs)
+                if path == root:
+                    return mock.Mock(st_mode=status.st_mode, st_uid=foreign_uid)
+                return status
+
+            with mock.patch.object(
+                Path, "stat", autospec=True, side_effect=stat_with_foreign_owner
+            ):
                 with self.assertRaisesRegex(
                     release_install.InstallError, "owned by root or the deployment"
                 ):
                     release_install.ensure_install_root(root / "install")
+
+    def test_staging_stays_private_until_every_member_is_sealed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            commit = "a" * 40
+            archive, checksum = write_archive(root, commit)
+            args = stage_args(root, archive, checksum, commit)
+            observed_modes = []
+
+            def inspect_private_staging(release_dir, _config, _policy):
+                observed_modes.append(release_dir.stat().st_mode & 0o7777)
+                self.assertTrue(release_dir.name.startswith(".stage-"))
+                for name, (expected_mode, _) in release_install.ARCHIVE_FILES.items():
+                    self.assertEqual(
+                        (release_dir / name).stat().st_mode & 0o777,
+                        expected_mode,
+                    )
+
+            previous_umask = os.umask(0o000)
+            try:
+                with mock.patch.object(
+                    release_install,
+                    "verify_runtime",
+                    side_effect=inspect_private_staging,
+                ):
+                    staged = release_install.stage_release(args)
+            finally:
+                os.umask(previous_umask)
+
+            self.assertEqual(observed_modes, [0o700])
+            release_dir = Path(args.install_root) / "releases" / staged["release_id"]
+            self.assertEqual(release_dir.stat().st_mode & 0o7777, 0o755)
 
     def test_stage_is_content_addressed_idempotent_and_does_not_activate(self):
         with tempfile.TemporaryDirectory() as temporary:
