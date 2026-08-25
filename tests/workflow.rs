@@ -2026,6 +2026,7 @@ fn partial_fill_cancel_race_uses_one_final_cumulative_fill_and_never_rebuys() {
             at(3),
         )
         .expect("partial fill observed");
+    assert_eq!(workflow.state().last_fill_at(), Some(at(3)));
     assert!(matches!(
         workflow.prepare_order(at(4)),
         Err(WorkflowError::InvalidTransition(_))
@@ -2041,6 +2042,7 @@ fn partial_fill_cancel_race_uses_one_final_cumulative_fill_and_never_rebuys() {
         )
         .expect("cancel/fill race reconciled to final cumulative values");
     assert_eq!(workflow.state().stage(), WorkflowStage::OrderFinalized);
+    assert_eq!(workflow.state().last_fill_at(), Some(at(5)));
     assert_eq!(workflow.state().purchased_hype(), hype(150));
     assert_eq!(workflow.state().filled_usdc(), usdc(30_000_000));
     assert_eq!(workflow.state().debited_usdc(), usdc(30_300_000));
@@ -2087,6 +2089,7 @@ fn timely_fill_evidence_can_reconcile_after_effective_expiry() {
             at(31),
         )
         .expect("terminal reconciliation may finish after expiry");
+    assert_eq!(workflow.state().last_fill_at(), Some(at(3)));
     let evidence = bound_evidence(&workflow, &[("timely-fill", 250, 3)], at(32));
     let eligibility = workflow
         .record_staking_eligibility(Some(evidence), at(32))

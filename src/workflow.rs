@@ -593,6 +593,8 @@ pub struct WorkflowState {
     staking_eligible_hype: HypeAtoms,
     eligibility_workflow_id: Option<String>,
     staking_target_hype: HypeAtoms,
+    #[serde(default)]
+    staking_confirmed_hype: HypeAtoms,
     delegated_hype: HypeAtoms,
     staking_submitted_at: Option<DateTime<Utc>>,
     delegation_submitted_at: Option<DateTime<Utc>>,
@@ -681,6 +683,11 @@ impl WorkflowState {
     }
 
     #[must_use]
+    pub const fn staking_confirmed_hype(&self) -> HypeAtoms {
+        self.staking_confirmed_hype
+    }
+
+    #[must_use]
     pub const fn delegated_hype(&self) -> HypeAtoms {
         self.delegated_hype
     }
@@ -738,6 +745,7 @@ impl WorkflowState {
             staking_eligible_hype: HypeAtoms::default(),
             eligibility_workflow_id: None,
             staking_target_hype: HypeAtoms::default(),
+            staking_confirmed_hype: HypeAtoms::default(),
             delegated_hype: HypeAtoms::default(),
             staking_submitted_at: None,
             delegation_submitted_at: None,
@@ -892,6 +900,7 @@ impl WorkflowState {
                         "order finalization is invalid for current state".into(),
                     ));
                 }
+                let new_fill_observed = *cumulative_hype > self.purchased_hype;
                 self.validate_order_finalization(
                     *cumulative_hype,
                     *cumulative_filled_usdc,
@@ -901,7 +910,7 @@ impl WorkflowState {
                 self.purchased_hype = *cumulative_hype;
                 self.filled_usdc = *cumulative_filled_usdc;
                 self.debited_usdc = *cumulative_debited_usdc;
-                if !cumulative_hype.is_zero() {
+                if new_fill_observed {
                     self.last_fill_at = Some(event.at);
                 }
                 self.stage = WorkflowStage::OrderFinalized;
@@ -970,6 +979,7 @@ impl WorkflowState {
                         "staking balance does not match decision-attributed HYPE".into(),
                     ));
                 }
+                self.staking_confirmed_hype = *attributable_hype;
                 self.stage = WorkflowStage::StakingBalanceConfirmed;
             }
             WorkflowTransition::DelegationObserved { action_id, receipt } => {

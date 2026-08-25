@@ -49,6 +49,7 @@ pub struct WorkflowObservation {
     last_fill_at: Option<DateTime<Utc>>,
     purchased_hype: HypeAtoms,
     staking_target_hype: HypeAtoms,
+    staking_confirmed_hype: HypeAtoms,
     delegated_hype: HypeAtoms,
 }
 
@@ -61,6 +62,7 @@ impl From<&WorkflowState> for WorkflowObservation {
             last_fill_at: state.last_fill_at(),
             purchased_hype: state.purchased_hype(),
             staking_target_hype: state.staking_target_hype(),
+            staking_confirmed_hype: state.staking_confirmed_hype(),
             delegated_hype: state.delegated_hype(),
         }
     }
@@ -196,35 +198,12 @@ impl MetricsSnapshot {
                 .checked_add(residual)
                 .ok_or(MetricsError::ArithmeticOverflow)?;
         }
-        let mut horizons = Vec::with_capacity(horizon_residuals.len());
-        for (horizon, residual) in horizon_residuals {
-            let signed_days_remaining = horizon
-                .signed_duration_since(observed_at.date_naive())
-                .num_days()
-                .saturating_add(1)
-                .max(0);
-            let days_remaining = u64::try_from(signed_days_remaining)
-                .map_err(|_| MetricsError::ArithmeticOverflow)?;
-            let slot_start = if pacing.decisions().contains_key(&observed_at.date_naive()) {
-                observed_at
-                    .date_naive()
-                    .checked_add_days(Days::new(1))
-                    .ok_or(MetricsError::ArithmeticOverflow)?
-            } else {
-                observed_at.date_naive()
-            };
-            let slots = limits.remaining_purchase_slots(slot_start, horizon)?;
-            let required_micros = (slots > 0).then(|| residual.div_ceil(slots));
-            horizons.push(HorizonMetrics {
-                horizon,
-                days_remaining,
-                purchase_slots_remaining: slots,
-                residual_usdc: as_usdc(residual),
-                required_pace_usdc: required_micros.map(as_usdc),
-                infeasible: required_micros
-                    .is_none_or(|required| required > limits.max_daily_notional_usdc.as_micros()),
-            });
-        }
+        let horizons = project_horizons(
+            observed_at.date_naive(),
+            pacing.decisions().contains_key(&observed_at.date_naive()),
+            limits,
+            horizon_residuals,
+        )?;
 
         let last_capital_event_at = pacing
             .deposits()
@@ -461,7 +440,7 @@ impl MetricsSnapshot {
         .expect("write string");
         writeln!(
             output,
-            "# HELP hype_accumulator_horizon_residual_usdc Residual admitted capital by horizon."
+            "# HELP hype_accumulator_horizon_residual_usdc Cumulative residual admitted capital due by horizon."
         )
         .expect("write string");
         writeln!(
@@ -530,29 +509,59 @@ impl MetricsSnapshot {
     }
 }
 
+fn project_horizons(
+    observed_date: NaiveDate,
+    today_decided: bool,
+    limits: &PacingLimits,
+    horizon_residuals: BTreeMap<NaiveDate, u64>,
+) -> Result<Vec<HorizonMetrics>, MetricsError> {
+    let slot_start = if today_decided {
+        observed_date
+            .checked_add_days(Days::new(1))
+            .ok_or(MetricsError::ArithmeticOverflow)?
+    } else {
+        observed_date
+    };
+    let mut cumulative_residual = 0_u64;
+    let mut horizons = Vec::with_capacity(horizon_residuals.len());
+    for (horizon, residual) in horizon_residuals {
+        cumulative_residual = cumulative_residual
+            .checked_add(residual)
+            .ok_or(MetricsError::ArithmeticOverflow)?;
+        let signed_days_remaining = horizon
+            .signed_duration_since(observed_date)
+            .num_days()
+            .saturating_add(1)
+            .max(0);
+        let days_remaining =
+            u64::try_from(signed_days_remaining).map_err(|_| MetricsError::ArithmeticOverflow)?;
+        let slots = limits.remaining_purchase_slots(slot_start, horizon)?;
+        let required_micros = (slots > 0).then(|| cumulative_residual.div_ceil(slots));
+        horizons.push(HorizonMetrics {
+            horizon,
+            days_remaining,
+            purchase_slots_remaining: slots,
+            residual_usdc: as_usdc(cumulative_residual),
+            required_pace_usdc: required_micros.map(as_usdc),
+            infeasible: required_micros
+                .is_none_or(|required| required > limits.max_daily_notional_usdc.as_micros()),
+        });
+    }
+    Ok(horizons)
+}
+
 impl WorkflowObservation {
     fn unstaked_hype_atoms(&self) -> Result<u64, MetricsError> {
         if self.staking_target_hype.as_atoms() > self.purchased_hype.as_atoms()
-            || self.delegated_hype.as_atoms() > self.staking_target_hype.as_atoms()
+            || self.staking_confirmed_hype.as_atoms() > self.staking_target_hype.as_atoms()
+            || self.delegated_hype.as_atoms() > self.staking_confirmed_hype.as_atoms()
         {
             return Err(MetricsError::InconsistentCapitalState);
         }
-        let staking_confirmed = self.staking_target_hype.as_atoms() > 0
-            && matches!(
-                self.stage,
-                WorkflowStage::StakingBalanceConfirmed
-                    | WorkflowStage::DelegationSubmitted
-                    | WorkflowStage::DelegatedConfirmed
-                    | WorkflowStage::Complete
-            );
-        if staking_confirmed {
-            self.purchased_hype
-                .as_atoms()
-                .checked_sub(self.staking_target_hype.as_atoms())
-                .ok_or(MetricsError::InconsistentCapitalState)
-        } else {
-            Ok(self.purchased_hype.as_atoms())
-        }
+        self.purchased_hype
+            .as_atoms()
+            .checked_sub(self.staking_confirmed_hype.as_atoms())
+            .ok_or(MetricsError::InconsistentCapitalState)
     }
 }
 
@@ -652,6 +661,7 @@ mod tests {
             last_fill_at: None,
             purchased_hype: HypeAtoms::from_atoms(0),
             staking_target_hype: HypeAtoms::from_atoms(0),
+            staking_confirmed_hype: HypeAtoms::from_atoms(0),
             delegated_hype: HypeAtoms::from_atoms(0),
         }
     }
@@ -693,6 +703,31 @@ mod tests {
     }
 
     #[test]
+    fn horizon_infeasibility_accumulates_all_earlier_deadlines() {
+        let first_horizon = at(12).date_naive();
+        let second_horizon = first_horizon
+            .checked_add_days(Days::new(1))
+            .expect("next date");
+        let horizons = project_horizons(
+            first_horizon,
+            false,
+            &limits(),
+            BTreeMap::from([
+                (first_horizon, usd(100).as_micros()),
+                (second_horizon, usd(150).as_micros()),
+            ]),
+        )
+        .expect("horizon projection");
+
+        assert!(!horizons[0].infeasible);
+        assert!(horizons[1].infeasible);
+        assert!((horizons[1].residual_usdc - 250.0).abs() < f64::EPSILON);
+        assert!(
+            (horizons[1].required_pace_usdc.expect("required pace") - 125.0).abs() < f64::EPSILON
+        );
+    }
+
+    #[test]
     fn filled_hype_remains_unstaked_before_eligibility_reconciliation() {
         let filled = WorkflowObservation {
             workflow_key: "workflow-filled".into(),
@@ -701,6 +736,7 @@ mod tests {
             last_fill_at: Some(at(11)),
             purchased_hype: HypeAtoms::from_atoms(250),
             staking_target_hype: HypeAtoms::from_atoms(0),
+            staking_confirmed_hype: HypeAtoms::from_atoms(0),
             delegated_hype: HypeAtoms::from_atoms(0),
         };
         let snapshot = MetricsSnapshot::from_runtime(
@@ -720,6 +756,33 @@ mod tests {
         assert_eq!(snapshot.unstaked_hype_atoms, 250);
         assert_eq!(snapshot.last_fill_at, Some(at(11)));
         assert!(!snapshot.workflow_stuck);
+
+        let manual_after_delegation = WorkflowObservation {
+            workflow_key: "workflow-manual".into(),
+            stage: WorkflowStage::ManualReview,
+            last_transition_at: at(11),
+            last_fill_at: Some(at(10)),
+            purchased_hype: HypeAtoms::from_atoms(250),
+            staking_target_hype: HypeAtoms::from_atoms(250),
+            staking_confirmed_hype: HypeAtoms::from_atoms(250),
+            delegated_hype: HypeAtoms::from_atoms(250),
+        };
+        let manual_snapshot = MetricsSnapshot::from_runtime(
+            at(12),
+            &PacingState::default(),
+            &limits(),
+            &ReplayState::default(),
+            &[manual_after_delegation],
+            None,
+            0,
+            0,
+            0,
+            7_200,
+        )
+        .expect("manual-review projection");
+        assert_eq!(manual_snapshot.unstaked_hype_atoms, 0);
+        assert_eq!(manual_snapshot.delegated_hype_atoms, 250);
+        assert_eq!(manual_snapshot.halt_reason, Some(HaltReason::ManualReview));
     }
 
     #[test]
