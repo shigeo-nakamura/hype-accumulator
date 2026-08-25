@@ -6,7 +6,10 @@
 //! same UTC day returns [`DecisionResult::Existing`], which is audit-only and
 //! must never be submitted again.
 
-use crate::config::{CarryOverPolicy, Config};
+use crate::{
+    config::{CarryOverPolicy, Config},
+    signal::SignalSnapshot,
+};
 use chrono::{DateTime, Datelike, Days, NaiveDate, TimeDelta, Timelike, Utc, Weekday};
 use rust_decimal::{
     prelude::{FromPrimitive, ToPrimitive},
@@ -21,6 +24,7 @@ use std::{
 use thiserror::Error;
 
 const STATE_SCHEMA_VERSION: u8 = 2;
+const DRY_RUN_REPORT_SCHEMA_VERSION: u8 = 1;
 const BPS_DENOMINATOR: u64 = 10_000;
 const USDC_MICROS_PER_UNIT: u64 = 1_000_000;
 type DueRow = (NaiveDate, DateTime<Utc>, String, UsdcMicros, UsdcMicros);
@@ -265,6 +269,7 @@ pub enum DecisionReason {
     ManualPause,
     MissingCapitalHistory,
     PriorDecisionUnsettled,
+    CoreSignalUnavailable,
     NoAdmittedCapital,
     HorizonInfeasible,
     BelowExchangeMinimum,
@@ -338,6 +343,87 @@ pub struct DecisionInput {
 pub enum DecisionResult {
     New(DailyDecision),
     Existing(DailyDecision),
+}
+
+/// Complete offline decision evidence. This report deliberately contains no
+/// signer, order payload, or exchange action.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DryRunDecisionReport {
+    schema_version: u8,
+    signal_snapshot: SignalSnapshot,
+    decision: DailyDecision,
+    new_decision: bool,
+    economic_action_suppressed: bool,
+    signed_action_created: bool,
+}
+
+impl DryRunDecisionReport {
+    /// Binds a dry-run report to the exact validated signal snapshot used by
+    /// the pacing decision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PacingError`] if the signal is invalid or its date, time, or
+    /// hash differs from the durable decision input.
+    pub fn new(
+        result: &DecisionResult,
+        signal_snapshot: &SignalSnapshot,
+    ) -> Result<Self, PacingError> {
+        signal_snapshot
+            .validate()
+            .map_err(|error| PacingError::InvalidSignalSnapshot(error.to_string()))?;
+        let decision = result.decision();
+        if decision.decision_date != signal_snapshot.decision_date()
+            || decision.decided_at != signal_snapshot.decision_at()
+            || decision.input_snapshot_hash != signal_snapshot.snapshot_hash()
+        {
+            return Err(PacingError::SignalDecisionMismatch);
+        }
+        let new_decision = result.is_new();
+        Ok(Self {
+            schema_version: DRY_RUN_REPORT_SCHEMA_VERSION,
+            signal_snapshot: signal_snapshot.clone(),
+            decision: decision.clone(),
+            new_decision,
+            economic_action_suppressed: new_decision && !decision.planned_usdc.is_zero(),
+            signed_action_created: false,
+        })
+    }
+
+    #[must_use]
+    pub const fn signal_snapshot(&self) -> &SignalSnapshot {
+        &self.signal_snapshot
+    }
+
+    #[must_use]
+    pub const fn decision(&self) -> &DailyDecision {
+        &self.decision
+    }
+
+    #[must_use]
+    pub const fn is_new_decision(&self) -> bool {
+        self.new_decision
+    }
+
+    #[must_use]
+    pub const fn economic_action_suppressed(&self) -> bool {
+        self.economic_action_suppressed
+    }
+
+    #[must_use]
+    pub const fn signed_action_created(&self) -> bool {
+        self.signed_action_created
+    }
+
+    /// Serializes the complete capital attribution, pacing explanation, and
+    /// signal evidence in deterministic struct-field order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PacingError::Snapshot`] on serialization failure.
+    pub fn to_canonical_json(&self) -> Result<String, PacingError> {
+        serde_json::to_string(self).map_err(|error| PacingError::Snapshot(error.to_string()))
+    }
 }
 
 impl DecisionResult {
@@ -460,6 +546,50 @@ impl PacingState {
         input: &DecisionInput,
         limits: &PacingLimits,
     ) -> Result<DecisionResult, PacingError> {
+        let input_snapshot_hash = snapshot_hash(&(input, limits))?;
+        self.decide_bound(input, limits, input_snapshot_hash, true, false)
+    }
+
+    /// Creates one durable decision bound to the exact immutable signal
+    /// snapshot used at the decision boundary. Unavailable core data creates a
+    /// durable zero-amount skip; auxiliary health remains neutral and does not
+    /// block fixed pacing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PacingError`] for an invalid or mismatched signal snapshot,
+    /// conflicting same-day signal evidence, or any ordinary pacing failure.
+    pub fn decide_with_signal(
+        &mut self,
+        input: &DecisionInput,
+        limits: &PacingLimits,
+        signal_snapshot: &SignalSnapshot,
+    ) -> Result<DecisionResult, PacingError> {
+        signal_snapshot
+            .validate()
+            .map_err(|error| PacingError::InvalidSignalSnapshot(error.to_string()))?;
+        if signal_snapshot.decision_at() != input.at
+            || signal_snapshot.decision_date() != input.at.date_naive()
+        {
+            return Err(PacingError::SignalDecisionMismatch);
+        }
+        self.decide_bound(
+            input,
+            limits,
+            signal_snapshot.snapshot_hash().to_owned(),
+            signal_snapshot.purchase_eligible(),
+            true,
+        )
+    }
+
+    fn decide_bound(
+        &mut self,
+        input: &DecisionInput,
+        limits: &PacingLimits,
+        input_snapshot_hash: String,
+        core_purchase_eligible: bool,
+        reject_conflicting_signal_replay: bool,
+    ) -> Result<DecisionResult, PacingError> {
         limits.validate()?;
         self.validate_invariants()?;
         self.validate_for_limits(limits)?;
@@ -476,6 +606,11 @@ impl PacingState {
         next.validate_for_limits(limits)?;
         let date = input.at.date_naive();
         if let Some(existing) = next.decisions.get(&date).cloned() {
+            if reject_conflicting_signal_replay
+                && existing.input_snapshot_hash != input_snapshot_hash
+            {
+                return Err(PacingError::ConflictingSignalSnapshot);
+            }
             *self = next;
             return Ok(DecisionResult::Existing(existing));
         }
@@ -483,7 +618,8 @@ impl PacingState {
             return Err(PacingError::DecisionNotDue);
         }
 
-        let decision = next.build_decision(input, limits)?;
+        let decision =
+            next.build_decision(input, limits, input_snapshot_hash, core_purchase_eligible)?;
         next.decisions.insert(date, decision.clone());
         next.validate_invariants()?;
         next.validate_for_limits(limits)?;
@@ -770,6 +906,8 @@ impl PacingState {
             if date != &decision.decision_date
                 || decision.decision_id != format!("fixed-dca:{date}")
                 || !decision_ids.insert(&decision.decision_id)
+                || !valid_snapshot_hash(&decision.capital_snapshot_hash)
+                || !valid_snapshot_hash(&decision.input_snapshot_hash)
                 || planned != decision.planned_usdc
                 || committed != decision.committed_usdc
                 || decision.committed_usdc < decision.planned_usdc
@@ -1117,10 +1255,11 @@ impl PacingState {
         &mut self,
         input: &DecisionInput,
         limits: &PacingLimits,
+        input_snapshot_hash: String,
+        core_purchase_eligible: bool,
     ) -> Result<DailyDecision, PacingError> {
         let date = input.at.date_naive();
         let capital_snapshot_hash = capital_snapshot_hash(self)?;
-        let input_snapshot_hash = snapshot_hash(&(input, limits))?;
         let admitted_unspent =
             checked_sum(self.deposits.values().map(DepositTranche::residual_usdc))?;
         let unadmitted = checked_sum(self.deposits.values().map(DepositTranche::unadmitted_usdc))?;
@@ -1156,6 +1295,8 @@ impl PacingState {
             reason = DecisionReason::MissingCapitalHistory;
         } else if prior_unsettled {
             reason = DecisionReason::PriorDecisionUnsettled;
+        } else if !core_purchase_eligible {
+            reason = DecisionReason::CoreSignalUnavailable;
         } else if due_rows.is_empty() {
             reason = if expired_residual.is_zero() {
                 DecisionReason::NoAdmittedCapital
@@ -1381,6 +1522,12 @@ pub enum PacingError {
     ReconciliationTimeRegressed,
     #[error("daily decision is not due")]
     DecisionNotDue,
+    #[error("signal snapshot is invalid: {0}")]
+    InvalidSignalSnapshot(String),
+    #[error("signal snapshot does not match the decision boundary")]
+    SignalDecisionMismatch,
+    #[error("UTC day already has a decision bound to different signal evidence")]
+    ConflictingSignalSnapshot,
     #[error("unknown decision")]
     UnknownDecision,
     #[error("decision has no economic commitment")]
@@ -1425,6 +1572,13 @@ fn validate_withdrawal(event: &WithdrawalEvent) -> Result<(), PacingError> {
 
 fn invalid_id(id: &str) -> bool {
     id.is_empty() || id.trim() != id
+}
+
+fn valid_snapshot_hash(hash: &str) -> bool {
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn monotonic_timestamp(old: Option<DateTime<Utc>>, new: Option<DateTime<Utc>>) -> bool {

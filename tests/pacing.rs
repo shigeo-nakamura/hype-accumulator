@@ -1,13 +1,20 @@
-use chrono::{DateTime, TimeDelta, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, TimeDelta, TimeZone, Utc};
 use hype_accumulator::{
     config::{CarryOverPolicy, Config, ConfigError},
     pacing::{
         AdmissionStatus, CapitalEvent, DecisionInput, DecisionReason, DecisionResult, DepositEvent,
-        PacingAlert, PacingLimits, PacingState, UsdcMicros, WithdrawalEvent,
+        DryRunDecisionReport, PacingAlert, PacingError, PacingLimits, PacingState, UsdcMicros,
+        WithdrawalEvent,
+    },
+    signal::{
+        AuxiliaryHealth, FreshnessRequirement, LiveSignalNormalizer, RevisionQuery, SignalSnapshot,
+        SnapshotRequest, NEUTRAL_MULTIPLIER_BPS,
     },
 };
 use proptest::prelude::*;
 use std::collections::{BTreeSet, HashMap};
+
+const RAW_SIGNALS: &str = include_str!("../fixtures/signal-snapshots-v1/raw.json");
 
 fn at(year: i32, month: u32, day: u32, hour: u32) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(year, month, day, hour, 0, 0)
@@ -80,6 +87,127 @@ fn input(at: DateTime<Utc>, observed: u64) -> DecisionInput {
         capital_history_complete: true,
         manual_pause: false,
     }
+}
+
+fn day(value: &str) -> NaiveDate {
+    NaiveDate::parse_from_str(value, "%Y-%m-%d").expect("valid fixture date")
+}
+
+fn signal_snapshot(
+    decision_at: DateTime<Utc>,
+    core_date: &str,
+    auxiliary_date: &str,
+) -> SignalSnapshot {
+    let core = RevisionQuery::new("fixture-core", "v1", "hype_market", day(core_date))
+        .expect("core query");
+    let auxiliary =
+        RevisionQuery::new("fixture-aux", "v1", "btc_etf_net_flow", day(auxiliary_date))
+            .expect("auxiliary query");
+    LiveSignalNormalizer::normalize_json(RAW_SIGNALS)
+        .expect("normalized fixture")
+        .snapshot(&SnapshotRequest::new(
+            decision_at,
+            FreshnessRequirement::new(core, 60).expect("core freshness"),
+            FreshnessRequirement::new(auxiliary, 604_800).expect("auxiliary freshness"),
+        ))
+        .expect("signal snapshot")
+}
+
+#[test]
+fn signal_bound_decision_emits_complete_dry_run_attribution() {
+    let limits = limits();
+    let decision_at = at(2026, 7, 6, 12);
+    let mut state = PacingState::default();
+    state
+        .reconcile_capital(
+            &[deposit("deposit-signal-bound", 100, at(2026, 7, 6, 8))],
+            at(2026, 7, 6, 10),
+            &limits,
+        )
+        .expect("capital admitted");
+    let snapshot = signal_snapshot(decision_at, "2026-07-06", "2026-07-03");
+    assert!(snapshot.purchase_eligible());
+    assert_eq!(snapshot.auxiliary_health(), &AuxiliaryHealth::Missing);
+    assert_eq!(snapshot.pacing_multiplier_bps(), NEUTRAL_MULTIPLIER_BPS);
+
+    let result = state
+        .decide_with_signal(&input(decision_at, 1_000), &limits, &snapshot)
+        .expect("signal-bound decision");
+    let decision = result.decision();
+    assert!(result.is_new());
+    assert_eq!(decision.reason, DecisionReason::Planned);
+    assert_eq!(decision.input_snapshot_hash, snapshot.snapshot_hash());
+    assert!(decision.planned_usdc > UsdcMicros::default());
+    assert_eq!(decision.allocations[0].tranche_id, "deposit-signal-bound");
+
+    let report = DryRunDecisionReport::new(&result, &snapshot).expect("dry-run report");
+    assert!(!report.signed_action_created());
+    assert_eq!(report.signal_snapshot(), &snapshot);
+    assert_eq!(report.decision(), decision);
+    let json: serde_json::Value = serde_json::from_str(
+        &report
+            .to_canonical_json()
+            .expect("canonical dry-run report"),
+    )
+    .expect("valid report JSON");
+    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["signed_action_created"], false);
+    assert_eq!(
+        json["signal_snapshot"]["snapshot_hash"],
+        snapshot.snapshot_hash()
+    );
+    assert_eq!(
+        json["decision"]["allocations"][0]["tranche_id"],
+        "deposit-signal-bound"
+    );
+    assert!(json["decision"]["explanation"]["daily_cap_usdc"].is_number());
+}
+
+#[test]
+fn unavailable_core_is_a_durable_skip_and_signal_conflicts_fail_closed() {
+    let limits = limits();
+    let decision_at = at(2026, 7, 8, 12);
+    let mut state = PacingState::default();
+    state
+        .reconcile_capital(
+            &[deposit("deposit-core-outage", 100, at(2026, 7, 8, 8))],
+            at(2026, 7, 8, 10),
+            &limits,
+        )
+        .expect("capital admitted");
+    let outage = signal_snapshot(decision_at, "2026-07-08", "2026-07-08");
+    assert!(!outage.purchase_eligible());
+
+    let input = input(decision_at, 1_000);
+    let first = state
+        .decide_with_signal(&input, &limits, &outage)
+        .expect("durable outage skip");
+    assert!(first.is_new());
+    assert_eq!(
+        first.decision().reason,
+        DecisionReason::CoreSignalUnavailable
+    );
+    assert_eq!(first.decision().planned_usdc, UsdcMicros::default());
+    assert_eq!(first.decision().input_snapshot_hash, outage.snapshot_hash());
+
+    let replay = state
+        .decide_with_signal(&input, &limits, &outage)
+        .expect("exact same-day replay");
+    assert!(matches!(replay, DecisionResult::Existing(_)));
+
+    let conflicting = signal_snapshot(decision_at, "2026-07-08", "2026-07-02");
+    assert_eq!(
+        state.decide_with_signal(&input, &limits, &conflicting),
+        Err(PacingError::ConflictingSignalSnapshot)
+    );
+    assert_eq!(state.decisions().len(), 1);
+
+    let next_day = signal_snapshot(at(2026, 7, 9, 12), "2026-07-09", "2026-07-09");
+    assert_eq!(
+        state.decide_with_signal(&input, &limits, &next_day),
+        Err(PacingError::SignalDecisionMismatch)
+    );
+    assert_eq!(state.decisions().len(), 1);
 }
 
 #[test]
