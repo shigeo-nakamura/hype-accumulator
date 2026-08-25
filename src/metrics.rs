@@ -1,7 +1,7 @@
 use crate::{
     ledger::ReplayState,
     pacing::{PacingError, PacingLimits, PacingState},
-    signal::SignalSnapshot,
+    signal::{AuxiliaryHealth, SignalSnapshot},
     workflow::{HypeAtoms, WorkflowStage, WorkflowState},
 };
 use chrono::{DateTime, Days, NaiveDate, Utc};
@@ -53,6 +53,13 @@ pub struct WorkflowObservation {
     delegated_hype: HypeAtoms,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct SignalHealthMetrics {
+    pub core_unavailable: bool,
+    pub auxiliary_missing: bool,
+    pub auxiliary_stale: bool,
+}
+
 impl From<&WorkflowState> for WorkflowObservation {
     fn from(state: &WorkflowState) -> Self {
         Self {
@@ -90,6 +97,7 @@ pub struct MetricsSnapshot {
     pub api_errors_total: u64,
     pub stale_signal_events_total: u64,
     pub dry_run_actions_total: u64,
+    pub signal_health: SignalHealthMetrics,
     pub stale_signal: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub halt_reason: Option<HaltReason>,
@@ -273,6 +281,15 @@ impl MetricsSnapshot {
         }
 
         let stale_signal = signal.is_none_or(|snapshot| snapshot.core_is_stale_at(observed_at));
+        let (auxiliary_signal_missing, auxiliary_signal_stale) =
+            signal.map_or((true, false), |snapshot| {
+                match snapshot.auxiliary_health() {
+                    AuxiliaryHealth::Missing | AuxiliaryHealth::Future { .. } => (true, false),
+                    AuxiliaryHealth::Healthy { .. } | AuxiliaryHealth::Stale { .. } => {
+                        (false, snapshot.auxiliary_is_stale_at(observed_at))
+                    }
+                }
+            });
         let halt_reason = if manual_review_workflows > 0 {
             Some(HaltReason::ManualReview)
         } else if workflow_stuck {
@@ -304,6 +321,11 @@ impl MetricsSnapshot {
             api_errors_total,
             stale_signal_events_total,
             dry_run_actions_total,
+            signal_health: SignalHealthMetrics {
+                core_unavailable: stale_signal,
+                auxiliary_missing: auxiliary_signal_missing,
+                auxiliary_stale: auxiliary_signal_stale,
+            },
             stale_signal,
             halt_reason,
             horizons,
@@ -403,6 +425,21 @@ impl MetricsSnapshot {
                 "hype_accumulator_stale_signal",
                 "Whether the core signal is absent or stale.",
                 u8::from(self.stale_signal).to_string(),
+            ),
+            (
+                "hype_accumulator_core_signal_unavailable",
+                "Whether core market data is absent, future, or stale.",
+                u8::from(self.signal_health.core_unavailable).to_string(),
+            ),
+            (
+                "hype_accumulator_auxiliary_signal_missing",
+                "Whether auxiliary data is absent or not yet usable.",
+                u8::from(self.signal_health.auxiliary_missing).to_string(),
+            ),
+            (
+                "hype_accumulator_auxiliary_signal_stale",
+                "Whether selected auxiliary data is stale at observation time.",
+                u8::from(self.signal_health.auxiliary_stale).to_string(),
             ),
         ] {
             writeln!(output, "# HELP {name} {help}").expect("write string");
@@ -591,6 +628,7 @@ mod tests {
             DurableLedger, LedgerEvent, LedgerEventKind, ProtectedAnchorStore, ProtectedHeadAnchor,
         },
         pacing::{CapitalEvent, DecisionInput, DepositEvent, UsdcMicros},
+        signal::{FreshnessRequirement, LiveSignalNormalizer, RevisionQuery, SnapshotRequest},
         status::{AccumulatorStatus, DashboardStatus},
         status_io::write_metrics_atomic,
     };
@@ -632,6 +670,35 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 8, 25, hour, 0, 0)
             .single()
             .expect("valid fixture time")
+    }
+
+    fn signal_at(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .expect("valid signal fixture time")
+            .with_timezone(&Utc)
+    }
+
+    fn signal_snapshot(
+        decision_at: DateTime<Utc>,
+        core_date: NaiveDate,
+        auxiliary_date: NaiveDate,
+        auxiliary_stale_after_seconds: u64,
+    ) -> SignalSnapshot {
+        let core =
+            RevisionQuery::new("fixture-core", "v1", "hype_market", core_date).expect("core query");
+        let auxiliary = RevisionQuery::new("fixture-aux", "v1", "btc_etf_net_flow", auxiliary_date)
+            .expect("auxiliary query");
+        LiveSignalNormalizer::normalize_json(include_str!(
+            "../fixtures/signal-snapshots-v1/raw.json"
+        ))
+        .expect("normalized fixture")
+        .snapshot(&SnapshotRequest::new(
+            decision_at,
+            FreshnessRequirement::new(core, 60).expect("core freshness"),
+            FreshnessRequirement::new(auxiliary, auxiliary_stale_after_seconds)
+                .expect("auxiliary freshness"),
+        ))
+        .expect("signal snapshot")
     }
 
     fn usd(value: u64) -> UsdcMicros {
@@ -814,6 +881,18 @@ mod tests {
 
         assert_eq!(value["schema_version"], 1);
         assert_eq!(value["operations"]["stale_signal"], true);
+        assert_eq!(
+            value["operations"]["signal_health"]["core_unavailable"],
+            true
+        );
+        assert_eq!(
+            value["operations"]["signal_health"]["auxiliary_missing"],
+            true
+        );
+        assert_eq!(
+            value["operations"]["signal_health"]["auxiliary_stale"],
+            false
+        );
         assert_eq!(value["operations"]["halt_reason"], "stale_signal");
         assert!(!json.contains("account"));
         assert!(!json.contains("signature"));
@@ -824,6 +903,67 @@ mod tests {
         let written = std::fs::read_to_string(path).expect("metrics payload");
         assert!(written.ends_with('\n'));
         assert!(written.contains("hype_accumulator_stale_signal 1"));
+        assert!(written.contains("hype_accumulator_core_signal_unavailable 1"));
+        assert!(written.contains("hype_accumulator_auxiliary_signal_missing 1"));
+        assert!(written.contains("hype_accumulator_auxiliary_signal_stale 0"));
+    }
+
+    #[test]
+    fn core_and_auxiliary_signal_health_are_exported_independently() {
+        let missing_at = signal_at("2026-07-03T12:00:00Z");
+        let missing_auxiliary = signal_snapshot(
+            missing_at,
+            missing_at.date_naive(),
+            missing_at.date_naive(),
+            604_800,
+        );
+        let missing = MetricsSnapshot::from_runtime(
+            missing_at,
+            &PacingState::default(),
+            &limits(),
+            &ReplayState::default(),
+            &[],
+            Some(&missing_auxiliary),
+            0,
+            0,
+            0,
+            3_600,
+        )
+        .expect("missing auxiliary projection");
+        assert!(!missing.signal_health.core_unavailable);
+        assert!(missing.signal_health.auxiliary_missing);
+        assert!(!missing.signal_health.auxiliary_stale);
+        assert_eq!(missing.halt_reason, None);
+
+        let decision_at = signal_at("2026-07-06T12:00:00Z");
+        let stale_auxiliary = signal_snapshot(
+            decision_at,
+            decision_at.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 7, 2).expect("auxiliary date"),
+            316_801,
+        );
+        let observed_at = signal_at("2026-07-06T12:00:02Z");
+        let stale = MetricsSnapshot::from_runtime(
+            observed_at,
+            &PacingState::default(),
+            &limits(),
+            &ReplayState::default(),
+            &[],
+            Some(&stale_auxiliary),
+            0,
+            0,
+            0,
+            3_600,
+        )
+        .expect("stale auxiliary projection");
+        assert!(!stale.signal_health.core_unavailable);
+        assert!(!stale.signal_health.auxiliary_missing);
+        assert!(stale.signal_health.auxiliary_stale);
+        assert_eq!(stale.halt_reason, None);
+        let prometheus = stale.to_prometheus();
+        assert!(prometheus.contains("hype_accumulator_core_signal_unavailable 0"));
+        assert!(prometheus.contains("hype_accumulator_auxiliary_signal_missing 0"));
+        assert!(prometheus.contains("hype_accumulator_auxiliary_signal_stale 1"));
     }
 
     #[test]

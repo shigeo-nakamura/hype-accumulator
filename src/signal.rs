@@ -814,6 +814,17 @@ impl SignalSnapshot {
         })
     }
 
+    /// Re-evaluates auxiliary freshness at a later observation time without
+    /// coupling it to core purchase eligibility.
+    #[must_use]
+    pub fn auxiliary_is_stale_at(&self, observed_at: DateTime<Utc>) -> bool {
+        self.body.auxiliary.as_ref().is_some_and(|revision| {
+            revision.timestamps().first_usable_at() > observed_at
+                || age_seconds(observed_at, revision.timestamps().observed_at())
+                    .is_none_or(|age| age >= self.body.auxiliary_stale_after_seconds)
+        })
+    }
+
     #[must_use]
     pub fn snapshot_hash(&self) -> &str {
         &self.snapshot_hash
