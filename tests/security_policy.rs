@@ -166,6 +166,45 @@ fn example_policy_is_typed_and_safe_for_dry_run() {
 }
 
 #[test]
+fn offline_install_requires_an_explicit_halted_dry_run_policy() {
+    let runtime = include_str!("fixtures/safe.toml");
+    let policy = include_str!("../config/security-policy.example.toml");
+    let safe = Config::from_toml_with_security_policy(runtime, policy)
+        .expect("offline install documents parse");
+    safe.validate_offline_install(&HashMap::new())
+        .expect("halted dry-run install is accepted");
+
+    let missing_policy = Config::from_toml(runtime).expect("runtime document parses");
+    assert_eq!(
+        missing_policy.validate_offline_install(&HashMap::new()),
+        Err(ConfigError::MissingSecurityPolicy)
+    );
+
+    for (field, invalid_runtime) in [
+        (
+            "dry_run",
+            runtime.replace("dry_run = true", "dry_run = false"),
+        ),
+        (
+            "manual_halt",
+            runtime.replace("manual_halt = true", "manual_halt = false"),
+        ),
+        ("live_approved", format!("live_approved = true\n{runtime}")),
+    ] {
+        let invalid = Config::from_toml_with_security_policy(&invalid_runtime, policy)
+            .expect("invalid-mode documents remain typed");
+        assert_eq!(
+            invalid.validate_offline_install(&HashMap::new()),
+            Err(ConfigError::Invalid(
+                "offline install requires dry_run=true, manual_halt=true, and live_approved=false"
+                    .into()
+            )),
+            "{field} must fail closed"
+        );
+    }
+}
+
+#[test]
 fn dry_run_policy_reserve_must_fit_the_runtime_admission_cap() {
     let policy = include_str!("../config/security-policy.example.toml")
         .replace("reserve_microusd = 0", "reserve_microusd = 100000000");

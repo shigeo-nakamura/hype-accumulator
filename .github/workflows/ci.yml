@@ -100,6 +100,11 @@ jobs:
 
           test "$(target/al2023/${TARGET}/release/hype-accumulator config/example.toml)" = \
             "mode=dry-run ready"
+          test "$(target/al2023/${TARGET}/release/hype-accumulator \
+            --install-preflight \
+            config/example.toml \
+            config/security-policy.example.toml)" = \
+            "mode=dry-run halted install-ready"
           if target/al2023/${TARGET}/release/hype-status extra argument rejected; then
             printf "hype-status unexpectedly accepted excess arguments\n" >&2
             exit 1

@@ -127,6 +127,12 @@ report containing the image digest, OS/libc identity, dynamic dependencies, and
 required glibc symbol versions. This artifact workflow does not deploy, start a
 service, install configuration or credentials, or enable live behavior.
 
+The offline installer verifies the attested artifact's outer and inner
+checksums, provenance, ABI, immutable image and lock digests, and an explicit
+halted dry-run policy before staging or atomically selecting a release. It has
+no network, AWS, secret, signer, or service-lifecycle capability. See
+`docs/runbooks/release-install.md` for the exact stage/activate/rollback contract.
+
 ## Research
 
 The standard-library-only point-in-time research harness compares deposit-aware daily and weekly DCA with explicitly bounded adaptive pacing. It enforces capital admission times, one purchase per UTC day, execution limits, and data revision/publication rules.

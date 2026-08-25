@@ -177,6 +177,30 @@ impl Config {
         self.validate_at(env, Utc::now())
     }
 
+    /// Validates the artifact-install boundary without enabling runtime actions.
+    ///
+    /// This gate is intentionally stricter than ordinary dry-run startup: an
+    /// explicit typed security policy is required and both the runtime and the
+    /// policy must remain dry-run, manually halted, and without live approval.
+    /// It does not read the signing-key environment value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fail-closed configuration or policy error unless the release
+    /// can be installed for signer-free, halted verification only.
+    pub fn validate_offline_install<E: Environment>(&self, env: &E) -> Result<(), ConfigError> {
+        if !self.dry_run || !self.manual_halt || self.live_approved {
+            return Err(ConfigError::Invalid(
+                "offline install requires dry_run=true, manual_halt=true, and live_approved=false"
+                    .into(),
+            ));
+        }
+        if self.security_policy.is_none() {
+            return Err(ConfigError::MissingSecurityPolicy);
+        }
+        self.validate(env)
+    }
+
     /// Validates configuration at an injected UTC instant.
     ///
     /// This entry point keeps acknowledgement-expiry boundary tests
