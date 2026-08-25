@@ -22,7 +22,7 @@ use std::{
 use thiserror::Error;
 
 pub const LEDGER_SCHEMA_VERSION: u8 = 1;
-pub const SNAPSHOT_SCHEMA_VERSION: u8 = 1;
+pub const SNAPSHOT_SCHEMA_VERSION: u8 = 2;
 pub const PROTECTED_ANCHOR_SCHEMA_VERSION: u8 = 1;
 pub const LEDGER_FILE_NAME: &str = "ledger.jsonl";
 pub const SNAPSHOT_FILE_NAME: &str = "snapshot.json";
@@ -225,6 +225,8 @@ pub struct ReplayState {
     observed_hype_atoms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_observation_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_decision_at: Option<DateTime<Utc>>,
     last_event_at: Option<DateTime<Utc>>,
 }
 
@@ -272,6 +274,39 @@ impl ReplayState {
     #[must_use]
     pub const fn last_event_at(&self) -> Option<&DateTime<Utc>> {
         self.last_event_at.as_ref()
+    }
+
+    #[must_use]
+    pub fn last_capital_event_at(&self) -> Option<DateTime<Utc>> {
+        let mut unmatched_commitments = BTreeMap::<(DateTime<Utc>, UsdcMicros), usize>::new();
+        for commitment in self.commitments.values() {
+            *unmatched_commitments
+                .entry((commitment.occurred_at, commitment.committed_usdc))
+                .or_default() += 1;
+        }
+        let last_withdrawal = self.capital_timeline.iter().filter_map(|entry| {
+            if !entry.credit_usdc.is_zero() || entry.debit_usdc.is_zero() {
+                return None;
+            }
+            let key = (entry.occurred_at, entry.debit_usdc);
+            if let Some(count) = unmatched_commitments.get_mut(&key) {
+                if *count > 0 {
+                    *count -= 1;
+                    return None;
+                }
+            }
+            Some(entry.occurred_at)
+        });
+        self.deposits
+            .values()
+            .map(|deposit| deposit.occurred_at)
+            .chain(last_withdrawal)
+            .max()
+    }
+
+    #[must_use]
+    pub const fn last_decision_at(&self) -> Option<DateTime<Utc>> {
+        self.last_decision_at
     }
 
     #[must_use]
@@ -1017,12 +1052,7 @@ fn apply_event(state: &mut ReplayState, event: &LedgerEvent) -> Result<(), Ledge
             decision_id,
             decision_date,
             ..
-        } => record_daily_outcome(
-            state,
-            event.occurred_at.date_naive(),
-            *decision_date,
-            decision_id,
-        )?,
+        } => record_daily_outcome(state, event.occurred_at, *decision_date, decision_id)?,
         LedgerEventKind::OrderRecorded {
             order_id,
             decision_id,
@@ -1206,10 +1236,11 @@ fn record_observed_balance(
 
 fn record_daily_outcome(
     state: &mut ReplayState,
-    occurred_date: NaiveDate,
+    occurred_at: DateTime<Utc>,
     decision_date: NaiveDate,
     decision_id: &str,
 ) -> Result<(), LedgerError> {
+    let occurred_date = occurred_at.date_naive();
     if decision_date != occurred_date {
         return Err(LedgerError::DecisionDateMismatch {
             declared: decision_date,
@@ -1226,6 +1257,7 @@ fn record_daily_outcome(
         .decision_outcomes
         .insert(decision_date, decision_id.to_owned());
     state.decision_ids.insert(decision_id.to_owned());
+    state.last_decision_at = state.last_decision_at.max(Some(occurred_at));
     Ok(())
 }
 
@@ -1250,7 +1282,7 @@ fn record_purchase_decision(
             ));
         }
     }
-    record_daily_outcome(state, occurred_at.date_naive(), decision_date, decision_id)?;
+    record_daily_outcome(state, occurred_at, decision_date, decision_id)?;
     if state.decision_commitment_ids.contains(commitment_id) {
         return Err(LedgerError::DecisionCommitmentCollision(
             commitment_id.to_owned(),

@@ -134,7 +134,7 @@ impl MetricsSnapshot {
         dry_run_actions_total: u64,
         stuck_after_seconds: u64,
     ) -> Result<Self, MetricsError> {
-        limits.validate()?;
+        pacing.validate_for_limits(limits)?;
         if stuck_after_seconds == 0 {
             return Err(MetricsError::InvalidStuckThreshold);
         }
@@ -223,22 +223,8 @@ impl MetricsSnapshot {
             horizon_residuals,
         )?;
 
-        let last_capital_event_at = pacing
-            .deposits()
-            .values()
-            .map(|tranche| tranche.received_at)
-            .chain(
-                pacing
-                    .withdrawals()
-                    .values()
-                    .map(|withdrawal| withdrawal.event.occurred_at),
-            )
-            .max();
-        let last_decision_at = pacing
-            .decisions()
-            .values()
-            .map(|decision| decision.decided_at)
-            .max();
+        let last_capital_event_at = ledger.last_capital_event_at();
+        let last_decision_at = ledger.last_decision_at();
 
         let mut last_fill_at = None;
         let mut unstaked_hype_atoms = 0_u64;
@@ -1132,5 +1118,157 @@ mod tests {
             ),
             Err(MetricsError::Pacing(PacingError::InvalidLimits))
         ));
+    }
+
+    #[test]
+    fn malformed_pacing_state_fails_closed_before_aggregation() {
+        let mut value =
+            serde_json::to_value(PacingState::default()).expect("serialize pacing fixture");
+        value["schema_version"] = serde_json::json!(u8::MAX);
+        let malformed: PacingState =
+            serde_json::from_value(value).expect("deserialize malformed pacing fixture");
+
+        assert!(matches!(
+            MetricsSnapshot::from_runtime(
+                at(12),
+                &malformed,
+                &limits(),
+                &ReplayState::default(),
+                &[],
+                None,
+                0,
+                0,
+                0,
+                3_600,
+            ),
+            Err(MetricsError::Pacing(PacingError::CorruptState))
+        ));
+    }
+
+    #[test]
+    fn authoritative_ledger_drives_last_capital_activity() {
+        let directory = tempfile::tempdir().expect("temporary ledger");
+        let mut ledger = DurableLedger::open(directory.path(), Arc::new(MemoryAnchor::default()))
+            .expect("ledger opens");
+        ledger
+            .append(LedgerEvent {
+                event_id: "confirmed-unadmitted-deposit".into(),
+                occurred_at: at(8),
+                kind: LedgerEventKind::AuthoritativeDeposit {
+                    amount_usdc: usd(100),
+                },
+            })
+            .expect("authoritative deposit recorded");
+
+        let ledger_first = MetricsSnapshot::from_runtime(
+            at(12),
+            &PacingState::default(),
+            &limits(),
+            ledger.state(),
+            &[],
+            None,
+            0,
+            0,
+            0,
+            3_600,
+        )
+        .expect("ledger-only capital projection");
+        assert_eq!(ledger_first.last_capital_event_at, Some(at(8)));
+        assert!((ledger_first.unallocated_deposits_usdc - 100.0).abs() < f64::EPSILON);
+
+        let mut pacing_only = PacingState::default();
+        pacing_only
+            .reconcile_capital(
+                &[CapitalEvent::Deposit(DepositEvent {
+                    event_id: "pending-pacing-deposit".into(),
+                    amount_usdc: usd(100),
+                    received_at: at(8),
+                    confirmed_at: None,
+                    confirmation_count: 0,
+                    admission_approved_at: None,
+                })],
+                at(10),
+                &limits(),
+            )
+            .expect("pending pacing deposit");
+        let pending_only = MetricsSnapshot::from_runtime(
+            at(12),
+            &pacing_only,
+            &limits(),
+            &ReplayState::default(),
+            &[],
+            None,
+            0,
+            0,
+            0,
+            3_600,
+        )
+        .expect("pending pacing projection");
+        assert_eq!(pending_only.last_capital_event_at, None);
+    }
+
+    #[test]
+    fn durable_ledger_drives_last_decision_activity() {
+        let directory = tempfile::tempdir().expect("temporary ledger");
+        let anchor = Arc::new(MemoryAnchor::default());
+        let mut ledger =
+            DurableLedger::open(directory.path(), anchor.clone()).expect("ledger opens");
+        ledger
+            .append(LedgerEvent {
+                event_id: "durable-skip".into(),
+                occurred_at: at(8),
+                kind: LedgerEventKind::DailySkip {
+                    decision_id: "decision/durable-skip".into(),
+                    decision_date: at(8).date_naive(),
+                    reason: "no admitted capital".into(),
+                },
+            })
+            .expect("durable skip recorded");
+        drop(ledger);
+        let ledger = DurableLedger::open(directory.path(), anchor).expect("ledger reopens");
+        let durable = MetricsSnapshot::from_runtime(
+            at(12),
+            &PacingState::default(),
+            &limits(),
+            ledger.state(),
+            &[],
+            None,
+            0,
+            0,
+            0,
+            3_600,
+        )
+        .expect("durable decision projection");
+        assert_eq!(durable.last_decision_at, Some(at(8)));
+
+        let mut pacing_only = PacingState::default();
+        pacing_only
+            .reconcile_capital(&[], at(10), &limits())
+            .expect("pacing reconciles");
+        pacing_only
+            .decide(
+                &DecisionInput {
+                    at: at(12),
+                    observed_spot_usdc: UsdcMicros::default(),
+                    capital_history_complete: true,
+                    manual_pause: false,
+                },
+                &limits(),
+            )
+            .expect("pacing skip recorded");
+        let nondurable = MetricsSnapshot::from_runtime(
+            at(12),
+            &pacing_only,
+            &limits(),
+            &ReplayState::default(),
+            &[],
+            None,
+            0,
+            0,
+            0,
+            3_600,
+        )
+        .expect("pacing-only decision projection");
+        assert_eq!(nondurable.last_decision_at, None);
     }
 }
