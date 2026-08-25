@@ -351,6 +351,8 @@ pub enum DecisionResult {
 pub struct DryRunDecisionReport {
     schema_version: u8,
     signal_snapshot: SignalSnapshot,
+    decision_input: DecisionInput,
+    pacing_limits: PacingLimits,
     decision: DailyDecision,
     new_decision: bool,
     economic_action_suppressed: bool,
@@ -368,14 +370,19 @@ impl DryRunDecisionReport {
     pub fn new(
         result: &DecisionResult,
         signal_snapshot: &SignalSnapshot,
+        decision_input: &DecisionInput,
+        pacing_limits: &PacingLimits,
     ) -> Result<Self, PacingError> {
+        pacing_limits.validate()?;
         signal_snapshot
             .validate()
             .map_err(|error| PacingError::InvalidSignalSnapshot(error.to_string()))?;
         let decision = result.decision();
         if decision.decision_date != signal_snapshot.decision_date()
             || decision.decided_at != signal_snapshot.decision_at()
-            || decision.input_snapshot_hash != signal_snapshot.snapshot_hash()
+            || decision.decided_at != decision_input.at
+            || decision.input_snapshot_hash
+                != signal_bound_input_hash(decision_input, pacing_limits, signal_snapshot)?
         {
             return Err(PacingError::SignalDecisionMismatch);
         }
@@ -383,6 +390,8 @@ impl DryRunDecisionReport {
         Ok(Self {
             schema_version: DRY_RUN_REPORT_SCHEMA_VERSION,
             signal_snapshot: signal_snapshot.clone(),
+            decision_input: decision_input.clone(),
+            pacing_limits: pacing_limits.clone(),
             decision: decision.clone(),
             new_decision,
             economic_action_suppressed: new_decision && !decision.planned_usdc.is_zero(),
@@ -398,6 +407,16 @@ impl DryRunDecisionReport {
     #[must_use]
     pub const fn decision(&self) -> &DailyDecision {
         &self.decision
+    }
+
+    #[must_use]
+    pub const fn decision_input(&self) -> &DecisionInput {
+        &self.decision_input
+    }
+
+    #[must_use]
+    pub const fn pacing_limits(&self) -> &PacingLimits {
+        &self.pacing_limits
     }
 
     #[must_use]
@@ -576,7 +595,7 @@ impl PacingState {
         self.decide_bound(
             input,
             limits,
-            signal_snapshot.snapshot_hash().to_owned(),
+            signal_bound_input_hash(input, limits, signal_snapshot)?,
             signal_snapshot.purchase_eligible(),
             true,
         )
@@ -609,7 +628,7 @@ impl PacingState {
             if reject_conflicting_signal_replay
                 && existing.input_snapshot_hash != input_snapshot_hash
             {
-                return Err(PacingError::ConflictingSignalSnapshot);
+                return Err(PacingError::ConflictingDecisionEvidence);
             }
             *self = next;
             return Ok(DecisionResult::Existing(existing));
@@ -1526,8 +1545,8 @@ pub enum PacingError {
     InvalidSignalSnapshot(String),
     #[error("signal snapshot does not match the decision boundary")]
     SignalDecisionMismatch,
-    #[error("UTC day already has a decision bound to different signal evidence")]
-    ConflictingSignalSnapshot,
+    #[error("UTC day already has a decision bound to different input evidence")]
+    ConflictingDecisionEvidence,
     #[error("unknown decision")]
     UnknownDecision,
     #[error("decision has no economic commitment")]
@@ -1806,6 +1825,19 @@ const fn weekday_number(weekday: Weekday) -> u8 {
 
 fn capital_snapshot_hash(state: &PacingState) -> Result<String, PacingError> {
     snapshot_hash(&(state.schema_version, &state.deposits, &state.withdrawals))
+}
+
+fn signal_bound_input_hash(
+    input: &DecisionInput,
+    limits: &PacingLimits,
+    signal_snapshot: &SignalSnapshot,
+) -> Result<String, PacingError> {
+    snapshot_hash(&(
+        "signal-bound-input-v1",
+        input,
+        limits,
+        signal_snapshot.snapshot_hash(),
+    ))
 }
 
 fn snapshot_hash<T: Serialize>(value: &T) -> Result<String, PacingError> {
