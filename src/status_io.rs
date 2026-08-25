@@ -1,4 +1,4 @@
-use crate::status::DashboardStatus;
+use crate::{metrics::MetricsSnapshot, status::DashboardStatus};
 use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
@@ -27,7 +27,23 @@ pub fn write_status_atomic(
     path: impl AsRef<Path>,
     status: &DashboardStatus,
 ) -> Result<(), StatusIoError> {
-    let path = path.as_ref();
+    write_text_atomic(path.as_ref(), &status.to_json()?)
+}
+
+/// Atomically rewrites a local Prometheus text exposition.
+///
+/// # Errors
+///
+/// Returns `StatusIoError` when directory creation, durable temporary-file
+/// write, or atomic rename fails.
+pub fn write_metrics_atomic(
+    path: impl AsRef<Path>,
+    metrics: &MetricsSnapshot,
+) -> Result<(), StatusIoError> {
+    write_text_atomic(path.as_ref(), &metrics.to_prometheus())
+}
+
+fn write_text_atomic(path: &Path, payload: &str) -> Result<(), StatusIoError> {
     let parent = normalized_parent(path);
     let file_name = path.file_name().ok_or(StatusIoError::InvalidPath)?;
     fs::create_dir_all(parent)?;
@@ -36,7 +52,6 @@ pub fn write_status_atomic(
         .map_err(io::Error::other)?
         .as_nanos();
     let temporary = temporary_path(parent, file_name, nonce);
-    let payload = status.to_json()?;
     let result: Result<(), io::Error> = (|| {
         let mut options = OpenOptions::new();
         options.create_new(true).write(true);
@@ -47,7 +62,9 @@ pub fn write_status_atomic(
         }
         let mut file = options.open(&temporary)?;
         file.write_all(payload.as_bytes())?;
-        file.write_all(b"\n")?;
+        if !payload.ends_with('\n') {
+            file.write_all(b"\n")?;
+        }
         file.sync_all()?;
         fs::rename(&temporary, path)?;
         #[cfg(unix)]

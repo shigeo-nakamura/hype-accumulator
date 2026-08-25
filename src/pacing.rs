@@ -75,6 +75,21 @@ pub struct PacingLimits {
 }
 
 impl PacingLimits {
+    /// Counts remaining purchase slots using the same weekday and final
+    /// catch-up rules as the decision planner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PacingError::ArithmeticOverflow`] if the date range cannot be
+    /// represented safely.
+    pub fn remaining_purchase_slots(
+        &self,
+        start: NaiveDate,
+        horizon: NaiveDate,
+    ) -> Result<u64, PacingError> {
+        eligible_days(start, horizon, self)
+    }
+
     /// Converts validated application config to exact scheduler limits.
     ///
     /// # Errors

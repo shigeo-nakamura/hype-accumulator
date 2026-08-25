@@ -230,6 +230,16 @@ pub struct ReplayState {
 
 impl ReplayState {
     #[must_use]
+    pub fn authoritative_deposits_usdc(&self) -> Option<UsdcMicros> {
+        self.deposits
+            .values()
+            .try_fold(0_u64, |total, deposit| {
+                total.checked_add(deposit.authoritative_usdc.as_micros())
+            })
+            .map(UsdcMicros::from_micros)
+    }
+
+    #[must_use]
     pub const fn admitted_usdc(&self) -> UsdcMicros {
         self.admitted_usdc
     }

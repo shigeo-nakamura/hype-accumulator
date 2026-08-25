@@ -1,3 +1,4 @@
+use crate::metrics::MetricsSnapshot;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use thiserror::Error;
@@ -32,6 +33,8 @@ pub struct DashboardStatus {
     dex: &'static str,
     dry_run: bool,
     accumulator: AccumulatorStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operations: Option<MetricsSnapshot>,
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -48,6 +51,8 @@ pub enum StatusError {
     EmptyHealthReason,
     #[error("last_trade_at must not be after balance_observed_at")]
     FutureLastTrade,
+    #[error("operations observation must not be after status update")]
+    FutureOperations,
 }
 
 impl AccumulatorStatus {
@@ -166,7 +171,22 @@ impl DashboardStatus {
             dex: "hyperliquid",
             dry_run,
             accumulator,
+            operations: None,
         }
+    }
+
+    /// Attaches an identifier-free operational projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StatusError::FutureOperations`] if the projection is newer
+    /// than this status update.
+    pub fn with_operations(mut self, operations: MetricsSnapshot) -> Result<Self, StatusError> {
+        if operations.observed_at > self.updated_at {
+            return Err(StatusError::FutureOperations);
+        }
+        self.operations = Some(operations);
+        Ok(self)
     }
 
     /// Serializes the public dashboard payload without account identity or

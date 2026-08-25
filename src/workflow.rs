@@ -596,6 +596,8 @@ pub struct WorkflowState {
     delegated_hype: HypeAtoms,
     staking_submitted_at: Option<DateTime<Utc>>,
     delegation_submitted_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    last_fill_at: Option<DateTime<Utc>>,
     manual_review_reason: Option<String>,
     last_transition_at: DateTime<Utc>,
 }
@@ -684,6 +686,16 @@ impl WorkflowState {
     }
 
     #[must_use]
+    pub const fn last_fill_at(&self) -> Option<DateTime<Utc>> {
+        self.last_fill_at
+    }
+
+    #[must_use]
+    pub const fn last_transition_at(&self) -> DateTime<Utc> {
+        self.last_transition_at
+    }
+
+    #[must_use]
     pub fn manual_review_reason(&self) -> Option<&str> {
         self.manual_review_reason.as_deref()
     }
@@ -729,6 +741,7 @@ impl WorkflowState {
             delegated_hype: HypeAtoms::default(),
             staking_submitted_at: None,
             delegation_submitted_at: None,
+            last_fill_at: None,
             manual_review_reason: None,
             last_transition_at: first.at,
         };
@@ -853,6 +866,7 @@ impl WorkflowState {
                 self.purchased_hype = *cumulative_hype;
                 self.filled_usdc = *cumulative_filled_usdc;
                 self.debited_usdc = *cumulative_debited_usdc;
+                self.last_fill_at = Some(event.at);
                 self.stage = if *fully_filled {
                     WorkflowStage::Filled
                 } else {
@@ -887,6 +901,9 @@ impl WorkflowState {
                 self.purchased_hype = *cumulative_hype;
                 self.filled_usdc = *cumulative_filled_usdc;
                 self.debited_usdc = *cumulative_debited_usdc;
+                if !cumulative_hype.is_zero() {
+                    self.last_fill_at = Some(event.at);
+                }
                 self.stage = WorkflowStage::OrderFinalized;
             }
             WorkflowTransition::StakingEligibilityRecorded {
