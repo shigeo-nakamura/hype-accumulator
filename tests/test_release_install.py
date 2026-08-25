@@ -159,6 +159,17 @@ class ReleaseInstallTests(unittest.TestCase):
             self.assertEqual(install_root.stat().st_mode & 0o7777, 0o755)
             self.assertEqual(releases.stat().st_mode & 0o7777, 0o755)
 
+    def test_foreign_owned_ancestor_is_rejected_even_when_mode_is_0755(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o755)
+            foreign_uid = os.geteuid() + 1
+            with mock.patch.object(release_install.os, "geteuid", return_value=foreign_uid):
+                with self.assertRaisesRegex(
+                    release_install.InstallError, "owned by root or the deployment"
+                ):
+                    release_install.ensure_install_root(root / "install")
+
     def test_stage_is_content_addressed_idempotent_and_does_not_activate(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

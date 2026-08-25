@@ -321,6 +321,10 @@ def ensure_install_root(install_root: Path) -> tuple[Path, Path]:
             raise InstallError(
                 f"install root parent must be traversable by the runtime identity: {ancestor}"
             )
+        if ancestor_status.st_uid not in {0, os.geteuid()}:
+            raise InstallError(
+                f"install root parent must be owned by root or the deployment identity: {ancestor}"
+            )
         if ancestor_status.st_mode & (stat.S_IWGRP | stat.S_IWOTH) and not (
             ancestor_status.st_mode & stat.S_ISVTX
         ):
