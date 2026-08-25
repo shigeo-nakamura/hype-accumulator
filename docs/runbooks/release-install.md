@@ -72,11 +72,13 @@ release directory so later activation cannot trust a rewritten install manifest
 or substituted binary. The dedicated install root, `releases`, and each release
 directory are exactly `0755`: non-writable by the service identity while
 remaining traversable when deployment and runtime use different UIDs. Existing
-ancestors of the dedicated install root must also permit traversal by other UIDs;
-the installer validates but never changes those external directories. Installed
-file ownership, link count, and modes are checked again before every selection.
-A non-symlink, single-link local lock serializes stage and selection commands and
-rejects a concurrent invocation without waiting indefinitely.
+ancestors of the dedicated install root must also permit traversal by other UIDs.
+Any group- or world-writable ancestor must use sticky-bit rename protection, as
+`/tmp` does; otherwise the installer rejects the path. It validates but never
+changes those external directories. Installed file ownership, link count, and
+modes are checked again before every selection. A non-symlink, single-link local
+lock serializes stage and selection commands and rejects a concurrent invocation
+without waiting indefinitely.
 
 That result requires an explicit typed security policy plus `dry_run=true`,
 `manual_halt=true`, and `live_approved=false`. A successful JSON result contains

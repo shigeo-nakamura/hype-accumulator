@@ -139,6 +139,26 @@ class ReleaseInstallTests(unittest.TestCase):
             with self.assertRaisesRegex(release_install.InstallError, "exact mode 0755"):
                 release_install.ensure_install_root(install_root)
 
+    def test_writable_ancestor_requires_sticky_bit_rename_protection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o755)
+            shared = root / "shared"
+            shared.mkdir()
+            shared.chmod(0o777)
+
+            with self.assertRaisesRegex(
+                release_install.InstallError, "writable without sticky-bit"
+            ):
+                release_install.ensure_install_root(shared / "install")
+
+            shared.chmod(0o1777)
+            install_root, releases = release_install.ensure_install_root(
+                shared / "install"
+            )
+            self.assertEqual(install_root.stat().st_mode & 0o7777, 0o755)
+            self.assertEqual(releases.stat().st_mode & 0o7777, 0o755)
+
     def test_stage_is_content_addressed_idempotent_and_does_not_activate(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -321,6 +321,12 @@ def ensure_install_root(install_root: Path) -> tuple[Path, Path]:
             raise InstallError(
                 f"install root parent must be traversable by the runtime identity: {ancestor}"
             )
+        if ancestor_status.st_mode & (stat.S_IWGRP | stat.S_IWOTH) and not (
+            ancestor_status.st_mode & stat.S_ISVTX
+        ):
+            raise InstallError(
+                f"install root parent is writable without sticky-bit rename protection: {ancestor}"
+            )
     install_root = ensure_owned_traversable_directory(install_root, "install root")
     releases = install_root / "releases"
     releases = ensure_owned_traversable_directory(releases, "releases directory")
