@@ -1,0 +1,353 @@
+{
+  "schema_version": "hype-stage1-offline-evidence/v1",
+  "captured_at": "2026-08-25T15:22:43Z",
+  "scope": {
+    "kind": "offline_and_replay_only",
+    "overall_status": "PARTIAL",
+    "stage1_accepted": false,
+    "statement": "This snapshot records offline and deterministic replay evidence only. PASS means the named offline gate is satisfied at the recorded commits; it is not authorization for a later rollout stage.",
+    "excluded_operations": [
+      "network or exchange API probes",
+      "testnet or mainnet funding",
+      "action signing or submission",
+      "release tag creation",
+      "caller dependency updates",
+      "deployment or service restart",
+      "live enablement"
+    ]
+  },
+  "source_state": {
+    "hype_accumulator": {
+      "repository": "shigeo-nakamura/hype-accumulator",
+      "ref": "master",
+      "commit": "8ab6f730e463d6c1bc1bda14ad9bbf7ae33f9756",
+      "dex_connector_ref": "v4.7.12"
+    },
+    "dex_connector": {
+      "repository": "shigeo-nakamura/dex-connector",
+      "master_commit": "4cf4ca7f89627f2b903974f35f463e66e31fa48a",
+      "release_candidate": {
+        "version": "4.7.14",
+        "version_commit": "170a4b168a292b587bf0a51e6ff915588e867b0a",
+        "tag_present": false
+      }
+    },
+    "pairtrade": {
+      "repository": "shigeo-nakamura/pairtrade",
+      "ref": "master",
+      "dex_connector_ref": "v4.7.13"
+    }
+  },
+  "verification_runs": [
+    {
+      "repository": "shigeo-nakamura/hype-accumulator",
+      "commit": "8ab6f730e463d6c1bc1bda14ad9bbf7ae33f9756",
+      "command": "make test",
+      "status": "PASS",
+      "result": "41 Python tests passed"
+    },
+    {
+      "repository": "shigeo-nakamura/hype-accumulator",
+      "commit": "8ab6f730e463d6c1bc1bda14ad9bbf7ae33f9756",
+      "command": "make research",
+      "status": "PASS",
+      "result": "Deterministic fixture report reproduced; recommendation remained no-go because licensed point-in-time and out-of-sample economic evidence is absent"
+    },
+    {
+      "repository": "shigeo-nakamura/hype-accumulator",
+      "commit": "8ab6f730e463d6c1bc1bda14ad9bbf7ae33f9756",
+      "command": "cargo test --all-targets --locked",
+      "status": "PASS",
+      "result": "233 Rust tests passed"
+    },
+    {
+      "repository": "shigeo-nakamura/hype-accumulator",
+      "commit": "8ab6f730e463d6c1bc1bda14ad9bbf7ae33f9756",
+      "command": "cargo fmt --all --check",
+      "status": "PASS",
+      "result": "Formatting check passed"
+    },
+    {
+      "repository": "shigeo-nakamura/hype-accumulator",
+      "commit": "8ab6f730e463d6c1bc1bda14ad9bbf7ae33f9756",
+      "command": "cargo clippy --all-targets --locked -- -D warnings",
+      "status": "PASS",
+      "result": "Strict lint check passed"
+    },
+    {
+      "repository": "shigeo-nakamura/hype-accumulator",
+      "commit": "8ab6f730e463d6c1bc1bda14ad9bbf7ae33f9756",
+      "command": "cargo build --locked",
+      "status": "PASS",
+      "result": "Locked debug build passed"
+    },
+    {
+      "repository": "shigeo-nakamura/dex-connector",
+      "commit": "170a4b168a292b587bf0a51e6ff915588e867b0a",
+      "command": "cargo test --offline --features hyperliquid-sdk",
+      "status": "PASS",
+      "result": "111 tests passed"
+    },
+    {
+      "repository": "shigeo-nakamura/dex-connector",
+      "commit": "170a4b168a292b587bf0a51e6ff915588e867b0a",
+      "command": "cargo fmt --all --check",
+      "status": "PASS",
+      "result": "Formatting check passed"
+    },
+    {
+      "repository": "shigeo-nakamura/dex-connector",
+      "commit": "170a4b168a292b587bf0a51e6ff915588e867b0a",
+      "command": "cargo clippy --offline --features hyperliquid-sdk -- -D warnings",
+      "status": "PASS",
+      "result": "Strict lint check passed"
+    }
+  ],
+  "required_gates": [
+    {
+      "id": "deterministic_strategy_and_pacing",
+      "status": "PASS",
+      "summary": "Point-in-time fixture mechanics, revision/publication lag, arbitrary capital paths, once-per-day pacing, capital conservation, execution caps, and DRY_RUN signal boundaries are deterministic. This does not establish economic edge; the research recommendation remains no-go.",
+      "evidence": [
+        {
+          "kind": "github_pr",
+          "repository": "shigeo-nakamura/hype-accumulator",
+          "number": 3,
+          "head_commit": "b23f819cdaab7ec2af5bb7320ce012e1584cd981",
+          "merge_commit": "b6274e7198746d9d090b3719c21eb27bdcb359bd",
+          "url": "https://github.com/shigeo-nakamura/hype-accumulator/pull/3"
+        },
+        {
+          "kind": "github_pr",
+          "repository": "shigeo-nakamura/hype-accumulator",
+          "number": 8,
+          "head_commit": "a169054046eb8dbe179ca7c213a7c59a321d6062",
+          "merge_commit": "71c9fa8170ac377a4b0f5aeee21b97f5e4230160",
+          "url": "https://github.com/shigeo-nakamura/hype-accumulator/pull/8"
+        },
+        {
+          "kind": "github_pr",
+          "repository": "shigeo-nakamura/hype-accumulator",
+          "number": 15,
+          "head_commit": "746d895da2f3186f248caf0d5a502839de0635b1",
+          "merge_commit": "8ab6f730e463d6c1bc1bda14ad9bbf7ae33f9756",
+          "url": "https://github.com/shigeo-nakamura/hype-accumulator/pull/15"
+        },
+        {
+          "kind": "verification_run",
+          "command": "make test && make research",
+          "result": "PASS"
+        }
+      ]
+    },
+    {
+      "id": "full_workflow_fault_injection",
+      "status": "FAIL",
+      "summary": "Order preparation through finalization and unsigned staking eligibility is crash-safe, but durable staking deposit/delegation transitions and their ambiguous-response recovery are not exercised end to end. A complete replay audit chain is therefore absent.",
+      "evidence": [
+        {
+          "kind": "github_pr",
+          "repository": "shigeo-nakamura/hype-accumulator",
+          "number": 9,
+          "head_commit": "b64ffd3eb52ba61cbef07254adb26dcaa13cac20",
+          "merge_commit": "18e9b2b19c353d453b97677d1235aa741fea9607",
+          "url": "https://github.com/shigeo-nakamura/hype-accumulator/pull/9"
+        },
+        {
+          "kind": "issue_audit",
+          "url": "https://github.com/shigeo-nakamura/bot-strategy/issues/841#issuecomment-5409160555",
+          "result": "FAIL"
+        }
+      ]
+    },
+    {
+      "id": "spot_execution_vectors_and_reconciliation",
+      "status": "PASS",
+      "summary": "The pinned connector lineage contains deterministic spot execution vectors and ambiguity-safe order reconciliation used by the offline workflow.",
+      "evidence": [
+        {
+          "kind": "github_pr",
+          "repository": "shigeo-nakamura/dex-connector",
+          "number": 64,
+          "head_commit": "2cefa082e1e7b03b8fc5e5c60a7c1e443c26269c",
+          "merge_commit": "1acd5220067a29f1dc57893415211bd156f6d625",
+          "url": "https://github.com/shigeo-nakamura/dex-connector/pull/64"
+        },
+        {
+          "kind": "verification_run",
+          "command": "cargo test --all-targets --locked",
+          "result": "PASS"
+        }
+      ]
+    },
+    {
+      "id": "staking_vectors_validator_and_reconciliation",
+      "status": "PASS",
+      "summary": "Account-bound staking reads, deterministic cDeposit/tokenDelegate payload vectors, fail-closed validator evaluation, guarded externally signed submission, persistent nonces, and authoritative ambiguity reconciliation pass offline tests. This does not prove signer capability or protocol availability on testnet or mainnet.",
+      "evidence": [
+        {
+          "kind": "github_pr",
+          "repository": "shigeo-nakamura/dex-connector",
+          "number": 67,
+          "head_commit": "a511126ff3d9bdb141e65e0a68afec301fd73a35",
+          "merge_commit": "eda10673ac8d118aeb9e7521a672a7520c614834",
+          "url": "https://github.com/shigeo-nakamura/dex-connector/pull/67"
+        },
+        {
+          "kind": "github_pr",
+          "repository": "shigeo-nakamura/dex-connector",
+          "number": 68,
+          "head_commit": "94a1f4cfaac7ca21affbeb45aa679e64af816c51",
+          "merge_commit": "53ab07a5b7c9016f25ea89447e16781bf7555d76",
+          "url": "https://github.com/shigeo-nakamura/dex-connector/pull/68"
+        },
+        {
+          "kind": "github_pr",
+          "repository": "shigeo-nakamura/dex-connector",
+          "number": 69,
+          "head_commit": "ca8279d3aae5e875b6eded7a4918354b1527be8a",
+          "merge_commit": "9c90bb8b899aac08a4c2d178efc6512118d13d2f",
+          "url": "https://github.com/shigeo-nakamura/dex-connector/pull/69"
+        },
+        {
+          "kind": "github_pr",
+          "repository": "shigeo-nakamura/dex-connector",
+          "number": 70,
+          "head_commit": "2268b8e000136d2d0eb5a40fcf9a413ed45a7682",
+          "merge_commit": "6956d9e259356e08ffff3bf903df6cc37675321e",
+          "url": "https://github.com/shigeo-nakamura/dex-connector/pull/70"
+        },
+        {
+          "kind": "verification_run",
+          "command": "cargo test --offline --features hyperliquid-sdk",
+          "result": "PASS"
+        }
+      ]
+    },
+    {
+      "id": "protected_ledger_restore",
+      "status": "PASS",
+      "summary": "The local ledger detects tampering, rejects rollback and divergent restore candidates, and preserves crash-safe recovery semantics through its protected-store interface. A production backup drill belongs to a later rollout stage.",
+      "evidence": [
+        {
+          "kind": "github_pr",
+          "repository": "shigeo-nakamura/hype-accumulator",
+          "number": 10,
+          "head_commit": "959ad430ccab3d9df2b3d15cd65a99515a80e8d3",
+          "merge_commit": "aa6b364536a7b7d3891b78d07de34ece31626e1b",
+          "url": "https://github.com/shigeo-nakamura/hype-accumulator/pull/10"
+        },
+        {
+          "kind": "verification_run",
+          "command": "cargo test --test ledger --locked",
+          "result": "PASS"
+        }
+      ]
+    },
+    {
+      "id": "fail_closed_configuration",
+      "status": "PASS",
+      "summary": "Unknown fields and unsafe live configuration fail closed; DRY_RUN and manual halt remain the defaults; live prerequisites are validated before constructing an execution client.",
+      "evidence": [
+        {
+          "kind": "github_pr",
+          "repository": "shigeo-nakamura/hype-accumulator",
+          "number": 12,
+          "head_commit": "a69c4370f155c9f6cc7cc944fed845b46b6162d1",
+          "merge_commit": "f90d5212986c27d5dd7b4ea729639abed9c6a115",
+          "url": "https://github.com/shigeo-nakamura/hype-accumulator/pull/12"
+        },
+        {
+          "kind": "verification_run",
+          "command": "cargo test --test security_policy --locked",
+          "result": "PASS"
+        }
+      ]
+    },
+    {
+      "id": "observability_and_durable_suppression",
+      "status": "PASS",
+      "summary": "Offline tests cover durable decision status, skip reasons, stale inputs, reconciliation state, manual review, suppression, and restart-visible metrics. Host alerting and multi-window DRY_RUN observation belong to later stages.",
+      "evidence": [
+        {
+          "kind": "github_pr",
+          "repository": "shigeo-nakamura/hype-accumulator",
+          "number": 14,
+          "head_commit": "d7aa501c4402987f2a6a5c5f0e561d9f74cffce1",
+          "merge_commit": "cdca3158fc73a40e7415f5e5578b85e38edff09f",
+          "url": "https://github.com/shigeo-nakamura/hype-accumulator/pull/14"
+        },
+        {
+          "kind": "verification_run",
+          "command": "cargo test --test monitor --test status --test status_io --locked",
+          "result": "PASS"
+        }
+      ]
+    },
+    {
+      "id": "staking_release_and_active_callers",
+      "status": "FAIL",
+      "summary": "The connector package version is 4.7.14, but the v4.7.14 tag is absent. The active hype-accumulator and pairtrade references remain v4.7.12 and v4.7.13, so the merged staking surface is not delivered to callers.",
+      "evidence": [
+        {
+          "kind": "github_pr",
+          "repository": "shigeo-nakamura/dex-connector",
+          "number": 71,
+          "head_commit": "170a4b168a292b587bf0a51e6ff915588e867b0a",
+          "merge_commit": "110718e926ba89b9994e40aeb666c16fd6780829",
+          "url": "https://github.com/shigeo-nakamura/dex-connector/pull/71"
+        },
+        {
+          "kind": "source_state",
+          "result": "FAIL"
+        }
+      ]
+    },
+    {
+      "id": "immutable_aggregate_evidence",
+      "status": "PASS",
+      "summary": "This dated append-only JSON snapshot has a companion SHA-256 digest and repository tests that enforce the gate set, status closure, source-reference shape, and checksum. The digest detects content changes but does not independently authenticate them; reviewed Git history is the trust boundary.",
+      "evidence": [
+        {
+          "kind": "verification_run",
+          "command": "python3 -m unittest tests.test_stage1_evidence -v",
+          "result": "PASS"
+        }
+      ]
+    }
+  ],
+  "blocking_gate_ids": [
+    "full_workflow_fault_injection",
+    "staking_release_and_active_callers"
+  ],
+  "next_actions": [
+    {
+      "order": 1,
+      "action": "Obtain separate explicit approval before creating or pushing a v4.7.14 release tag."
+    },
+    {
+      "order": 2,
+      "action": "After the tag exists, update hype-accumulator and pairtrade pins through reviewed pull requests."
+    },
+    {
+      "order": 3,
+      "action": "Extend signer-free replay orchestration through staking deposit and delegation transitions, including crash-at-every-transition and ambiguous-response fixtures."
+    },
+    {
+      "order": 4,
+      "action": "Create a new evidence snapshot; do not rewrite this dated artifact."
+    }
+  ],
+  "residual_risks": [
+    "Synthetic fixtures validate deterministic mechanics, not adaptive economic edge.",
+    "No testnet or mainnet signer capability has been demonstrated.",
+    "No end-to-end replay currently completes buy, reconcile, staking deposit, delegation, and final reconciliation.",
+    "No production backup restore or host alerting drill is represented by this Stage 1 snapshot.",
+    "Later rollout stages retain their own explicit approval and evidence gates."
+  ],
+  "integrity": {
+    "algorithm": "sha256",
+    "companion": "stage1-offline-2026-08-25.json.sha256",
+    "trust_model": "The companion digest detects accidental or unreviewed content changes. Repository review and Git history authenticate the snapshot."
+  }
+}
