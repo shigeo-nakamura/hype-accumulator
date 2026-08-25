@@ -28,7 +28,8 @@
       "master_commit": "4cf4ca7f89627f2b903974f35f463e66e31fa48a",
       "release_candidate": {
         "version": "4.7.14",
-        "version_commit": "170a4b168a292b587bf0a51e6ff915588e867b0a",
+        "version_pr_head_commit": "170a4b168a292b587bf0a51e6ff915588e867b0a",
+        "version_merge_commit": "110718e926ba89b9994e40aeb666c16fd6780829",
         "tag_present": false
       }
     },
@@ -144,7 +145,7 @@
     {
       "id": "full_workflow_fault_injection",
       "status": "FAIL",
-      "summary": "Order preparation through finalization and unsigned staking eligibility is crash-safe, but durable staking deposit/delegation transitions and their ambiguous-response recovery are not exercised end to end. A complete replay audit chain is therefore absent.",
+      "summary": "Order preparation through finalization and unsigned staking eligibility is crash-safe, but the current policy intentionally forbids staking intents because cDeposit and tokenDelegate lack a venue-enforced acceptance deadline. Dormant action transitions are not capability-bound or exercised end to end, and signer-free simulation cannot prove safe acceptance-time behavior or change this gate to PASS.",
       "evidence": [
         {
           "kind": "github_pr",
@@ -156,8 +157,13 @@
         },
         {
           "kind": "issue_audit",
-          "url": "https://github.com/shigeo-nakamura/bot-strategy/issues/841#issuecomment-5409160555",
+          "url": "https://github.com/shigeo-nakamura/bot-strategy/issues/841#issuecomment-5413114192",
           "result": "FAIL"
+        },
+        {
+          "kind": "repository_document",
+          "path": "docs/security/custody-threat-model.md",
+          "result": "Automatic staking remains disabled until both staking actions have a cryptographically bound venue-enforced acceptance deadline, a revised threat model, and explicit user approval"
         }
       ]
     },
@@ -332,7 +338,7 @@
     },
     {
       "order": 3,
-      "action": "Extend signer-free replay orchestration through staking deposit and delegation transitions, including crash-at-every-transition and ambiguous-response fixtures."
+      "action": "Do not enable or count staking transitions as verified until the venue supports a cryptographically bound acceptance deadline for both cDeposit and tokenDelegate and the revised custody design receives explicit approval. A signer-free simulation may test orchestration mechanics only; it cannot change the full-workflow gate to PASS."
     },
     {
       "order": 4,
@@ -342,6 +348,7 @@
   "residual_risks": [
     "Synthetic fixtures validate deterministic mechanics, not adaptive economic edge.",
     "No testnet or mainnet signer capability has been demonstrated.",
+    "The current staking actions have no venue-enforced acceptance deadline, so a delayed first submission cannot satisfy the approved expiry boundary and automatic staking remains prohibited.",
     "No end-to-end replay currently completes buy, reconcile, staking deposit, delegation, and final reconciliation.",
     "No production backup restore or host alerting drill is represented by this Stage 1 snapshot.",
     "Later rollout stages retain their own explicit approval and evidence gates."

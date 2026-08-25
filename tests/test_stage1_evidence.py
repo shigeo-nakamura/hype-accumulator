@@ -75,6 +75,19 @@ class Stage1EvidenceTests(unittest.TestCase):
         self.assertFalse(evidence["scope"]["stage1_accepted"])
         self.assertTrue(all(gate["summary"] and gate["evidence"] for gate in gates))
 
+        workflow_gate = next(
+            gate for gate in gates if gate["id"] == "full_workflow_fault_injection"
+        )
+        self.assertEqual(workflow_gate["status"], "FAIL")
+        self.assertIn("venue-enforced acceptance deadline", workflow_gate["summary"])
+        self.assertIn("cannot prove", workflow_gate["summary"])
+        self.assertTrue(
+            any(
+                "cannot change the full-workflow gate to PASS" in item["action"]
+                for item in evidence["next_actions"]
+            )
+        )
+
     def test_source_state_proves_release_delivery_is_incomplete(self) -> None:
         evidence = load_evidence()
         source = evidence["source_state"]
@@ -83,10 +96,14 @@ class Stage1EvidenceTests(unittest.TestCase):
         for commit in (
             source["hype_accumulator"]["commit"],
             source["dex_connector"]["master_commit"],
-            release["version_commit"],
+            release["version_pr_head_commit"],
+            release["version_merge_commit"],
             source["pairtrade"]["commit"],
         ):
             self.assertRegex(commit, SHA_PATTERN)
+        self.assertNotEqual(
+            release["version_pr_head_commit"], release["version_merge_commit"]
+        )
         self.assertEqual(release["version"], "4.7.14")
         self.assertFalse(release["tag_present"])
         self.assertEqual(source["hype_accumulator"]["dex_connector_ref"], "v4.7.12")
