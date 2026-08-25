@@ -272,32 +272,58 @@ def fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def ensure_owned_traversable_directory(path: Path, label: str) -> Path:
+    if path.is_symlink():
+        raise InstallError(f"{label} must not be a symlink")
+    created = False
+    try:
+        path.mkdir(mode=0o755)
+        created = True
+    except FileExistsError:
+        pass
+    except OSError as error:
+        raise InstallError(f"{label} cannot be created: {error}") from error
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise InstallError(f"{label} cannot be safely opened: {error}") from error
+    try:
+        if created:
+            os.fchmod(descriptor, 0o755)
+        status = os.fstat(descriptor)
+        if status.st_uid != os.geteuid() or status.st_mode & 0o7777 != 0o755:
+            raise InstallError(
+                f"{label} must be owner-controlled with exact mode 0755"
+            )
+    finally:
+        os.close(descriptor)
+    return path.resolve(strict=True)
+
+
 def ensure_install_root(install_root: Path) -> tuple[Path, Path]:
     if not install_root.is_absolute():
         raise InstallError("install root must be an absolute canonical path")
     requested_root = install_root.absolute()
     if requested_root != install_root.resolve(strict=False):
         raise InstallError("install root path must not contain aliases or symlink components")
-    install_root.mkdir(parents=True, exist_ok=True)
-    install_root = install_root.resolve(strict=True)
-    root_status = install_root.stat()
-    if (
-        not install_root.is_dir()
-        or root_status.st_uid != os.geteuid()
-        or root_status.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-    ):
-        raise InstallError("install root must be a non-shared directory")
+    for ancestor in install_root.parents:
+        try:
+            ancestor_status = ancestor.stat()
+        except OSError as error:
+            raise InstallError(
+                f"install root parent cannot be inspected: {ancestor}: {error}"
+            ) from error
+        if not stat.S_ISDIR(ancestor_status.st_mode) or not (
+            ancestor_status.st_mode & stat.S_IXOTH
+        ):
+            raise InstallError(
+                f"install root parent must be traversable by the runtime identity: {ancestor}"
+            )
+    install_root = ensure_owned_traversable_directory(install_root, "install root")
     releases = install_root / "releases"
-    if releases.is_symlink():
-        raise InstallError("releases directory must not be a symlink")
-    releases.mkdir(mode=0o755, exist_ok=True)
-    releases_status = releases.stat()
-    if (
-        not releases.is_dir()
-        or releases_status.st_uid != os.geteuid()
-        or releases_status.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-    ):
-        raise InstallError("releases must be a non-shared directory")
+    releases = ensure_owned_traversable_directory(releases, "releases directory")
     return install_root, releases
 
 

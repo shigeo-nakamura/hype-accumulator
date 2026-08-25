@@ -89,6 +89,9 @@ def stage_args(
     checksum: Path,
     commit: str,
 ) -> argparse.Namespace:
+    # The installer requires every existing ancestor to be traversable by a
+    # distinct runtime UID. TemporaryDirectory defaults to 0700.
+    root.chmod(0o755)
     config = root / "config.toml"
     policy = root / "security-policy.toml"
     config.write_text("dry_run = true\nmanual_halt = true\nlive_approved = false\n")
@@ -117,6 +120,25 @@ def select_args(stage: argparse.Namespace, release_id: str) -> argparse.Namespac
 
 
 class ReleaseInstallTests(unittest.TestCase):
+    def test_restrictive_umask_cannot_hide_release_parents_from_runtime(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o755)
+            previous_umask = os.umask(0o077)
+            try:
+                install_root, releases = release_install.ensure_install_root(
+                    root / "install"
+                )
+            finally:
+                os.umask(previous_umask)
+
+            self.assertEqual(install_root.stat().st_mode & 0o7777, 0o755)
+            self.assertEqual(releases.stat().st_mode & 0o7777, 0o755)
+
+            install_root.chmod(0o700)
+            with self.assertRaisesRegex(release_install.InstallError, "exact mode 0755"):
+                release_install.ensure_install_root(install_root)
+
     def test_stage_is_content_addressed_idempotent_and_does_not_activate(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -190,6 +212,7 @@ class ReleaseInstallTests(unittest.TestCase):
 
     def test_concurrent_install_lock_fails_without_waiting(self):
         with tempfile.TemporaryDirectory() as temporary:
+            Path(temporary).chmod(0o755)
             install_root, _ = release_install.ensure_install_root(
                 Path(temporary) / "install"
             )
