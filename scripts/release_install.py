@@ -130,8 +130,8 @@ def extract_closed_archive(archive_path: Path, destination: Path) -> None:
                 with source, output.open("xb") as target:
                     shutil.copyfileobj(source, target, length=1_048_576)
                     target.flush()
+                    os.fchmod(target.fileno(), expected_mode)
                     os.fsync(target.fileno())
-                output.chmod(expected_mode)
     except InstallError:
         raise
     except (OSError, tarfile.TarError) as error:
@@ -408,8 +408,8 @@ def write_manifest(path: Path, manifest: dict[str, object]) -> None:
         json.dump(manifest, handle, sort_keys=True, separators=(",", ":"))
         handle.write("\n")
         handle.flush()
+        os.fchmod(handle.fileno(), 0o644)
         os.fsync(handle.fileno())
-    path.chmod(0o644)
 
 
 def read_manifest(release_dir: Path) -> dict[str, object]:
@@ -501,8 +501,8 @@ def retain_source_archive(source: Path, destination: Path) -> None:
     with source.open("rb") as input_handle, destination.open("xb") as output_handle:
         shutil.copyfileobj(input_handle, output_handle, length=1_048_576)
         output_handle.flush()
+        os.fchmod(output_handle.fileno(), 0o444)
         os.fsync(output_handle.fileno())
-    destination.chmod(0o444)
 
 
 def stage_release(args: argparse.Namespace) -> dict[str, str]:

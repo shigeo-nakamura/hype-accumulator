@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import stat
 import tarfile
 import tempfile
 import unittest
@@ -187,6 +188,14 @@ class ReleaseInstallTests(unittest.TestCase):
             archive, checksum = write_archive(root, commit)
             args = stage_args(root, archive, checksum, commit)
             observed_modes = []
+            fsynced_regular_modes = []
+            real_fsync = os.fsync
+
+            def inspect_fsync(descriptor):
+                status = os.fstat(descriptor)
+                if stat.S_ISREG(status.st_mode):
+                    fsynced_regular_modes.append(status.st_mode & 0o777)
+                return real_fsync(descriptor)
 
             def inspect_private_staging(release_dir, _config, _policy):
                 observed_modes.append(release_dir.stat().st_mode & 0o7777)
@@ -199,16 +208,28 @@ class ReleaseInstallTests(unittest.TestCase):
 
             previous_umask = os.umask(0o000)
             try:
-                with mock.patch.object(
-                    release_install,
-                    "verify_runtime",
-                    side_effect=inspect_private_staging,
+                with (
+                    mock.patch.object(
+                        release_install,
+                        "verify_runtime",
+                        side_effect=inspect_private_staging,
+                    ),
+                    mock.patch.object(
+                        release_install.os,
+                        "fsync",
+                        side_effect=inspect_fsync,
+                    ),
                 ):
                     staged = release_install.stage_release(args)
             finally:
                 os.umask(previous_umask)
 
             self.assertEqual(observed_modes, [0o700])
+            expected_fsynced_modes = sorted(
+                [mode for mode, _ in release_install.ARCHIVE_FILES.values()] * 2
+                + [0o444, 0o644]
+            )
+            self.assertEqual(sorted(fsynced_regular_modes), expected_fsynced_modes)
             release_dir = Path(args.install_root) / "releases" / staged["release_id"]
             self.assertEqual(release_dir.stat().st_mode & 0o7777, 0o755)
 
