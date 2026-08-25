@@ -125,16 +125,44 @@ class ReleaseInstallTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             root.chmod(0o755)
+            synced_directories = []
+            real_fsync = os.fsync
+
+            def inspect_directory_fsync(descriptor):
+                status = os.fstat(descriptor)
+                if stat.S_ISDIR(status.st_mode):
+                    synced_directories.append((status.st_dev, status.st_ino))
+                return real_fsync(descriptor)
+
             previous_umask = os.umask(0o077)
             try:
-                install_root, releases = release_install.ensure_install_root(
-                    root / "install"
-                )
+                with mock.patch.object(
+                    release_install.os,
+                    "fsync",
+                    side_effect=inspect_directory_fsync,
+                ):
+                    install_root, releases = release_install.ensure_install_root(
+                        root / "install"
+                    )
             finally:
                 os.umask(previous_umask)
 
             self.assertEqual(install_root.stat().st_mode & 0o7777, 0o755)
             self.assertEqual(releases.stat().st_mode & 0o7777, 0o755)
+
+            def identity(path):
+                status = path.stat()
+                return status.st_dev, status.st_ino
+
+            self.assertEqual(
+                synced_directories,
+                [
+                    identity(install_root),
+                    identity(root),
+                    identity(releases),
+                    identity(install_root),
+                ],
+            )
 
             install_root.chmod(0o700)
             with self.assertRaisesRegex(release_install.InstallError, "exact mode 0755"):
@@ -227,7 +255,7 @@ class ReleaseInstallTests(unittest.TestCase):
             self.assertEqual(observed_modes, [0o700])
             expected_fsynced_modes = sorted(
                 [mode for mode, _ in release_install.ARCHIVE_FILES.values()] * 2
-                + [0o444, 0o644]
+                + [0o444, 0o444, 0o644]
             )
             self.assertEqual(sorted(fsynced_regular_modes), expected_fsynced_modes)
             release_dir = Path(args.install_root) / "releases" / staged["release_id"]
@@ -273,6 +301,46 @@ class ReleaseInstallTests(unittest.TestCase):
             with self.assertRaisesRegex(release_install.InstallError, "unexpected members"):
                 release_install.stage_release(bad_args)
             self.assertFalse((root / "escape").exists())
+
+    def test_archive_replacement_after_verification_cannot_change_staged_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            commit = "a" * 40
+            archive, checksum = write_archive(root, commit)
+            original_digest = release_install.sha256_file(archive)
+            args = stage_args(root, archive, checksum, commit)
+            real_extract = release_install.extract_closed_archive
+            replaced = False
+
+            def replace_external_path(verified_archive, destination):
+                nonlocal replaced
+                if not replaced:
+                    self.assertNotEqual(verified_archive, archive)
+                    replacement = root / "attacker-replacement.tar.gz"
+                    replacement.write_bytes(b"unverified replacement")
+                    os.replace(replacement, archive)
+                    replaced = True
+                return real_extract(verified_archive, destination)
+
+            with (
+                mock.patch.object(
+                    release_install,
+                    "extract_closed_archive",
+                    side_effect=replace_external_path,
+                ),
+                mock.patch.object(release_install, "verify_runtime"),
+            ):
+                staged = release_install.stage_release(args)
+
+            retained_archive = (
+                Path(args.install_root)
+                / "releases"
+                / staged["release_id"]
+                / release_install.SOURCE_ARCHIVE
+            )
+            self.assertTrue(replaced)
+            self.assertEqual(release_install.sha256_file(retained_archive), original_digest)
+            self.assertNotEqual(release_install.sha256_file(archive), original_digest)
 
     def test_noncanonical_external_checksum_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:

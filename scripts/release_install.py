@@ -101,6 +101,40 @@ def read_outer_checksum(checksum_path: Path, archive_path: Path) -> str:
     return match.group(1)
 
 
+@contextmanager
+def verified_archive_copy(
+    source_path: Path, expected_digest: str
+) -> Iterator[tuple[Path, str]]:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(source_path, flags)
+    except OSError as error:
+        raise InstallError(f"release archive cannot be safely opened: {error}") from error
+    try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode):
+            raise InstallError("release archive must be a regular non-symlink file")
+        with tempfile.TemporaryDirectory(prefix="hype-archive-verify-") as temporary:
+            private_archive = Path(temporary) / source_path.name
+            digest = hashlib.sha256()
+            with (
+                os.fdopen(descriptor, "rb", closefd=False) as input_handle,
+                private_archive.open("xb") as output_handle,
+            ):
+                for block in iter(lambda: input_handle.read(1_048_576), b""):
+                    digest.update(block)
+                    output_handle.write(block)
+                output_handle.flush()
+                os.fchmod(output_handle.fileno(), 0o444)
+                os.fsync(output_handle.fileno())
+            archive_digest = digest.hexdigest()
+            if archive_digest != expected_digest:
+                raise InstallError("release archive failed its external checksum")
+            yield private_archive, archive_digest
+    finally:
+        os.close(descriptor)
+
+
 def extract_closed_archive(archive_path: Path, destination: Path) -> None:
     require_regular_file(archive_path, "release archive")
     try:
@@ -265,9 +299,15 @@ def verify_runtime(
 
 
 def fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise InstallError(f"directory cannot be safely opened for sync: {error}") from error
     try:
         os.fsync(descriptor)
+    except OSError as error:
+        raise InstallError(f"directory metadata cannot be synced: {error}") from error
     finally:
         os.close(descriptor)
 
@@ -320,8 +360,12 @@ def ensure_owned_traversable_directory(path: Path, label: str) -> Path:
             raise InstallError(
                 f"{label} must be owner-controlled with exact mode 0755"
             )
+        if created:
+            os.fsync(descriptor)
     finally:
         os.close(descriptor)
+    if created:
+        fsync_directory(path.parent)
     return path.resolve(strict=True)
 
 
@@ -515,28 +559,28 @@ def stage_release(args: argparse.Namespace) -> dict[str, str]:
     )
     expected.validate()
     archive_path = Path(args.archive)
-    expected_archive_digest = read_outer_checksum(
-        Path(args.archive_sha256_file), archive_path
-    )
-    archive_digest = sha256_file(archive_path)
-    if archive_digest != expected_archive_digest:
-        raise InstallError("release archive failed its external checksum")
     expected_name = f"hype-accumulator-{expected.commit}-{expected.target}.tar.gz"
     if archive_path.name != expected_name:
         raise InstallError("release archive name does not match commit and target")
+    expected_archive_digest = read_outer_checksum(
+        Path(args.archive_sha256_file), archive_path
+    )
 
-    install_root, releases = ensure_install_root(Path(args.install_root))
-    release_id = f"{expected.commit}-{archive_digest}"
-    with install_lock(install_root):
-        return stage_release_locked(
-            args,
-            expected,
-            archive_path,
-            archive_digest,
-            install_root,
-            releases,
-            release_id,
-        )
+    with verified_archive_copy(
+        archive_path, expected_archive_digest
+    ) as (verified_archive, archive_digest):
+        install_root, releases = ensure_install_root(Path(args.install_root))
+        release_id = f"{expected.commit}-{archive_digest}"
+        with install_lock(install_root):
+            return stage_release_locked(
+                args,
+                expected,
+                verified_archive,
+                archive_digest,
+                install_root,
+                releases,
+                release_id,
+            )
 
 
 def stage_release_locked(
