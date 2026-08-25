@@ -134,6 +134,7 @@ impl MetricsSnapshot {
         dry_run_actions_total: u64,
         stuck_after_seconds: u64,
     ) -> Result<Self, MetricsError> {
+        limits.validate()?;
         if stuck_after_seconds == 0 {
             return Err(MetricsError::InvalidStuckThreshold);
         }
@@ -1108,6 +1109,28 @@ mod tests {
                 3_600,
             ),
             Err(MetricsError::FutureRuntimeState)
+        ));
+    }
+
+    #[test]
+    fn invalid_pacing_limits_fail_closed_for_empty_state() {
+        let mut invalid_limits = limits();
+        invalid_limits.max_daily_notional_usdc = UsdcMicros::default();
+
+        assert!(matches!(
+            MetricsSnapshot::from_runtime(
+                at(12),
+                &PacingState::default(),
+                &invalid_limits,
+                &ReplayState::default(),
+                &[],
+                None,
+                0,
+                0,
+                0,
+                3_600,
+            ),
+            Err(MetricsError::Pacing(PacingError::InvalidLimits))
         ));
     }
 }
