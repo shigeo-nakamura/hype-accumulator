@@ -350,6 +350,24 @@ impl MetricsSnapshot {
                 self.spent_usdc.to_string(),
             ),
             (
+                "hype_accumulator_last_capital_event_timestamp_seconds",
+                "Unix timestamp of the latest authoritative capital event.",
+                self.last_capital_event_at
+                    .map_or_else(|| "0".to_owned(), |value| value.timestamp().to_string()),
+            ),
+            (
+                "hype_accumulator_last_decision_timestamp_seconds",
+                "Unix timestamp of the latest durable daily decision or skip.",
+                self.last_decision_at
+                    .map_or_else(|| "0".to_owned(), |value| value.timestamp().to_string()),
+            ),
+            (
+                "hype_accumulator_last_fill_timestamp_seconds",
+                "Unix timestamp of the latest observed decision-attributed fill.",
+                self.last_fill_at
+                    .map_or_else(|| "0".to_owned(), |value| value.timestamp().to_string()),
+            ),
+            (
                 "hype_accumulator_unstaked_hype_atoms",
                 "Decision-attributed HYPE not confirmed in staking.",
                 self.unstaked_hype_atoms.to_string(),
@@ -410,6 +428,18 @@ impl MetricsSnapshot {
             writeln!(output, "# TYPE {name} counter").expect("write string");
             writeln!(output, "{name} {value}").expect("write string");
         }
+        writeln!(output, "# HELP hype_accumulator_horizon_days_remaining Calendar days remaining through the horizon.").expect("write string");
+        writeln!(
+            output,
+            "# TYPE hype_accumulator_horizon_days_remaining gauge"
+        )
+        .expect("write string");
+        writeln!(output, "# HELP hype_accumulator_horizon_required_pace_usdc Required USDC per remaining purchase slot.").expect("write string");
+        writeln!(
+            output,
+            "# TYPE hype_accumulator_horizon_required_pace_usdc gauge"
+        )
+        .expect("write string");
         writeln!(
             output,
             "# HELP hype_accumulator_horizon_residual_usdc Residual admitted capital by horizon."
@@ -429,6 +459,20 @@ impl MetricsSnapshot {
         writeln!(output, "# HELP hype_accumulator_horizon_infeasible Whether required pace exceeds the daily cap.").expect("write string");
         writeln!(output, "# TYPE hype_accumulator_horizon_infeasible gauge").expect("write string");
         for horizon in &self.horizons {
+            writeln!(
+                output,
+                "hype_accumulator_horizon_days_remaining{{horizon=\"{}\"}} {}",
+                horizon.horizon, horizon.days_remaining
+            )
+            .expect("write string");
+            if let Some(required_pace_usdc) = horizon.required_pace_usdc {
+                writeln!(
+                    output,
+                    "hype_accumulator_horizon_required_pace_usdc{{horizon=\"{}\"}} {}",
+                    horizon.horizon, required_pace_usdc
+                )
+                .expect("write string");
+            }
             writeln!(
                 output,
                 "hype_accumulator_horizon_residual_usdc{{horizon=\"{}\"}} {}",
@@ -726,6 +770,15 @@ mod tests {
         );
         assert!(snapshot.horizons[0].purchase_slots_remaining > 0);
         assert!(snapshot.horizons[0].required_pace_usdc.is_some());
+        let prometheus = snapshot.to_prometheus();
+        assert!(
+            prometheus.contains("hype_accumulator_last_capital_event_timestamp_seconds 1787644800")
+        );
+        assert!(
+            prometheus.contains("hype_accumulator_horizon_days_remaining{horizon=\"2026-12-31\"}")
+        );
+        assert!(prometheus
+            .contains("hype_accumulator_horizon_required_pace_usdc{horizon=\"2026-12-31\"}"));
     }
 
     #[test]
