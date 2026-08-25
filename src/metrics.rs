@@ -140,6 +140,23 @@ impl MetricsSnapshot {
         if pacing
             .capital_reconciled_through()
             .is_some_and(|watermark| watermark > observed_at)
+            || pacing.deposits().values().any(|tranche| {
+                tranche.received_at > observed_at
+                    || tranche
+                        .confirmed_at
+                        .is_some_and(|confirmed| confirmed > observed_at)
+                    || tranche
+                        .admission_approved_at
+                        .is_some_and(|approved| approved > observed_at)
+            })
+            || pacing.withdrawals().values().any(|withdrawal| {
+                withdrawal.event.occurred_at > observed_at
+                    || withdrawal.event.reconciled_at > observed_at
+            })
+            || pacing
+                .decisions()
+                .values()
+                .any(|decision| decision.decided_at > observed_at)
             || ledger
                 .last_event_at()
                 .is_some_and(|last_event| *last_event > observed_at)
@@ -1056,6 +1073,41 @@ mod tests {
                 3_600,
             ),
             Err(MetricsError::FutureWorkflowObservation)
+        ));
+    }
+
+    #[test]
+    fn future_pending_capital_event_fails_closed() {
+        let mut pacing = PacingState::default();
+        pacing
+            .reconcile_capital(
+                &[CapitalEvent::Deposit(DepositEvent {
+                    event_id: "future-pending-deposit".into(),
+                    amount_usdc: usd(100),
+                    received_at: at(13),
+                    confirmed_at: None,
+                    confirmation_count: 0,
+                    admission_approved_at: None,
+                })],
+                at(10),
+                &limits(),
+            )
+            .expect("future pending deposit fixture");
+
+        assert!(matches!(
+            MetricsSnapshot::from_runtime(
+                at(12),
+                &pacing,
+                &limits(),
+                &ReplayState::default(),
+                &[],
+                None,
+                0,
+                0,
+                0,
+                3_600,
+            ),
+            Err(MetricsError::FutureRuntimeState)
         ));
     }
 }

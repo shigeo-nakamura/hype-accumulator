@@ -871,10 +871,13 @@ impl WorkflowState {
                         "a fully filled order regressed to partial".into(),
                     ));
                 }
+                let new_fill_observed = *cumulative_hype > self.purchased_hype;
                 self.purchased_hype = *cumulative_hype;
                 self.filled_usdc = *cumulative_filled_usdc;
                 self.debited_usdc = *cumulative_debited_usdc;
-                self.last_fill_at = Some(event.at);
+                if new_fill_observed {
+                    self.last_fill_at = Some(event.at);
+                }
                 self.stage = if *fully_filled {
                     WorkflowStage::Filled
                 } else {

@@ -2027,6 +2027,17 @@ fn partial_fill_cancel_race_uses_one_final_cumulative_fill_and_never_rebuys() {
         )
         .expect("partial fill observed");
     assert_eq!(workflow.state().last_fill_at(), Some(at(3)));
+    workflow
+        .observe_order_fill(
+            "unchanged-after-cancel",
+            hype(100),
+            usdc(20_000_000),
+            usdc(20_200_000),
+            false,
+            at(4),
+        )
+        .expect("unchanged cumulative observation accepted");
+    assert_eq!(workflow.state().last_fill_at(), Some(at(3)));
     assert!(matches!(
         workflow.prepare_order(at(4)),
         Err(WorkflowError::InvalidTransition(_))
