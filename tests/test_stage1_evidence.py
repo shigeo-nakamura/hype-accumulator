@@ -12,7 +12,8 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 EVIDENCE_DIR = ROOT / "docs" / "evidence"
 HISTORICAL_EVIDENCE = EVIDENCE_DIR / "stage1-offline-2026-08-25.json"
-LATEST_EVIDENCE = EVIDENCE_DIR / "stage1-offline-2026-09-01.json"
+PREVIOUS_EVIDENCE = EVIDENCE_DIR / "stage1-offline-2026-09-01.json"
+LATEST_EVIDENCE = EVIDENCE_DIR / "stage1-offline-2026-09-01T225915Z.json"
 EVIDENCE_FILES = tuple(sorted(EVIDENCE_DIR.glob("stage1-offline-*.json")))
 EXPECTED_GATES = {
     "deterministic_strategy_and_pacing",
@@ -55,7 +56,10 @@ class Stage1EvidenceTests(unittest.TestCase):
             self.assertIn("--offline", command)
 
     def test_companion_digest_matches_exact_bytes(self) -> None:
-        self.assertEqual(EVIDENCE_FILES, (HISTORICAL_EVIDENCE, LATEST_EVIDENCE))
+        self.assertEqual(
+            EVIDENCE_FILES,
+            (HISTORICAL_EVIDENCE, PREVIOUS_EVIDENCE, LATEST_EVIDENCE),
+        )
         for evidence_path in EVIDENCE_FILES:
             with self.subTest(evidence=evidence_path.name):
                 expected = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
@@ -130,7 +134,7 @@ class Stage1EvidenceTests(unittest.TestCase):
         self.assertNotEqual(source["pairtrade"]["dex_connector_ref"], "v4.7.14")
 
     def test_latest_source_state_records_unmerged_release_candidates(self) -> None:
-        evidence = load_evidence(LATEST_EVIDENCE)
+        evidence = load_evidence(PREVIOUS_EVIDENCE)
         source = evidence["source_state"]
         release = source["dex_connector"]["release_candidate"]
 
@@ -166,6 +170,40 @@ class Stage1EvidenceTests(unittest.TestCase):
             open_pr_heads[source["pairtrade"]["repository"]],
             source["pairtrade"]["commit"],
         )
+
+    def test_latest_source_state_records_merged_release_callers(self) -> None:
+        evidence = load_evidence(LATEST_EVIDENCE)
+        source = evidence["source_state"]
+        release = source["dex_connector"]["release_candidate"]
+
+        self.assertTrue(release["tag_present"])
+        self.assertRegex(release["tag_commit"], SHA_PATTERN)
+        self.assertEqual(release["tag_commit"], release["version_pr_head_commit"])
+        self.assertEqual(source["hype_accumulator"]["ref"], "master")
+        self.assertEqual(source["pairtrade"]["ref"], "master")
+        self.assertEqual(source["hype_accumulator"]["dex_connector_ref"], "v4.7.14")
+        self.assertEqual(source["pairtrade"]["dex_connector_ref"], "v4.7.14")
+
+        release_gate = next(
+            gate
+            for gate in evidence["required_gates"]
+            if gate["id"] == "staking_release_and_active_callers"
+        )
+        self.assertEqual(release_gate["status"], "PASS")
+        merged_prs = {
+            (item["repository"], item["number"]): item
+            for item in release_gate["evidence"]
+            if item["kind"] == "github_pr"
+        }
+        self.assertEqual(
+            merged_prs[("shigeo-nakamura/hype-accumulator", 18)]["merge_commit"],
+            "4ee2843b161460ed7d01b85a0cea9f2a5bf5caa0",
+        )
+        self.assertEqual(
+            merged_prs[("shigeo-nakamura/pairtrade", 236)]["merge_commit"],
+            "1251bb8dcc7b6f57dc248618f967c0e617ed0823",
+        )
+        self.assertNotIn("staking_release_and_active_callers", evidence["blocking_gate_ids"])
 
     def test_references_and_verification_results_are_well_formed(self) -> None:
         for evidence_path in EVIDENCE_FILES:
