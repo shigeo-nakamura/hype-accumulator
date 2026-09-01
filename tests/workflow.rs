@@ -1,5 +1,9 @@
 use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use fs2::FileExt as _;
+#[cfg(feature = "offline-staking-simulation")]
+use hype_accumulator::workflow::{
+    DelegatedBalanceConfirmation, OfflineStakingCapabilityBinding, StakingBalanceConfirmation,
+};
 use hype_accumulator::{
     pacing::{DailyDecision, DecisionAllocation, DecisionReason, PacingExplanation, UsdcMicros},
     workflow::{
@@ -418,6 +422,20 @@ fn binding() -> DecisionBinding {
     .expect("valid workflow binding")
 }
 
+#[cfg(feature = "offline-staking-simulation")]
+fn offline_staking_binding() -> DecisionBinding {
+    binding()
+        .with_offline_staking_capability(OfflineStakingCapabilityBinding {
+            capability_version: "offline-staking-simulation/v1".to_owned(),
+            execution_identity_hash: "signer-identity-hash-a".to_owned(),
+            validator_address: format!("0x{}", "1".repeat(40)),
+            validator_summary_evidence_hash: "a".repeat(64),
+            policy_version: "custody-policy-v1".to_owned(),
+            policy_acknowledgement_hash: "b".repeat(64),
+        })
+        .expect("valid offline staking capability")
+}
+
 fn submission_evidence(
     workflow: &DurableWorkflow,
     exchange_order_id: &str,
@@ -657,8 +675,176 @@ fn ready(outcome: PrepareOutcome) -> ExternalAction {
     }
 }
 
+#[cfg(feature = "offline-staking-simulation")]
+fn offline_staking_submitted_with_receipt(
+    path: &Path,
+    binding: &DecisionBinding,
+    receipt: ExternalReceipt,
+) -> (DurableWorkflow, StakingBalanceConfirmation) {
+    let mut workflow = reopen(path, binding);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    observe_submission(&mut workflow, "exchange-order-negative", at(2))
+        .expect("submission reconciled");
+    workflow
+        .observe_order_fill(
+            "fill-negative",
+            hype(250),
+            usdc(50_000_000),
+            usdc(50_500_000),
+            true,
+            at(3),
+        )
+        .expect("fill reconciled");
+    workflow
+        .finalize_order(
+            hype(250),
+            usdc(50_000_000),
+            usdc(50_500_000),
+            OrderFinality::Filled,
+            at(4),
+        )
+        .expect("order finalized");
+    let evidence = bound_evidence(&workflow, &[("fill-negative", 250, 3)], at(5));
+    workflow
+        .record_staking_eligibility(Some(evidence), at(5))
+        .expect("eligibility recorded");
+    let deposit = ready(
+        workflow
+            .prepare_offline_staking_deposit(at(6))
+            .expect("offline deposit prepared"),
+    );
+    let ExternalAction::DepositToStaking {
+        action_id,
+        eligibility_workflow_id,
+        ..
+    } = deposit
+    else {
+        panic!("expected offline staking deposit");
+    };
+    let submission_receipt_hash = receipt.canonical_digest().expect("receipt digest");
+    let matched_transaction_hash = match &receipt {
+        ExternalReceipt::Confirmed { transaction_hash } => transaction_hash.clone(),
+        ExternalReceipt::Ambiguous => "4".repeat(64),
+    };
+    workflow
+        .observe_staking_deposit(receipt, at(7))
+        .expect("deposit response recorded");
+    let confirmation = StakingBalanceConfirmation {
+        observation_id: "staking-negative-observation".to_owned(),
+        action_id,
+        execution_identity_hash: "signer-identity-hash-a".to_owned(),
+        eligibility_workflow_id,
+        submission_receipt_hash,
+        baseline_history_hash: "2".repeat(64),
+        baseline_captured_at: at(5),
+        current_history_hash: "3".repeat(64),
+        current_captured_at: at(8),
+        matched_transaction_hash,
+        attributable_hype: hype(250),
+    };
+    (workflow, confirmation)
+}
+
+#[cfg(feature = "offline-staking-simulation")]
+fn offline_staking_submitted(
+    path: &Path,
+    binding: &DecisionBinding,
+) -> (DurableWorkflow, StakingBalanceConfirmation) {
+    offline_staking_submitted_with_receipt(path, binding, ExternalReceipt::Ambiguous)
+}
+
+#[cfg(feature = "offline-staking-simulation")]
+fn offline_delegation_submitted_with_receipt(
+    path: &Path,
+    binding: &DecisionBinding,
+    receipt: ExternalReceipt,
+) -> (DurableWorkflow, DelegatedBalanceConfirmation, String) {
+    let (mut workflow, staking_confirmation) = offline_staking_submitted(path, binding);
+    workflow
+        .confirm_staking_balance(staking_confirmation, at(8))
+        .expect("staking confirmation recorded");
+    let delegation = ready(
+        workflow
+            .prepare_offline_delegation(at(9))
+            .expect("delegation prepared"),
+    );
+    let ExternalAction::Delegate {
+        action_id,
+        eligibility_workflow_id,
+        validator_address,
+        validator_summary_evidence_hash,
+        ..
+    } = delegation
+    else {
+        panic!("expected offline delegation");
+    };
+    let expected_validator = validator_address.clone();
+    let submission_receipt_hash = receipt.canonical_digest().expect("receipt digest");
+    let matched_transaction_hash = match &receipt {
+        ExternalReceipt::Confirmed { transaction_hash } => transaction_hash.clone(),
+        ExternalReceipt::Ambiguous => "7".repeat(64),
+    };
+    workflow
+        .observe_delegation(receipt, at(10))
+        .expect("delegation response recorded");
+    let confirmation = DelegatedBalanceConfirmation {
+        observation_id: "delegation-negative-observation".to_owned(),
+        action_id,
+        execution_identity_hash: "signer-identity-hash-a".to_owned(),
+        eligibility_workflow_id,
+        validator_address,
+        validator_summary_evidence_hash,
+        submission_receipt_hash,
+        baseline_history_hash: "5".repeat(64),
+        baseline_captured_at: at(8),
+        current_history_hash: "6".repeat(64),
+        current_captured_at: at(11),
+        matched_transaction_hash,
+        attributable_hype: hype(250),
+    };
+    (workflow, confirmation, expected_validator)
+}
+
 fn assert_binding_mismatch(result: &Result<DurableWorkflow, WorkflowError>) {
     assert!(matches!(result, Err(WorkflowError::BindingMismatch)));
+}
+
+#[cfg(feature = "offline-staking-simulation")]
+#[test]
+fn offline_staking_capability_is_exactly_account_policy_and_validator_bound() {
+    let valid = OfflineStakingCapabilityBinding {
+        capability_version: "offline-staking-simulation/v1".to_owned(),
+        execution_identity_hash: "signer-identity-hash-a".to_owned(),
+        validator_address: format!("0x{}", "1".repeat(40)),
+        validator_summary_evidence_hash: "a".repeat(64),
+        policy_version: "custody-policy-v1".to_owned(),
+        policy_acknowledgement_hash: "b".repeat(64),
+    };
+    for invalid in [
+        "version",
+        "account",
+        "validator",
+        "validator_evidence",
+        "policy",
+        "acknowledgement",
+    ] {
+        let mut capability = valid.clone();
+        match invalid {
+            "version" => capability.capability_version = "offline-staking-simulation/v2".into(),
+            "account" => capability.execution_identity_hash = "different-account".into(),
+            "validator" => capability.validator_address = format!("0x{}", "A".repeat(40)),
+            "validator_evidence" => {
+                capability.validator_summary_evidence_hash = "not-a-digest".into();
+            }
+            "policy" => capability.policy_version = "other-policy".into(),
+            "acknowledgement" => capability.policy_acknowledgement_hash = "A".repeat(64),
+            _ => unreachable!("fixture cases are exhaustive"),
+        }
+        assert!(matches!(
+            binding().with_offline_staking_capability(capability),
+            Err(WorkflowError::InvalidBinding(_))
+        ));
+    }
 }
 
 #[test]
@@ -1724,6 +1910,419 @@ fn every_transition_survives_a_restart_without_double_counting() {
     );
 }
 
+#[cfg(feature = "offline-staking-simulation")]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn offline_staking_every_transition_survives_restart_and_ambiguity() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("offline-staking-workflow.jsonl");
+    let binding = offline_staking_binding();
+    let mut workflow = reopen(&path, &binding);
+
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    drop(workflow);
+    workflow = reopen(&path, &binding);
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission reconciled");
+    drop(workflow);
+    workflow = reopen(&path, &binding);
+    workflow
+        .observe_order_fill(
+            "fill-1",
+            hype(250),
+            usdc(50_000_000),
+            usdc(50_500_000),
+            true,
+            at(3),
+        )
+        .expect("fill reconciled");
+    drop(workflow);
+    workflow = reopen(&path, &binding);
+    workflow
+        .finalize_order(
+            hype(250),
+            usdc(50_000_000),
+            usdc(50_500_000),
+            OrderFinality::Filled,
+            at(4),
+        )
+        .expect("order finalized");
+    drop(workflow);
+    workflow = reopen(&path, &binding);
+    let eligibility_evidence = bound_evidence(&workflow, &[("fill-1", 250, 3)], at(5));
+    workflow
+        .record_staking_eligibility(Some(eligibility_evidence), at(5))
+        .expect("eligibility recorded");
+    drop(workflow);
+    workflow = reopen(&path, &binding);
+
+    assert!(matches!(
+        workflow.prepare_staking_deposit(at(6)),
+        Err(WorkflowError::AutomaticStakingDisabled)
+    ));
+    let deposit = ready(
+        workflow
+            .prepare_offline_staking_deposit(at(6))
+            .expect("offline deposit prepared"),
+    );
+    let (deposit_action_id, eligibility_workflow_id) = match &deposit {
+        ExternalAction::DepositToStaking {
+            action_id,
+            eligibility_workflow_id,
+            capability_binding_hash,
+            amount_hype,
+        } => {
+            assert_eq!(*amount_hype, hype(250));
+            assert_eq!(capability_binding_hash.len(), 64);
+            (action_id.clone(), eligibility_workflow_id.clone())
+        }
+        _ => panic!("expected offline staking deposit"),
+    };
+    drop(workflow);
+    workflow = reopen(&path, &binding);
+    assert_eq!(workflow.state().pending_action(), Some(&deposit));
+    assert_eq!(
+        workflow
+            .prepare_offline_staking_deposit(at(7))
+            .expect("restart is reconciliation only"),
+        PrepareOutcome::ReconcileOnly {
+            action_id: deposit_action_id.clone(),
+            kind: ActionKind::DepositToStaking,
+        }
+    );
+    workflow
+        .observe_staking_deposit(ExternalReceipt::Ambiguous, at(7))
+        .expect("ambiguous response durably recorded");
+    drop(workflow);
+    workflow = reopen(&path, &binding);
+    assert_eq!(
+        workflow.state().stage(),
+        WorkflowStage::StakingDepositSubmitted
+    );
+    let deposit_response_count = workflow.record_count();
+    assert_eq!(
+        workflow
+            .observe_staking_deposit(ExternalReceipt::Ambiguous, at(8))
+            .expect("duplicate ambiguous response is idempotent"),
+        AppendOutcome::Duplicate
+    );
+    assert_eq!(workflow.record_count(), deposit_response_count);
+
+    let staking_confirmation = StakingBalanceConfirmation {
+        observation_id: "staking-balance-observation-1".to_owned(),
+        action_id: deposit_action_id,
+        execution_identity_hash: "signer-identity-hash-a".to_owned(),
+        eligibility_workflow_id: eligibility_workflow_id.clone(),
+        submission_receipt_hash: ExternalReceipt::Ambiguous
+            .canonical_digest()
+            .expect("receipt digest"),
+        baseline_history_hash: "c".repeat(64),
+        baseline_captured_at: at(5),
+        current_history_hash: "d".repeat(64),
+        current_captured_at: at(8),
+        matched_transaction_hash: "e".repeat(64),
+        attributable_hype: hype(250),
+    };
+    workflow
+        .confirm_staking_balance(staking_confirmation.clone(), at(8))
+        .expect("staking balance authoritatively confirmed");
+    drop(workflow);
+    workflow = reopen(&path, &binding);
+    assert_eq!(
+        workflow.state().stage(),
+        WorkflowStage::StakingBalanceConfirmed
+    );
+    let staking_confirmation_count = workflow.record_count();
+    assert_eq!(
+        workflow
+            .confirm_staking_balance(staking_confirmation, at(9))
+            .expect("staking confirmation replay is idempotent"),
+        AppendOutcome::Duplicate
+    );
+    assert_eq!(workflow.record_count(), staking_confirmation_count);
+
+    assert!(matches!(
+        workflow.prepare_delegation(at(9)),
+        Err(WorkflowError::AutomaticStakingDisabled)
+    ));
+    let delegation = ready(
+        workflow
+            .prepare_offline_delegation(at(9))
+            .expect("offline delegation prepared"),
+    );
+    let (delegation_action_id, validator_address, validator_evidence_hash) = match &delegation {
+        ExternalAction::Delegate {
+            action_id,
+            eligibility_workflow_id: action_eligibility_id,
+            capability_binding_hash,
+            validator_address,
+            validator_summary_evidence_hash,
+            amount_hype,
+        } => {
+            assert_eq!(action_eligibility_id, &eligibility_workflow_id);
+            assert_eq!(capability_binding_hash.len(), 64);
+            assert_eq!(*amount_hype, hype(250));
+            (
+                action_id.clone(),
+                validator_address.clone(),
+                validator_summary_evidence_hash.clone(),
+            )
+        }
+        _ => panic!("expected offline delegation"),
+    };
+    drop(workflow);
+    workflow = reopen(&path, &binding);
+    assert_eq!(workflow.state().pending_action(), Some(&delegation));
+    assert_eq!(
+        workflow
+            .prepare_offline_delegation(at(10))
+            .expect("delegation restart is reconciliation only"),
+        PrepareOutcome::ReconcileOnly {
+            action_id: delegation_action_id.clone(),
+            kind: ActionKind::Delegate,
+        }
+    );
+    let delegation_receipt = ExternalReceipt::Confirmed {
+        transaction_hash: "1".repeat(64),
+    };
+    workflow
+        .observe_delegation(delegation_receipt.clone(), at(10))
+        .expect("confirmed delegation response recorded");
+    drop(workflow);
+    workflow = reopen(&path, &binding);
+    assert_eq!(workflow.state().stage(), WorkflowStage::DelegationSubmitted);
+
+    let delegation_confirmation = DelegatedBalanceConfirmation {
+        observation_id: "delegated-balance-observation-1".to_owned(),
+        action_id: delegation_action_id,
+        execution_identity_hash: "signer-identity-hash-a".to_owned(),
+        eligibility_workflow_id,
+        validator_address,
+        validator_summary_evidence_hash: validator_evidence_hash,
+        submission_receipt_hash: delegation_receipt
+            .canonical_digest()
+            .expect("receipt digest"),
+        baseline_history_hash: "f".repeat(64),
+        baseline_captured_at: at(8),
+        current_history_hash: "0".repeat(64),
+        current_captured_at: at(11),
+        matched_transaction_hash: "1".repeat(64),
+        attributable_hype: hype(250),
+    };
+    workflow
+        .confirm_delegated_balance(delegation_confirmation, at(11))
+        .expect("delegation authoritatively confirmed");
+    drop(workflow);
+    workflow = reopen(&path, &binding);
+    assert_eq!(workflow.state().stage(), WorkflowStage::DelegatedConfirmed);
+    assert_eq!(workflow.state().delegated_hype(), hype(250));
+    workflow.complete(at(12)).expect("workflow completed");
+    drop(workflow);
+    workflow = reopen(&path, &binding);
+    assert_eq!(workflow.state().stage(), WorkflowStage::Complete);
+    assert_eq!(workflow.state().staking_target_hype(), hype(250));
+    assert_eq!(workflow.state().staking_confirmed_hype(), hype(250));
+    assert_eq!(workflow.state().delegated_hype(), hype(250));
+}
+
+#[cfg(feature = "offline-staking-simulation")]
+#[test]
+fn offline_staking_uses_recorded_residual_split_and_cannot_complete_early() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("offline-staking-residual.jsonl");
+    let mut binding = offline_staking_binding();
+    binding.inventory_before.unconsumed_residual_spot_hype_atoms = hype(5);
+    let mut workflow = reopen(&path, &binding);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    observe_submission(&mut workflow, "exchange-order-residual", at(2))
+        .expect("submission reconciled");
+    workflow
+        .observe_order_fill(
+            "fill-residual",
+            hype(250),
+            usdc(50_000_000),
+            usdc(50_500_000),
+            true,
+            at(3),
+        )
+        .expect("fill reconciled");
+    workflow
+        .finalize_order(
+            hype(250),
+            usdc(50_000_000),
+            usdc(50_500_000),
+            OrderFinality::Filled,
+            at(4),
+        )
+        .expect("order finalized");
+    let evidence = bound_evidence(&workflow, &[("fill-residual", 250, 3)], at(5));
+    let eligibility = workflow
+        .record_staking_eligibility(Some(evidence), at(5))
+        .expect("eligibility recorded");
+    assert_eq!(eligibility.residual_hype, hype(5));
+    assert_eq!(eligibility.eligible_hype, hype(245));
+
+    let count = workflow.record_count();
+    assert!(matches!(
+        workflow.complete(at(6)),
+        Err(WorkflowError::InvalidTransition(_))
+    ));
+    assert_eq!(workflow.record_count(), count);
+    let action = ready(
+        workflow
+            .prepare_offline_staking_deposit(at(6))
+            .expect("offline deposit prepared"),
+    );
+    assert!(matches!(
+        action,
+        ExternalAction::DepositToStaking {
+            amount_hype,
+            ..
+        } if amount_hype == hype(245)
+    ));
+}
+
+#[cfg(feature = "offline-staking-simulation")]
+#[test]
+fn offline_staking_confirmations_fail_closed_on_identity_receipt_time_or_validator_tampering() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let binding = offline_staking_binding();
+
+    let account_path = temp.path().join("wrong-account.jsonl");
+    let (mut account_workflow, mut account_confirmation) =
+        offline_staking_submitted(&account_path, &binding);
+    account_confirmation.execution_identity_hash = "other-account".to_owned();
+    assert!(matches!(
+        account_workflow.confirm_staking_balance(account_confirmation, at(8)),
+        Err(WorkflowError::ContradictoryObservation(_))
+    ));
+    assert_eq!(
+        account_workflow.state().stage(),
+        WorkflowStage::ManualReview
+    );
+
+    let receipt_path = temp.path().join("wrong-receipt.jsonl");
+    let (mut receipt_workflow, mut receipt_confirmation) =
+        offline_staking_submitted(&receipt_path, &binding);
+    receipt_confirmation.submission_receipt_hash = "8".repeat(64);
+    assert!(matches!(
+        receipt_workflow.confirm_staking_balance(receipt_confirmation, at(8)),
+        Err(WorkflowError::ContradictoryObservation(_))
+    ));
+    assert_eq!(
+        receipt_workflow.state().stage(),
+        WorkflowStage::ManualReview
+    );
+
+    let timing_path = temp.path().join("late-baseline.jsonl");
+    let (mut timing_workflow, mut timing_confirmation) =
+        offline_staking_submitted(&timing_path, &binding);
+    timing_confirmation.baseline_captured_at = at(8);
+    assert!(matches!(
+        timing_workflow.confirm_staking_balance(timing_confirmation, at(8)),
+        Err(WorkflowError::ContradictoryObservation(_))
+    ));
+    assert_eq!(timing_workflow.state().stage(), WorkflowStage::ManualReview);
+}
+
+#[cfg(feature = "offline-staking-simulation")]
+#[test]
+fn offline_staking_confirmed_transactions_and_validator_are_exactly_bound() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let binding = offline_staking_binding();
+
+    let confirmed_path = temp.path().join("confirmed-transaction.jsonl");
+    let confirmed_transaction_hash = "a".repeat(64);
+    let (mut confirmed_workflow, confirmed_confirmation) = offline_staking_submitted_with_receipt(
+        &confirmed_path,
+        &binding,
+        ExternalReceipt::Confirmed {
+            transaction_hash: confirmed_transaction_hash.clone(),
+        },
+    );
+    assert_eq!(
+        confirmed_confirmation.matched_transaction_hash,
+        confirmed_transaction_hash
+    );
+    confirmed_workflow
+        .confirm_staking_balance(confirmed_confirmation, at(8))
+        .expect("confirmed receipt transaction matches");
+
+    let wrong_transaction_path = temp.path().join("wrong-transaction.jsonl");
+    let (mut transaction_workflow, mut transaction_confirmation) =
+        offline_staking_submitted_with_receipt(
+            &wrong_transaction_path,
+            &binding,
+            ExternalReceipt::Confirmed {
+                transaction_hash: "a".repeat(64),
+            },
+        );
+    transaction_confirmation.matched_transaction_hash = "b".repeat(64);
+    assert!(matches!(
+        transaction_workflow.confirm_staking_balance(transaction_confirmation, at(8)),
+        Err(WorkflowError::ContradictoryObservation(_))
+    ));
+    assert_eq!(
+        transaction_workflow.state().stage(),
+        WorkflowStage::ManualReview
+    );
+
+    let validator_path = temp.path().join("wrong-validator.jsonl");
+    let (mut validator_workflow, mut tampered_confirmation, validator_address) =
+        offline_delegation_submitted_with_receipt(
+            &validator_path,
+            &binding,
+            ExternalReceipt::Ambiguous,
+        );
+    tampered_confirmation.validator_address = format!("0x{}", "9".repeat(40));
+    assert_ne!(tampered_confirmation.validator_address, validator_address);
+    assert!(matches!(
+        validator_workflow.confirm_delegated_balance(tampered_confirmation, at(11)),
+        Err(WorkflowError::ContradictoryObservation(_))
+    ));
+    assert_eq!(
+        validator_workflow.state().stage(),
+        WorkflowStage::ManualReview
+    );
+
+    let delegation_timing_path = temp.path().join("late-delegation-baseline.jsonl");
+    let (mut delegation_timing_workflow, mut delegation_timing_confirmation, _) =
+        offline_delegation_submitted_with_receipt(
+            &delegation_timing_path,
+            &binding,
+            ExternalReceipt::Ambiguous,
+        );
+    delegation_timing_confirmation.baseline_captured_at = at(9);
+    assert!(matches!(
+        delegation_timing_workflow
+            .confirm_delegated_balance(delegation_timing_confirmation, at(11)),
+        Err(WorkflowError::ContradictoryObservation(_))
+    ));
+    assert_eq!(
+        delegation_timing_workflow.state().stage(),
+        WorkflowStage::ManualReview
+    );
+
+    let delegation_transaction_path = temp.path().join("wrong-delegation-transaction.jsonl");
+    let (mut delegation_transaction_workflow, mut delegation_transaction_confirmation, _) =
+        offline_delegation_submitted_with_receipt(
+            &delegation_transaction_path,
+            &binding,
+            ExternalReceipt::Confirmed {
+                transaction_hash: "7".repeat(64),
+            },
+        );
+    delegation_transaction_confirmation.matched_transaction_hash = "8".repeat(64);
+    assert!(matches!(
+        delegation_transaction_workflow
+            .confirm_delegated_balance(delegation_transaction_confirmation, at(11)),
+        Err(WorkflowError::ContradictoryObservation(_))
+    ));
+    assert_eq!(
+        delegation_transaction_workflow.state().stage(),
+        WorkflowStage::ManualReview
+    );
+}
+
 #[test]
 fn duplicate_responses_are_idempotent_even_when_redelivered_later() {
     let temp = tempfile::tempdir().expect("temp directory");
@@ -2569,6 +3168,11 @@ fn staking_and_delegation_actions_remain_hard_disabled() {
         .record_staking_eligibility(Some(evidence), at(7))
         .expect("unsigned eligibility recorded");
     assert_eq!(eligibility.eligible_hype, hype(250));
+    #[cfg(feature = "offline-staking-simulation")]
+    assert!(matches!(
+        workflow.prepare_offline_staking_deposit(at(8)),
+        Err(WorkflowError::AutomaticStakingDisabled)
+    ));
 }
 
 #[test]

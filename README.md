@@ -62,6 +62,31 @@ it reports zero HYPE with degraded health until an authoritative accumulator
 ledger supplies reconciled holdings and last-trade identity. Raw account HYPE
 and account-wide fills are never presented as accumulator activity.
 
+## Offline staking workflow fault injection
+
+The optional `offline-staking-simulation` feature exercises the durable
+post-purchase mechanics without adding a signer or exchange client to the
+default/release build. A simulation binding is versioned and fixed to the
+execution-account identity hash, eligibility policy, policy acknowledgement,
+one validator address, and its validator-summary evidence hash. Staking and
+delegation action IDs additionally bind the exact content-addressed eligibility
+workflow, so an old eligibility-only journal cannot become action-capable after
+restart.
+
+The simulation covers write-ahead preparation, ambiguous responses,
+reconciliation-only restart behavior, exact account/transaction evidence,
+validator-bound delegation, duplicate replay, and completion only after the
+delegated amount matches the recorded staking target:
+
+```text
+cargo test --test workflow --features offline-staking-simulation --locked
+```
+
+The public `prepare_staking_deposit` and `prepare_delegation` methods remain
+hard-disabled in every build. Simulation evidence does not prove venue signer
+capability or safe acceptance timing and does not authorize testnet/mainnet
+submission, automatic staking, secret installation, or live operation.
+
 ## Dashboard status contract
 
 The accumulator publishes a nested `accumulator` status block for
