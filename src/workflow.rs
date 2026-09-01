@@ -114,6 +114,20 @@ pub struct EligibilityPolicyBinding {
     pub lot_eligibility_max_age_seconds: u64,
 }
 
+/// Immutable, signer-free capability used only by the offline staking
+/// simulation feature. Production builds reject bindings that contain it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OfflineStakingCapabilityBinding {
+    pub capability_version: String,
+    pub execution_identity_hash: String,
+    pub validator_address: String,
+    pub validator_summary_evidence_hash: String,
+    pub policy_version: String,
+    pub policy_acknowledgement_hash: String,
+}
+
+const OFFLINE_STAKING_CAPABILITY_VERSION: &str = "offline-staking-simulation/v1";
+
 /// Immutable fields of the signer-authorized IOC order envelope.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OrderEnvelopeBinding {
@@ -153,6 +167,8 @@ pub struct DecisionBinding {
     pub inventory_before: InventoryBaseline,
     pub order_envelope: OrderEnvelopeBinding,
     pub eligibility_policy: EligibilityPolicyBinding,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline_staking_capability: Option<OfflineStakingCapabilityBinding>,
 }
 
 impl DecisionBinding {
@@ -206,9 +222,28 @@ impl DecisionBinding {
             inventory_before,
             order_envelope,
             eligibility_policy,
+            offline_staking_capability: None,
         };
         binding.validate()?;
         Ok(binding)
+    }
+
+    /// Binds signer-free staking/delegation mechanics to an offline-only
+    /// capability before the durable workflow identity is derived.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the capability is canonical, account-bound,
+    /// policy-bound, and this crate was built with the explicit simulation
+    /// feature.
+    #[cfg(feature = "offline-staking-simulation")]
+    pub fn with_offline_staking_capability(
+        mut self,
+        capability: OfflineStakingCapabilityBinding,
+    ) -> Result<Self, WorkflowError> {
+        self.offline_staking_capability = Some(capability);
+        self.validate()?;
+        Ok(self)
     }
 
     fn validate(&self) -> Result<(), WorkflowError> {
@@ -252,6 +287,14 @@ impl DecisionBinding {
                 "decision identity, snapshots, date, and capital must be complete".into(),
             ));
         }
+        if let Some(capability) = &self.offline_staking_capability {
+            if !cfg!(feature = "offline-staking-simulation") {
+                return Err(WorkflowError::InvalidBinding(
+                    "offline staking capability is unavailable in this build".into(),
+                ));
+            }
+            capability.validate(self)?;
+        }
         let mut ids = BTreeSet::new();
         let mut planned_total = 0_u64;
         let mut committed_total = 0_u64;
@@ -285,6 +328,29 @@ impl DecisionBinding {
             ));
         }
         Ok(())
+    }
+}
+
+impl OfflineStakingCapabilityBinding {
+    fn validate(&self, binding: &DecisionBinding) -> Result<(), WorkflowError> {
+        if self.capability_version != OFFLINE_STAKING_CAPABILITY_VERSION
+            || self.execution_identity_hash != binding.inventory_before.execution_identity_hash
+            || self.policy_version != binding.eligibility_policy.policy_version
+            || !canonical_ethereum_address(&self.validator_address)
+            || !lower_hex_digest(&self.validator_summary_evidence_hash)
+            || !lower_hex_digest(&self.policy_acknowledgement_hash)
+        {
+            return Err(WorkflowError::InvalidBinding(
+                "offline staking capability is not canonical or account/policy bound".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn digest(&self) -> Result<String, WorkflowError> {
+        serde_json::to_vec(self)
+            .map(|encoded| digest_hex(&encoded))
+            .map_err(WorkflowError::json)
     }
 }
 
@@ -332,10 +398,16 @@ pub enum ExternalAction {
     },
     DepositToStaking {
         action_id: String,
+        eligibility_workflow_id: String,
+        capability_binding_hash: String,
         amount_hype: HypeAtoms,
     },
     Delegate {
         action_id: String,
+        eligibility_workflow_id: String,
+        capability_binding_hash: String,
+        validator_address: String,
+        validator_summary_evidence_hash: String,
         amount_hype: HypeAtoms,
     },
 }
@@ -371,6 +443,55 @@ pub enum PrepareOutcome {
 pub enum ExternalReceipt {
     Confirmed(String),
     Ambiguous,
+}
+
+impl ExternalReceipt {
+    /// Returns the canonical digest used to bind later confirmation evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkflowError`] if the receipt cannot be serialized.
+    pub fn canonical_digest(&self) -> Result<String, WorkflowError> {
+        serde_json::to_vec(self)
+            .map(|encoded| digest_hex(&encoded))
+            .map_err(WorkflowError::json)
+    }
+}
+
+/// Authoritative, account-bound evidence that the exact simulated staking
+/// deposit is reflected in staking state after submission.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StakingBalanceConfirmation {
+    pub observation_id: String,
+    pub action_id: String,
+    pub execution_identity_hash: String,
+    pub eligibility_workflow_id: String,
+    pub submission_receipt_hash: String,
+    pub baseline_history_hash: String,
+    pub baseline_captured_at: DateTime<Utc>,
+    pub current_history_hash: String,
+    pub current_captured_at: DateTime<Utc>,
+    pub matched_transaction_hash: String,
+    pub attributable_hype: HypeAtoms,
+}
+
+/// Authoritative, validator-bound evidence that the exact simulated
+/// delegation is reflected in account delegation state after submission.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DelegatedBalanceConfirmation {
+    pub observation_id: String,
+    pub action_id: String,
+    pub execution_identity_hash: String,
+    pub eligibility_workflow_id: String,
+    pub validator_address: String,
+    pub validator_summary_evidence_hash: String,
+    pub submission_receipt_hash: String,
+    pub baseline_history_hash: String,
+    pub baseline_captured_at: DateTime<Utc>,
+    pub current_history_hash: String,
+    pub current_captured_at: DateTime<Utc>,
+    pub matched_transaction_hash: String,
+    pub attributable_hype: HypeAtoms,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -515,7 +636,7 @@ pub struct AuthenticatedOrderSubmission {
 pub enum WorkflowTransition {
     DecisionRecorded {
         workflow_id: String,
-        binding: DecisionBinding,
+        binding: Box<DecisionBinding>,
     },
     ActionPrepared {
         action: ExternalAction,
@@ -553,16 +674,14 @@ pub enum WorkflowTransition {
         receipt: ExternalReceipt,
     },
     StakingBalanceConfirmed {
-        observation_id: String,
-        attributable_hype: HypeAtoms,
+        evidence: Box<StakingBalanceConfirmation>,
     },
     DelegationObserved {
         action_id: String,
         receipt: ExternalReceipt,
     },
     DelegatedBalanceConfirmed {
-        observation_id: String,
-        attributable_hype: HypeAtoms,
+        evidence: Box<DelegatedBalanceConfirmation>,
     },
     Completed,
     ManualReview {
@@ -597,7 +716,11 @@ pub struct WorkflowState {
     staking_confirmed_hype: HypeAtoms,
     delegated_hype: HypeAtoms,
     staking_submitted_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    staking_submission_receipt_hash: Option<String>,
     delegation_submitted_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    delegation_submission_receipt_hash: Option<String>,
     #[serde(default)]
     last_fill_at: Option<DateTime<Utc>>,
     manual_review_reason: Option<String>,
@@ -718,6 +841,7 @@ impl WorkflowState {
                 "first event is not a decision".into(),
             ));
         };
+        let binding = binding.as_ref();
         binding.validate()?;
         if first.event_id != event_id_for_decision(workflow_id) {
             return Err(WorkflowError::CorruptJournal(
@@ -748,7 +872,9 @@ impl WorkflowState {
             staking_confirmed_hype: HypeAtoms::default(),
             delegated_hype: HypeAtoms::default(),
             staking_submitted_at: None,
+            staking_submission_receipt_hash: None,
             delegation_submitted_at: None,
+            delegation_submission_receipt_hash: None,
             last_fill_at: None,
             manual_review_reason: None,
             last_transition_at: first.at,
@@ -962,27 +1088,25 @@ impl WorkflowState {
             }
             WorkflowTransition::StakingDepositObserved { action_id, receipt } => {
                 self.require_pending(ActionKind::DepositToStaking, action_id)?;
-                if self.stage != WorkflowStage::OrderFinalized {
+                if self.stage != WorkflowStage::StakingEligibilityRecorded {
                     return Err(WorkflowError::InvalidTransition(
-                        "staking response is invalid for current state".into(),
+                        "staking response requires recorded eligibility".into(),
                     ));
                 }
                 validate_receipt(receipt)?;
                 self.pending_action = None;
+                self.staking_submission_receipt_hash = Some(receipt.canonical_digest()?);
                 self.staking_submitted_at = Some(event.at);
                 self.stage = WorkflowStage::StakingDepositSubmitted;
             }
-            WorkflowTransition::StakingBalanceConfirmed {
-                attributable_hype, ..
-            } => {
-                if self.stage != WorkflowStage::StakingDepositSubmitted
-                    || *attributable_hype != self.staking_target_hype
-                {
-                    return Err(WorkflowError::ContradictoryObservation(
-                        "staking balance does not match decision-attributed HYPE".into(),
+            WorkflowTransition::StakingBalanceConfirmed { evidence } => {
+                if self.stage != WorkflowStage::StakingDepositSubmitted {
+                    return Err(WorkflowError::InvalidTransition(
+                        "staking confirmation is invalid for current state".into(),
                     ));
                 }
-                self.staking_confirmed_hype = *attributable_hype;
+                self.validate_staking_balance_confirmation(evidence, event.at)?;
+                self.staking_confirmed_hype = evidence.attributable_hype;
                 self.stage = WorkflowStage::StakingBalanceConfirmed;
             }
             WorkflowTransition::DelegationObserved { action_id, receipt } => {
@@ -994,28 +1118,32 @@ impl WorkflowState {
                 }
                 validate_receipt(receipt)?;
                 self.pending_action = None;
+                self.delegation_submission_receipt_hash = Some(receipt.canonical_digest()?);
                 self.delegation_submitted_at = Some(event.at);
                 self.stage = WorkflowStage::DelegationSubmitted;
             }
-            WorkflowTransition::DelegatedBalanceConfirmed {
-                attributable_hype, ..
-            } => {
-                if self.stage != WorkflowStage::DelegationSubmitted
-                    || *attributable_hype != self.staking_target_hype
-                {
-                    return Err(WorkflowError::ContradictoryObservation(
-                        "delegated balance does not match decision-attributed HYPE".into(),
+            WorkflowTransition::DelegatedBalanceConfirmed { evidence } => {
+                if self.stage != WorkflowStage::DelegationSubmitted {
+                    return Err(WorkflowError::InvalidTransition(
+                        "delegation confirmation is invalid for current state".into(),
                     ));
                 }
-                self.delegated_hype = *attributable_hype;
+                self.validate_delegated_balance_confirmation(evidence, event.at)?;
+                self.delegated_hype = evidence.attributable_hype;
                 self.stage = WorkflowStage::DelegatedConfirmed;
             }
             WorkflowTransition::Completed => {
-                let unsigned_eligibility_complete =
-                    self.stage == WorkflowStage::StakingEligibilityRecorded;
-                let future_staking_complete = self.stage == WorkflowStage::DelegatedConfirmed
+                let eligibility_only_complete = self.binding.offline_staking_capability.is_none()
+                    && self.stage == WorkflowStage::StakingEligibilityRecorded;
+                let zero_staking_complete = self.staking_eligible_hype.is_zero()
+                    && self.stage == WorkflowStage::StakingEligibilityRecorded;
+                let simulated_staking_complete = self.binding.offline_staking_capability.is_some()
+                    && self.stage == WorkflowStage::DelegatedConfirmed
                     && self.delegated_hype == self.staking_target_hype;
-                if !unsigned_eligibility_complete && !future_staking_complete {
+                if !eligibility_only_complete
+                    && !zero_staking_complete
+                    && !simulated_staking_complete
+                {
                     return Err(WorkflowError::InvalidTransition(
                         "workflow cannot complete before terminal eligibility reconciliation"
                             .into(),
@@ -1039,7 +1167,7 @@ impl WorkflowState {
     }
 
     fn validate_prepared_action(&self, action: &ExternalAction) -> Result<(), WorkflowError> {
-        let expected_id = action_id_for(&self.workflow_id, action.kind());
+        let expected_id = action_id_for_state(self, action.kind())?;
         if action.action_id() != expected_id {
             return Err(WorkflowError::InvalidTransition(
                 "external action ID is not deterministic".into(),
@@ -1078,20 +1206,36 @@ impl WorkflowState {
             {
                 Ok(())
             }
-            ExternalAction::DepositToStaking { amount_hype, .. }
-                if self.stage == WorkflowStage::OrderFinalized
-                    && !amount_hype.is_zero()
-                    && Some(*amount_hype)
-                        == self
-                            .purchased_hype
-                            .checked_sub(self.binding.inventory_before.residual_hype_deficit()) =>
+            ExternalAction::DepositToStaking {
+                eligibility_workflow_id,
+                capability_binding_hash,
+                amount_hype,
+                ..
+            } if self.stage == WorkflowStage::StakingEligibilityRecorded
+                && !amount_hype.is_zero()
+                && *amount_hype == self.staking_eligible_hype
+                && self.eligibility_workflow_id() == Some(eligibility_workflow_id)
+                && self.offline_staking_capability_hash()?.as_str() == capability_binding_hash =>
             {
                 Ok(())
             }
-            ExternalAction::Delegate { amount_hype, .. }
-                if self.stage == WorkflowStage::StakingBalanceConfirmed
-                    && *amount_hype == self.staking_target_hype
-                    && !amount_hype.is_zero() =>
+            ExternalAction::Delegate {
+                eligibility_workflow_id,
+                capability_binding_hash,
+                validator_address,
+                validator_summary_evidence_hash,
+                amount_hype,
+                ..
+            } if self.stage == WorkflowStage::StakingBalanceConfirmed
+                && *amount_hype == self.staking_target_hype
+                && !amount_hype.is_zero()
+                && self.eligibility_workflow_id() == Some(eligibility_workflow_id)
+                && self.offline_staking_capability_hash()?.as_str() == capability_binding_hash
+                && self.offline_staking_capability()?.validator_address == *validator_address
+                && self
+                    .offline_staking_capability()?
+                    .validator_summary_evidence_hash
+                    == *validator_summary_evidence_hash =>
             {
                 Ok(())
             }
@@ -1099,6 +1243,104 @@ impl WorkflowState {
                 "external action payload is invalid for current state".into(),
             )),
         }
+    }
+
+    fn offline_staking_capability(
+        &self,
+    ) -> Result<&OfflineStakingCapabilityBinding, WorkflowError> {
+        self.binding
+            .offline_staking_capability
+            .as_ref()
+            .ok_or(WorkflowError::AutomaticStakingDisabled)
+    }
+
+    fn offline_staking_capability_hash(&self) -> Result<String, WorkflowError> {
+        self.offline_staking_capability()?.digest()
+    }
+
+    fn validate_staking_balance_confirmation(
+        &self,
+        evidence: &StakingBalanceConfirmation,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<(), WorkflowError> {
+        let capability = self.offline_staking_capability()?;
+        let submitted_at = self.staking_submitted_at.ok_or_else(|| {
+            WorkflowError::CorruptJournal("staking submission timestamp is missing".into())
+        })?;
+        let receipt_hash = self
+            .staking_submission_receipt_hash
+            .as_deref()
+            .ok_or_else(|| {
+                WorkflowError::CorruptJournal("staking submission receipt is missing".into())
+            })?;
+        let eligibility_workflow_id = self.eligibility_workflow_id().ok_or_else(|| {
+            WorkflowError::CorruptJournal("staking eligibility identity is missing".into())
+        })?;
+        if !canonical_nonempty(&evidence.observation_id)
+            || evidence.action_id != action_id_for_state(self, ActionKind::DepositToStaking)?
+            || evidence.execution_identity_hash != capability.execution_identity_hash
+            || evidence.eligibility_workflow_id != eligibility_workflow_id
+            || evidence.submission_receipt_hash != receipt_hash
+            || !lower_hex_digest(&evidence.baseline_history_hash)
+            || evidence.baseline_captured_at > submitted_at
+            || !lower_hex_digest(&evidence.current_history_hash)
+            || evidence.current_captured_at < submitted_at
+            || evidence.current_captured_at <= evidence.baseline_captured_at
+            || evidence.current_captured_at > recorded_at
+            || evidence.baseline_history_hash == evidence.current_history_hash
+            || !lower_hex_digest(&evidence.matched_transaction_hash)
+            || evidence.attributable_hype != self.staking_target_hype
+            || evidence.attributable_hype.is_zero()
+        {
+            return Err(WorkflowError::ContradictoryObservation(
+                "staking confirmation is not uniquely account/action/eligibility bound".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_delegated_balance_confirmation(
+        &self,
+        evidence: &DelegatedBalanceConfirmation,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<(), WorkflowError> {
+        let capability = self.offline_staking_capability()?;
+        let submitted_at = self.delegation_submitted_at.ok_or_else(|| {
+            WorkflowError::CorruptJournal("delegation submission timestamp is missing".into())
+        })?;
+        let receipt_hash = self
+            .delegation_submission_receipt_hash
+            .as_deref()
+            .ok_or_else(|| {
+                WorkflowError::CorruptJournal("delegation submission receipt is missing".into())
+            })?;
+        let eligibility_workflow_id = self.eligibility_workflow_id().ok_or_else(|| {
+            WorkflowError::CorruptJournal("staking eligibility identity is missing".into())
+        })?;
+        if !canonical_nonempty(&evidence.observation_id)
+            || evidence.action_id != action_id_for_state(self, ActionKind::Delegate)?
+            || evidence.execution_identity_hash != capability.execution_identity_hash
+            || evidence.eligibility_workflow_id != eligibility_workflow_id
+            || evidence.validator_address != capability.validator_address
+            || evidence.validator_summary_evidence_hash
+                != capability.validator_summary_evidence_hash
+            || evidence.submission_receipt_hash != receipt_hash
+            || !lower_hex_digest(&evidence.baseline_history_hash)
+            || evidence.baseline_captured_at > submitted_at
+            || !lower_hex_digest(&evidence.current_history_hash)
+            || evidence.current_captured_at < submitted_at
+            || evidence.current_captured_at <= evidence.baseline_captured_at
+            || evidence.current_captured_at > recorded_at
+            || evidence.baseline_history_hash == evidence.current_history_hash
+            || !lower_hex_digest(&evidence.matched_transaction_hash)
+            || evidence.attributable_hype != self.staking_target_hype
+            || evidence.attributable_hype.is_zero()
+        {
+            return Err(WorkflowError::ContradictoryObservation(
+                "delegation confirmation is not uniquely account/action/validator bound".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn validate_conclusive_absence(
@@ -1855,7 +2097,7 @@ impl DurableWorkflow {
                 at: binding.decided_at,
                 transition: WorkflowTransition::DecisionRecorded {
                     workflow_id,
-                    binding: binding.clone(),
+                    binding: Box::new(binding.clone()),
                 },
             };
             let state = WorkflowState::replay(std::slice::from_ref(&initial))?;
@@ -2351,6 +2593,22 @@ impl DurableWorkflow {
         Err(WorkflowError::AutomaticStakingDisabled)
     }
 
+    /// Persists a signer-free staking intent for fault-injection and replay.
+    /// This method is absent from production/default builds and cannot submit
+    /// an exchange action.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the decision carries the exact offline
+    /// capability and staking eligibility has already been durably recorded.
+    #[cfg(feature = "offline-staking-simulation")]
+    pub fn prepare_offline_staking_deposit(
+        &mut self,
+        at: DateTime<Utc>,
+    ) -> Result<PrepareOutcome, WorkflowError> {
+        self.prepare_action(ActionKind::DepositToStaking, at)
+    }
+
     /// Records the staking submission response, including ambiguity.
     ///
     /// # Errors
@@ -2361,7 +2619,7 @@ impl DurableWorkflow {
         receipt: ExternalReceipt,
         at: DateTime<Utc>,
     ) -> Result<AppendOutcome, WorkflowError> {
-        let action_id = action_id_for(self.state.workflow_id(), ActionKind::DepositToStaking);
+        let action_id = action_id_for_state(&self.state, ActionKind::DepositToStaking)?;
         self.append_observation(
             stable_id(
                 "event/staking_submitted/v1",
@@ -2380,8 +2638,7 @@ impl DurableWorkflow {
     /// replay conflict, or write failure.
     pub fn confirm_staking_balance(
         &mut self,
-        observation_id: impl Into<String>,
-        attributable_hype: HypeAtoms,
+        evidence: StakingBalanceConfirmation,
         observed_at: DateTime<Utc>,
     ) -> Result<AppendOutcome, WorkflowError> {
         let submitted_at = self.state.staking_submitted_at.ok_or_else(|| {
@@ -2390,12 +2647,7 @@ impl DurableWorkflow {
         if observed_at < submitted_at {
             return Err(WorkflowError::StaleObservation);
         }
-        if attributable_hype != self.state.staking_target_hype {
-            let reason = "staking balance contradicted the decision-attributed amount".to_owned();
-            self.mark_manual_review(reason.clone(), observed_at)?;
-            return Err(WorkflowError::ContradictoryObservation(reason));
-        }
-        let observation_id = observation_id.into();
+        let observation_id = evidence.observation_id.clone();
         self.append_observation(
             stable_id(
                 "event/staking_balance/v1",
@@ -2403,8 +2655,7 @@ impl DurableWorkflow {
             ),
             observed_at,
             WorkflowTransition::StakingBalanceConfirmed {
-                observation_id,
-                attributable_hype,
+                evidence: Box::new(evidence),
             },
         )
     }
@@ -2421,6 +2672,21 @@ impl DurableWorkflow {
         Err(WorkflowError::AutomaticStakingDisabled)
     }
 
+    /// Persists a signer-free delegation intent for fault-injection and replay.
+    /// This method is absent from production/default builds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the exact simulated staking balance has already
+    /// been authoritatively reconciled.
+    #[cfg(feature = "offline-staking-simulation")]
+    pub fn prepare_offline_delegation(
+        &mut self,
+        at: DateTime<Utc>,
+    ) -> Result<PrepareOutcome, WorkflowError> {
+        self.prepare_action(ActionKind::Delegate, at)
+    }
+
     /// Records the delegation submission response, including ambiguity.
     ///
     /// # Errors
@@ -2431,7 +2697,7 @@ impl DurableWorkflow {
         receipt: ExternalReceipt,
         at: DateTime<Utc>,
     ) -> Result<AppendOutcome, WorkflowError> {
-        let action_id = action_id_for(self.state.workflow_id(), ActionKind::Delegate);
+        let action_id = action_id_for_state(&self.state, ActionKind::Delegate)?;
         self.append_observation(
             stable_id(
                 "event/delegation_submitted/v1",
@@ -2450,8 +2716,7 @@ impl DurableWorkflow {
     /// replay conflict, or write failure.
     pub fn confirm_delegated_balance(
         &mut self,
-        observation_id: impl Into<String>,
-        attributable_hype: HypeAtoms,
+        evidence: DelegatedBalanceConfirmation,
         observed_at: DateTime<Utc>,
     ) -> Result<AppendOutcome, WorkflowError> {
         let submitted_at = self.state.delegation_submitted_at.ok_or_else(|| {
@@ -2460,12 +2725,7 @@ impl DurableWorkflow {
         if observed_at < submitted_at {
             return Err(WorkflowError::StaleObservation);
         }
-        if attributable_hype != self.state.staking_target_hype {
-            let reason = "delegated balance contradicted the decision-attributed amount".to_owned();
-            self.mark_manual_review(reason.clone(), observed_at)?;
-            return Err(WorkflowError::ContradictoryObservation(reason));
-        }
-        let observation_id = observation_id.into();
+        let observation_id = evidence.observation_id.clone();
         self.append_observation(
             stable_id(
                 "event/delegated_balance/v1",
@@ -2473,8 +2733,7 @@ impl DurableWorkflow {
             ),
             observed_at,
             WorkflowTransition::DelegatedBalanceConfirmed {
-                observation_id,
-                attributable_hype,
+                evidence: Box::new(evidence),
             },
         )
     }
@@ -2760,7 +3019,7 @@ fn external_action_for(
     state: &WorkflowState,
     kind: ActionKind,
 ) -> Result<ExternalAction, WorkflowError> {
-    let action_id = action_id_for(state.workflow_id(), kind);
+    let action_id = action_id_for_state(state, kind)?;
     match kind {
         ActionKind::SubmitOrder if state.stage == WorkflowStage::Decided => {
             Ok(ExternalAction::SubmitOrder {
@@ -2782,29 +3041,37 @@ fn external_action_for(
                 signed_expiry_at: state.binding.order_envelope.signed_expiry_at,
             })
         }
-        ActionKind::DepositToStaking if state.stage == WorkflowStage::OrderFinalized => {
-            let amount_hype = state
-                .purchased_hype
-                .checked_sub(
-                    state
-                        .binding
-                        .inventory_before
-                        .configured_residual_hype_atoms,
-                )
-                .filter(|amount| !amount.is_zero())
-                .ok_or_else(|| {
-                    WorkflowError::InvalidTransition(
-                        "reconciled HYPE does not exceed the residual buffer".into(),
-                    )
-                })?;
+        ActionKind::DepositToStaking
+            if state.stage == WorkflowStage::StakingEligibilityRecorded =>
+        {
+            let eligibility_workflow_id = state.eligibility_workflow_id().ok_or_else(|| {
+                WorkflowError::CorruptJournal("staking eligibility identity is missing".into())
+            })?;
+            let capability_binding_hash = state.offline_staking_capability_hash()?;
+            let amount_hype = state.staking_eligible_hype;
+            if amount_hype.is_zero() {
+                return Err(WorkflowError::InvalidTransition(
+                    "recorded eligibility has no HYPE to stake".into(),
+                ));
+            }
             Ok(ExternalAction::DepositToStaking {
                 action_id,
+                eligibility_workflow_id: eligibility_workflow_id.to_owned(),
+                capability_binding_hash,
                 amount_hype,
             })
         }
         ActionKind::Delegate if state.stage == WorkflowStage::StakingBalanceConfirmed => {
+            let eligibility_workflow_id = state.eligibility_workflow_id().ok_or_else(|| {
+                WorkflowError::CorruptJournal("staking eligibility identity is missing".into())
+            })?;
+            let capability = state.offline_staking_capability()?;
             Ok(ExternalAction::Delegate {
                 action_id,
+                eligibility_workflow_id: eligibility_workflow_id.to_owned(),
+                capability_binding_hash: capability.digest()?,
+                validator_address: capability.validator_address.clone(),
+                validator_summary_evidence_hash: capability.validator_summary_evidence_hash.clone(),
                 amount_hype: state.staking_target_hype,
             })
         }
@@ -2841,6 +3108,21 @@ fn valid_gap_free_watermark(
 
 fn canonical_nonempty(value: &str) -> bool {
     !value.is_empty() && value == value.trim()
+}
+
+fn lower_hex_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn canonical_ethereum_address(value: &str) -> bool {
+    value.len() == 42
+        && value.starts_with("0x")
+        && value[2..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn independent_history_watermarks(
@@ -3073,6 +3355,32 @@ fn action_id_for(workflow_id: &str, kind: ActionKind) -> String {
     stable_id("action/v1", &[workflow_id, kind])
 }
 
+fn action_id_for_state(state: &WorkflowState, kind: ActionKind) -> Result<String, WorkflowError> {
+    if kind == ActionKind::SubmitOrder {
+        return Ok(action_id_for(state.workflow_id(), kind));
+    }
+    let eligibility_workflow_id = state.eligibility_workflow_id().ok_or_else(|| {
+        WorkflowError::InvalidTransition(
+            "staking action requires a content-addressed eligibility workflow".into(),
+        )
+    })?;
+    let capability_binding_hash = state.offline_staking_capability_hash()?;
+    let kind = match kind {
+        ActionKind::DepositToStaking => "deposit_to_staking",
+        ActionKind::Delegate => "delegate",
+        ActionKind::SubmitOrder => unreachable!("submit order returned above"),
+    };
+    Ok(stable_id(
+        "action/staking/v2",
+        &[
+            state.workflow_id(),
+            eligibility_workflow_id,
+            &capability_binding_hash,
+            kind,
+        ],
+    ))
+}
+
 fn client_order_id_for(workflow_id: &str) -> String {
     let digest = stable_id("cloid/v1", &[workflow_id]);
     format!("0x{}", &digest[..32])
@@ -3117,15 +3425,17 @@ fn validate_event_id(workflow_id: &str, event: &WorkflowEvent) -> Result<(), Wor
         WorkflowTransition::StakingDepositObserved { action_id, .. } => {
             stable_id("event/staking_submitted/v1", &[workflow_id, action_id])
         }
-        WorkflowTransition::StakingBalanceConfirmed { observation_id, .. } => {
-            stable_id("event/staking_balance/v1", &[workflow_id, observation_id])
-        }
+        WorkflowTransition::StakingBalanceConfirmed { evidence } => stable_id(
+            "event/staking_balance/v1",
+            &[workflow_id, &evidence.observation_id],
+        ),
         WorkflowTransition::DelegationObserved { action_id, .. } => {
             stable_id("event/delegation_submitted/v1", &[workflow_id, action_id])
         }
-        WorkflowTransition::DelegatedBalanceConfirmed { observation_id, .. } => {
-            stable_id("event/delegated_balance/v1", &[workflow_id, observation_id])
-        }
+        WorkflowTransition::DelegatedBalanceConfirmed { evidence } => stable_id(
+            "event/delegated_balance/v1",
+            &[workflow_id, &evidence.observation_id],
+        ),
         WorkflowTransition::Completed => stable_id("event/complete/v1", &[workflow_id, "complete"]),
         WorkflowTransition::ManualReview { reason } => {
             stable_id("event/manual_review/v1", &[workflow_id, reason.trim()])

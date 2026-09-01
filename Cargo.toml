@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+offline-staking-simulation = []
+
 [dependencies]
 chrono = { version = "=0.4.41", default-features = false, features = ["clock", "serde"] }
 dex-connector = { git = "https://github.com/shigeo-nakamura/dex-connector", tag = "v4.7.14", default-features = false, features = ["hyperliquid-sdk"] }
