@@ -201,6 +201,45 @@ impl Config {
         self.validate(env)
     }
 
+    /// Validates the recurring signer-free runtime boundary.
+    ///
+    /// Unlike install preflight, a dry-run planner may clear `manual_halt` so
+    /// that scheduled decisions are computed while every economic action is
+    /// still suppressed. The process refuses to start when the configured
+    /// signing-key variable is populated, even though this path never reads or
+    /// constructs a signer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fail-closed configuration error unless an effective security
+    /// policy is attached, live approval is absent, dry-run is active, and no
+    /// signing material is present in the process environment.
+    pub fn validate_signer_free_runtime<E: Environment>(&self, env: &E) -> Result<(), ConfigError> {
+        if !self.dry_run || self.live_approved {
+            return Err(ConfigError::Invalid(
+                "signer-free runtime requires dry_run=true and live_approved=false".into(),
+            ));
+        }
+        if self.security_policy.is_none() {
+            return Err(ConfigError::MissingSecurityPolicy);
+        }
+        let signing_key_name = self.hyperliquid.signing_key_env.trim();
+        if signing_key_name.is_empty() {
+            return Err(ConfigError::Invalid(
+                "Hyperliquid signing-key environment name is empty".into(),
+            ));
+        }
+        if env
+            .get(signing_key_name)
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Err(ConfigError::Invalid(
+                "signer-free runtime refuses a populated signing-key environment variable".into(),
+            ));
+        }
+        self.validate(env)
+    }
+
     /// Validates configuration at an injected UTC instant.
     ///
     /// This entry point keeps acknowledgement-expiry boundary tests

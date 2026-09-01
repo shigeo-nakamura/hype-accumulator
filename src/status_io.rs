@@ -1,4 +1,5 @@
 use crate::{metrics::MetricsSnapshot, status::DashboardStatus};
+use serde::Serialize;
 use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
@@ -27,7 +28,7 @@ pub fn write_status_atomic(
     path: impl AsRef<Path>,
     status: &DashboardStatus,
 ) -> Result<(), StatusIoError> {
-    write_text_atomic(path.as_ref(), &status.to_json()?)
+    write_text_atomic(path.as_ref(), &status.to_json()?, 0o640)
 }
 
 /// Atomically rewrites a local Prometheus text exposition.
@@ -40,10 +41,23 @@ pub fn write_metrics_atomic(
     path: impl AsRef<Path>,
     metrics: &MetricsSnapshot,
 ) -> Result<(), StatusIoError> {
-    write_text_atomic(path.as_ref(), &metrics.to_prometheus())
+    write_text_atomic(path.as_ref(), &metrics.to_prometheus(), 0o640)
 }
 
-fn write_text_atomic(path: &Path, payload: &str) -> Result<(), StatusIoError> {
+/// Atomically rewrites a pretty-printed JSON document with owner-only mode.
+///
+/// # Errors
+///
+/// Returns [`StatusIoError`] when serialization, directory creation, durable
+/// temporary-file write, or atomic rename fails.
+pub fn write_private_json_atomic<T: Serialize + ?Sized>(
+    path: impl AsRef<Path>,
+    value: &T,
+) -> Result<(), StatusIoError> {
+    write_text_atomic(path.as_ref(), &serde_json::to_string_pretty(value)?, 0o600)
+}
+
+fn write_text_atomic(path: &Path, payload: &str, mode: u32) -> Result<(), StatusIoError> {
     let parent = normalized_parent(path);
     let file_name = path.file_name().ok_or(StatusIoError::InvalidPath)?;
     fs::create_dir_all(parent)?;
@@ -58,8 +72,10 @@ fn write_text_atomic(path: &Path, payload: &str) -> Result<(), StatusIoError> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o640);
+            options.mode(mode);
         }
+        #[cfg(not(unix))]
+        let _ = mode;
         let mut file = options.open(&temporary)?;
         file.write_all(payload.as_bytes())?;
         if !payload.ends_with('\n') {

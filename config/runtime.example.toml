@@ -1,0 +1,16 @@
+# Signer-free recurring runtime paths. Production copies belong outside Git.
+schema_version = 1
+state_directory = "/var/lib/hype-accumulator/runtime"
+protected_anchor_path = "/var/lib/hype-accumulator-protected/ledger-anchor.json"
+admission_approvals_path = "/etc/hype-accumulator/admission-approvals.json"
+signal_snapshot_path = "/var/lib/hype-accumulator-inputs/signal-snapshot.json"
+status_path = "/var/lib/hype-accumulator-public/status.json"
+metrics_path = "/var/lib/hype-accumulator-public/metrics.prom"
+cycle_report_path = "/var/lib/hype-accumulator-private/cycle-report.json"
+
+# Set once to the reviewed beginning of complete authoritative movement history.
+movement_history_start_ms = 1788220800000
+movement_overlap_ms = 86400000
+stuck_after_seconds = 3600
+# Reject an account balance captured too long before the closed movement range.
+account_observation_max_age_seconds = 60

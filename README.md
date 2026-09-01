@@ -125,6 +125,15 @@ nonterminal workflow older than the configured threshold emits
 `hype_accumulator_workflow_stuck 1` and the stable `stuck_workflow` halt label.
 Alert routing and deployed scheduling remain rollout-gated.
 
+For recurring signer-free planning, `hype-accumulator --dry-run-cycle`
+combines the read-only account observer with a durable overlapping movement
+cursor, admission approvals, UTC-bound signal snapshots, one-decision-per-day
+pacing, and a protected crash-recovery ledger. It refuses live mode and a
+populated signing-key environment variable and never constructs an economic
+action. See `docs/runbooks/signer-free-runtime.md` for the closed input and
+persistence contract. Service installation or start remains a separate
+approval gate.
+
 ## Local development
 
 ```text

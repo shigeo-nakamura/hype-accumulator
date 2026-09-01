@@ -601,6 +601,25 @@ impl PacingState {
         )
     }
 
+    /// Records a durable, fail-closed skip when the required core signal is
+    /// unavailable at the decision boundary.
+    ///
+    /// The absence marker is part of the bound input hash, so a later same-day
+    /// signal cannot replace the recorded skip after a restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns ordinary pacing validation, schedule, or replay-conflict
+    /// errors.
+    pub fn decide_with_unavailable_signal(
+        &mut self,
+        input: &DecisionInput,
+        limits: &PacingLimits,
+    ) -> Result<DecisionResult, PacingError> {
+        let input_snapshot_hash = snapshot_hash(&("core_signal_unavailable/v1", input, limits))?;
+        self.decide_bound(input, limits, input_snapshot_hash, false, true)
+    }
+
     fn decide_bound(
         &mut self,
         input: &DecisionInput,
