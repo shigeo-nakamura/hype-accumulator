@@ -441,11 +441,18 @@ pub enum PrepareOutcome {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExternalReceipt {
-    Confirmed(String),
+    Confirmed { transaction_hash: String },
     Ambiguous,
 }
 
 impl ExternalReceipt {
+    fn confirmed_transaction_hash(&self) -> Option<&str> {
+        match self {
+            Self::Confirmed { transaction_hash } => Some(transaction_hash),
+            Self::Ambiguous => None,
+        }
+    }
+
     /// Returns the canonical digest used to bind later confirmation evidence.
     ///
     /// # Errors
@@ -715,12 +722,20 @@ pub struct WorkflowState {
     #[serde(default)]
     staking_confirmed_hype: HypeAtoms,
     delegated_hype: HypeAtoms,
+    #[serde(default)]
+    staking_prepared_at: Option<DateTime<Utc>>,
     staking_submitted_at: Option<DateTime<Utc>>,
     #[serde(default)]
     staking_submission_receipt_hash: Option<String>,
+    #[serde(default)]
+    staking_confirmed_transaction_hash: Option<String>,
+    #[serde(default)]
+    delegation_prepared_at: Option<DateTime<Utc>>,
     delegation_submitted_at: Option<DateTime<Utc>>,
     #[serde(default)]
     delegation_submission_receipt_hash: Option<String>,
+    #[serde(default)]
+    delegation_confirmed_transaction_hash: Option<String>,
     #[serde(default)]
     last_fill_at: Option<DateTime<Utc>>,
     manual_review_reason: Option<String>,
@@ -871,10 +886,14 @@ impl WorkflowState {
             staking_target_hype: HypeAtoms::default(),
             staking_confirmed_hype: HypeAtoms::default(),
             delegated_hype: HypeAtoms::default(),
+            staking_prepared_at: None,
             staking_submitted_at: None,
             staking_submission_receipt_hash: None,
+            staking_confirmed_transaction_hash: None,
+            delegation_prepared_at: None,
             delegation_submitted_at: None,
             delegation_submission_receipt_hash: None,
+            delegation_confirmed_transaction_hash: None,
             last_fill_at: None,
             manual_review_reason: None,
             last_transition_at: first.at,
@@ -914,9 +933,12 @@ impl WorkflowState {
                         self.order_prepared_at = Some(event.at);
                     }
                     ExternalAction::DepositToStaking { amount_hype, .. } => {
+                        self.staking_prepared_at = Some(event.at);
                         self.staking_target_hype = *amount_hype;
                     }
-                    ExternalAction::Delegate { .. } => {}
+                    ExternalAction::Delegate { .. } => {
+                        self.delegation_prepared_at = Some(event.at);
+                    }
                 }
             }
             WorkflowTransition::OrderSubmissionObserved {
@@ -1096,6 +1118,8 @@ impl WorkflowState {
                 validate_receipt(receipt)?;
                 self.pending_action = None;
                 self.staking_submission_receipt_hash = Some(receipt.canonical_digest()?);
+                self.staking_confirmed_transaction_hash =
+                    receipt.confirmed_transaction_hash().map(str::to_owned);
                 self.staking_submitted_at = Some(event.at);
                 self.stage = WorkflowStage::StakingDepositSubmitted;
             }
@@ -1119,6 +1143,8 @@ impl WorkflowState {
                 validate_receipt(receipt)?;
                 self.pending_action = None;
                 self.delegation_submission_receipt_hash = Some(receipt.canonical_digest()?);
+                self.delegation_confirmed_transaction_hash =
+                    receipt.confirmed_transaction_hash().map(str::to_owned);
                 self.delegation_submitted_at = Some(event.at);
                 self.stage = WorkflowStage::DelegationSubmitted;
             }
@@ -1264,6 +1290,9 @@ impl WorkflowState {
         recorded_at: DateTime<Utc>,
     ) -> Result<(), WorkflowError> {
         let capability = self.offline_staking_capability()?;
+        let prepared_at = self.staking_prepared_at.ok_or_else(|| {
+            WorkflowError::CorruptJournal("staking preparation timestamp is missing".into())
+        })?;
         let submitted_at = self.staking_submitted_at.ok_or_else(|| {
             WorkflowError::CorruptJournal("staking submission timestamp is missing".into())
         })?;
@@ -1282,13 +1311,17 @@ impl WorkflowState {
             || evidence.eligibility_workflow_id != eligibility_workflow_id
             || evidence.submission_receipt_hash != receipt_hash
             || !lower_hex_digest(&evidence.baseline_history_hash)
-            || evidence.baseline_captured_at > submitted_at
+            || evidence.baseline_captured_at >= prepared_at
             || !lower_hex_digest(&evidence.current_history_hash)
             || evidence.current_captured_at < submitted_at
             || evidence.current_captured_at <= evidence.baseline_captured_at
             || evidence.current_captured_at > recorded_at
             || evidence.baseline_history_hash == evidence.current_history_hash
-            || !lower_hex_digest(&evidence.matched_transaction_hash)
+            || !confirmation_transaction_matches(
+                receipt_hash,
+                self.staking_confirmed_transaction_hash.as_deref(),
+                &evidence.matched_transaction_hash,
+            )?
             || evidence.attributable_hype != self.staking_target_hype
             || evidence.attributable_hype.is_zero()
         {
@@ -1305,6 +1338,9 @@ impl WorkflowState {
         recorded_at: DateTime<Utc>,
     ) -> Result<(), WorkflowError> {
         let capability = self.offline_staking_capability()?;
+        let prepared_at = self.delegation_prepared_at.ok_or_else(|| {
+            WorkflowError::CorruptJournal("delegation preparation timestamp is missing".into())
+        })?;
         let submitted_at = self.delegation_submitted_at.ok_or_else(|| {
             WorkflowError::CorruptJournal("delegation submission timestamp is missing".into())
         })?;
@@ -1326,13 +1362,17 @@ impl WorkflowState {
                 != capability.validator_summary_evidence_hash
             || evidence.submission_receipt_hash != receipt_hash
             || !lower_hex_digest(&evidence.baseline_history_hash)
-            || evidence.baseline_captured_at > submitted_at
+            || evidence.baseline_captured_at >= prepared_at
             || !lower_hex_digest(&evidence.current_history_hash)
             || evidence.current_captured_at < submitted_at
             || evidence.current_captured_at <= evidence.baseline_captured_at
             || evidence.current_captured_at > recorded_at
             || evidence.baseline_history_hash == evidence.current_history_hash
-            || !lower_hex_digest(&evidence.matched_transaction_hash)
+            || !confirmation_transaction_matches(
+                receipt_hash,
+                self.delegation_confirmed_transaction_hash.as_deref(),
+                &evidence.matched_transaction_hash,
+            )?
             || evidence.attributable_hype != self.staking_target_hype
             || evidence.attributable_hype.is_zero()
         {
@@ -3082,12 +3122,29 @@ fn external_action_for(
 }
 
 fn validate_receipt(receipt: &ExternalReceipt) -> Result<(), WorkflowError> {
-    if matches!(receipt, ExternalReceipt::Confirmed(reference) if reference.trim().is_empty()) {
+    if matches!(
+        receipt,
+        ExternalReceipt::Confirmed { transaction_hash } if !lower_hex_digest(transaction_hash)
+    ) {
         return Err(WorkflowError::ContradictoryObservation(
-            "confirmed receipt has an empty reference".into(),
+            "confirmed receipt lacks a canonical transaction hash".into(),
         ));
     }
     Ok(())
+}
+
+fn confirmation_transaction_matches(
+    receipt_hash: &str,
+    confirmed_transaction_hash: Option<&str>,
+    matched_transaction_hash: &str,
+) -> Result<bool, WorkflowError> {
+    if !lower_hex_digest(matched_transaction_hash) {
+        return Ok(false);
+    }
+    match confirmed_transaction_hash {
+        Some(expected) => Ok(matched_transaction_hash == expected),
+        None => Ok(receipt_hash == ExternalReceipt::Ambiguous.canonical_digest()?),
+    }
 }
 
 fn valid_gap_free_watermark(

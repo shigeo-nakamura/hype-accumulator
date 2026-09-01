@@ -676,9 +676,10 @@ fn ready(outcome: PrepareOutcome) -> ExternalAction {
 }
 
 #[cfg(feature = "offline-staking-simulation")]
-fn offline_staking_submitted(
+fn offline_staking_submitted_with_receipt(
     path: &Path,
     binding: &DecisionBinding,
+    receipt: ExternalReceipt,
 ) -> (DurableWorkflow, StakingBalanceConfirmation) {
     let mut workflow = reopen(path, binding);
     ready(workflow.prepare_order(at(1)).expect("order prepared"));
@@ -720,25 +721,88 @@ fn offline_staking_submitted(
     else {
         panic!("expected offline staking deposit");
     };
+    let submission_receipt_hash = receipt.canonical_digest().expect("receipt digest");
+    let matched_transaction_hash = match &receipt {
+        ExternalReceipt::Confirmed { transaction_hash } => transaction_hash.clone(),
+        ExternalReceipt::Ambiguous => "4".repeat(64),
+    };
     workflow
-        .observe_staking_deposit(ExternalReceipt::Ambiguous, at(7))
-        .expect("ambiguous deposit recorded");
+        .observe_staking_deposit(receipt, at(7))
+        .expect("deposit response recorded");
     let confirmation = StakingBalanceConfirmation {
         observation_id: "staking-negative-observation".to_owned(),
         action_id,
         execution_identity_hash: "signer-identity-hash-a".to_owned(),
         eligibility_workflow_id,
-        submission_receipt_hash: ExternalReceipt::Ambiguous
-            .canonical_digest()
-            .expect("receipt digest"),
+        submission_receipt_hash,
         baseline_history_hash: "2".repeat(64),
-        baseline_captured_at: at(6),
+        baseline_captured_at: at(5),
         current_history_hash: "3".repeat(64),
         current_captured_at: at(8),
-        matched_transaction_hash: "4".repeat(64),
+        matched_transaction_hash,
         attributable_hype: hype(250),
     };
     (workflow, confirmation)
+}
+
+#[cfg(feature = "offline-staking-simulation")]
+fn offline_staking_submitted(
+    path: &Path,
+    binding: &DecisionBinding,
+) -> (DurableWorkflow, StakingBalanceConfirmation) {
+    offline_staking_submitted_with_receipt(path, binding, ExternalReceipt::Ambiguous)
+}
+
+#[cfg(feature = "offline-staking-simulation")]
+fn offline_delegation_submitted_with_receipt(
+    path: &Path,
+    binding: &DecisionBinding,
+    receipt: ExternalReceipt,
+) -> (DurableWorkflow, DelegatedBalanceConfirmation, String) {
+    let (mut workflow, staking_confirmation) = offline_staking_submitted(path, binding);
+    workflow
+        .confirm_staking_balance(staking_confirmation, at(8))
+        .expect("staking confirmation recorded");
+    let delegation = ready(
+        workflow
+            .prepare_offline_delegation(at(9))
+            .expect("delegation prepared"),
+    );
+    let ExternalAction::Delegate {
+        action_id,
+        eligibility_workflow_id,
+        validator_address,
+        validator_summary_evidence_hash,
+        ..
+    } = delegation
+    else {
+        panic!("expected offline delegation");
+    };
+    let expected_validator = validator_address.clone();
+    let submission_receipt_hash = receipt.canonical_digest().expect("receipt digest");
+    let matched_transaction_hash = match &receipt {
+        ExternalReceipt::Confirmed { transaction_hash } => transaction_hash.clone(),
+        ExternalReceipt::Ambiguous => "7".repeat(64),
+    };
+    workflow
+        .observe_delegation(receipt, at(10))
+        .expect("delegation response recorded");
+    let confirmation = DelegatedBalanceConfirmation {
+        observation_id: "delegation-negative-observation".to_owned(),
+        action_id,
+        execution_identity_hash: "signer-identity-hash-a".to_owned(),
+        eligibility_workflow_id,
+        validator_address,
+        validator_summary_evidence_hash,
+        submission_receipt_hash,
+        baseline_history_hash: "5".repeat(64),
+        baseline_captured_at: at(8),
+        current_history_hash: "6".repeat(64),
+        current_captured_at: at(11),
+        matched_transaction_hash,
+        attributable_hype: hype(250),
+    };
+    (workflow, confirmation, expected_validator)
 }
 
 fn assert_binding_mismatch(result: &Result<DurableWorkflow, WorkflowError>) {
@@ -1952,7 +2016,7 @@ fn offline_staking_every_transition_survives_restart_and_ambiguity() {
             .canonical_digest()
             .expect("receipt digest"),
         baseline_history_hash: "c".repeat(64),
-        baseline_captured_at: at(6),
+        baseline_captured_at: at(5),
         current_history_hash: "d".repeat(64),
         current_captured_at: at(8),
         matched_transaction_hash: "e".repeat(64),
@@ -2017,9 +2081,12 @@ fn offline_staking_every_transition_survives_restart_and_ambiguity() {
             kind: ActionKind::Delegate,
         }
     );
+    let delegation_receipt = ExternalReceipt::Confirmed {
+        transaction_hash: "1".repeat(64),
+    };
     workflow
-        .observe_delegation(ExternalReceipt::Ambiguous, at(10))
-        .expect("ambiguous delegation response recorded");
+        .observe_delegation(delegation_receipt.clone(), at(10))
+        .expect("confirmed delegation response recorded");
     drop(workflow);
     workflow = reopen(&path, &binding);
     assert_eq!(workflow.state().stage(), WorkflowStage::DelegationSubmitted);
@@ -2031,11 +2098,11 @@ fn offline_staking_every_transition_survives_restart_and_ambiguity() {
         eligibility_workflow_id,
         validator_address,
         validator_summary_evidence_hash: validator_evidence_hash,
-        submission_receipt_hash: ExternalReceipt::Ambiguous
+        submission_receipt_hash: delegation_receipt
             .canonical_digest()
             .expect("receipt digest"),
         baseline_history_hash: "f".repeat(64),
-        baseline_captured_at: at(9),
+        baseline_captured_at: at(8),
         current_history_hash: "0".repeat(64),
         current_captured_at: at(11),
         matched_transaction_hash: "1".repeat(64),
@@ -2155,48 +2222,58 @@ fn offline_staking_confirmations_fail_closed_on_identity_receipt_time_or_validat
         Err(WorkflowError::ContradictoryObservation(_))
     ));
     assert_eq!(timing_workflow.state().stage(), WorkflowStage::ManualReview);
+}
+
+#[cfg(feature = "offline-staking-simulation")]
+#[test]
+fn offline_staking_confirmed_transactions_and_validator_are_exactly_bound() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let binding = offline_staking_binding();
+
+    let confirmed_path = temp.path().join("confirmed-transaction.jsonl");
+    let confirmed_transaction_hash = "a".repeat(64);
+    let (mut confirmed_workflow, confirmed_confirmation) = offline_staking_submitted_with_receipt(
+        &confirmed_path,
+        &binding,
+        ExternalReceipt::Confirmed {
+            transaction_hash: confirmed_transaction_hash.clone(),
+        },
+    );
+    assert_eq!(
+        confirmed_confirmation.matched_transaction_hash,
+        confirmed_transaction_hash
+    );
+    confirmed_workflow
+        .confirm_staking_balance(confirmed_confirmation, at(8))
+        .expect("confirmed receipt transaction matches");
+
+    let wrong_transaction_path = temp.path().join("wrong-transaction.jsonl");
+    let (mut transaction_workflow, mut transaction_confirmation) =
+        offline_staking_submitted_with_receipt(
+            &wrong_transaction_path,
+            &binding,
+            ExternalReceipt::Confirmed {
+                transaction_hash: "a".repeat(64),
+            },
+        );
+    transaction_confirmation.matched_transaction_hash = "b".repeat(64);
+    assert!(matches!(
+        transaction_workflow.confirm_staking_balance(transaction_confirmation, at(8)),
+        Err(WorkflowError::ContradictoryObservation(_))
+    ));
+    assert_eq!(
+        transaction_workflow.state().stage(),
+        WorkflowStage::ManualReview
+    );
 
     let validator_path = temp.path().join("wrong-validator.jsonl");
-    let (mut validator_workflow, staking_confirmation) =
-        offline_staking_submitted(&validator_path, &binding);
-    validator_workflow
-        .confirm_staking_balance(staking_confirmation, at(8))
-        .expect("staking confirmation recorded");
-    let delegation = ready(
-        validator_workflow
-            .prepare_offline_delegation(at(9))
-            .expect("delegation prepared"),
-    );
-    let ExternalAction::Delegate {
-        action_id: delegation_action_id,
-        eligibility_workflow_id,
-        validator_address,
-        validator_summary_evidence_hash,
-        ..
-    } = delegation
-    else {
-        panic!("expected offline delegation");
-    };
-    validator_workflow
-        .observe_delegation(ExternalReceipt::Ambiguous, at(10))
-        .expect("ambiguous delegation recorded");
-    let tampered_confirmation = DelegatedBalanceConfirmation {
-        observation_id: "delegation-negative-observation".to_owned(),
-        action_id: delegation_action_id,
-        execution_identity_hash: "signer-identity-hash-a".to_owned(),
-        eligibility_workflow_id,
-        validator_address: format!("0x{}", "9".repeat(40)),
-        validator_summary_evidence_hash,
-        submission_receipt_hash: ExternalReceipt::Ambiguous
-            .canonical_digest()
-            .expect("receipt digest"),
-        baseline_history_hash: "5".repeat(64),
-        baseline_captured_at: at(9),
-        current_history_hash: "6".repeat(64),
-        current_captured_at: at(11),
-        matched_transaction_hash: "7".repeat(64),
-        attributable_hype: hype(250),
-    };
+    let (mut validator_workflow, mut tampered_confirmation, validator_address) =
+        offline_delegation_submitted_with_receipt(
+            &validator_path,
+            &binding,
+            ExternalReceipt::Ambiguous,
+        );
+    tampered_confirmation.validator_address = format!("0x{}", "9".repeat(40));
     assert_ne!(tampered_confirmation.validator_address, validator_address);
     assert!(matches!(
         validator_workflow.confirm_delegated_balance(tampered_confirmation, at(11)),
@@ -2204,6 +2281,44 @@ fn offline_staking_confirmations_fail_closed_on_identity_receipt_time_or_validat
     ));
     assert_eq!(
         validator_workflow.state().stage(),
+        WorkflowStage::ManualReview
+    );
+
+    let delegation_timing_path = temp.path().join("late-delegation-baseline.jsonl");
+    let (mut delegation_timing_workflow, mut delegation_timing_confirmation, _) =
+        offline_delegation_submitted_with_receipt(
+            &delegation_timing_path,
+            &binding,
+            ExternalReceipt::Ambiguous,
+        );
+    delegation_timing_confirmation.baseline_captured_at = at(9);
+    assert!(matches!(
+        delegation_timing_workflow
+            .confirm_delegated_balance(delegation_timing_confirmation, at(11)),
+        Err(WorkflowError::ContradictoryObservation(_))
+    ));
+    assert_eq!(
+        delegation_timing_workflow.state().stage(),
+        WorkflowStage::ManualReview
+    );
+
+    let delegation_transaction_path = temp.path().join("wrong-delegation-transaction.jsonl");
+    let (mut delegation_transaction_workflow, mut delegation_transaction_confirmation, _) =
+        offline_delegation_submitted_with_receipt(
+            &delegation_transaction_path,
+            &binding,
+            ExternalReceipt::Confirmed {
+                transaction_hash: "7".repeat(64),
+            },
+        );
+    delegation_transaction_confirmation.matched_transaction_hash = "8".repeat(64);
+    assert!(matches!(
+        delegation_transaction_workflow
+            .confirm_delegated_balance(delegation_transaction_confirmation, at(11)),
+        Err(WorkflowError::ContradictoryObservation(_))
+    ));
+    assert_eq!(
+        delegation_transaction_workflow.state().stage(),
         WorkflowStage::ManualReview
     );
 }
