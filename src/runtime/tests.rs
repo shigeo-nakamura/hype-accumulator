@@ -216,8 +216,7 @@ fn runtime_open_rejects_a_hard_linked_protected_anchor() {
     fs::create_dir_all(&protected).expect("protected directory");
     let alias_source = directory.path().join("anchor-alias-source.json");
     fs::write(&alias_source, b"{}\n").expect("anchor alias source");
-    fs::hard_link(&alias_source, protected.join("ledger-anchor.json"))
-        .expect("hard-linked anchor");
+    fs::hard_link(&alias_source, protected.join("ledger-anchor.json")).expect("hard-linked anchor");
 
     assert!(SignerFreeRuntime::open(config(directory.path(), 1), limits()).is_err());
 }
