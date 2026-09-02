@@ -96,6 +96,50 @@ impl HyperliquidLiveProbe {
         Ok(self.connector.reserve_l1_action_nonce().await?)
     }
 
+    /// Retires the nonce reservation for a durably prepared action that was
+    /// never submitted and is now past its signed expiry. This performs no
+    /// venue action and refuses unexpired or mismatched workflow actions.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a mismatched/non-order action, a non-canonical or unexpired
+    /// envelope, or a reservation that was already consumed.
+    pub async fn abandon_expired(
+        &self,
+        action: &ExternalAction,
+        now: DateTime<Utc>,
+    ) -> Result<(), LiveProbeError> {
+        let ExternalAction::SubmitOrder {
+            execution_identity_hash,
+            signer_identity_hash,
+            market_metadata_digest,
+            l1_nonce,
+            signed_expiry_at,
+            ..
+        } = action
+        else {
+            return Err(LiveProbeError::NotOrder);
+        };
+        validate_binding(
+            execution_identity_hash,
+            signer_identity_hash,
+            market_metadata_digest,
+            &self.binding,
+        )?;
+        let expires_after_ms = u64::try_from(signed_expiry_at.timestamp_millis())
+            .map_err(|_| LiveProbeError::InvalidExpiry)?;
+        if signed_expiry_at.timestamp_subsec_nanos() % 1_000_000 != 0 || now < *signed_expiry_at {
+            return Err(LiveProbeError::InvalidExpiry);
+        }
+        self.connector
+            .abandon_expired_l1_action_envelope(HyperliquidL1ActionEnvelope {
+                nonce: *l1_nonce,
+                expires_after_ms,
+            })
+            .await?;
+        Ok(())
+    }
+
     /// Converts and submits one already-fsynced workflow action exactly once.
     ///
     /// # Errors
