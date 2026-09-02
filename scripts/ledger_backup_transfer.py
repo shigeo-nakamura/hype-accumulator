@@ -335,22 +335,24 @@ def captured_backup(
 ) -> Iterator[tuple[Path, Path, str, dict[str, str]]]:
     bundle = require_absolute_canonical(bundle, "bundle directory", exists=True)
     require_bundle(bundle, anchor)
-    temporary_parent: str | None = None
+    selected_staging_root = (
+        staging_root if staging_root is not None else Path(tempfile.gettempdir())
+    )
+    selected_staging_root = require_absolute_canonical(
+        selected_staging_root, "staging root", exists=True
+    )
     if staging_root is not None:
-        staging_root = require_absolute_canonical(
-            staging_root, "staging root", exists=True
-        )
-        staging_info = staging_root.stat()
+        staging_info = selected_staging_root.stat()
         if (
-            not staging_root.is_dir()
+            not selected_staging_root.is_dir()
             or staging_info.st_uid != os.geteuid()
             or staging_info.st_mode & 0o077
         ):
             raise TransferError("staging root must be owner-controlled and private")
-        require_trusted_directory_chain(staging_root, "staging root")
-        if staging_root == bundle or bundle in staging_root.parents:
-            raise TransferError("staging root must not overlap the source bundle")
-        temporary_parent = str(staging_root)
+    require_trusted_directory_chain(selected_staging_root, "staging root")
+    if selected_staging_root == bundle or bundle in selected_staging_root.parents:
+        raise TransferError("staging root must not overlap the source bundle")
+    temporary_parent = str(selected_staging_root)
     with tempfile.TemporaryDirectory(
         prefix="hype-ledger-transfer-", dir=temporary_parent
     ) as temporary:
@@ -585,6 +587,7 @@ def parse_stored_object(value: object, label: str) -> StoredObject:
         or not stored.version_id
         or not stored.etag
         or not stored.checksum_sha256
+        or any("\0" in getattr(stored, field) for field in string_fields)
         or SHA256_RE.fullmatch(stored.sha256) is None
         or stored.size_bytes < 0
     ):

@@ -209,6 +209,27 @@ class LedgerBackupTransferTests(unittest.TestCase):
             self.upload(staging_root=staging_root)
         self.assertEqual(self.aws.put_calls, 0)
 
+    def test_upload_rejects_default_staging_root_inside_source_bundle(self) -> None:
+        with (
+            mock.patch.object(transfer.tempfile, "gettempdir", return_value=str(self.bundle)),
+            self.assertRaisesRegex(transfer.TransferError, "must not overlap"),
+        ):
+            self.upload()
+        self.assertEqual(self.aws.put_calls, 0)
+
+    def test_upload_rejects_untrusted_default_staging_root(self) -> None:
+        unsafe_parent = self.root / "unsafe-default-staging"
+        unsafe_parent.mkdir(mode=0o700)
+        os.chmod(unsafe_parent, 0o777)
+        with (
+            mock.patch.object(
+                transfer.tempfile, "gettempdir", return_value=str(unsafe_parent)
+            ),
+            self.assertRaisesRegex(transfer.TransferError, "untrusted writable"),
+        ):
+            self.upload()
+        self.assertEqual(self.aws.put_calls, 0)
+
     def test_upload_rejects_one_storage_boundary(self) -> None:
         with self.assertRaisesRegex(transfer.TransferError, "different buckets"):
             self.upload(anchor_bucket=PAYLOAD_BUCKET)
@@ -417,6 +438,25 @@ class LedgerBackupTransferTests(unittest.TestCase):
         os.chmod(receipt, 0o600)
         with self.assertRaisesRegex(transfer.TransferError, "invalid field types"):
             transfer.load_receipt(receipt)
+
+    def test_receipt_nul_command_arguments_fail_closed(self) -> None:
+        invalid_fields = (
+            ("version_id", "version-1\0unexpected"),
+            (
+                "key",
+                f"unsafe\0prefix/{BACKUP_ID}/payload/ledger.jsonl",
+            ),
+        )
+        for index, (field, value) in enumerate(invalid_fields):
+            with self.subTest(field=field):
+                receipt = self.root / f"nul-receipt-{index}.json"
+                self.upload(receipt_name=receipt.name)
+                document = json.loads(receipt.read_text())
+                document["payload_objects"]["ledger.jsonl"][field] = value
+                receipt.write_text(json.dumps(document), encoding="utf-8")
+                os.chmod(receipt, 0o600)
+                with self.assertRaisesRegex(transfer.TransferError, "invalid values"):
+                    transfer.load_receipt(receipt)
 
     def test_load_receipt_rejects_untrusted_writable_parent(self) -> None:
         self.upload()
