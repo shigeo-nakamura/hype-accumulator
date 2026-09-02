@@ -461,6 +461,24 @@ def write_private_json(path: Path, document: dict[str, object]) -> None:
                 pass
 
 
+def write_new_private_json(path: Path, document: dict[str, object], label: str) -> None:
+    """Create and fsync a private JSON file in an already trusted scratch directory."""
+    payload = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+            0o600,
+        )
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fchmod(handle.fileno(), 0o600)
+            os.fsync(handle.fileno())
+    except OSError as error:
+        raise TransferError(f"{label} cannot be written: {error}") from error
+
+
 def validate_receipt_output(receipt: Path, bundle: Path, anchor: Path) -> None:
     receipt = require_absolute_canonical(receipt, "receipt path", exists=False)
     bundle = require_absolute_canonical(bundle, "bundle directory", exists=True)
@@ -1011,7 +1029,9 @@ class AwsCli:
                 if not parts or len(parts) > MAX_MULTIPART_PARTS:
                     raise TransferError("multipart upload has an invalid part count")
                 completion_path = temporary_root / "completion.json"
-                write_private_json(completion_path, {"Parts": parts})
+                write_new_private_json(
+                    completion_path, {"Parts": parts}, "multipart completion manifest"
+                )
                 self._json(
                     [
                         "s3api", "complete-multipart-upload", "--bucket", bucket, "--key", key,

@@ -695,6 +695,11 @@ class LedgerBackupTransferTests(unittest.TestCase):
         with (
             mock.patch.object(cli, "_json", side_effect=fake_json),
             mock.patch.object(cli, "_abort_multipart") as abort,
+            mock.patch.object(
+                transfer,
+                "rename_noreplace",
+                side_effect=AssertionError("scratch JSON must not require renameat2"),
+            ),
         ):
             checksum = cli._put_multipart(
                 bucket=PAYLOAD_BUCKET,
