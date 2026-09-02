@@ -253,12 +253,36 @@ class LedgerBackupTransferTests(unittest.TestCase):
             ),
             mock.patch.object(transfer.subprocess, "run", return_value=completed) as run,
         ):
-            transfer.AwsCli(Path("/usr/bin/true"), "eu-central-1")._json(
+            cli = transfer.AwsCli(Path("/usr/bin/true"), "eu-central-1")
+            cli._json(
                 ["s3api", "get-bucket-versioning"], "test"
             )
-        environment = run.call_args.kwargs["env"]
+            cli._json(["s3api", "put-object"], "transfer", transfer=True)
+        environment = run.call_args_list[0].kwargs["env"]
         self.assertNotIn("HYPE_SIGNING_KEY", environment)
         self.assertEqual(environment["AWS_SESSION_TOKEN"], "session")
+        self.assertEqual(run.call_args_list[0].kwargs["timeout"], 120)
+        self.assertIsNone(run.call_args_list[1].kwargs["timeout"])
+
+    def test_full_replay_has_no_default_timeout(self) -> None:
+        completed = SimpleNamespace(returncode=0, stdout="verified", stderr="")
+        with mock.patch.object(transfer.subprocess, "run", return_value=completed) as run:
+            transfer.run_verifier(Path("/usr/bin/true"), self.bundle, self.anchor)
+        self.assertIsNone(run.call_args.kwargs["timeout"])
+
+    def test_explicit_transfer_timeout_and_nonfinite_values(self) -> None:
+        completed = SimpleNamespace(returncode=0, stdout="{}", stderr="")
+        cli = transfer.AwsCli(
+            Path("/usr/bin/true"),
+            "eu-central-1",
+            transfer_timeout_seconds=900,
+        )
+        with mock.patch.object(transfer.subprocess, "run", return_value=completed) as run:
+            cli._json(["s3api", "get-object"], "transfer", transfer=True)
+        self.assertEqual(run.call_args.kwargs["timeout"], 900)
+        for value in ["0", "-1", "nan", "inf"]:
+            with self.assertRaises(transfer.argparse.ArgumentTypeError):
+                transfer.positive_seconds(value)
 
     def test_aws_cli_rejects_an_unexpected_kms_key(self) -> None:
         source = self.anchor

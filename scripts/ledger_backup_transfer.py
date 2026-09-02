@@ -13,6 +13,7 @@ import argparse
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -21,6 +22,7 @@ import sys
 import tempfile
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+from functools import partial
 from pathlib import Path
 from typing import Callable, Iterator, Protocol, Sequence
 
@@ -292,7 +294,12 @@ def validate_remote_name(value: str, pattern: re.Pattern[str], label: str) -> st
     return value
 
 
-def run_verifier(verifier: Path, bundle: Path, anchor: Path) -> None:
+def run_verifier(
+    verifier: Path,
+    bundle: Path,
+    anchor: Path,
+    timeout_seconds: float | None = None,
+) -> None:
     verifier = require_absolute_canonical(verifier, "verifier binary", exists=True)
     require_executable_file(verifier, "verifier binary")
     environment = {"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"}
@@ -302,7 +309,7 @@ def run_verifier(verifier: Path, bundle: Path, anchor: Path) -> None:
             check=False,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=timeout_seconds,
             env=environment,
         )
     except (OSError, subprocess.SubprocessError) as error:
@@ -518,13 +525,27 @@ def download_backup(
 
 
 class AwsCli:
-    def __init__(self, aws_bin: Path, region: str) -> None:
+    def __init__(
+        self,
+        aws_bin: Path,
+        region: str,
+        control_timeout_seconds: float = 120,
+        transfer_timeout_seconds: float | None = None,
+    ) -> None:
         aws_path = require_absolute_canonical(aws_bin, "AWS CLI", exists=True)
         require_executable_file(aws_path, "AWS CLI")
         self.aws_bin = str(aws_path)
         self.region = region
+        self.control_timeout_seconds = control_timeout_seconds
+        self.transfer_timeout_seconds = transfer_timeout_seconds
 
-    def _json(self, arguments: Sequence[str], label: str) -> dict[str, object]:
+    def _json(
+        self,
+        arguments: Sequence[str],
+        label: str,
+        *,
+        transfer: bool = False,
+    ) -> dict[str, object]:
         allowed = {
             "AWS_ACCESS_KEY_ID",
             "AWS_CA_BUNDLE",
@@ -558,7 +579,11 @@ class AwsCli:
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=(
+                    self.transfer_timeout_seconds
+                    if transfer
+                    else self.control_timeout_seconds
+                ),
                 env=environment,
             )
         except (OSError, subprocess.SubprocessError) as error:
@@ -689,6 +714,7 @@ class AwsCli:
                  "--bucket-key-enabled", "--expected-bucket-owner", owner,
                  "--metadata", f"backup-id={backup_id},sha256={sha256}"],
                 f"immutable upload for {bucket}/{key}",
+                transfer=True,
             )
             existing = self._head(bucket, key, owner)
             versions, delete_markers = self._key_history(bucket, key, owner)
@@ -713,16 +739,30 @@ class AwsCli:
              "--version-id", stored.version_id, "--checksum-mode", "ENABLED",
              "--expected-bucket-owner", stored.expected_bucket_owner, str(destination)],
             f"exact download for {stored.bucket}/{stored.key}",
+            transfer=True,
         )
         os.chmod(destination, 0o600)
         if response.get("VersionId") != stored.version_id or response.get("ChecksumSHA256") != stored.checksum_sha256:
             raise TransferError(f"download response mismatch for {stored.bucket}/{stored.key}")
 
 
+def positive_seconds(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("timeout must be a positive number") from error
+    if not math.isfinite(parsed) or not parsed > 0:
+        raise argparse.ArgumentTypeError("timeout must be a positive number")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--aws-bin", required=True)
     parser.add_argument("--region", required=True)
+    parser.add_argument("--control-timeout-seconds", type=positive_seconds, default=120.0)
+    parser.add_argument("--transfer-timeout-seconds", type=positive_seconds)
+    parser.add_argument("--verifier-timeout-seconds", type=positive_seconds)
     subparsers = parser.add_subparsers(dest="command", required=True)
     upload = subparsers.add_parser("upload")
     upload.add_argument("--bundle", required=True)
@@ -746,19 +786,28 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        aws = AwsCli(Path(args.aws_bin), args.region)
+        aws = AwsCli(
+            Path(args.aws_bin),
+            args.region,
+            control_timeout_seconds=args.control_timeout_seconds,
+            transfer_timeout_seconds=args.transfer_timeout_seconds,
+        )
+        verify = partial(
+            run_verifier,
+            timeout_seconds=args.verifier_timeout_seconds,
+        )
         if args.command == "upload":
             result = upload_backup(
                 bundle=Path(args.bundle), anchor=Path(args.anchor), receipt=Path(args.receipt),
                 verifier=Path(args.verifier), aws=aws, payload_bucket=args.payload_bucket,
                 payload_owner=args.payload_owner, payload_kms_key=args.payload_kms_key,
                 anchor_bucket=args.anchor_bucket, anchor_owner=args.anchor_owner,
-                anchor_kms_key=args.anchor_kms_key, prefix=args.prefix,
+                anchor_kms_key=args.anchor_kms_key, prefix=args.prefix, verify=verify,
             )
         else:
             result = download_backup(
                 receipt=Path(args.receipt), destination_root=Path(args.destination_root),
-                verifier=Path(args.verifier), aws=aws,
+                verifier=Path(args.verifier), aws=aws, verify=verify,
             )
     except (TransferError, OSError, UnicodeError) as error:
         print(f"ledger backup transfer rejected: {error}", file=sys.stderr)

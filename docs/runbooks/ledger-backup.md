@@ -101,6 +101,13 @@ outside the repository and operator logs. It contains infrastructure
 identifiers, but never wallet addresses, credentials, ciphertext, or signed
 payloads.
 
+Full replay and S3 `put-object`/`get-object` transfers have no wall-clock
+timeout by default, so backup size or recovery-host bandwidth alone cannot
+invalidate a correct backup. Control-plane calls retain a 120-second timeout.
+An operator may add `--verifier-timeout-seconds`,
+`--transfer-timeout-seconds`, or `--control-timeout-seconds` before the
+subcommand when an environment requires explicit positive bounds.
+
 ## Clean-directory restore drill
 
 Download every exact version from the private receipt into a new local root:
