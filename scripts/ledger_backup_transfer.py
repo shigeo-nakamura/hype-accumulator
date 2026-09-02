@@ -106,8 +106,8 @@ def checksum_b64(path: Path) -> str:
     return base64.b64encode(digest.digest()).decode("ascii")
 
 
-def multipart_checksum_b64(path: Path, part_size: int) -> str:
-    """Return S3's SHA-256 composite checksum for fixed-size multipart data."""
+def multipart_checksums_b64(path: Path, part_size: int) -> tuple[str, str]:
+    """Return the S3 request and stored SHA-256 composite representations."""
     if part_size <= 0:
         raise TransferError("multipart part size must be positive")
     composite = hashlib.sha256()
@@ -118,7 +118,8 @@ def multipart_checksum_b64(path: Path, part_size: int) -> str:
             part_count += 1
     if part_count == 0 or part_count > MAX_MULTIPART_PARTS:
         raise TransferError("multipart upload has an invalid part count")
-    return base64.b64encode(composite.digest()).decode("ascii")
+    request_checksum = base64.b64encode(composite.digest()).decode("ascii")
+    return request_checksum, f"{request_checksum}-{part_count}"
 
 
 def require_absolute_canonical(path: Path, label: str, *, exists: bool) -> Path:
@@ -435,6 +436,13 @@ def parse_stored_object(value: object, label: str) -> StoredObject:
     fields = {field.name for field in StoredObject.__dataclass_fields__.values()}
     if not isinstance(value, dict) or set(value) != fields:
         raise TransferError(f"{label} receipt object is malformed")
+    string_fields = fields - {"size_bytes"}
+    if (
+        any(not isinstance(value[field], str) for field in string_fields)
+        or not isinstance(value["size_bytes"], int)
+        or isinstance(value["size_bytes"], bool)
+    ):
+        raise TransferError(f"{label} receipt object has invalid field types")
     try:
         stored = StoredObject(**value)
     except TypeError as error:
@@ -448,7 +456,6 @@ def parse_stored_object(value: object, label: str) -> StoredObject:
         or not stored.etag
         or not stored.checksum_sha256
         or SHA256_RE.fullmatch(stored.sha256) is None
-        or not isinstance(stored.size_bytes, int)
         or stored.size_bytes < 0
     ):
         raise TransferError(f"{label} receipt object has invalid values")
@@ -810,7 +817,7 @@ class AwsCli:
         )
         if part_size < MIN_MULTIPART_PART_BYTES or part_size > SINGLE_PUT_LIMIT_BYTES:
             raise TransferError("multipart part size cannot satisfy S3 limits")
-        expected_checksum = multipart_checksum_b64(source, part_size)
+        request_checksum, stored_checksum = multipart_checksums_b64(source, part_size)
         created = self._json(
             [
                 "s3api", "create-multipart-upload", "--bucket", bucket, "--key", key,
@@ -879,7 +886,7 @@ class AwsCli:
                         "--upload-id", upload_id,
                         "--multipart-upload", f"file://{completion_path}",
                         "--checksum-type", "COMPOSITE",
-                        "--checksum-sha256", expected_checksum,
+                        "--checksum-sha256", request_checksum,
                         "--if-none-match", "*",
                         "--expected-bucket-owner", owner,
                     ],
@@ -887,7 +894,7 @@ class AwsCli:
                     transfer=True,
                 )
                 completed = True
-                return expected_checksum
+                return stored_checksum
         finally:
             if not completed:
                 self._abort_multipart(bucket, key, owner, upload_id)
@@ -901,11 +908,12 @@ class AwsCli:
             self.multipart_part_bytes,
             (size + MAX_MULTIPART_PARTS - 1) // MAX_MULTIPART_PARTS,
         )
-        expected_checksum = (
-            checksum_b64(source)
-            if size <= self.put_object_limit_bytes
-            else multipart_checksum_b64(source, multipart_part_size)
-        )
+        if size <= self.put_object_limit_bytes:
+            expected_checksum = checksum_b64(source)
+        else:
+            _, expected_checksum = multipart_checksums_b64(
+                source, multipart_part_size
+            )
         versions, delete_markers = self._key_history(bucket, key, owner)
         if delete_markers or len(versions) > 1:
             raise TransferError(

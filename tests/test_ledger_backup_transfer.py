@@ -261,6 +261,26 @@ class LedgerBackupTransferTests(unittest.TestCase):
         with self.assertRaisesRegex(transfer.TransferError, "unsupported schema"):
             transfer.load_receipt(receipt)
 
+    def test_receipt_non_string_object_field_fails_closed(self) -> None:
+        self.upload()
+        receipt = self.root / "receipt.json"
+        document = json.loads(receipt.read_text())
+        document["payload_objects"]["ledger.jsonl"]["bucket"] = 123
+        receipt.write_text(json.dumps(document), encoding="utf-8")
+        os.chmod(receipt, 0o600)
+        with self.assertRaisesRegex(transfer.TransferError, "invalid field types"):
+            transfer.load_receipt(receipt)
+
+    def test_receipt_boolean_size_field_fails_closed(self) -> None:
+        self.upload()
+        receipt = self.root / "receipt.json"
+        document = json.loads(receipt.read_text())
+        document["protected_anchor"]["size_bytes"] = True
+        receipt.write_text(json.dumps(document), encoding="utf-8")
+        os.chmod(receipt, 0o600)
+        with self.assertRaisesRegex(transfer.TransferError, "invalid field types"):
+            transfer.load_receipt(receipt)
+
     def test_aws_subprocess_does_not_inherit_bot_signing_material(self) -> None:
         completed = SimpleNamespace(returncode=0, stdout="{}", stderr="")
         with (
@@ -364,7 +384,7 @@ class LedgerBackupTransferTests(unittest.TestCase):
     def test_large_object_branch_uses_multipart_and_reconciles_one_version(self) -> None:
         kms_key = f"arn:aws:kms:eu-central-1:{OWNER}:key/payload"
         digest = transfer.sha256_file(self.anchor)
-        composite = transfer.multipart_checksum_b64(
+        _, composite = transfer.multipart_checksums_b64(
             self.anchor, transfer.DEFAULT_MULTIPART_PART_BYTES
         )
         head_response = {
@@ -427,9 +447,9 @@ class LedgerBackupTransferTests(unittest.TestCase):
                 self.assertIn("COMPOSITE", arguments)
                 self.assertEqual(
                     arguments[arguments.index("--checksum-sha256") + 1],
-                    transfer_module.multipart_checksum_b64(
+                    transfer_module.multipart_checksums_b64(
                         self.anchor, transfer_module.MIN_MULTIPART_PART_BYTES
-                    ),
+                    )[0],
                 )
                 completion = arguments[arguments.index("--multipart-upload") + 1]
                 self.assertTrue(completion.startswith("file://"))
@@ -456,9 +476,9 @@ class LedgerBackupTransferTests(unittest.TestCase):
             )
         self.assertEqual(
             checksum,
-            transfer.multipart_checksum_b64(
+            transfer.multipart_checksums_b64(
                 self.anchor, transfer.MIN_MULTIPART_PART_BYTES
-            ),
+            )[1],
         )
         abort.assert_not_called()
         self.assertEqual(
@@ -479,7 +499,10 @@ class LedgerBackupTransferTests(unittest.TestCase):
             hashlib.sha256(part).digest() for part in (b"abc", b"def", b"gh")
         )
         expected = base64.b64encode(hashlib.sha256(part_digests).digest()).decode("ascii")
-        self.assertEqual(transfer.multipart_checksum_b64(source, 3), expected)
+        self.assertEqual(
+            transfer.multipart_checksums_b64(source, 3),
+            (expected, f"{expected}-3"),
+        )
 
 
 if __name__ == "__main__":
