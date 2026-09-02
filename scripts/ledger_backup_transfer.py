@@ -220,6 +220,21 @@ def require_executable_file(path: Path, label: str) -> None:
             )
 
 
+def require_trusted_directory_chain(path: Path, label: str) -> None:
+    for directory in (path, *path.parents):
+        try:
+            info = directory.lstat()
+        except OSError as error:
+            raise TransferError(f"{label} cannot be inspected: {error}") from error
+        sticky_protected = bool(info.st_mode & stat.S_ISVTX)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid not in {0, os.geteuid()}
+            or (info.st_mode & 0o022 and not sticky_protected)
+        ):
+            raise TransferError(f"{label} has an untrusted writable directory")
+
+
 def require_bundle(bundle: Path, anchor: Path) -> tuple[str, dict[str, str]]:
     bundle = require_absolute_canonical(bundle, "bundle directory", exists=True)
     anchor = require_absolute_canonical(anchor, "anchor export", exists=True)
@@ -608,7 +623,10 @@ def download_backup(
     destination_root = require_absolute_canonical(
         destination_root, "download destination", exists=False
     )
-    require_absolute_canonical(destination_root.parent, "download parent", exists=True)
+    download_parent = require_absolute_canonical(
+        destination_root.parent, "download parent", exists=True
+    )
+    require_trusted_directory_chain(download_parent, "download parent")
     try:
         destination_root.mkdir(mode=0o700)
         os.chmod(destination_root, 0o700)

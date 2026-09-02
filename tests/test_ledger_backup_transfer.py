@@ -346,6 +346,21 @@ class LedgerBackupTransferTests(unittest.TestCase):
                 verify=fake_verify,
             )
 
+    def test_download_rejects_untrusted_writable_parent(self) -> None:
+        self.upload()
+        unsafe_parent = self.root / "unsafe-download-parent"
+        unsafe_parent.mkdir(mode=0o700)
+        os.chmod(unsafe_parent, 0o777)
+        with self.assertRaisesRegex(transfer.TransferError, "untrusted writable"):
+            transfer.download_backup(
+                receipt=self.root / "receipt.json",
+                destination_root=unsafe_parent / "restore",
+                verifier=Path("/bin/true"),
+                aws=self.aws,
+                verify=fake_verify,
+            )
+        self.assertFalse((unsafe_parent / "restore").exists())
+
     def test_receipt_unknown_fields_fail_closed(self) -> None:
         self.upload()
         receipt = self.root / "receipt.json"

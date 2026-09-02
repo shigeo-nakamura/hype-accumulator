@@ -149,6 +149,11 @@ python3 scripts/ledger_backup_transfer.py \
   --verifier <absolute-hype-accumulator-binary>
 ```
 
+The destination parent and its ancestor chain must be root/operator controlled
+and non-writable by untrusted users; root/operator-owned sticky directories are
+accepted where they provide rename protection. The tool rejects the destination
+before creating it when that boundary is unsafe.
+
 The destination must not exist. The tool reserves it with mode `0700`, requests
 every recorded object version explicitly, checks the S3 and local SHA-256
 values, and runs the Rust full-replay verifier before returning paths. A
