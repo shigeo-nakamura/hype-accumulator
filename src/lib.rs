@@ -6,6 +6,8 @@ pub mod config;
 pub mod exchange;
 pub mod execution;
 pub mod ledger;
+#[cfg(feature = "live-probe")]
+pub mod live_probe;
 pub mod metrics;
 pub mod monitor;
 pub mod pacing;
