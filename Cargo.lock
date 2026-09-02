@@ -745,8 +745,8 @@ dependencies = [
 
 [[package]]
 name = "dex-connector"
-version = "4.7.14"
-source = "git+https://github.com/shigeo-nakamura/dex-connector?tag=v4.7.14#170a4b168a292b587bf0a51e6ff915588e867b0a"
+version = "4.7.16"
+source = "git+https://github.com/shigeo-nakamura/dex-connector?tag=v4.7.16#7022b3e8148f861bd4496925170f4130d9af3918"
 dependencies = [
  "async-trait",
  "base64 0.21.7",
@@ -4588,7 +4588,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

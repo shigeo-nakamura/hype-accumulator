@@ -28,7 +28,20 @@ paths. `config/example.toml` is safe and non-routable.
 - `status`: validated, dashboard-safe balance and activity payload
 
 The live adapter and persistent ledger backend are intentionally outside this
-bootstrap. The crate pins tagged `dex-connector` with `hyperliquid-sdk` only.
+bootstrap. Release branches pin tagged `dex-connector` with
+`hyperliquid-sdk` only; dependent development changes may temporarily pin the
+reviewed connector commit and must return to a tag before merge.
+
+The optional `live-probe` library feature is a narrow integration seam for the
+rollout probe. It can reserve one persistent API-wallet nonce, translate only a
+currently pending `SubmitOrder` read directly from a `DurableWorkflow` into an
+exact IOC request, and perform read-only reconciliation using that same
+journal-backed action's CLOID and identity bindings. The adapter never accepts
+a caller-constructed or cloned action for submission.
+It has no CLI, scheduler, config or secret loader, retry loop, staking action,
+deployment path, or live authorization. The default build does not expose the
+module. After any submission attempt, including any error, the durable action
+is reconciliation-only and must never be submitted again.
 
 ## Offline fixed-DCA fallback
 
