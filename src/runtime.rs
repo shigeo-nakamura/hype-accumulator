@@ -630,6 +630,13 @@ impl SignerFreeRuntime {
             self.next_scan_start_ms(),
             self.config.account_observation_max_age_seconds,
         )?;
+        if input.approvals.0.values().any(|approval| {
+            approval.confirmed_at > input.observed_at || approval.approved_at > input.observed_at
+        }) {
+            return Err(RuntimeError::InvalidAdmissionArtifact(
+                "deposit approval evidence must not be in the future".to_owned(),
+            ));
+        }
         let existing_decision = self
             .state
             .pacing
@@ -802,7 +809,7 @@ impl SignerFreeRuntime {
             }
         }
         for approval_id in input.approvals.0.keys() {
-            if !observed_deposit_ids.contains(approval_id) {
+            if capital_history_complete && !observed_deposit_ids.contains(approval_id) {
                 return Err(RuntimeError::UnknownAdmissionApproval(approval_id.clone()));
             }
         }

@@ -1046,6 +1046,130 @@ fn unknown_approval_fails_closed_without_creating_capital() {
 }
 
 #[test]
+fn future_approval_is_rejected_before_persistence_and_can_be_corrected() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = at(2026, 7, 6, 9, 0);
+    let observed_at = at(2026, 7, 6, 10, 0);
+    let future_at = at(2026, 7, 7, 9, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-future-approval", deposit_at, 100);
+    let future_approval = approvals("deposit-future-approval", future_at, future_at);
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
+
+    let error = runtime
+        .apply_cycle(RuntimeCycleInput {
+            observed_at,
+            scan_start_ms: ms(start),
+            scan_end_ms: ms(observed_at),
+            movements: std::slice::from_ref(&movement),
+            approvals: &future_approval,
+            signal: None,
+            accumulator: status(observed_at, 100.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+        })
+        .expect_err("future approval evidence fails before persistence");
+    assert!(
+        matches!(error, RuntimeError::InvalidAdmissionArtifact(message) if message.contains("future"))
+    );
+    assert!(runtime.state.pacing.deposits().is_empty());
+    assert!(!runtime_config
+        .state_directory
+        .join(STATE_FILE_NAME)
+        .exists());
+
+    let corrected_approval = approvals("deposit-future-approval", deposit_at, deposit_at);
+    runtime
+        .apply_cycle(RuntimeCycleInput {
+            observed_at,
+            scan_start_ms: ms(start),
+            scan_end_ms: ms(observed_at),
+            movements: std::slice::from_ref(&movement),
+            approvals: &corrected_approval,
+            signal: None,
+            accumulator: status(observed_at, 100.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+        })
+        .expect("corrected approval recovers without manual state repair");
+    assert_eq!(
+        runtime
+            .ledger
+            .state()
+            .admitted_deposit_usdc("deposit-future-approval"),
+        Some(usd(100))
+    );
+}
+
+#[test]
+fn unknown_approval_is_deferred_only_while_history_is_incomplete() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = at(2026, 7, 6, 9, 0);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-hidden-by-outage", deposit_at, 100);
+    let admission = approvals("deposit-hidden-by-outage", deposit_at, deposit_at);
+    let signal = signal(decision_at);
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
+
+    let outage = runtime
+        .apply_cycle(RuntimeCycleInput {
+            observed_at: decision_at,
+            scan_start_ms: ms(start),
+            scan_end_ms: ms(decision_at),
+            movements: &[],
+            approvals: &admission,
+            signal: Some(&signal),
+            accumulator: status(decision_at, 0.0),
+            capital_history_complete: false,
+            manual_pause: false,
+            api_errors: 1,
+        })
+        .expect("unknown approval is deferred during history outage");
+    assert_eq!(
+        outage.decision().expect("durable outage decision").reason,
+        DecisionReason::MissingCapitalHistory
+    );
+    assert_eq!(runtime.state.api_errors_total, 1);
+    assert!(runtime.state.last_complete_scan_end_ms.is_none());
+    drop(runtime);
+
+    let replay_at = decision_at + TimeDelta::minutes(5);
+    let mut reopened = SignerFreeRuntime::open(runtime_config, limits()).expect("reopen runtime");
+    reopened
+        .apply_cycle(RuntimeCycleInput {
+            observed_at: replay_at,
+            scan_start_ms: reopened.next_scan_start_ms(),
+            scan_end_ms: ms(replay_at),
+            movements: &[movement],
+            approvals: &admission,
+            signal: Some(&signal),
+            accumulator: status(replay_at, 100.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+        })
+        .expect("complete history validates and applies the deferred approval");
+    assert_eq!(
+        reopened
+            .ledger
+            .state()
+            .admitted_deposit_usdc("deposit-hidden-by-outage"),
+        Some(usd(100))
+    );
+    assert_eq!(
+        reopened.state.last_complete_scan_end_ms,
+        Some(ms(replay_at))
+    );
+}
+
+#[test]
 fn prepared_partial_cycle_resumes_from_authenticated_pending_payload() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let start = at(2026, 7, 6, 8, 0);
