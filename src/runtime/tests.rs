@@ -615,6 +615,80 @@ fn newly_admitted_deposit_is_committed_before_a_dependent_withdrawal() {
 }
 
 #[test]
+fn delayed_cycle_preserves_a_preboundary_withdrawal_identity() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = at(2026, 7, 6, 9, 0);
+    let withdrawal_at = at(2026, 7, 6, 10, 0);
+    let boundary = at(2026, 7, 6, 12, 0);
+    let observed_at = boundary + TimeDelta::minutes(5);
+    let runtime_config = config(directory.path(), ms(start));
+    let movements = vec![
+        deposit("deposit-before-withdrawal", deposit_at, 100),
+        withdrawal("withdrawal-before-boundary", withdrawal_at, 40),
+    ];
+    let admission = approvals("deposit-before-withdrawal", deposit_at, deposit_at);
+    let signal = signal(boundary);
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
+
+    let report = runtime
+        .apply_cycle(RuntimeCycleInput {
+            observed_at,
+            scan_start_ms: ms(start),
+            scan_end_ms: ms(observed_at),
+            movements: &movements,
+            approvals: &admission,
+            signal: Some(&signal),
+            accumulator: status(observed_at, 60.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+        })
+        .expect("pre-boundary withdrawal remains identical across both reconciliations");
+
+    let decision = report.decision().expect("durable boundary decision");
+    assert_eq!(decision.reason, DecisionReason::Planned);
+    assert_eq!(
+        decision.explanation.observed_budget_after_reserve_usdc,
+        usd(60)
+    );
+    assert_eq!(runtime.ledger.state().withdrawn_usdc(), usd(40));
+    assert_eq!(
+        runtime
+            .state
+            .pacing
+            .withdrawals()
+            .get("withdrawal-before-boundary")
+            .expect("durable withdrawal")
+            .event
+            .reconciled_at,
+        boundary
+    );
+    drop(runtime);
+
+    let replay_at = observed_at + TimeDelta::minutes(5);
+    let mut reopened =
+        SignerFreeRuntime::open(runtime_config, limits()).expect("reopen committed cycle");
+    let replay = reopened
+        .apply_cycle(RuntimeCycleInput {
+            observed_at: replay_at,
+            scan_start_ms: reopened.next_scan_start_ms(),
+            scan_end_ms: ms(replay_at),
+            movements: &movements,
+            approvals: &admission,
+            signal: None,
+            accumulator: status(replay_at, 60.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+        })
+        .expect("overlap replay keeps the boundary reconciliation timestamp");
+    assert!(!replay.is_new_decision());
+    assert_eq!(reopened.ledger.state().withdrawn_usdc(), usd(40));
+}
+
+#[test]
 fn delayed_cycle_reconstructs_boundary_balance_before_a_later_withdrawal() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let start = at(2026, 7, 6, 8, 0);

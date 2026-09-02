@@ -754,16 +754,26 @@ impl SignerFreeRuntime {
                             amount_usdc: amount,
                         },
                     });
+                    let reconciled_at = self
+                        .state
+                        .pacing
+                        .withdrawals()
+                        .get(&movement.event_id)
+                        .map_or_else(
+                            || {
+                                scheduled_boundary
+                                    .filter(|boundary| {
+                                        boundary_replay_safe && occurred_at <= *boundary
+                                    })
+                                    .unwrap_or(input.observed_at)
+                            },
+                            |record| record.event.reconciled_at,
+                        );
                     capital_events.push(CapitalEvent::Withdrawal(WithdrawalEvent {
                         event_id: movement.event_id.clone(),
                         amount_usdc: amount,
                         occurred_at,
-                        reconciled_at: self
-                            .state
-                            .pacing
-                            .withdrawals()
-                            .get(&movement.event_id)
-                            .map_or(input.observed_at, |record| record.event.reconciled_at),
+                        reconciled_at,
                     }));
                 }
                 HyperliquidAccountMovementKind::Unknown => {
@@ -1314,9 +1324,7 @@ fn capital_events_as_of(events: &[CapitalEvent], at: DateTime<Utc>) -> Vec<Capit
                 Some(CapitalEvent::Deposit(deposit))
             }
             CapitalEvent::Withdrawal(withdrawal) if withdrawal.occurred_at <= at => {
-                let mut withdrawal = withdrawal.clone();
-                withdrawal.reconciled_at = at;
-                Some(CapitalEvent::Withdrawal(withdrawal))
+                Some(CapitalEvent::Withdrawal(withdrawal.clone()))
             }
             CapitalEvent::Deposit(_) | CapitalEvent::Withdrawal(_) => None,
         })
