@@ -59,8 +59,9 @@ itself an approval-gated operation. It requires:
 
 - two different S3 buckets so the payload and protected anchor can have
   separate IAM/delete boundaries;
-- versioning in the `Enabled` state on both buckets;
-- expected 12-digit bucket-owner IDs and explicit KMS keys;
+- versioning in the `Enabled` state on both buckets and permission to inspect
+  the complete object-version/delete-marker history;
+- expected 12-digit bucket-owner IDs and explicit full KMS key ARNs;
 - immutable conditional puts (`If-None-Match: *`), S3 SHA-256 checksums, KMS
   encryption, and a read-after-write check;
 - a private, no-replace receipt containing the exact version ID, checksum,
@@ -84,19 +85,21 @@ python3 scripts/ledger_backup_transfer.py \
   --verifier <absolute-hype-accumulator-binary> \
   --payload-bucket <versioned-payload-bucket> \
   --payload-owner <12-digit-account-id> \
-  --payload-kms-key <payload-kms-key-id-or-arn> \
+  --payload-kms-key <full-payload-kms-key-arn> \
   --anchor-bucket <separately-protected-anchor-bucket> \
   --anchor-owner <12-digit-account-id> \
-  --anchor-kms-key <anchor-kms-key-id-or-arn>
+  --anchor-kms-key <full-anchor-kms-key-arn>
 ```
 
 The tool first captures the private source files, then runs the Rust full-replay
 verifier and uploads only those exact captured bytes. Object keys are derived
-from the verified backup ID. A retry accepts a pre-existing object only when its
-backup metadata, size, SHA-256, KMS encryption, and content match exactly; it
-never creates a replacement version intentionally. Keep the receipt outside
-the repository and operator logs. It contains infrastructure identifiers, but
-never wallet addresses, credentials, ciphertext, or signed payloads.
+from the verified backup ID. A retry accepts a pre-existing object only when it
+has exactly one version, no delete marker, the configured KMS key ARN, and exact
+backup metadata, size, SHA-256, and content. Any deletion or replacement
+history fails closed instead of creating another version. Keep the receipt
+outside the repository and operator logs. It contains infrastructure
+identifiers, but never wallet addresses, credentials, ciphertext, or signed
+payloads.
 
 ## Clean-directory restore drill
 

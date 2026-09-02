@@ -123,10 +123,10 @@ class LedgerBackupTransferTests(unittest.TestCase):
             "aws": self.aws,
             "payload_bucket": PAYLOAD_BUCKET,
             "payload_owner": OWNER,
-            "payload_kms_key": "alias/payload",
+            "payload_kms_key": f"arn:aws:kms:eu-central-1:{OWNER}:key/payload-key",
             "anchor_bucket": ANCHOR_BUCKET,
             "anchor_owner": OWNER,
-            "anchor_kms_key": "alias/anchor",
+            "anchor_kms_key": f"arn:aws:kms:eu-central-1:{OWNER}:key/anchor-key",
             "prefix": "hype-accumulator/ledger-backups",
             "verify": fake_verify,
         }
@@ -259,6 +259,64 @@ class LedgerBackupTransferTests(unittest.TestCase):
         environment = run.call_args.kwargs["env"]
         self.assertNotIn("HYPE_SIGNING_KEY", environment)
         self.assertEqual(environment["AWS_SESSION_TOKEN"], "session")
+
+    def test_aws_cli_rejects_an_unexpected_kms_key(self) -> None:
+        source = self.anchor
+        expected_key = f"arn:aws:kms:eu-central-1:{OWNER}:key/expected"
+        response = {
+            "VersionId": "version-1",
+            "ChecksumSHA256": transfer.checksum_b64(source),
+            "ContentLength": source.stat().st_size,
+            "ServerSideEncryption": "aws:kms",
+            "SSEKMSKeyId": f"arn:aws:kms:eu-central-1:{OWNER}:key/unexpected",
+            "Metadata": {"sha256": transfer.sha256_file(source)},
+            "ETag": '"etag"',
+        }
+        cli = transfer.AwsCli(Path("/usr/bin/true"), "eu-central-1")
+        with self.assertRaisesRegex(transfer.TransferError, "verification failed"):
+            cli._stored_from_response(
+                bucket=ANCHOR_BUCKET,
+                key="backup/anchor",
+                owner=OWNER,
+                kms_key_id=expected_key,
+                source=source,
+                sha256=transfer.sha256_file(source),
+                response=response,
+            )
+
+    def test_aws_cli_rejects_delete_marker_before_any_put(self) -> None:
+        cli = transfer.AwsCli(Path("/usr/bin/true"), "eu-central-1")
+        with (
+            mock.patch.object(cli, "_key_history", return_value=([], ["delete-1"])),
+            mock.patch.object(cli, "_head") as head,
+            self.assertRaisesRegex(transfer.TransferError, "replacement or deletion"),
+        ):
+            cli.put_immutable(
+                bucket=ANCHOR_BUCKET,
+                key="backup/anchor",
+                source=self.anchor,
+                owner=OWNER,
+                kms_key_id=f"arn:aws:kms:eu-central-1:{OWNER}:key/anchor",
+                backup_id=BACKUP_ID,
+                sha256=transfer.sha256_file(self.anchor),
+            )
+        head.assert_not_called()
+
+    def test_aws_cli_rejects_multiple_historical_versions(self) -> None:
+        cli = transfer.AwsCli(Path("/usr/bin/true"), "eu-central-1")
+        with (
+            mock.patch.object(cli, "_key_history", return_value=(["v2", "v1"], [])),
+            self.assertRaisesRegex(transfer.TransferError, "replacement or deletion"),
+        ):
+            cli.put_immutable(
+                bucket=PAYLOAD_BUCKET,
+                key="backup/ledger",
+                source=self.anchor,
+                owner=OWNER,
+                kms_key_id=f"arn:aws:kms:eu-central-1:{OWNER}:key/payload",
+                backup_id=BACKUP_ID,
+                sha256=transfer.sha256_file(self.anchor),
+            )
 
 
 if __name__ == "__main__":

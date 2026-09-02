@@ -36,6 +36,9 @@ SHA256_RE = re.compile(r"[0-9a-f]{64}")
 BUCKET_RE = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
 OWNER_RE = re.compile(r"[0-9]{12}")
 PREFIX_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,510}")
+KMS_KEY_ARN_RE = re.compile(
+    r"arn:(?:aws|aws-us-gov|aws-cn):kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]{1,128}"
+)
 
 
 class TransferError(RuntimeError):
@@ -352,6 +355,8 @@ def upload_backup(
         raise TransferError("payload and protected anchor must use different buckets")
     validate_remote_name(payload_owner, OWNER_RE, "payload bucket owner")
     validate_remote_name(anchor_owner, OWNER_RE, "anchor bucket owner")
+    validate_remote_name(payload_kms_key, KMS_KEY_ARN_RE, "payload KMS key ARN")
+    validate_remote_name(anchor_kms_key, KMS_KEY_ARN_RE, "anchor KMS key ARN")
     prefix = validate_remote_name(prefix.strip("/"), PREFIX_RE, "object prefix")
     with captured_backup(bundle, anchor) as (captured_bundle, captured_anchor, backup_id, digests):
         verify(verifier, captured_bundle, captured_anchor)
@@ -398,12 +403,12 @@ def parse_stored_object(value: object, label: str) -> StoredObject:
         raise TransferError(f"{label} receipt object is malformed") from error
     validate_remote_name(stored.bucket, BUCKET_RE, f"{label} bucket")
     validate_remote_name(stored.expected_bucket_owner, OWNER_RE, f"{label} owner")
+    validate_remote_name(stored.kms_key_id, KMS_KEY_ARN_RE, f"{label} KMS key ARN")
     if (
         not stored.key
         or not stored.version_id
         or not stored.etag
         or not stored.checksum_sha256
-        or not stored.kms_key_id
         or SHA256_RE.fullmatch(stored.sha256) is None
         or not isinstance(stored.size_bytes, int)
         or stored.size_bytes < 0
@@ -588,6 +593,51 @@ class AwsCli:
                 return None
             raise
 
+    def _key_history(self, bucket: str, key: str, owner: str) -> tuple[list[str], list[str]]:
+        result = self._json(
+            [
+                "s3api",
+                "list-object-versions",
+                "--bucket",
+                bucket,
+                "--prefix",
+                key,
+                "--expected-bucket-owner",
+                owner,
+            ],
+            f"immutable object history for {bucket}/{key}",
+        )
+        raw_versions = result.get("Versions", [])
+        raw_delete_markers = result.get("DeleteMarkers", [])
+        if not isinstance(raw_versions, list) or not isinstance(raw_delete_markers, list):
+            raise TransferError(f"remote object history is malformed for {bucket}/{key}")
+        versions = [
+            item.get("VersionId")
+            for item in raw_versions
+            if isinstance(item, dict) and item.get("Key") == key
+        ]
+        delete_markers = [
+            item.get("VersionId")
+            for item in raw_delete_markers
+            if isinstance(item, dict) and item.get("Key") == key
+        ]
+        if any(not isinstance(value, str) or not value for value in versions + delete_markers):
+            raise TransferError(f"remote object history is malformed for {bucket}/{key}")
+        return versions, delete_markers  # type: ignore[return-value]
+
+    @staticmethod
+    def _require_single_history(
+        bucket: str,
+        key: str,
+        versions: list[str],
+        delete_markers: list[str],
+    ) -> str:
+        if delete_markers or len(versions) != 1:
+            raise TransferError(
+                f"remote object history is not one immutable version for {bucket}/{key}"
+            )
+        return versions[0]
+
     def _stored_from_response(
         self, *, bucket: str, key: str, owner: str, kms_key_id: str,
         source: Path, sha256: str, response: dict[str, object]
@@ -600,7 +650,7 @@ class AwsCli:
             or response.get("ChecksumSHA256") != expected_checksum
             or response.get("ContentLength") != source.stat().st_size
             or response.get("ServerSideEncryption") != "aws:kms"
-            or not isinstance(response.get("SSEKMSKeyId"), str)
+            or response.get("SSEKMSKeyId") != kms_key_id
             or not isinstance(metadata, dict)
             or metadata.get("sha256") != sha256
         ):
@@ -619,8 +669,18 @@ class AwsCli:
         self, *, bucket: str, key: str, source: Path, owner: str,
         kms_key_id: str, backup_id: str, sha256: str
     ) -> StoredObject:
+        versions, delete_markers = self._key_history(bucket, key, owner)
+        if delete_markers or len(versions) > 1:
+            raise TransferError(
+                f"remote object history shows replacement or deletion for {bucket}/{key}"
+            )
         existing = self._head(bucket, key, owner)
-        if existing is None:
+        if versions:
+            if existing is None or existing.get("VersionId") != versions[0]:
+                raise TransferError(f"remote object current version is inconsistent for {bucket}/{key}")
+        elif existing is not None:
+            raise TransferError(f"remote object exists without version history for {bucket}/{key}")
+        else:
             self._json(
                 ["s3api", "put-object", "--bucket", bucket, "--key", key,
                  "--body", str(source), "--if-none-match", "*",
@@ -631,8 +691,14 @@ class AwsCli:
                 f"immutable upload for {bucket}/{key}",
             )
             existing = self._head(bucket, key, owner)
+            versions, delete_markers = self._key_history(bucket, key, owner)
         if existing is None:
             raise TransferError(f"uploaded object cannot be read back: {bucket}/{key}")
+        only_version = self._require_single_history(
+            bucket, key, versions, delete_markers
+        )
+        if existing.get("VersionId") != only_version:
+            raise TransferError(f"uploaded object version history changed for {bucket}/{key}")
         metadata = existing.get("Metadata")
         if not isinstance(metadata, dict) or metadata.get("backup-id") != backup_id:
             raise TransferError(f"remote object backup ID mismatch for {bucket}/{key}")
