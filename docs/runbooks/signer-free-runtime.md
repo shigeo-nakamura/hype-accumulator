@@ -44,8 +44,10 @@ action.
 - Each cycle captures the read-only balance first, fixes an observation
   boundary, and then closes movement history through that boundary. A balance
   older than `account_observation_max_age_seconds` is rejected.
-- A missing or invalid signal snapshot produces a durable
-  `core_signal_unavailable` skip. A later same-day snapshot cannot replace it.
+- A missing, invalid, or boundary-mismatched signal snapshot produces a
+  durable `core_signal_unavailable` skip. A stale snapshot left from another
+  decision day cannot wedge the movement cursor, and a later same-day snapshot
+  cannot replace the recorded skip.
 - A valid signal snapshot must bind to that day's configured UTC hour/minute,
   with seconds set to zero. Delayed timer execution still records the decision
   at that boundary. Unless the balance observation is bound to that exact
@@ -56,7 +58,9 @@ action.
   available no earlier than the next eligible day.
 - Every planned DRY_RUN amount is recorded and counted, but the cycle report
   always states `economic_action_suppressed=true` and
-  `signed_action_created=false`.
+  `signed_action_created=false`. The simulated commitment is then settled with
+  zero fill and zero debit in the same crash-safe cycle, releasing all capital
+  for a later scheduled plan without recording spend.
 
 ## Persistence boundaries
 
@@ -64,7 +68,9 @@ The runtime state directory is reserved exclusively for the pacing snapshot,
 transaction proof files, lock, and append-only audit ledger. Every configured
 input/output file must be outside that directory, including after resolving
 its parent. Relative paths, `.`/`..` components, configured-file symlinks, and
-parent symlink aliases into the state directory are rejected.
+parent symlink aliases into the state directory are rejected. Resolved parent
+plus filename identities must also be distinct, so two lexical paths cannot
+alias one input or output through a symlinked parent.
 
 `protected_anchor_path` also requires its own filesystem/IAM boundary; a second
 path on the same mutable boundary is not credited as rollback protection.

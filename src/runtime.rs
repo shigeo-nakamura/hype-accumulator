@@ -628,6 +628,11 @@ impl SignerFreeRuntime {
             .get(&input.observed_at.date_naive())
             .cloned();
         let scheduled_boundary = scheduled_decision_boundary(input.observed_at, &self.limits)?;
+        let decision_signal = scheduled_boundary.and_then(|boundary| {
+            input.signal.filter(|signal| {
+                signal.decision_at() == boundary && signal.decision_date() == boundary.date_naive()
+            })
+        });
         let boundary_balance_available = scheduled_boundary
             .is_some_and(|boundary| *input.accumulator.balance_observed_at() == boundary);
         let boundary_replay_safe = scheduled_boundary.is_some_and(|boundary| {
@@ -771,7 +776,7 @@ impl SignerFreeRuntime {
                 capital_history_complete: capital_history_complete && boundary_balance_available,
                 manual_pause: input.manual_pause,
             };
-            let result = match input.signal {
+            let result = match decision_signal {
                 Some(signal) => {
                     next_state
                         .pacing
@@ -781,13 +786,13 @@ impl SignerFreeRuntime {
                     .pacing
                     .decide_with_unavailable_signal(&decision_input, &self.limits),
             };
-            let decision = match result {
+            let mut decision = match result {
                 Ok(result) => Some(result),
                 Err(PacingError::DecisionNotDue) => None,
                 Err(error) => return Err(error.into()),
             };
-            if let Some(result) = &decision {
-                ledger_events.extend(decision_events(result.decision())?);
+            if let Some(result) = &mut decision {
+                ledger_events.extend(dry_run_decision_events(&mut next_state.pacing, result)?);
             }
             next_state.pacing.reconcile_capital(
                 &capital_events,
@@ -830,8 +835,8 @@ impl SignerFreeRuntime {
                     .ok_or(RuntimeError::CounterOverflow)?;
             }
             if result.is_new()
-                && (input.signal.is_none()
-                    || input.signal.is_some_and(|signal| {
+                && (decision_signal.is_none()
+                    || decision_signal.is_some_and(|signal| {
                         signal.core_is_stale_at(result.decision().decided_at)
                     }))
             {
@@ -873,7 +878,7 @@ impl SignerFreeRuntime {
             new_decision: decision_result.as_ref().is_some_and(DecisionResult::is_new),
             economic_action_suppressed: true,
             signed_action_created: false,
-            signal_available: input.signal.is_some(),
+            signal_available: decision_signal.is_some(),
             boundary_balance_available,
         };
         let pending = PendingRuntimeCycle::new(input.observed_at, next_state, ledger_events)?;
@@ -888,7 +893,7 @@ impl SignerFreeRuntime {
             &self.limits,
             self.ledger.state(),
             &[],
-            input.signal,
+            decision_signal,
             self.state.api_errors_total,
             self.state.stale_signal_events_total,
             self.state.dry_run_actions_total,
@@ -926,6 +931,7 @@ fn ensure_protected_boundary(config: &RuntimeConfig) -> Result<(), RuntimeError>
 
 fn ensure_configured_files_outside_state(config: &RuntimeConfig) -> Result<(), RuntimeError> {
     let canonical_state = fs::canonicalize(&config.state_directory)?;
+    let mut resolved_paths = BTreeSet::new();
     for path in config.configured_file_paths() {
         let parent = path.parent().ok_or_else(|| {
             RuntimeError::InvalidConfig("configured runtime file has no parent".to_owned())
@@ -935,6 +941,14 @@ fn ensure_configured_files_outside_state(config: &RuntimeConfig) -> Result<(), R
         if canonical_parent.starts_with(&canonical_state) {
             return Err(RuntimeError::InvalidConfig(
                 "configured runtime file resolves inside the reserved state directory".to_owned(),
+            ));
+        }
+        let file_name = path.file_name().ok_or_else(|| {
+            RuntimeError::InvalidConfig("configured runtime file has no file name".to_owned())
+        })?;
+        if !resolved_paths.insert(canonical_parent.join(file_name)) {
+            return Err(RuntimeError::InvalidConfig(
+                "configured runtime files resolve to the same path".to_owned(),
             ));
         }
         reject_linked_file(path)?;
@@ -1320,6 +1334,38 @@ fn capital_ledger_event_order(kind: &LedgerEventKind) -> u8 {
         LedgerEventKind::AuthoritativeWithdrawal { .. } => 2,
         _ => 3,
     }
+}
+
+fn dry_run_decision_events(
+    pacing: &mut PacingState,
+    result: &mut DecisionResult,
+) -> Result<Vec<LedgerEvent>, RuntimeError> {
+    let decision = result.decision().clone();
+    let mut events = decision_events(&decision)?;
+    if result.is_new() && !decision.planned_usdc.is_zero() {
+        pacing.settle_decision(
+            &decision.decision_id,
+            UsdcMicros::default(),
+            UsdcMicros::default(),
+        )?;
+        events.push(LedgerEvent {
+            event_id: format!("decision:{}:dry-run-settlement", decision.decision_id),
+            occurred_at: decision.decided_at,
+            kind: LedgerEventKind::CapitalSettled {
+                commitment_id: format!("commitment:{}", decision.decision_id),
+                debited_usdc: UsdcMicros::default(),
+            },
+        });
+        let settled = pacing
+            .decisions()
+            .get(&decision.decision_date)
+            .cloned()
+            .ok_or_else(|| {
+                RuntimeError::InvalidCycle("settled dry-run decision is missing".to_owned())
+            })?;
+        *result = DecisionResult::New(settled);
+    }
+    Ok(events)
 }
 
 fn decision_events(decision: &DailyDecision) -> Result<Vec<LedgerEvent>, RuntimeError> {

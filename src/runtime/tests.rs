@@ -134,7 +134,11 @@ fn day(value: &str) -> NaiveDate {
 }
 
 fn signal(decision_at: DateTime<Utc>) -> SignalSnapshot {
-    let core = RevisionQuery::new("fixture-core", "v1", "hype_market", day("2026-07-06"))
+    signal_for(decision_at, "2026-07-06")
+}
+
+fn signal_for(decision_at: DateTime<Utc>, core_date: &str) -> SignalSnapshot {
+    let core = RevisionQuery::new("fixture-core", "v1", "hype_market", day(core_date))
         .expect("core query");
     let auxiliary = RevisionQuery::new("fixture-aux", "v1", "btc_etf_net_flow", day("2026-07-03"))
         .expect("auxiliary query");
@@ -266,6 +270,24 @@ fn runtime_open_rejects_an_output_parent_symlinked_into_state() {
     assert!(matches!(
         SignerFreeRuntime::open(config(directory.path(), 1), limits()),
         Err(RuntimeError::InvalidConfig(_))
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_open_rejects_configured_paths_with_aliased_parents() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let public = directory.path().join("public");
+    fs::create_dir_all(&public).expect("public directory");
+    symlink(&public, directory.path().join("public-alias")).expect("public parent alias");
+    let mut runtime_config = config(directory.path(), 1);
+    runtime_config.metrics_path = directory.path().join("public-alias/status.json");
+
+    assert!(matches!(
+        SignerFreeRuntime::open(runtime_config, limits()),
+        Err(RuntimeError::InvalidConfig(message)) if message.contains("same path")
     ));
 }
 
@@ -406,18 +428,24 @@ fn approved_deposit_plans_once_and_same_day_restart_replays_without_second_actio
         .expect("planned decision")
         .planned_usdc
         .is_zero());
+    assert!(first.decision().expect("planned decision").settled);
+    assert_eq!(
+        runtime.ledger.state().committed_usdc(),
+        UsdcMicros::default()
+    );
     assert_eq!(runtime.state.dry_run_actions_total, 1);
     drop(runtime);
 
     let replay_at = decision_at + TimeDelta::minutes(5);
-    let mut reopened = SignerFreeRuntime::open(runtime_config, limits()).expect("reopen runtime");
+    let mut reopened =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("reopen runtime");
     assert_eq!(reopened.next_scan_start_ms(), ms(start));
     let replay = reopened
         .apply_cycle(RuntimeCycleInput {
             observed_at: replay_at,
             scan_start_ms: ms(start),
             scan_end_ms: ms(replay_at),
-            movements: &[movement],
+            movements: std::slice::from_ref(&movement),
             approvals: &admission,
             signal: Some(&signal),
             accumulator: status(replay_at, 100.0),
@@ -429,6 +457,75 @@ fn approved_deposit_plans_once_and_same_day_restart_replays_without_second_actio
     assert!(!replay.is_new_decision());
     assert_eq!(reopened.state.dry_run_actions_total, 1);
     assert_eq!(reopened.state.pacing.decisions().len(), 1);
+
+    let next_decision_at = at(2026, 7, 7, 12, 0);
+    let next_signal = signal_for(next_decision_at, "2026-07-07");
+    let next_scan_start_ms = reopened.next_scan_start_ms();
+    let next = reopened
+        .apply_cycle(RuntimeCycleInput {
+            observed_at: next_decision_at,
+            scan_start_ms: next_scan_start_ms,
+            scan_end_ms: ms(next_decision_at),
+            movements: &[movement],
+            approvals: &admission,
+            signal: Some(&next_signal),
+            accumulator: status(next_decision_at, 100.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+        })
+        .expect("next-day dry-run plan");
+    assert!(next.is_new_decision());
+    assert_eq!(
+        next.decision().expect("next-day decision").reason,
+        DecisionReason::Planned
+    );
+    assert!(next.decision().expect("next-day decision").settled);
+    assert_eq!(reopened.state.dry_run_actions_total, 2);
+    assert_eq!(reopened.state.pacing.decisions().len(), 2);
+    assert_eq!(
+        reopened.ledger.state().committed_usdc(),
+        UsdcMicros::default()
+    );
+}
+
+#[test]
+fn boundary_mismatched_signal_becomes_a_durable_unavailable_skip() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 7, 8, 0);
+    let deposit_at = at(2026, 7, 7, 9, 0);
+    let decision_at = at(2026, 7, 7, 12, 0);
+    let previous_signal = signal(at(2026, 7, 6, 12, 0));
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-with-old-signal", deposit_at, 100);
+    let admission = approvals("deposit-with-old-signal", deposit_at, deposit_at);
+    let mut runtime = SignerFreeRuntime::open(runtime_config, limits()).expect("open runtime");
+
+    let report = runtime
+        .apply_cycle(RuntimeCycleInput {
+            observed_at: decision_at,
+            scan_start_ms: ms(start),
+            scan_end_ms: ms(decision_at),
+            movements: &[movement],
+            approvals: &admission,
+            signal: Some(&previous_signal),
+            accumulator: status(decision_at, 100.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+        })
+        .expect("mismatched signal fails closed without failing the cycle");
+
+    assert_eq!(
+        report.decision().expect("durable unavailable skip").reason,
+        DecisionReason::CoreSignalUnavailable
+    );
+    assert!(!report.signal_available);
+    assert_eq!(
+        runtime.state.last_complete_scan_end_ms,
+        Some(ms(decision_at))
+    );
+    assert_eq!(runtime.state.stale_signal_events_total, 1);
 }
 
 #[test]
