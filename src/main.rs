@@ -1,5 +1,6 @@
 use chrono::Utc;
 use hype_accumulator::{
+    backup::{create_ledger_backup, restore_ledger_backup, verify_ledger_backup},
     bootstrap,
     config::{Config, ProcessEnvironment},
     exchange::UnavailableLiveExchange,
@@ -49,6 +50,51 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             run_dry_run_cycle(&config_path, &security_policy_path, &runtime_config_path).await?;
         }
+        Invocation::LedgerBackupCreate {
+            ledger_directory,
+            source_anchor_path,
+            bundle_directory,
+            anchor_export_path,
+        } => {
+            let manifest = create_ledger_backup(
+                ledger_directory,
+                source_anchor_path,
+                bundle_directory,
+                anchor_export_path,
+                Utc::now(),
+            )?;
+            println!(
+                "backup_id={} records={} head={}",
+                manifest.backup_id, manifest.record_count, manifest.head_hash
+            );
+        }
+        Invocation::LedgerBackupVerify {
+            bundle_directory,
+            anchor_export_path,
+        } => {
+            let manifest = verify_ledger_backup(bundle_directory, anchor_export_path)?;
+            println!(
+                "backup_id={} records={} head={} verified",
+                manifest.backup_id, manifest.record_count, manifest.head_hash
+            );
+        }
+        Invocation::LedgerBackupRestore {
+            bundle_directory,
+            anchor_export_path,
+            destination_directory,
+            destination_anchor_path,
+        } => {
+            let manifest = restore_ledger_backup(
+                bundle_directory,
+                anchor_export_path,
+                destination_directory,
+                destination_anchor_path,
+            )?;
+            println!(
+                "backup_id={} records={} head={} restored",
+                manifest.backup_id, manifest.record_count, manifest.head_hash
+            );
+        }
     }
     Ok(())
 }
@@ -68,6 +114,22 @@ enum Invocation {
         security_policy_path: PathBuf,
         runtime_config_path: PathBuf,
     },
+    LedgerBackupCreate {
+        ledger_directory: PathBuf,
+        source_anchor_path: PathBuf,
+        bundle_directory: PathBuf,
+        anchor_export_path: PathBuf,
+    },
+    LedgerBackupVerify {
+        bundle_directory: PathBuf,
+        anchor_export_path: PathBuf,
+    },
+    LedgerBackupRestore {
+        bundle_directory: PathBuf,
+        anchor_export_path: PathBuf,
+        destination_directory: PathBuf,
+        destination_anchor_path: PathBuf,
+    },
 }
 
 fn invocation<I>(args: I) -> Result<Invocation, &'static str>
@@ -80,11 +142,11 @@ where
             config_path: PathBuf::from("config.toml"),
             security_policy_path: None,
         }),
-        [config_path] => Ok(Invocation::Startup {
+        [config_path] if !config_path.starts_with("--") => Ok(Invocation::Startup {
             config_path: PathBuf::from(config_path),
             security_policy_path: None,
         }),
-        [config_path, security_policy_path] if config_path != "--install-preflight" => {
+        [config_path, security_policy_path] if !config_path.starts_with("--") => {
             Ok(Invocation::Startup {
                 config_path: PathBuf::from(config_path),
                 security_policy_path: Some(PathBuf::from(security_policy_path)),
@@ -105,8 +167,38 @@ where
                 runtime_config_path: PathBuf::from(runtime_config_path),
             })
         }
+        [command, ledger_directory, source_anchor_path, bundle_directory, anchor_export_path]
+            if command == "--ledger-backup-create" =>
+        {
+            Ok(Invocation::LedgerBackupCreate {
+                ledger_directory: PathBuf::from(ledger_directory),
+                source_anchor_path: PathBuf::from(source_anchor_path),
+                bundle_directory: PathBuf::from(bundle_directory),
+                anchor_export_path: PathBuf::from(anchor_export_path),
+            })
+        }
+        [command, bundle_directory, anchor_export_path]
+            if command == "--ledger-backup-verify" =>
+        {
+            Ok(Invocation::LedgerBackupVerify {
+                bundle_directory: PathBuf::from(bundle_directory),
+                anchor_export_path: PathBuf::from(anchor_export_path),
+            })
+        }
+        [
+            command,
+            bundle_directory,
+            anchor_export_path,
+            destination_directory,
+            destination_anchor_path,
+        ] if command == "--ledger-backup-restore" => Ok(Invocation::LedgerBackupRestore {
+            bundle_directory: PathBuf::from(bundle_directory),
+            anchor_export_path: PathBuf::from(anchor_export_path),
+            destination_directory: PathBuf::from(destination_directory),
+            destination_anchor_path: PathBuf::from(destination_anchor_path),
+        }),
         _ => Err(
-            "usage: hype-accumulator [config.toml] [security-policy.toml] | --install-preflight config.toml security-policy.toml | --dry-run-cycle config.toml security-policy.toml runtime.toml",
+            "usage: hype-accumulator [config.toml] [security-policy.toml] | --install-preflight config.toml security-policy.toml | --dry-run-cycle config.toml security-policy.toml runtime.toml | --ledger-backup-create LEDGER_DIR SOURCE_ANCHOR BUNDLE_DIR ANCHOR_EXPORT | --ledger-backup-verify BUNDLE_DIR ANCHOR_EXPORT | --ledger-backup-restore BUNDLE_DIR ANCHOR_EXPORT DESTINATION_DIR DESTINATION_ANCHOR",
         ),
     }
 }
@@ -255,6 +347,69 @@ mod tests {
             ]
             .into_iter()
             .map(str::to_owned)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn ledger_backup_commands_require_explicit_separate_paths() {
+        assert_eq!(
+            invocation(
+                [
+                    "--ledger-backup-create",
+                    "/state/ledger",
+                    "/anchors/source.json",
+                    "/backups/bundle",
+                    "/protected/anchor.json",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+            ),
+            Ok(Invocation::LedgerBackupCreate {
+                ledger_directory: PathBuf::from("/state/ledger"),
+                source_anchor_path: PathBuf::from("/anchors/source.json"),
+                bundle_directory: PathBuf::from("/backups/bundle"),
+                anchor_export_path: PathBuf::from("/protected/anchor.json"),
+            })
+        );
+        assert_eq!(
+            invocation(
+                [
+                    "--ledger-backup-verify",
+                    "/backups/bundle",
+                    "/protected/anchor.json",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+            ),
+            Ok(Invocation::LedgerBackupVerify {
+                bundle_directory: PathBuf::from("/backups/bundle"),
+                anchor_export_path: PathBuf::from("/protected/anchor.json"),
+            })
+        );
+        assert_eq!(
+            invocation(
+                [
+                    "--ledger-backup-restore",
+                    "/backups/bundle",
+                    "/protected/anchor.json",
+                    "/restore/ledger",
+                    "/restore-protected/anchor.json",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+            ),
+            Ok(Invocation::LedgerBackupRestore {
+                bundle_directory: PathBuf::from("/backups/bundle"),
+                anchor_export_path: PathBuf::from("/protected/anchor.json"),
+                destination_directory: PathBuf::from("/restore/ledger"),
+                destination_anchor_path: PathBuf::from("/restore-protected/anchor.json"),
+            })
+        );
+        assert!(invocation(
+            ["--ledger-backup-verify", "/backups/bundle"]
+                .into_iter()
+                .map(str::to_owned)
         )
         .is_err());
     }
