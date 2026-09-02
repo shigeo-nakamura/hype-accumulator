@@ -65,6 +65,8 @@ struct ProtectedAnchorExport {
 struct VerifiedBackup {
     manifest: LedgerBackupManifest,
     anchor: Option<ProtectedHeadAnchor>,
+    ledger_payload: Vec<u8>,
+    snapshot_payload: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -279,6 +281,16 @@ pub fn restore_ledger_backup(
         destination_anchor_path,
     )?;
     let verified = load_verified_backup(bundle_directory, anchor_export_path)?;
+    let restore_source = stage_verified_restore_source(
+        &verified.ledger_payload,
+        &verified.snapshot_payload,
+        destination_directory.parent().ok_or_else(|| {
+            LedgerBackupError::InvalidPath(format!(
+                "restore destination has no parent: {}",
+                destination_directory.display()
+            ))
+        })?,
+    )?;
     let source_store: Arc<dyn ProtectedAnchorStore> = Arc::new(
         MemoryProtectedAnchorStore::from_anchor(verified.anchor.clone()),
     );
@@ -287,7 +299,7 @@ pub fn restore_ledger_backup(
             .map_err(|error| LedgerBackupError::InvalidPath(error.to_string()))?,
     );
     let restored = DurableLedger::restore_clean(
-        bundle_directory,
+        restore_source.path(),
         destination_directory,
         source_store,
         destination_store,
@@ -392,14 +404,33 @@ fn load_verified_backup(
         ));
     }
     drop(ledger);
-    for (name, expected) in &manifest.files {
-        let payload = read_single_linked_file(&bundle_directory.join(name))?;
-        verify_digest(name, &payload, expected)?;
-    }
+    let (ledger_payload, snapshot_payload) =
+        read_verified_restore_payloads(bundle_directory, &manifest)?;
     Ok(VerifiedBackup {
         manifest,
         anchor: anchor_export.anchor,
+        ledger_payload,
+        snapshot_payload,
     })
+}
+
+fn read_verified_restore_payloads(
+    bundle_directory: &Path,
+    manifest: &LedgerBackupManifest,
+) -> Result<(Vec<u8>, Vec<u8>), LedgerBackupError> {
+    let mut payloads = BTreeMap::new();
+    for (name, expected) in &manifest.files {
+        let payload = read_single_linked_file(&bundle_directory.join(name))?;
+        verify_digest(name, &payload, expected)?;
+        payloads.insert(name.as_str(), payload);
+    }
+    let ledger = payloads.remove(LEDGER_FILE_NAME).ok_or_else(|| {
+        LedgerBackupError::InvalidBundle("verified ledger payload is missing".to_owned())
+    })?;
+    let snapshot = payloads.remove(SNAPSHOT_FILE_NAME).ok_or_else(|| {
+        LedgerBackupError::InvalidBundle("verified snapshot payload is missing".to_owned())
+    })?;
+    Ok((ledger, snapshot))
 }
 
 fn validate_create_paths(
@@ -741,6 +772,26 @@ fn write_private_file(path: &Path, payload: &[u8]) -> Result<(), LedgerBackupErr
     Ok(())
 }
 
+fn stage_verified_restore_source(
+    ledger_payload: &[u8],
+    snapshot_payload: &[u8],
+    parent: &Path,
+) -> Result<tempfile::TempDir, LedgerBackupError> {
+    let directory = tempfile::Builder::new()
+        .prefix(".hype-ledger-restore.")
+        .tempdir_in(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
+    }
+    write_private_file(&directory.path().join(LEDGER_FILE_NAME), ledger_payload)?;
+    write_private_file(&directory.path().join(SNAPSHOT_FILE_NAME), snapshot_payload)?;
+    write_private_file(&directory.path().join(LEDGER_LOCK_FILE_NAME), &[])?;
+    sync_directory(directory.path())?;
+    Ok(directory)
+}
+
 fn publish_file_noreplace(source: &Path, destination: &Path) -> Result<(), LedgerBackupError> {
     // Both paths are siblings by construction. A hard link therefore provides
     // an atomic no-replace publication primitive on the same filesystem.
@@ -797,7 +848,10 @@ fn sync_directory(path: &Path) -> Result<(), LedgerBackupError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{publish_directory_noreplace, publish_file_noreplace, LedgerBackupError};
+    use super::{
+        publish_directory_noreplace, publish_file_noreplace, stage_verified_restore_source,
+        LedgerBackupError,
+    };
     use std::{fs, io};
 
     #[test]
@@ -841,6 +895,25 @@ mod tests {
         assert_eq!(
             fs::read_dir(&reserved).expect("read reservation").count(),
             0
+        );
+    }
+
+    #[test]
+    fn restore_source_is_materialized_from_captured_verified_bytes() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let staged = stage_verified_restore_source(
+            b"verified-ledger",
+            b"verified-snapshot",
+            directory.path(),
+        )
+        .expect("stage verified restore source");
+        assert_eq!(
+            fs::read(staged.path().join(super::LEDGER_FILE_NAME)).expect("read staged ledger"),
+            b"verified-ledger"
+        );
+        assert_eq!(
+            fs::read(staged.path().join(super::SNAPSHOT_FILE_NAME)).expect("read staged snapshot"),
+            b"verified-snapshot"
         );
     }
 }

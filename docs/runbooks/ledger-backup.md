@@ -99,8 +99,9 @@ hype-accumulator --ledger-backup-restore \
 
 Restore verifies every digest, the backup-ID/anchor binding, the hash chain,
 snapshot equality, and full ledger replay before it creates destination state.
-It then uses the durable ledger's clean-restore transaction and reopens the
-result against the new protected anchor. Never restore over the active runtime
+It preserves the exact verified payload bytes in a private temporary source,
+then uses the durable ledger's clean-restore transaction and reopens the result
+against the new protected anchor. Never restore over the active runtime
 directory or active protected anchor. Replacing active state, installing the
 restored copy, starting/restarting a service, or changing a deployment remains
 a separate explicit approval gate.
