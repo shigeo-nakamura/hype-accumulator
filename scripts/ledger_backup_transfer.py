@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ctypes
+import errno
 import hashlib
 import json
 import math
@@ -45,6 +47,8 @@ SINGLE_PUT_LIMIT_BYTES = 5_000_000_000
 DEFAULT_MULTIPART_PART_BYTES = 64 * 1024 * 1024
 MIN_MULTIPART_PART_BYTES = 5 * 1024 * 1024
 MAX_MULTIPART_PARTS = 10_000
+AT_FDCWD = -100
+RENAME_NOREPLACE = 1
 
 
 class TransferError(RuntimeError):
@@ -338,6 +342,33 @@ def run_verifier(
         raise TransferError("ledger verifier rejected the backup")
 
 
+def rename_noreplace(source: Path, destination: Path) -> None:
+    """Atomically move source to an absent destination on Linux."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        renameat2 = libc.renameat2
+    except AttributeError as error:
+        raise OSError(errno.ENOSYS, "renameat2 is unavailable") from error
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        AT_FDCWD,
+        os.fsencode(source),
+        AT_FDCWD,
+        os.fsencode(destination),
+        RENAME_NOREPLACE,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), str(destination))
+
+
 def write_private_json(path: Path, document: dict[str, object]) -> None:
     path = require_absolute_canonical(path, "receipt path", exists=False)
     parent = require_absolute_canonical(path.parent, "receipt parent", exists=True)
@@ -355,8 +386,7 @@ def write_private_json(path: Path, document: dict[str, object]) -> None:
             handle.flush()
             os.fchmod(handle.fileno(), 0o600)
             os.fsync(handle.fileno())
-        os.link(temporary_path, path, follow_symlinks=False)
-        temporary_path.unlink()
+        rename_noreplace(temporary_path, path)
         temporary_path = None
         parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:

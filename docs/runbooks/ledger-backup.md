@@ -68,8 +68,10 @@ itself an approval-gated operation. It requires:
   size, ETag, key, bucket owner, and returned KMS key ID for all six objects.
 
 The receipt is written and fsynced through a mode-0600 sibling temporary file,
-then atomically published without replacement. A pre-publication crash or I/O
-failure therefore cannot reserve the final receipt path with partial content.
+then atomically moved into place with Linux `renameat2(RENAME_NOREPLACE)`. A
+pre-publication crash or I/O failure therefore cannot reserve the final receipt
+path with partial or multiply-linked content. An unsupported filesystem fails
+closed without publishing the final path.
 
 Object Lock is preferred where fleet policy supports it. The runtime principal
 must not have delete access to both boundaries. A single bucket with different

@@ -206,18 +206,16 @@ class LedgerBackupTransferTests(unittest.TestCase):
 
     def test_receipt_publish_race_never_replaces_winner(self) -> None:
         receipt = self.root / "receipt.json"
-        original_link = os.link
+        original_rename = transfer.rename_noreplace
 
-        def publish_competitor_then_link(
-            source: Path, destination: Path, *, follow_symlinks: bool
-        ) -> None:
+        def publish_competitor_then_rename(source: Path, destination: Path) -> None:
             Path(destination).write_text("winner\n", encoding="utf-8")
             os.chmod(destination, 0o600)
-            original_link(source, destination, follow_symlinks=follow_symlinks)
+            original_rename(source, destination)
 
         with (
             mock.patch.object(
-                transfer.os, "link", side_effect=publish_competitor_then_link
+                transfer, "rename_noreplace", side_effect=publish_competitor_then_rename
             ),
             self.assertRaisesRegex(transfer.TransferError, "cannot be published"),
         ):
@@ -227,6 +225,12 @@ class LedgerBackupTransferTests(unittest.TestCase):
             [path.name for path in self.root.iterdir() if path.name.startswith(".receipt.json.tmp-")],
             [],
         )
+
+    def test_published_receipt_has_exactly_one_link(self) -> None:
+        receipt = self.root / "atomic-receipt.json"
+        transfer.write_private_json(receipt, {"backup_id": BACKUP_ID})
+        self.assertEqual(receipt.stat().st_nlink, 1)
+        self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
 
     def test_upload_rejects_suspended_versioning_before_put(self) -> None:
         self.aws.versioned.remove(ANCHOR_BUCKET)
