@@ -344,13 +344,20 @@ def write_private_json(path: Path, document: dict[str, object]) -> None:
     if path.exists() or path.is_symlink():
         raise TransferError("receipt output already exists")
     payload = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    temporary_path: Path | None = None
     try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.tmp-", dir=parent
+        )
+        temporary_path = Path(temporary_name)
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(payload)
             handle.flush()
             os.fchmod(handle.fileno(), 0o600)
             os.fsync(handle.fileno())
+        os.link(temporary_path, path, follow_symlinks=False)
+        temporary_path.unlink()
+        temporary_path = None
         parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
             os.fsync(parent_fd)
@@ -358,6 +365,15 @@ def write_private_json(path: Path, document: dict[str, object]) -> None:
             os.close(parent_fd)
     except OSError as error:
         raise TransferError(f"receipt cannot be published: {error}") from error
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                # Never mask the original publish result with temporary cleanup.
+                pass
 
 
 def validate_receipt_output(receipt: Path, bundle: Path, anchor: Path) -> None:

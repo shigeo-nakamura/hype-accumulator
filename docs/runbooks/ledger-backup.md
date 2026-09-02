@@ -67,6 +67,10 @@ itself an approval-gated operation. It requires:
 - a private, no-replace receipt containing the exact version ID, checksum,
   size, ETag, key, bucket owner, and returned KMS key ID for all six objects.
 
+The receipt is written and fsynced through a mode-0600 sibling temporary file,
+then atomically published without replacement. A pre-publication crash or I/O
+failure therefore cannot reserve the final receipt path with partial content.
+
 Object Lock is preferred where fleet policy supports it. The runtime principal
 must not have delete access to both boundaries. A single bucket with different
 prefixes is rejected because it does not prove an independent protected-anchor

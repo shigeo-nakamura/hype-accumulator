@@ -191,6 +191,43 @@ class LedgerBackupTransferTests(unittest.TestCase):
         self.assertEqual(self.aws.put_calls, 0)
         self.assertEqual(receipt.read_text(encoding="utf-8"), "existing\n")
 
+    def test_receipt_fsync_failure_never_reserves_final_path(self) -> None:
+        receipt = self.root / "receipt.json"
+        with (
+            mock.patch.object(transfer.os, "fsync", side_effect=OSError("fsync failed")),
+            self.assertRaisesRegex(transfer.TransferError, "cannot be published"),
+        ):
+            transfer.write_private_json(receipt, {"backup_id": BACKUP_ID})
+        self.assertFalse(receipt.exists())
+        self.assertEqual(
+            [path.name for path in self.root.iterdir() if path.name.startswith(".receipt.json.tmp-")],
+            [],
+        )
+
+    def test_receipt_publish_race_never_replaces_winner(self) -> None:
+        receipt = self.root / "receipt.json"
+        original_link = os.link
+
+        def publish_competitor_then_link(
+            source: Path, destination: Path, *, follow_symlinks: bool
+        ) -> None:
+            Path(destination).write_text("winner\n", encoding="utf-8")
+            os.chmod(destination, 0o600)
+            original_link(source, destination, follow_symlinks=follow_symlinks)
+
+        with (
+            mock.patch.object(
+                transfer.os, "link", side_effect=publish_competitor_then_link
+            ),
+            self.assertRaisesRegex(transfer.TransferError, "cannot be published"),
+        ):
+            transfer.write_private_json(receipt, {"backup_id": BACKUP_ID})
+        self.assertEqual(receipt.read_text(encoding="utf-8"), "winner\n")
+        self.assertEqual(
+            [path.name for path in self.root.iterdir() if path.name.startswith(".receipt.json.tmp-")],
+            [],
+        )
+
     def test_upload_rejects_suspended_versioning_before_put(self) -> None:
         self.aws.versioned.remove(ANCHOR_BUCKET)
         with self.assertRaisesRegex(transfer.TransferError, "versioning"):
