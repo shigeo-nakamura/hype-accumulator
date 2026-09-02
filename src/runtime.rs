@@ -164,12 +164,13 @@ impl RuntimeConfig {
                 "runtime paths must be absolute and may not contain . or .. components".to_owned(),
             ));
         }
-        if wire
-            .protected_anchor_path
-            .starts_with(&wire.state_directory)
+        if paths
+            .iter()
+            .skip(1)
+            .any(|path| path.starts_with(&wire.state_directory))
         {
             return Err(RuntimeError::InvalidConfig(
-                "protected anchor must be outside the mutable runtime state directory".to_owned(),
+                "configured runtime files must be outside the reserved state directory".to_owned(),
             ));
         }
         let mut unique_paths = BTreeSet::new();
@@ -213,6 +214,17 @@ impl RuntimeConfig {
     #[must_use]
     pub fn signal_snapshot_path(&self) -> &Path {
         &self.signal_snapshot_path
+    }
+
+    fn configured_file_paths(&self) -> [&Path; 6] {
+        [
+            &self.protected_anchor_path,
+            &self.admission_approvals_path,
+            &self.signal_snapshot_path,
+            &self.status_path,
+            &self.metrics_path,
+            &self.cycle_report_path,
+        ]
     }
 }
 
@@ -502,6 +514,7 @@ pub struct RuntimeCycleReport {
     economic_action_suppressed: bool,
     signed_action_created: bool,
     signal_available: bool,
+    boundary_balance_available: bool,
 }
 
 impl RuntimeCycleReport {
@@ -537,6 +550,7 @@ impl SignerFreeRuntime {
     pub fn open(config: RuntimeConfig, limits: PacingLimits) -> Result<Self, RuntimeError> {
         limits.validate()?;
         fs::create_dir_all(&config.state_directory)?;
+        ensure_configured_files_outside_state(&config)?;
         ensure_protected_boundary(&config)?;
         let lock_path = config.state_directory.join(RUNTIME_LOCK_FILE_NAME);
         let mut options = OpenOptions::new();
@@ -614,6 +628,8 @@ impl SignerFreeRuntime {
             .get(&input.observed_at.date_naive())
             .cloned();
         let scheduled_boundary = scheduled_decision_boundary(input.observed_at, &self.limits)?;
+        let boundary_balance_available = scheduled_boundary
+            .is_some_and(|boundary| *input.accumulator.balance_observed_at() == boundary);
         let boundary_replay_safe = scheduled_boundary.is_some_and(|boundary| {
             existing_decision.is_none()
                 && self
@@ -741,8 +757,12 @@ impl SignerFreeRuntime {
             let boundary_pacing = next_state.pacing.clone();
             let decision_input = DecisionInput {
                 at: boundary,
-                observed_spot_usdc,
-                capital_history_complete,
+                observed_spot_usdc: if boundary_balance_available {
+                    observed_spot_usdc
+                } else {
+                    UsdcMicros::default()
+                },
+                capital_history_complete: capital_history_complete && boundary_balance_available,
                 manual_pause: input.manual_pause,
             };
             let result = match input.signal {
@@ -842,6 +862,7 @@ impl SignerFreeRuntime {
             economic_action_suppressed: true,
             signed_action_created: false,
             signal_available: input.signal.is_some(),
+            boundary_balance_available,
         };
         let pending = PendingRuntimeCycle::new(input.observed_at, next_state, ledger_events)?;
         write_private_json_atomic(
@@ -887,6 +908,24 @@ fn ensure_protected_boundary(config: &RuntimeConfig) -> Result<(), RuntimeError>
         return Err(RuntimeError::InvalidConfig(
             "protected anchor resolves inside the mutable runtime state directory".to_owned(),
         ));
+    }
+    Ok(())
+}
+
+fn ensure_configured_files_outside_state(config: &RuntimeConfig) -> Result<(), RuntimeError> {
+    let canonical_state = fs::canonicalize(&config.state_directory)?;
+    for path in config.configured_file_paths() {
+        let parent = path.parent().ok_or_else(|| {
+            RuntimeError::InvalidConfig("configured runtime file has no parent".to_owned())
+        })?;
+        fs::create_dir_all(parent)?;
+        let canonical_parent = fs::canonicalize(parent)?;
+        if canonical_parent.starts_with(&canonical_state) {
+            return Err(RuntimeError::InvalidConfig(
+                "configured runtime file resolves inside the reserved state directory".to_owned(),
+            ));
+        }
+        reject_linked_file(path)?;
     }
     Ok(())
 }
@@ -1331,7 +1370,13 @@ fn ensure_runtime_state_authenticated(
         Err(error) => return Err(error.into()),
     };
     match (ledger.last_runtime_cycle_hash(), proof) {
-        (None, None) if state.last_committed_cycle_hash.is_none() => Ok(()),
+        (None, None)
+            if state == &RuntimeState::new(config.movement_history_start_ms)
+                && ledger.last_event_at().is_none() =>
+        {
+            Ok(())
+        }
+        (None, None) => Err(RuntimeError::RuntimeStateRollback),
         (Some(head), Some(proof)) => {
             proof.validate(config.movement_history_start_ms)?;
             if proof.cycle_hash != head {

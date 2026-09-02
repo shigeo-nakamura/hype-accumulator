@@ -120,10 +120,11 @@ async fn run_dry_run_cycle(
     config.validate_signer_free_runtime(&ProcessEnvironment)?;
     let limits = PacingLimits::from_config(&config)?;
     let runtime_config = RuntimeConfig::from_toml(&fs::read_to_string(runtime_config_path)?)?;
-    let approvals = AdmissionApprovals::from_json(&fs::read_to_string(
-        runtime_config.admission_approvals_path(),
-    )?)?;
-    let signal = match fs::read_to_string(runtime_config.signal_snapshot_path()) {
+    let approvals_path = runtime_config.admission_approvals_path().to_path_buf();
+    let signal_path = runtime_config.signal_snapshot_path().to_path_buf();
+    let mut runtime = SignerFreeRuntime::open(runtime_config, limits)?;
+    let approvals = AdmissionApprovals::from_json(&fs::read_to_string(approvals_path)?)?;
+    let signal = match fs::read_to_string(signal_path) {
         Ok(payload) => {
             if let Ok(signal) = SignalSnapshot::from_json(&payload) {
                 Some(signal)
@@ -140,7 +141,6 @@ async fn run_dry_run_cycle(
     };
     let account = config.observation_account(&ProcessEnvironment)?;
     let observer = HyperliquidObserver::new(&config.hyperliquid.endpoint, &account)?;
-    let mut runtime = SignerFreeRuntime::open(runtime_config, limits)?;
     let accumulator = observer
         .observe(
             &HypeAttribution::Unavailable,

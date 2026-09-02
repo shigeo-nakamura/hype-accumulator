@@ -34,23 +34,30 @@ no signer, order, staking payload, nonce, or submission client.
   `core_signal_unavailable` skip. A later same-day snapshot cannot replace it.
 - A valid signal snapshot must bind to that day's configured UTC hour/minute,
   with seconds set to zero. Delayed timer execution still records the decision
-  at that boundary. Deposits, withdrawals, confirmations, and approvals after
-  the boundary are reconciled only after the decision and become available no
-  earlier than the next eligible day.
+  at that boundary. Unless the balance observation is bound to that exact
+  instant, the decision uses a fixed zero balance and durably skips with
+  `missing_capital_history`; it never substitutes an earlier or current
+  balance for a historical one. Deposits, withdrawals, confirmations, and
+  approvals after the boundary are reconciled only after that skip and become
+  available no earlier than the next eligible day.
 - Every planned DRY_RUN amount is recorded and counted, but the cycle report
   always states `economic_action_suppressed=true` and
   `signed_action_created=false`.
 
 ## Persistence boundaries
 
-The runtime state directory contains the pacing snapshot and append-only audit
-ledger. `protected_anchor_path` must be outside that directory. On a deployed
-host, protect the anchor parent with a distinct filesystem/IAM boundary; a
-second path on the same mutable boundary is not credited as rollback
-protection. Relative paths, `.`/`..` components, anchor symlinks, hard-linked
-anchors, and anchor-parent symlink aliases into the state directory are
-rejected. Runtime state, pending transaction, protected anchor, and private
-cycle report files are written with mode `0600` on Unix.
+The runtime state directory is reserved exclusively for the pacing snapshot,
+transaction proof files, lock, and append-only audit ledger. Every configured
+input/output file must be outside that directory, including after resolving
+its parent. Relative paths, `.`/`..` components, configured-file symlinks, and
+parent symlink aliases into the state directory are rejected.
+
+`protected_anchor_path` also requires its own filesystem/IAM boundary; a second
+path on the same mutable boundary is not credited as rollback protection.
+Anchor symlinks and hard links are rejected. Before the first protected cycle,
+an empty ledger accepts only the exact pristine runtime state. Runtime state,
+pending transaction, committed proof, protected anchor, and private cycle
+report files are written with mode `0600` on Unix.
 
 The private cycle report contains correlation IDs and tranche allocation. The
 public `status.json` and Prometheus output are identifier-free. Do not place an

@@ -190,6 +190,23 @@ movement_history_start_ms = 1
         ),
         Err(RuntimeError::InvalidConfig(_))
     ));
+    let reserved_artifact = colocated
+        .replace(
+            &state.join("anchor.json").display().to_string(),
+            &directory
+                .path()
+                .join("protected/anchor.json")
+                .display()
+                .to_string(),
+        )
+        .replace(
+            &directory.path().join("cycle.json").display().to_string(),
+            &state.join(STATE_FILE_NAME).display().to_string(),
+        );
+    assert!(matches!(
+        RuntimeConfig::from_toml(&reserved_artifact),
+        Err(RuntimeError::InvalidConfig(_))
+    ));
 }
 
 #[cfg(unix)]
@@ -219,6 +236,41 @@ fn runtime_open_rejects_a_hard_linked_protected_anchor() {
     fs::hard_link(&alias_source, protected.join("ledger-anchor.json")).expect("hard-linked anchor");
 
     assert!(SignerFreeRuntime::open(config(directory.path(), 1), limits()).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_open_rejects_an_output_parent_symlinked_into_state() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let state = directory.path().join("state");
+    fs::create_dir_all(&state).expect("state directory");
+    symlink(&state, directory.path().join("private")).expect("private parent symlink");
+
+    assert!(matches!(
+        SignerFreeRuntime::open(config(directory.path(), 1), limits()),
+        Err(RuntimeError::InvalidConfig(_))
+    ));
+}
+
+#[test]
+fn empty_ledger_requires_exact_pristine_runtime_state() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let runtime_config = config(directory.path(), 1);
+    fs::create_dir_all(&runtime_config.state_directory).expect("state directory");
+    let mut forged = RuntimeState::new(1);
+    forged.last_complete_scan_end_ms = Some(2);
+    write_private_json_atomic(
+        runtime_config.state_directory.join(STATE_FILE_NAME),
+        &forged,
+    )
+    .expect("forged pristine state");
+
+    assert!(matches!(
+        SignerFreeRuntime::open(runtime_config, limits()),
+        Err(RuntimeError::RuntimeStateRollback)
+    ));
 }
 
 #[test]
@@ -365,7 +417,7 @@ fn approved_deposit_plans_once_and_same_day_restart_replays_without_second_actio
 }
 
 #[test]
-fn deposit_after_scheduled_boundary_is_admitted_only_after_that_days_decision() {
+fn delayed_decision_ignores_current_balance_and_admits_later_deposit_after_skip() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let start = at(2026, 7, 6, 8, 0);
     let boundary = at(2026, 7, 6, 12, 0);
@@ -394,8 +446,13 @@ fn deposit_after_scheduled_boundary_is_admitted_only_after_that_days_decision() 
 
     let decision = report.decision().expect("durable boundary decision");
     assert_eq!(decision.decided_at, boundary);
-    assert_eq!(decision.reason, DecisionReason::NoAdmittedCapital);
+    assert_eq!(decision.reason, DecisionReason::MissingCapitalHistory);
     assert!(decision.planned_usdc.is_zero());
+    assert_eq!(
+        decision.explanation.observed_budget_after_reserve_usdc,
+        UsdcMicros::default()
+    );
+    assert!(!report.boundary_balance_available);
     assert_eq!(
         runtime
             .state
