@@ -904,7 +904,6 @@ class AwsCli:
         sha256: str,
         scratch_root: Path | None = None,
     ) -> str:
-        self._require_no_pending_multipart(bucket, key, owner)
         size = source.stat().st_size
         part_size = max(
             self.multipart_part_bytes,
@@ -1027,6 +1026,7 @@ class AwsCli:
             raise TransferError(
                 f"remote object history shows replacement or deletion for {bucket}/{key}"
             )
+        self._require_no_pending_multipart(bucket, key, owner)
         existing = self._head(bucket, key, owner)
         if versions:
             if existing is None or existing.get("VersionId") != versions[0]:

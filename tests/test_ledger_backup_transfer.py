@@ -499,6 +499,31 @@ class LedgerBackupTransferTests(unittest.TestCase):
                 sha256=transfer.sha256_file(self.anchor),
             )
 
+    def test_pending_multipart_is_rejected_before_single_put(self) -> None:
+        cli = transfer.AwsCli(Path("/usr/bin/true"), "eu-central-1")
+        with (
+            mock.patch.object(cli, "_key_history", return_value=([], [])),
+            mock.patch.object(
+                cli,
+                "_require_no_pending_multipart",
+                side_effect=transfer.TransferError("incomplete multipart upload exists"),
+            ),
+            mock.patch.object(cli, "_head") as head,
+            mock.patch.object(cli, "_put_single") as put_single,
+            self.assertRaisesRegex(transfer.TransferError, "incomplete multipart"),
+        ):
+            cli.put_immutable(
+                bucket=PAYLOAD_BUCKET,
+                key="backup/ledger",
+                source=self.anchor,
+                owner=OWNER,
+                kms_key_id=f"arn:aws:kms:eu-central-1:{OWNER}:key/payload",
+                backup_id=BACKUP_ID,
+                sha256=transfer.sha256_file(self.anchor),
+            )
+        head.assert_not_called()
+        put_single.assert_not_called()
+
     def test_large_object_branch_uses_multipart_and_reconciles_one_version(self) -> None:
         kms_key = f"arn:aws:kms:eu-central-1:{OWNER}:key/payload"
         digest = transfer.sha256_file(self.anchor)
@@ -521,6 +546,7 @@ class LedgerBackupTransferTests(unittest.TestCase):
         )
         with (
             mock.patch.object(cli, "_key_history", side_effect=[([], []), (["version-1"], [])]),
+            mock.patch.object(cli, "_require_no_pending_multipart"),
             mock.patch.object(cli, "_head", side_effect=[None, head_response]),
             mock.patch.object(cli, "_put_multipart", return_value=composite) as multipart,
         ):
@@ -548,8 +574,6 @@ class LedgerBackupTransferTests(unittest.TestCase):
         def fake_json(arguments: list[str], _label: str, *, transfer: bool = False) -> dict[str, object]:
             commands.append(arguments)
             operation = arguments[1]
-            if operation == "list-multipart-uploads":
-                return {}
             if operation == "create-multipart-upload":
                 self.assertIn("COMPOSITE", arguments)
                 self.assertIn(kms_key, arguments)
@@ -603,7 +627,6 @@ class LedgerBackupTransferTests(unittest.TestCase):
         self.assertEqual(
             [command[1] for command in commands],
             [
-                "list-multipart-uploads",
                 "create-multipart-upload",
                 "upload-part",
                 "complete-multipart-upload",
