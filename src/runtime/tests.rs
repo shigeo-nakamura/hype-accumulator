@@ -82,6 +82,24 @@ fn status(observed_at: DateTime<Utc>, usdc: f64) -> AccumulatorStatus {
     .expect("valid status")
 }
 
+fn status_window(
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+    usdc: f64,
+) -> AccumulatorStatus {
+    AccumulatorStatus::new_with_balance_window(
+        usdc,
+        0.0,
+        10.0,
+        started_at,
+        completed_at,
+        None,
+        "daily",
+        Some("HYPE attribution unavailable; account holdings excluded".to_owned()),
+    )
+    .expect("valid status window")
+}
+
 fn deposit(event_id: &str, occurred_at: DateTime<Utc>, amount: u64) -> HyperliquidAccountMovement {
     HyperliquidAccountMovement {
         event_id: event_id.to_owned(),
@@ -575,11 +593,72 @@ fn newly_admitted_deposit_is_committed_before_a_dependent_withdrawal() {
         .exists());
     drop(runtime);
 
-    SignerFreeRuntime::open(runtime_config, limits()).expect("reopen committed cycle");
+    let replay_at = observed_at + TimeDelta::minutes(5);
+    let mut reopened =
+        SignerFreeRuntime::open(runtime_config, limits()).expect("reopen committed cycle");
+    let replay = reopened
+        .apply_cycle(RuntimeCycleInput {
+            observed_at: replay_at,
+            scan_start_ms: reopened.next_scan_start_ms(),
+            scan_end_ms: ms(replay_at),
+            movements: &movements,
+            approvals: &admission,
+            signal: None,
+            accumulator: status(replay_at, 60.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+        })
+        .expect("overlap scan reuses the durable withdrawal reconciliation time");
+    assert!(replay.decision().is_none());
+    assert_eq!(reopened.ledger.state().withdrawn_usdc(), usd(40));
 }
 
 #[test]
-fn delayed_decision_ignores_current_balance_and_admits_later_deposit_after_skip() {
+fn delayed_cycle_reconstructs_boundary_balance_before_a_later_withdrawal() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = at(2026, 7, 6, 9, 0);
+    let boundary = at(2026, 7, 6, 12, 0);
+    let withdrawal_at = boundary + TimeDelta::minutes(3);
+    let observed_at = boundary + TimeDelta::minutes(5);
+    let runtime_config = config(directory.path(), ms(start));
+    let movements = vec![
+        deposit("deposit-before-boundary", deposit_at, 100),
+        withdrawal("withdrawal-after-boundary", withdrawal_at, 40),
+    ];
+    let admission = approvals("deposit-before-boundary", deposit_at, deposit_at);
+    let signal = signal(boundary);
+    let mut runtime = SignerFreeRuntime::open(runtime_config, limits()).expect("open runtime");
+
+    let report = runtime
+        .apply_cycle(RuntimeCycleInput {
+            observed_at,
+            scan_start_ms: ms(start),
+            scan_end_ms: ms(observed_at),
+            movements: &movements,
+            approvals: &admission,
+            signal: Some(&signal),
+            accumulator: status(observed_at, 60.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+        })
+        .expect("delayed dry-run cycle");
+
+    let decision = report.decision().expect("durable boundary decision");
+    assert_eq!(decision.decided_at, boundary);
+    assert_eq!(decision.reason, DecisionReason::Planned);
+    assert_eq!(
+        decision.explanation.observed_budget_after_reserve_usdc,
+        usd(100)
+    );
+    assert!(report.boundary_balance_available);
+    assert_eq!(runtime.ledger.state().withdrawn_usdc(), usd(40));
+}
+
+#[test]
+fn delayed_decision_removes_a_later_deposit_from_boundary_balance() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let start = at(2026, 7, 6, 8, 0);
     let boundary = at(2026, 7, 6, 12, 0);
@@ -608,13 +687,13 @@ fn delayed_decision_ignores_current_balance_and_admits_later_deposit_after_skip(
 
     let decision = report.decision().expect("durable boundary decision");
     assert_eq!(decision.decided_at, boundary);
-    assert_eq!(decision.reason, DecisionReason::MissingCapitalHistory);
+    assert_eq!(decision.reason, DecisionReason::NoAdmittedCapital);
     assert!(decision.planned_usdc.is_zero());
     assert_eq!(
         decision.explanation.observed_budget_after_reserve_usdc,
         UsdcMicros::default()
     );
-    assert!(!report.boundary_balance_available);
+    assert!(report.boundary_balance_available);
     assert_eq!(
         runtime
             .state
@@ -625,6 +704,42 @@ fn delayed_decision_ignores_current_balance_and_admits_later_deposit_after_skip(
             .admitted_usdc,
         usd(100)
     );
+}
+
+#[test]
+fn movement_during_balance_request_window_makes_boundary_balance_unavailable() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let boundary = at(2026, 7, 6, 12, 0);
+    let request_started_at = boundary + TimeDelta::minutes(3);
+    let deposit_at = boundary + TimeDelta::minutes(4);
+    let observed_at = boundary + TimeDelta::minutes(5);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-during-balance-request", deposit_at, 100);
+    let admission = approvals("deposit-during-balance-request", deposit_at, deposit_at);
+    let signal = signal(boundary);
+    let mut runtime = SignerFreeRuntime::open(runtime_config, limits()).expect("open runtime");
+
+    let report = runtime
+        .apply_cycle(RuntimeCycleInput {
+            observed_at,
+            scan_start_ms: ms(start),
+            scan_end_ms: ms(observed_at),
+            movements: &[movement],
+            approvals: &admission,
+            signal: Some(&signal),
+            accumulator: status_window(request_started_at, observed_at, 100.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+        })
+        .expect("ambiguous balance window records a fail-closed skip");
+
+    assert_eq!(
+        report.decision().expect("durable boundary decision").reason,
+        DecisionReason::MissingCapitalHistory
+    );
+    assert!(!report.boundary_balance_available);
 }
 
 #[cfg(unix)]

@@ -149,11 +149,13 @@ impl HyperliquidObserver {
         attribution: &HypeAttribution,
         trade_cadence: impl Into<String>,
     ) -> Result<AccumulatorStatus, MonitorError> {
+        let balance_observation_started_at = Utc::now();
         let combined = self
             .connector
             .get_combined_balance()
             .await
             .map_err(|error| MonitorError::Connector(error.to_string()))?;
+        let balance_observed_at = Utc::now();
         let ticker = self
             .connector
             .get_ticker(HYPE_SPOT_SYMBOL, None)
@@ -185,7 +187,14 @@ impl HyperliquidObserver {
                 },
             )?,
         };
-        reconcile_status(&balances, &staking, attribution, Utc::now(), trade_cadence)
+        reconcile_status_with_balance_window(
+            &balances,
+            &staking,
+            attribution,
+            balance_observation_started_at,
+            balance_observed_at,
+            trade_cadence,
+        )
     }
 
     async fn post_info<T: DeserializeOwned>(&self, body: Value) -> Result<T, MonitorError> {
@@ -217,6 +226,24 @@ pub fn reconcile_status(
     staking: &StakingObservation,
     attribution: &HypeAttribution,
     observed_at: DateTime<Utc>,
+    trade_cadence: impl Into<String>,
+) -> Result<AccumulatorStatus, MonitorError> {
+    reconcile_status_with_balance_window(
+        balances,
+        staking,
+        attribution,
+        observed_at,
+        observed_at,
+        trade_cadence,
+    )
+}
+
+fn reconcile_status_with_balance_window(
+    balances: &BalanceObservation,
+    staking: &StakingObservation,
+    attribution: &HypeAttribution,
+    balance_observation_started_at: DateTime<Utc>,
+    balance_observed_at: DateTime<Utc>,
     trade_cadence: impl Into<String>,
 ) -> Result<AccumulatorStatus, MonitorError> {
     for (label, value) in [
@@ -262,11 +289,12 @@ pub fn reconcile_status(
         }
     };
     let health_reason = (!health_reasons.is_empty()).then(|| health_reasons.join("; "));
-    AccumulatorStatus::new(
+    AccumulatorStatus::new_with_balance_window(
         balances.spot_usdc,
         attributed_hype,
         balances.hype_price_usdc,
-        observed_at,
+        balance_observation_started_at,
+        balance_observed_at,
         last_trade_at,
         trade_cadence,
         health_reason,

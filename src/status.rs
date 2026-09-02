@@ -16,6 +16,8 @@ pub struct AccumulatorStatus {
     usdc_balance: f64,
     hype_balance: f64,
     hype_price_usdc: f64,
+    #[serde(skip)]
+    balance_observation_started_at: DateTime<Utc>,
     balance_observed_at: DateTime<Utc>,
     last_trade_at: Option<DateTime<Utc>>,
     trade_cadence: String,
@@ -51,6 +53,8 @@ pub enum StatusError {
     EmptyHealthReason,
     #[error("last_trade_at must not be after balance_observed_at")]
     FutureLastTrade,
+    #[error("balance observation start must not be after completion")]
+    InvalidBalanceObservationWindow,
     #[error("operations observation must not be after status update")]
     FutureOperations,
 }
@@ -74,6 +78,37 @@ impl AccumulatorStatus {
         trade_cadence: impl Into<String>,
         health_reason: Option<String>,
     ) -> Result<Self, StatusError> {
+        Self::new_with_balance_window(
+            usdc_balance,
+            hype_balance,
+            hype_price_usdc,
+            balance_observed_at,
+            balance_observed_at,
+            last_trade_at,
+            trade_cadence,
+            health_reason,
+        )
+    }
+
+    /// Constructs a validated balance snapshot whose value was obtained within
+    /// a closed request window. The start is retained only for point-in-time
+    /// reconciliation and is not emitted in public status JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StatusError`] for an inverted observation window or any error
+    /// accepted by [`Self::new`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_balance_window(
+        usdc_balance: f64,
+        hype_balance: f64,
+        hype_price_usdc: f64,
+        balance_observation_started_at: DateTime<Utc>,
+        balance_observed_at: DateTime<Utc>,
+        last_trade_at: Option<DateTime<Utc>>,
+        trade_cadence: impl Into<String>,
+        health_reason: Option<String>,
+    ) -> Result<Self, StatusError> {
         finite_non_negative("usdc_balance", usdc_balance)?;
         finite_non_negative("hype_balance", hype_balance)?;
         if !hype_price_usdc.is_finite() {
@@ -84,6 +119,9 @@ impl AccumulatorStatus {
         }
         if last_trade_at.is_some_and(|value| value > balance_observed_at) {
             return Err(StatusError::FutureLastTrade);
+        }
+        if balance_observation_started_at > balance_observed_at {
+            return Err(StatusError::InvalidBalanceObservationWindow);
         }
         let trade_cadence = trade_cadence.into();
         if trade_cadence.trim().is_empty() {
@@ -101,6 +139,7 @@ impl AccumulatorStatus {
             usdc_balance,
             hype_balance,
             hype_price_usdc,
+            balance_observation_started_at,
             balance_observed_at,
             last_trade_at,
             trade_cadence,
@@ -132,6 +171,11 @@ impl AccumulatorStatus {
     #[must_use]
     pub const fn balance_observed_at(&self) -> &DateTime<Utc> {
         &self.balance_observed_at
+    }
+
+    #[must_use]
+    pub const fn balance_observation_started_at(&self) -> &DateTime<Utc> {
+        &self.balance_observation_started_at
     }
 
     #[must_use]

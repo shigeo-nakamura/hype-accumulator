@@ -633,8 +633,6 @@ impl SignerFreeRuntime {
                 signal.decision_at() == boundary && signal.decision_date() == boundary.date_naive()
             })
         });
-        let boundary_balance_available = scheduled_boundary
-            .is_some_and(|boundary| *input.accumulator.balance_observed_at() == boundary);
         let boundary_replay_safe = scheduled_boundary.is_some_and(|boundary| {
             existing_decision.is_none()
                 && self
@@ -644,6 +642,25 @@ impl SignerFreeRuntime {
                     .is_none_or(|watermark| watermark <= boundary)
         });
         let mut capital_history_complete = input.capital_history_complete;
+        let balance_observation_started_at = *input.accumulator.balance_observation_started_at();
+        let balance_observed_at = *input.accumulator.balance_observed_at();
+        let boundary_interval_covered = scheduled_boundary.is_some_and(|boundary| {
+            let start_ms = boundary
+                .timestamp_millis()
+                .min(balance_observation_started_at.timestamp_millis());
+            let end_ms = boundary
+                .timestamp_millis()
+                .max(balance_observed_at.timestamp_millis());
+            u64::try_from(start_ms)
+                .ok()
+                .zip(u64::try_from(end_ms).ok())
+                .is_some_and(|(start_ms, end_ms)| {
+                    input.scan_start_ms <= start_ms && input.scan_end_ms >= end_ms
+                })
+        });
+        let mut boundary_balance_reconstructable =
+            input.capital_history_complete && boundary_interval_covered;
+        let mut boundary_balance_effects = BTreeMap::new();
         let mut capital_events = existing_deposit_events(&self.state.pacing, input.approvals)?;
         let mut observed_deposit_ids = self
             .state
@@ -659,13 +676,41 @@ impl SignerFreeRuntime {
         ordered_movements.sort_by_key(|movement| (movement.timestamp_ms, &movement.event_id));
         for movement in ordered_movements {
             validate_movement_range(movement, &input)?;
+            let occurred_at = timestamp_ms(movement.timestamp_ms)?;
+            let in_balance_request_window = movement_in_balance_observation_window(
+                movement.timestamp_ms,
+                balance_observation_started_at,
+                balance_observed_at,
+            );
+            let between_balance_and_boundary = scheduled_boundary.is_some_and(|boundary| {
+                boundary_balance_direction(occurred_at, balance_observed_at, boundary).is_some()
+            });
+            if matches!(
+                movement.kind,
+                HyperliquidAccountMovementKind::Unknown
+                    | HyperliquidAccountMovementKind::InternalTransfer
+                    | HyperliquidAccountMovementKind::TradingRelated
+            ) && (in_balance_request_window || between_balance_and_boundary)
+            {
+                boundary_balance_reconstructable = false;
+            }
             if movement.token != "USDC" {
                 continue;
+            }
+            if in_balance_request_window {
+                boundary_balance_reconstructable = false;
             }
             match movement.kind {
                 HyperliquidAccountMovementKind::ExternalDeposit => {
                     let amount = positive_usdc_micros(movement.amount)?;
-                    let occurred_at = timestamp_ms(movement.timestamp_ms)?;
+                    record_boundary_balance_effect(
+                        &mut boundary_balance_effects,
+                        &movement.event_id,
+                        occurred_at,
+                        scheduled_boundary,
+                        balance_observed_at,
+                        i128::from(amount.as_micros()),
+                    )?;
                     movement_ledger_events.push(LedgerEvent {
                         event_id: movement.event_id.clone(),
                         occurred_at,
@@ -694,7 +739,14 @@ impl SignerFreeRuntime {
                 }
                 HyperliquidAccountMovementKind::ExternalWithdrawal => {
                     let amount = positive_usdc_micros(movement.amount.abs())?;
-                    let occurred_at = timestamp_ms(movement.timestamp_ms)?;
+                    record_boundary_balance_effect(
+                        &mut boundary_balance_effects,
+                        &movement.event_id,
+                        occurred_at,
+                        scheduled_boundary,
+                        balance_observed_at,
+                        -i128::from(amount.as_micros()),
+                    )?;
                     movement_ledger_events.push(LedgerEvent {
                         event_id: movement.event_id.clone(),
                         occurred_at,
@@ -706,11 +758,17 @@ impl SignerFreeRuntime {
                         event_id: movement.event_id.clone(),
                         amount_usdc: amount,
                         occurred_at,
-                        reconciled_at: input.observed_at,
+                        reconciled_at: self
+                            .state
+                            .pacing
+                            .withdrawals()
+                            .get(&movement.event_id)
+                            .map_or(input.observed_at, |record| record.event.reconciled_at),
                     }));
                 }
                 HyperliquidAccountMovementKind::Unknown => {
                     capital_history_complete = false;
+                    boundary_balance_reconstructable = false;
                 }
                 HyperliquidAccountMovementKind::InternalTransfer
                 | HyperliquidAccountMovementKind::TradingRelated => {}
@@ -723,6 +781,14 @@ impl SignerFreeRuntime {
         }
 
         let observed_spot_usdc = f64_usdc_micros(input.accumulator.usdc_balance())?;
+        let (boundary_observed_spot_usdc, boundary_balance_available) =
+            reconstruct_boundary_balance(
+                observed_spot_usdc,
+                balance_observed_at,
+                scheduled_boundary,
+                capital_history_complete && boundary_balance_reconstructable,
+                &boundary_balance_effects,
+            )?;
         let mut next_state = self.state.clone();
         let mut ledger_events = Vec::new();
         let decision_result = if let Some(decision) = existing_decision {
@@ -768,11 +834,7 @@ impl SignerFreeRuntime {
             let boundary_pacing = next_state.pacing.clone();
             let decision_input = DecisionInput {
                 at: boundary,
-                observed_spot_usdc: if boundary_balance_available {
-                    observed_spot_usdc
-                } else {
-                    UsdcMicros::default()
-                },
+                observed_spot_usdc: boundary_observed_spot_usdc,
                 capital_history_complete: capital_history_complete && boundary_balance_available,
                 manual_pause: input.manual_pause,
             };
@@ -1082,6 +1144,97 @@ fn load_runtime_state(
         }
         Err(error) => Err(error.into()),
     }
+}
+
+fn boundary_balance_direction(
+    occurred_at: DateTime<Utc>,
+    balance_observed_at: DateTime<Utc>,
+    boundary: DateTime<Utc>,
+) -> Option<i128> {
+    if balance_observed_at < boundary
+        && occurred_at > balance_observed_at
+        && occurred_at <= boundary
+    {
+        Some(1)
+    } else if balance_observed_at > boundary
+        && occurred_at > boundary
+        && occurred_at <= balance_observed_at
+    {
+        Some(-1)
+    } else {
+        None
+    }
+}
+
+fn movement_in_balance_observation_window(
+    movement_timestamp_ms: u64,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+) -> bool {
+    u64::try_from(started_at.timestamp_millis())
+        .ok()
+        .zip(u64::try_from(completed_at.timestamp_millis()).ok())
+        .is_none_or(|(started_ms, completed_ms)| {
+            movement_timestamp_ms >= started_ms && movement_timestamp_ms <= completed_ms
+        })
+}
+
+fn record_boundary_balance_effect(
+    effects: &mut BTreeMap<String, i128>,
+    event_id: &str,
+    occurred_at: DateTime<Utc>,
+    scheduled_boundary: Option<DateTime<Utc>>,
+    balance_observed_at: DateTime<Utc>,
+    balance_effect: i128,
+) -> Result<(), RuntimeError> {
+    let Some(direction) = scheduled_boundary.and_then(|boundary| {
+        boundary_balance_direction(occurred_at, balance_observed_at, boundary)
+    }) else {
+        return Ok(());
+    };
+    let adjustment = balance_effect
+        .checked_mul(direction)
+        .ok_or_else(|| RuntimeError::InvalidCycle("boundary balance overflow".to_owned()))?;
+    if let Some(existing) = effects.get(event_id) {
+        if *existing != adjustment {
+            return Err(RuntimeError::InvalidCycle(
+                "conflicting movement in boundary balance interval".to_owned(),
+            ));
+        }
+        return Ok(());
+    }
+    effects.insert(event_id.to_owned(), adjustment);
+    Ok(())
+}
+
+fn reconstruct_boundary_balance(
+    observed_spot_usdc: UsdcMicros,
+    balance_observed_at: DateTime<Utc>,
+    scheduled_boundary: Option<DateTime<Utc>>,
+    interval_complete: bool,
+    effects: &BTreeMap<String, i128>,
+) -> Result<(UsdcMicros, bool), RuntimeError> {
+    let Some(boundary) = scheduled_boundary else {
+        return Ok((UsdcMicros::default(), false));
+    };
+    if balance_observed_at == boundary && interval_complete {
+        return Ok((observed_spot_usdc, true));
+    }
+    if !interval_complete {
+        return Ok((UsdcMicros::default(), false));
+    }
+    let adjustment = effects.values().try_fold(0_i128, |total, value| {
+        total
+            .checked_add(*value)
+            .ok_or_else(|| RuntimeError::InvalidCycle("boundary balance overflow".to_owned()))
+    })?;
+    let reconstructed = i128::from(observed_spot_usdc.as_micros())
+        .checked_add(adjustment)
+        .ok_or_else(|| RuntimeError::InvalidCycle("boundary balance overflow".to_owned()))?;
+    let Ok(reconstructed) = u64::try_from(reconstructed) else {
+        return Ok((UsdcMicros::default(), false));
+    };
+    Ok((UsdcMicros::from_micros(reconstructed), true))
 }
 
 fn validate_cycle_range(

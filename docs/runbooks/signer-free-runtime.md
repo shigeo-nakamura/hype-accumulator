@@ -50,12 +50,16 @@ action.
   cannot replace the recorded skip.
 - A valid signal snapshot must bind to that day's configured UTC hour/minute,
   with seconds set to zero. Delayed timer execution still records the decision
-  at that boundary. Unless the balance observation is bound to that exact
-  instant, the decision uses a fixed zero balance and durably skips with
-  `missing_capital_history`; it never substitutes an earlier or current
-  balance for a historical one. Deposits, withdrawals, confirmations, and
-  approvals after the boundary are reconciled only after that skip and become
-  available no earlier than the next eligible day.
+  at that boundary. The balance API request start and response time form a
+  closed uncertainty window. With complete movement coverage and no USDC
+  movement inside that window, an observation before or after the boundary is
+  adjusted to the boundary by applying or reversing only normalized external
+  USDC deposits and withdrawals. An internal, trading-related, unknown, or
+  request-window movement makes the boundary balance unavailable and durably
+  skips with `missing_capital_history`; the runtime never substitutes an
+  unadjusted current balance. Deposits, withdrawals, confirmations, and
+  approvals after the boundary are reconciled only after the boundary decision
+  and become available no earlier than the next eligible day.
 - Every planned DRY_RUN amount is recorded and counted, but the cycle report
   always states `economic_action_suppressed=true` and
   `signed_action_created=false`. The simulated commitment is then settled with
