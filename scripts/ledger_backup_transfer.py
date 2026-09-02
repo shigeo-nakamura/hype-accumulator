@@ -106,6 +106,21 @@ def checksum_b64(path: Path) -> str:
     return base64.b64encode(digest.digest()).decode("ascii")
 
 
+def multipart_checksum_b64(path: Path, part_size: int) -> str:
+    """Return S3's SHA-256 composite checksum for fixed-size multipart data."""
+    if part_size <= 0:
+        raise TransferError("multipart part size must be positive")
+    composite = hashlib.sha256()
+    part_count = 0
+    with path.open("rb") as handle:
+        while payload := handle.read(part_size):
+            composite.update(hashlib.sha256(payload).digest())
+            part_count += 1
+    if part_count == 0 or part_count > MAX_MULTIPART_PARTS:
+        raise TransferError("multipart upload has an invalid part count")
+    return base64.b64encode(composite.digest()).decode("ascii")
+
+
 def require_absolute_canonical(path: Path, label: str, *, exists: bool) -> Path:
     if not path.is_absolute():
         raise TransferError(f"{label} must be an absolute path")
@@ -349,6 +364,8 @@ def validate_receipt_output(receipt: Path, bundle: Path, anchor: Path) -> None:
     bundle = require_absolute_canonical(bundle, "bundle directory", exists=True)
     anchor = require_absolute_canonical(anchor, "anchor export", exists=True)
     require_absolute_canonical(receipt.parent, "receipt parent", exists=True)
+    if receipt.exists() or receipt.is_symlink():
+        raise TransferError("receipt output already exists")
     if receipt == anchor or receipt == bundle or bundle in receipt.parents:
         raise TransferError("receipt output must not overlap the source backup")
 
@@ -703,9 +720,9 @@ class AwsCli:
 
     def _stored_from_response(
         self, *, bucket: str, key: str, owner: str, kms_key_id: str,
-        source: Path, sha256: str, response: dict[str, object]
+        source: Path, sha256: str, expected_checksum: str,
+        response: dict[str, object]
     ) -> StoredObject:
-        expected_checksum = checksum_b64(source)
         metadata = response.get("Metadata")
         version_id = response.get("VersionId")
         if (
@@ -784,7 +801,7 @@ class AwsCli:
         kms_key_id: str,
         backup_id: str,
         sha256: str,
-    ) -> None:
+    ) -> str:
         self._require_no_pending_multipart(bucket, key, owner)
         size = source.stat().st_size
         part_size = max(
@@ -793,10 +810,11 @@ class AwsCli:
         )
         if part_size < MIN_MULTIPART_PART_BYTES or part_size > SINGLE_PUT_LIMIT_BYTES:
             raise TransferError("multipart part size cannot satisfy S3 limits")
+        expected_checksum = multipart_checksum_b64(source, part_size)
         created = self._json(
             [
                 "s3api", "create-multipart-upload", "--bucket", bucket, "--key", key,
-                "--checksum-algorithm", "SHA256", "--checksum-type", "FULL_OBJECT",
+                "--checksum-algorithm", "SHA256", "--checksum-type", "COMPOSITE",
                 "--server-side-encryption", "aws:kms", "--ssekms-key-id", kms_key_id,
                 "--bucket-key-enabled", "--expected-bucket-owner", owner,
                 "--metadata", f"backup-id={backup_id},sha256={sha256}",
@@ -860,8 +878,8 @@ class AwsCli:
                         "s3api", "complete-multipart-upload", "--bucket", bucket, "--key", key,
                         "--upload-id", upload_id,
                         "--multipart-upload", f"file://{completion_path}",
-                        "--checksum-type", "FULL_OBJECT",
-                        "--checksum-sha256", checksum_b64(source),
+                        "--checksum-type", "COMPOSITE",
+                        "--checksum-sha256", expected_checksum,
                         "--if-none-match", "*",
                         "--expected-bucket-owner", owner,
                     ],
@@ -869,6 +887,7 @@ class AwsCli:
                     transfer=True,
                 )
                 completed = True
+                return expected_checksum
         finally:
             if not completed:
                 self._abort_multipart(bucket, key, owner, upload_id)
@@ -877,6 +896,16 @@ class AwsCli:
         self, *, bucket: str, key: str, source: Path, owner: str,
         kms_key_id: str, backup_id: str, sha256: str
     ) -> StoredObject:
+        size = source.stat().st_size
+        multipart_part_size = max(
+            self.multipart_part_bytes,
+            (size + MAX_MULTIPART_PARTS - 1) // MAX_MULTIPART_PARTS,
+        )
+        expected_checksum = (
+            checksum_b64(source)
+            if size <= self.put_object_limit_bytes
+            else multipart_checksum_b64(source, multipart_part_size)
+        )
         versions, delete_markers = self._key_history(bucket, key, owner)
         if delete_markers or len(versions) > 1:
             raise TransferError(
@@ -889,8 +918,8 @@ class AwsCli:
         elif existing is not None:
             raise TransferError(f"remote object exists without version history for {bucket}/{key}")
         else:
-            put = self._put_single if source.stat().st_size <= self.put_object_limit_bytes else self._put_multipart
-            put(
+            put = self._put_single if size <= self.put_object_limit_bytes else self._put_multipart
+            uploaded_checksum = put(
                 bucket=bucket,
                 key=key,
                 source=source,
@@ -899,6 +928,8 @@ class AwsCli:
                 backup_id=backup_id,
                 sha256=sha256,
             )
+            if uploaded_checksum is not None and uploaded_checksum != expected_checksum:
+                raise TransferError(f"local multipart checksum changed for {bucket}/{key}")
             existing = self._head(bucket, key, owner)
             versions, delete_markers = self._key_history(bucket, key, owner)
         if existing is None:
@@ -913,7 +944,8 @@ class AwsCli:
             raise TransferError(f"remote object backup ID mismatch for {bucket}/{key}")
         return self._stored_from_response(
             bucket=bucket, key=key, owner=owner, kms_key_id=kms_key_id,
-            source=source, sha256=sha256, response=existing,
+            source=source, sha256=sha256, expected_checksum=expected_checksum,
+            response=existing,
         )
 
     def get_exact(self, stored: StoredObject, destination: Path) -> None:

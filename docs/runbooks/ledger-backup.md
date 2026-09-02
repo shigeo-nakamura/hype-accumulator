@@ -110,8 +110,10 @@ subcommand when an environment requires explicit positive bounds.
 
 Objects up to the conservative single-request limit use `PutObject`. Larger
 ledger or snapshot files use a bounded, private-part multipart upload with
-per-part SHA-256, a full-object SHA-256, KMS encryption, and conditional
-`CompleteMultipartUpload`. At most 10,000 dynamically sized parts are used.
+per-part SHA-256, S3's SHA-256 composite checksum, KMS encryption, and
+conditional `CompleteMultipartUpload`. The direct full-object SHA-256 remains
+bound in immutable object metadata and the receipt. At most 10,000 dynamically
+sized parts are used.
 Existing incomplete multipart uploads, delete markers, or prior versions fail
 closed; an interrupted upload must be inspected/aborted before retry.
 

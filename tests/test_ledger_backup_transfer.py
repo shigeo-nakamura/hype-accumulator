@@ -181,6 +181,15 @@ class LedgerBackupTransferTests(unittest.TestCase):
             transfer.BUNDLE_FILES,
         )
 
+    def test_upload_rejects_existing_receipt_before_aws(self) -> None:
+        receipt = self.root / "receipt.json"
+        receipt.write_text("existing\n", encoding="utf-8")
+        os.chmod(receipt, 0o600)
+        with self.assertRaisesRegex(transfer.TransferError, "already exists"):
+            self.upload(receipt=receipt)
+        self.assertEqual(self.aws.put_calls, 0)
+        self.assertEqual(receipt.read_text(encoding="utf-8"), "existing\n")
+
     def test_upload_rejects_suspended_versioning_before_put(self) -> None:
         self.aws.versioned.remove(ANCHOR_BUCKET)
         with self.assertRaisesRegex(transfer.TransferError, "versioning"):
@@ -314,6 +323,7 @@ class LedgerBackupTransferTests(unittest.TestCase):
                 kms_key_id=expected_key,
                 source=source,
                 sha256=transfer.sha256_file(source),
+                expected_checksum=transfer.checksum_b64(source),
                 response=response,
             )
 
@@ -354,9 +364,12 @@ class LedgerBackupTransferTests(unittest.TestCase):
     def test_large_object_branch_uses_multipart_and_reconciles_one_version(self) -> None:
         kms_key = f"arn:aws:kms:eu-central-1:{OWNER}:key/payload"
         digest = transfer.sha256_file(self.anchor)
+        composite = transfer.multipart_checksum_b64(
+            self.anchor, transfer.DEFAULT_MULTIPART_PART_BYTES
+        )
         head_response = {
             "VersionId": "version-1",
-            "ChecksumSHA256": transfer.checksum_b64(self.anchor),
+            "ChecksumSHA256": composite,
             "ContentLength": self.anchor.stat().st_size,
             "ServerSideEncryption": "aws:kms",
             "SSEKMSKeyId": kms_key,
@@ -371,7 +384,7 @@ class LedgerBackupTransferTests(unittest.TestCase):
         with (
             mock.patch.object(cli, "_key_history", side_effect=[([], []), (["version-1"], [])]),
             mock.patch.object(cli, "_head", side_effect=[None, head_response]),
-            mock.patch.object(cli, "_put_multipart") as multipart,
+            mock.patch.object(cli, "_put_multipart", return_value=composite) as multipart,
         ):
             stored = cli.put_immutable(
                 bucket=PAYLOAD_BUCKET,
@@ -385,7 +398,7 @@ class LedgerBackupTransferTests(unittest.TestCase):
         multipart.assert_called_once()
         self.assertEqual(stored.version_id, "version-1")
 
-    def test_multipart_uses_full_sha256_and_conditional_complete(self) -> None:
+    def test_multipart_uses_composite_sha256_and_conditional_complete(self) -> None:
         kms_key = f"arn:aws:kms:eu-central-1:{OWNER}:key/payload"
         cli = transfer.AwsCli(
             Path("/usr/bin/true"),
@@ -400,7 +413,7 @@ class LedgerBackupTransferTests(unittest.TestCase):
             if operation == "list-multipart-uploads":
                 return {}
             if operation == "create-multipart-upload":
-                self.assertIn("FULL_OBJECT", arguments)
+                self.assertIn("COMPOSITE", arguments)
                 self.assertIn(kms_key, arguments)
                 return {"UploadId": "upload-1"}
             if operation == "upload-part":
@@ -411,7 +424,13 @@ class LedgerBackupTransferTests(unittest.TestCase):
             if operation == "complete-multipart-upload":
                 self.assertTrue(transfer)
                 self.assertIn("--if-none-match", arguments)
-                self.assertIn("FULL_OBJECT", arguments)
+                self.assertIn("COMPOSITE", arguments)
+                self.assertEqual(
+                    arguments[arguments.index("--checksum-sha256") + 1],
+                    transfer_module.multipart_checksum_b64(
+                        self.anchor, transfer_module.MIN_MULTIPART_PART_BYTES
+                    ),
+                )
                 completion = arguments[arguments.index("--multipart-upload") + 1]
                 self.assertTrue(completion.startswith("file://"))
                 self.assertEqual(
@@ -426,7 +445,7 @@ class LedgerBackupTransferTests(unittest.TestCase):
             mock.patch.object(cli, "_json", side_effect=fake_json),
             mock.patch.object(cli, "_abort_multipart") as abort,
         ):
-            cli._put_multipart(
+            checksum = cli._put_multipart(
                 bucket=PAYLOAD_BUCKET,
                 key="backup/ledger",
                 source=self.anchor,
@@ -435,6 +454,12 @@ class LedgerBackupTransferTests(unittest.TestCase):
                 backup_id=BACKUP_ID,
                 sha256=transfer.sha256_file(self.anchor),
             )
+        self.assertEqual(
+            checksum,
+            transfer.multipart_checksum_b64(
+                self.anchor, transfer.MIN_MULTIPART_PART_BYTES
+            ),
+        )
         abort.assert_not_called()
         self.assertEqual(
             [command[1] for command in commands],
@@ -445,6 +470,16 @@ class LedgerBackupTransferTests(unittest.TestCase):
                 "complete-multipart-upload",
             ],
         )
+
+    def test_multipart_checksum_matches_checksum_of_part_digests(self) -> None:
+        source = self.root / "composite.bin"
+        source.write_bytes(b"abcdefgh")
+        os.chmod(source, 0o600)
+        part_digests = b"".join(
+            hashlib.sha256(part).digest() for part in (b"abc", b"def", b"gh")
+        )
+        expected = base64.b64encode(hashlib.sha256(part_digests).digest()).decode("ascii")
+        self.assertEqual(transfer.multipart_checksum_b64(source, 3), expected)
 
 
 if __name__ == "__main__":
