@@ -726,13 +726,16 @@ impl SignerFreeRuntime {
                 input.observed_at,
                 &self.limits,
             )?;
-            ledger_events.extend(movement_ledger_events);
-            ledger_events.extend(admission_delta_events(
+            let admission_events = admission_delta_events(
                 &self.ledger,
                 &next_state.pacing,
                 input.observed_at,
                 &new_authoritative_deposit_ids,
-            )?);
+            )?;
+            ledger_events.extend(ordered_capital_ledger_events(
+                movement_ledger_events,
+                admission_events,
+            ));
             Some(DecisionResult::Existing(decision))
         } else if boundary_replay_safe {
             let boundary = scheduled_boundary.ok_or_else(|| {
@@ -747,13 +750,16 @@ impl SignerFreeRuntime {
                 boundary,
                 &self.limits,
             )?;
-            ledger_events.extend(boundary_movements);
-            ledger_events.extend(admission_delta_events(
+            let boundary_admission_events = admission_delta_events(
                 &self.ledger,
                 &next_state.pacing,
                 boundary,
                 &new_authoritative_deposit_ids,
-            )?);
+            )?;
+            ledger_events.extend(ordered_capital_ledger_events(
+                boundary_movements,
+                boundary_admission_events,
+            ));
             let boundary_pacing = next_state.pacing.clone();
             let decision_input = DecisionInput {
                 at: boundary,
@@ -788,12 +794,15 @@ impl SignerFreeRuntime {
                 input.observed_at,
                 &self.limits,
             )?;
-            ledger_events.extend(later_movements);
-            ledger_events.extend(admission_delta_events_between(
+            let later_admission_events = admission_delta_events_between(
                 &boundary_pacing,
                 &next_state.pacing,
                 input.observed_at,
-            )?);
+            )?;
+            ledger_events.extend(ordered_capital_ledger_events(
+                later_movements,
+                later_admission_events,
+            ));
             decision
         } else {
             next_state.pacing.reconcile_capital(
@@ -801,13 +810,16 @@ impl SignerFreeRuntime {
                 input.observed_at,
                 &self.limits,
             )?;
-            ledger_events.extend(movement_ledger_events);
-            ledger_events.extend(admission_delta_events(
+            let admission_events = admission_delta_events(
                 &self.ledger,
                 &next_state.pacing,
                 input.observed_at,
                 &new_authoritative_deposit_ids,
-            )?);
+            )?;
+            ledger_events.extend(ordered_capital_ledger_events(
+                movement_ledger_events,
+                admission_events,
+            ));
             None
         };
         if let Some(result) = &decision_result {
@@ -1226,13 +1238,17 @@ fn admission_delta_events(
         if delta == 0 {
             continue;
         }
+        let occurred_at = tranche
+            .first_usable_at
+            .filter(|value| *value <= at)
+            .ok_or(RuntimeError::CapitalStateMismatch)?;
         events.push(LedgerEvent {
             event_id: format!(
                 "admission:{}:{}",
                 tranche.event_id,
                 tranche.admitted_usdc.as_micros()
             ),
-            occurred_at: at,
+            occurred_at,
             kind: LedgerEventKind::DepositAdmission {
                 deposit_event_id: tranche.event_id.clone(),
                 amount_usdc: UsdcMicros::from_micros(delta),
@@ -1261,13 +1277,17 @@ fn admission_delta_events_between(
         if delta == 0 {
             continue;
         }
+        let occurred_at = tranche
+            .first_usable_at
+            .filter(|value| *value <= at)
+            .ok_or(RuntimeError::CapitalStateMismatch)?;
         events.push(LedgerEvent {
             event_id: format!(
                 "admission:{}:{}",
                 tranche.event_id,
                 tranche.admitted_usdc.as_micros()
             ),
-            occurred_at: at,
+            occurred_at,
             kind: LedgerEventKind::DepositAdmission {
                 deposit_event_id: tranche.event_id.clone(),
                 amount_usdc: UsdcMicros::from_micros(delta),
@@ -1275,6 +1295,31 @@ fn admission_delta_events_between(
         });
     }
     Ok(events)
+}
+
+fn ordered_capital_ledger_events(
+    mut movement_events: Vec<LedgerEvent>,
+    admission_events: Vec<LedgerEvent>,
+) -> Vec<LedgerEvent> {
+    movement_events.extend(admission_events);
+    movement_events.sort_by(|left, right| {
+        left.occurred_at
+            .cmp(&right.occurred_at)
+            .then_with(|| {
+                capital_ledger_event_order(&left.kind).cmp(&capital_ledger_event_order(&right.kind))
+            })
+            .then_with(|| left.event_id.cmp(&right.event_id))
+    });
+    movement_events
+}
+
+fn capital_ledger_event_order(kind: &LedgerEventKind) -> u8 {
+    match kind {
+        LedgerEventKind::AuthoritativeDeposit { .. } => 0,
+        LedgerEventKind::DepositAdmission { .. } => 1,
+        LedgerEventKind::AuthoritativeWithdrawal { .. } => 2,
+        _ => 3,
+    }
 }
 
 fn decision_events(decision: &DailyDecision) -> Result<Vec<LedgerEvent>, RuntimeError> {

@@ -18,12 +18,26 @@ The runtime refuses non-DRY_RUN configuration, live approval, a missing
 security policy, or a populated signing-key environment variable. It creates
 no signer, order, staking payload, nonce, or submission client.
 
+The staged install preflight and the scheduled planner intentionally use
+different runtime halt settings. Keep `manual_halt=true` while staging and
+running `--install-preflight`. After the signer-free artifact is separately
+approved for recurring observation, use a reviewed runtime config copy with
+`manual_halt=false` for `--dry-run-cycle`; otherwise every due day is durably
+recorded as a `manual_pause` skip. The attached security policy remains
+`dry_run=true` and `manual_halt=true`, and the scheduled-runtime validator
+still requires `dry_run=true`, `live_approved=false`, and an empty signing-key
+environment. Clearing the runtime planning pause never enables an economic
+action.
+
 ## Capital and decision behavior
 
 - Only normalized external USDC deposits and withdrawals enter capital state.
 - A deposit remains confirmed-but-unallocated until its exact movement event
   ID appears in the separately reviewed admission artifact with confirmation
   and approval timestamps. An approval for an unknown event fails the cycle.
+- Newly admitted capital is journaled at its first usable timestamp, after its
+  authoritative deposit and before any later withdrawal that depends on it.
+  This ordering is preserved when both movements are discovered in one scan.
 - The movement cursor re-reads a 24-hour overlap by default; ledger event IDs
   make replay idempotent. An incomplete history query never advances the
   cursor and forces the day's decision to fail closed.

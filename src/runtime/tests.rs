@@ -93,6 +93,21 @@ fn deposit(event_id: &str, occurred_at: DateTime<Utc>, amount: u64) -> Hyperliqu
     }
 }
 
+fn withdrawal(
+    event_id: &str,
+    occurred_at: DateTime<Utc>,
+    amount: u64,
+) -> HyperliquidAccountMovement {
+    HyperliquidAccountMovement {
+        event_id: event_id.to_owned(),
+        timestamp_ms: ms(occurred_at),
+        kind: HyperliquidAccountMovementKind::ExternalWithdrawal,
+        token: "USDC".to_owned(),
+        amount: -Decimal::from(amount),
+        transaction_hash: None,
+    }
+}
+
 fn approvals(
     event_id: &str,
     confirmed_at: DateTime<Utc>,
@@ -414,6 +429,56 @@ fn approved_deposit_plans_once_and_same_day_restart_replays_without_second_actio
     assert!(!replay.is_new_decision());
     assert_eq!(reopened.state.dry_run_actions_total, 1);
     assert_eq!(reopened.state.pacing.decisions().len(), 1);
+}
+
+#[test]
+fn newly_admitted_deposit_is_committed_before_a_dependent_withdrawal() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = at(2026, 7, 6, 9, 0);
+    let withdrawal_at = at(2026, 7, 6, 9, 5);
+    let observed_at = at(2026, 7, 6, 10, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movements = vec![
+        deposit("deposit-with-withdrawal", deposit_at, 100),
+        withdrawal("withdrawal-after-deposit", withdrawal_at, 40),
+    ];
+    let admission = approvals("deposit-with-withdrawal", deposit_at, deposit_at);
+
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
+    let report = runtime
+        .apply_cycle(RuntimeCycleInput {
+            observed_at,
+            scan_start_ms: ms(start),
+            scan_end_ms: ms(observed_at),
+            movements: &movements,
+            approvals: &admission,
+            signal: None,
+            accumulator: status(observed_at, 60.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+        })
+        .expect("deposit and dependent withdrawal reconcile in one cycle");
+
+    assert!(report.decision().is_none());
+    assert_eq!(
+        runtime
+            .ledger
+            .state()
+            .admitted_deposit_usdc("deposit-with-withdrawal"),
+        Some(usd(100))
+    );
+    assert_eq!(runtime.ledger.state().withdrawn_usdc(), usd(40));
+    assert_eq!(runtime.ledger.state().deployable_usdc(), usd(60));
+    assert!(!runtime_config
+        .state_directory
+        .join(PENDING_CYCLE_FILE_NAME)
+        .exists());
+    drop(runtime);
+
+    SignerFreeRuntime::open(runtime_config, limits()).expect("reopen committed cycle");
 }
 
 #[test]

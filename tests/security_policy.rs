@@ -174,6 +174,22 @@ fn signer_free_runtime_refuses_signing_material_live_mode_and_missing_policy() {
     safe.validate_signer_free_runtime(&HashMap::new())
         .expect("signer-free dry-run is accepted");
 
+    let mut scheduled = safe.clone();
+    scheduled.manual_halt = false;
+    scheduled
+        .validate_signer_free_runtime(&HashMap::new())
+        .expect("scheduled signer-free planning may clear the runtime halt");
+    assert!(scheduled.validate(&HashMap::new()).is_err());
+
+    let unhalted_policy = Config::from_toml_with_security_policy(
+        runtime,
+        &policy.replace("manual_halt = true", "manual_halt = false"),
+    )
+    .expect("unhalted policy still parses");
+    assert!(unhalted_policy
+        .validate_signer_free_runtime(&HashMap::new())
+        .is_err());
+
     let with_signer = HashMap::from([(
         "HYPE_SIGNING_KEY".to_owned(),
         "must-never-be-read".to_owned(),

@@ -32,6 +32,12 @@ pub struct Config {
     #[serde(skip)]
     security_policy: Option<SecurityPolicy>,
 }
+
+#[derive(Clone, Copy)]
+enum ConfigValidationMode {
+    Standard,
+    SignerFreeRuntime,
+}
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapitalConfig {
@@ -237,7 +243,7 @@ impl Config {
                 "signer-free runtime refuses a populated signing-key environment variable".into(),
             ));
         }
-        self.validate(env)
+        self.validate_at_mode(env, Utc::now(), ConfigValidationMode::SignerFreeRuntime)
     }
 
     /// Validates configuration at an injected UTC instant.
@@ -252,6 +258,15 @@ impl Config {
         &self,
         env: &E,
         now: DateTime<Utc>,
+    ) -> Result<(), ConfigError> {
+        self.validate_at_mode(env, now, ConfigValidationMode::Standard)
+    }
+
+    fn validate_at_mode<E: Environment>(
+        &self,
+        env: &E,
+        now: DateTime<Utc>,
+        mode: ConfigValidationMode,
     ) -> Result<(), ConfigError> {
         positive(
             "max_automatically_deployable_usdc",
@@ -338,7 +353,12 @@ impl Config {
         }
         self.validate_observation_inputs()?;
         if let Some(policy) = &self.security_policy {
-            policy.validate_mode(self, env, now)?;
+            match mode {
+                ConfigValidationMode::Standard => policy.validate_mode(self, env, now)?,
+                ConfigValidationMode::SignerFreeRuntime => {
+                    policy.validate_signer_free_runtime()?;
+                }
+            }
         }
         if !self.dry_run {
             self.validate_live(env, now)?;
@@ -880,6 +900,23 @@ impl SecurityPolicy {
             || !operator.live_acknowledgement_expires_at.is_empty()
         {
             return invalid_policy("dry-run policy must not carry a live acknowledgement");
+        }
+        Ok(())
+    }
+
+    fn validate_signer_free_runtime(&self) -> Result<(), SecurityPolicyError> {
+        let operator = &self.wire.operator;
+        if !operator.dry_run || !operator.manual_halt {
+            return invalid_policy(
+                "attached signer-free runtime policy must remain dry-run and halted",
+            );
+        }
+        if !operator.live_acknowledgement.is_empty()
+            || !operator.live_acknowledgement_expires_at.is_empty()
+        {
+            return invalid_policy(
+                "signer-free runtime policy must not carry a live acknowledgement",
+            );
         }
         Ok(())
     }
