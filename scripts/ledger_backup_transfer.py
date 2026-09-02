@@ -89,6 +89,7 @@ class AwsClient(Protocol):
         kms_key_id: str,
         backup_id: str,
         sha256: str,
+        scratch_root: Path | None = None,
     ) -> StoredObject: ...
 
     def get_exact(self, stored: StoredObject, destination: Path) -> None: ...
@@ -315,6 +316,7 @@ def captured_backup(
     anchor: Path,
     staging_root: Path | None = None,
 ) -> Iterator[tuple[Path, Path, str, dict[str, str]]]:
+    bundle = require_absolute_canonical(bundle, "bundle directory", exists=True)
     require_bundle(bundle, anchor)
     temporary_parent: str | None = None
     if staging_root is not None:
@@ -328,6 +330,8 @@ def captured_backup(
             or staging_info.st_mode & 0o077
         ):
             raise TransferError("staging root must be owner-controlled and private")
+        if staging_root == bundle or bundle in staging_root.parents:
+            raise TransferError("staging root must not overlap the source bundle")
         temporary_parent = str(staging_root)
     with tempfile.TemporaryDirectory(
         prefix="hype-ledger-transfer-", dir=temporary_parent
@@ -496,6 +500,7 @@ def upload_backup(
                 kms_key_id=payload_kms_key,
                 backup_id=backup_id,
                 sha256=digests[name],
+                scratch_root=captured_bundle.parent,
             )
         protected = aws.put_immutable(
             bucket=anchor_bucket,
@@ -505,6 +510,7 @@ def upload_backup(
             kms_key_id=anchor_kms_key,
             backup_id=backup_id,
             sha256=digests["protected-anchor.json"],
+            scratch_root=captured_bundle.parent,
         )
         document: dict[str, object] = {
             "schema_version": 1,
@@ -896,6 +902,7 @@ class AwsCli:
         kms_key_id: str,
         backup_id: str,
         sha256: str,
+        scratch_root: Path | None = None,
     ) -> str:
         self._require_no_pending_multipart(bucket, key, owner)
         size = source.stat().st_size
@@ -906,6 +913,16 @@ class AwsCli:
         if part_size < MIN_MULTIPART_PART_BYTES or part_size > SINGLE_PUT_LIMIT_BYTES:
             raise TransferError("multipart part size cannot satisfy S3 limits")
         request_checksum, stored_checksum = multipart_checksums_b64(source, part_size)
+        scratch_root = require_absolute_canonical(
+            scratch_root or source.parent, "multipart scratch root", exists=True
+        )
+        scratch_info = scratch_root.stat()
+        if (
+            not scratch_root.is_dir()
+            or scratch_info.st_uid != os.geteuid()
+            or scratch_info.st_mode & 0o077
+        ):
+            raise TransferError("multipart scratch root must be owner-controlled and private")
         created = self._json(
             [
                 "s3api", "create-multipart-upload", "--bucket", bucket, "--key", key,
@@ -922,7 +939,9 @@ class AwsCli:
         completed = False
         try:
             parts: list[dict[str, object]] = []
-            with tempfile.TemporaryDirectory(prefix="hype-ledger-part-") as temporary:
+            with tempfile.TemporaryDirectory(
+                prefix="hype-ledger-part-", dir=scratch_root
+            ) as temporary:
                 temporary_root = Path(temporary)
                 os.chmod(temporary_root, 0o700)
                 with source.open("rb") as source_handle:
@@ -989,7 +1008,8 @@ class AwsCli:
 
     def put_immutable(
         self, *, bucket: str, key: str, source: Path, owner: str,
-        kms_key_id: str, backup_id: str, sha256: str
+        kms_key_id: str, backup_id: str, sha256: str,
+        scratch_root: Path | None = None,
     ) -> StoredObject:
         size = source.stat().st_size
         multipart_part_size = max(
@@ -1014,16 +1034,21 @@ class AwsCli:
         elif existing is not None:
             raise TransferError(f"remote object exists without version history for {bucket}/{key}")
         else:
-            put = self._put_single if size <= self.put_object_limit_bytes else self._put_multipart
-            uploaded_checksum = put(
-                bucket=bucket,
-                key=key,
-                source=source,
-                owner=owner,
-                kms_key_id=kms_key_id,
-                backup_id=backup_id,
-                sha256=sha256,
-            )
+            arguments = {
+                "bucket": bucket,
+                "key": key,
+                "source": source,
+                "owner": owner,
+                "kms_key_id": kms_key_id,
+                "backup_id": backup_id,
+                "sha256": sha256,
+            }
+            if size <= self.put_object_limit_bytes:
+                uploaded_checksum = self._put_single(**arguments)
+            else:
+                uploaded_checksum = self._put_multipart(
+                    **arguments, scratch_root=scratch_root
+                )
             if uploaded_checksum is not None and uploaded_checksum != expected_checksum:
                 raise TransferError(f"local multipart checksum changed for {bucket}/{key}")
             existing = self._head(bucket, key, owner)

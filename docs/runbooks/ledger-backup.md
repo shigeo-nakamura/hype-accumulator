@@ -112,9 +112,11 @@ receipt.
 
 `--staging-root` is optional, but should point to a mode-0700 operator-owned
 directory on capacity-checked storage when the bundle might not fit in the
-system temporary filesystem. The per-run capture directory is removed after
-the operation. AWS CLI and verifier binaries must also be beneath root- or
-operator-owned ancestor directories that are not group/world writable.
+system temporary filesystem. It must not be the source bundle or a directory
+inside that bundle. Both the full capture and bounded multipart scratch files
+remain under the per-run capture root, which is removed after the operation.
+AWS CLI and verifier binaries must also be beneath root- or operator-owned
+ancestor directories that are not group/world writable.
 
 Full replay and S3 `put-object`/`get-object` transfers have no wall-clock
 timeout by default, so backup size or recovery-host bandwidth alone cannot

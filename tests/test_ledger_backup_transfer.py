@@ -39,6 +39,7 @@ class FakeAws:
         kms_key_id: str,
         backup_id: str,
         sha256: str,
+        scratch_root: Path | None = None,
     ) -> transfer.StoredObject:
         identity = (bucket, key)
         payload = source.read_bytes()
@@ -179,6 +180,15 @@ class LedgerBackupTransferTests(unittest.TestCase):
 
         self.upload(staging_root=staging_root, verify=verify_staging)
         self.assertEqual(tuple(staging_root.iterdir()), ())
+
+    def test_upload_rejects_staging_root_inside_source_bundle(self) -> None:
+        with self.assertRaisesRegex(transfer.TransferError, "must not overlap"):
+            self.upload(staging_root=self.bundle)
+        self.assertEqual(self.aws.put_calls, 0)
+        self.assertEqual(
+            tuple(sorted(path.name for path in self.bundle.iterdir())),
+            transfer.BUNDLE_FILES,
+        )
 
     def test_upload_rejects_one_storage_boundary(self) -> None:
         with self.assertRaisesRegex(transfer.TransferError, "different buckets"):
@@ -546,6 +556,7 @@ class LedgerBackupTransferTests(unittest.TestCase):
                 return {"UploadId": "upload-1"}
             if operation == "upload-part":
                 part_path = Path(arguments[arguments.index("--body") + 1])
+                self.assertIn(self.root, part_path.parents)
                 expected = transfer_module.checksum_b64(part_path)
                 self.assertTrue(transfer)
                 return {"ETag": '"part-etag"', "ChecksumSHA256": expected}
