@@ -228,7 +228,7 @@ pub fn create_ledger_backup(
         return Err(error);
     }
 
-    fs::rename(&temporary_bundle, bundle_directory)?;
+    publish_directory_noreplace(&temporary_bundle, bundle_directory)?;
     if let Err(error) = publish_file_noreplace(&temporary_anchor, anchor_export_path) {
         // A two-path publication cannot be one filesystem transaction. Leave
         // the verified bundle for operator inspection instead of recursively
@@ -749,6 +749,37 @@ fn publish_file_noreplace(source: &Path, destination: &Path) -> Result<(), Ledge
     Ok(())
 }
 
+#[cfg(any(
+    target_os = "android",
+    target_os = "linux",
+    target_vendor = "apple",
+    target_os = "redox"
+))]
+fn publish_directory_noreplace(source: &Path, destination: &Path) -> Result<(), LedgerBackupError> {
+    use rustix::fs::{renameat_with, RenameFlags, CWD};
+
+    renameat_with(CWD, source, CWD, destination, RenameFlags::NOREPLACE)
+        .map_err(io::Error::from)?;
+    Ok(())
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "linux",
+    target_vendor = "apple",
+    target_os = "redox"
+)))]
+fn publish_directory_noreplace(
+    _source: &Path,
+    _destination: &Path,
+) -> Result<(), LedgerBackupError> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic no-replace directory publication is unsupported on this platform",
+    )
+    .into())
+}
+
 fn sync_parent(path: &Path) -> Result<(), LedgerBackupError> {
     let parent = path.parent().ok_or_else(|| {
         LedgerBackupError::InvalidPath(format!("path has no parent: {}", path.display()))
@@ -766,7 +797,7 @@ fn sync_directory(path: &Path) -> Result<(), LedgerBackupError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{publish_file_noreplace, LedgerBackupError};
+    use super::{publish_directory_noreplace, publish_file_noreplace, LedgerBackupError};
     use std::{fs, io};
 
     #[test]
@@ -785,5 +816,31 @@ mod tests {
         ));
         assert_eq!(fs::read(&published).expect("read anchor"), b"first");
         assert_eq!(fs::read(&second).expect("read staged anchor"), b"second");
+    }
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "linux",
+        target_vendor = "apple",
+        target_os = "redox"
+    ))]
+    #[test]
+    fn bundle_publication_never_replaces_an_empty_reserved_directory() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let staged = directory.path().join("staged");
+        let reserved = directory.path().join("reserved");
+        fs::create_dir(&staged).expect("create staged directory");
+        fs::write(staged.join("payload"), b"staged").expect("write staged payload");
+        fs::create_dir(&reserved).expect("create empty reservation");
+
+        assert!(matches!(
+            publish_directory_noreplace(&staged, &reserved),
+            Err(LedgerBackupError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists
+        ));
+        assert!(staged.join("payload").exists());
+        assert_eq!(
+            fs::read_dir(&reserved).expect("read reservation").count(),
+            0
+        );
     }
 }
