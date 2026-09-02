@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const USDC_MICROS_PER_USDC: u64 = 1_000_000;
+const BPS_DENOMINATOR: u16 = 10_000;
 const HYPE_SPOT_MARKET: &str = "HYPE/USDC";
 const EXECUTION_IDENTITY_DOMAIN: &[u8] = b"hype-accumulator/execution-account-identity/v1";
 const SIGNER_IDENTITY_DOMAIN: &[u8] = b"hype-accumulator/api-wallet-identity/v1";
@@ -122,6 +123,8 @@ pub enum LiveProbeError {
     InvalidDecimal(&'static str),
     #[error("prepared order limit notional exceeds its durable capital bounds")]
     CapitalBound,
+    #[error("purchase-fee ceiling must be below 10000 bps")]
+    InvalidFeeCeiling,
     #[error("durable workflow does not expose the authorized pending order: {0}")]
     Workflow(#[from] WorkflowError),
     #[error("Hyperliquid action requires CLOID reconciliation: {0}")]
@@ -131,22 +134,37 @@ pub enum LiveProbeError {
 pub struct HyperliquidLiveProbe {
     connector: HyperliquidConnector,
     binding: LiveProbeBinding,
+    max_purchase_fee_bps: u16,
 }
 
 impl HyperliquidLiveProbe {
     /// Constructs a probe only when its durable identity binding matches the
     /// connector's actual execution account and API-wallet signer.
     ///
+    /// `max_purchase_fee_bps` is the authoritative aggregate venue/builder
+    /// fee ceiling used to bound the pre-submission debit check; it must
+    /// match the same ceiling enforced by the [`crate::exchange::Exchange`]
+    /// boundary for this deployment.
+    ///
     /// # Errors
     ///
-    /// Rejects missing or mismatched connector identities and invalid binding
-    /// metadata before any nonce can be reserved or action submitted.
+    /// Rejects missing or mismatched connector identities, invalid binding
+    /// metadata, or a fee ceiling that is not below 10000 bps, before any
+    /// nonce can be reserved or action submitted.
     pub fn new(
         connector: HyperliquidConnector,
         binding: LiveProbeBinding,
+        max_purchase_fee_bps: u16,
     ) -> Result<Self, LiveProbeError> {
         binding.validate_connector(&connector)?;
-        Ok(Self { connector, binding })
+        if max_purchase_fee_bps >= BPS_DENOMINATOR {
+            return Err(LiveProbeError::InvalidFeeCeiling);
+        }
+        Ok(Self {
+            connector,
+            binding,
+            max_purchase_fee_bps,
+        })
     }
 
     /// Durably reserves one API-wallet nonce without signing or submitting.
@@ -218,7 +236,8 @@ impl HyperliquidLiveProbe {
         now: DateTime<Utc>,
     ) -> Result<ProbeSubmission, LiveProbeError> {
         let action = workflow.pending_prepared_order()?;
-        let prepared = PreparedIocOrder::from_action(action, &self.binding, now)?;
+        let prepared =
+            PreparedIocOrder::from_action(action, &self.binding, self.max_purchase_fee_bps, now)?;
         let response = self
             .connector
             .create_spot_ioc_order_with_envelope(
@@ -280,6 +299,7 @@ impl PreparedIocOrder {
     fn from_action(
         action: &ExternalAction,
         binding: &LiveProbeBinding,
+        max_purchase_fee_bps: u16,
         now: DateTime<Utc>,
     ) -> Result<Self, LiveProbeError> {
         let ExternalAction::SubmitOrder {
@@ -315,9 +335,11 @@ impl PreparedIocOrder {
         let limit_notional = quantity
             .checked_mul(limit_price)
             .ok_or(LiveProbeError::CapitalBound)?;
-        if limit_notional > micros_to_decimal(*notional_usdc)?
-            || limit_notional > micros_to_decimal(*max_debit_usdc)?
-        {
+        if limit_notional > micros_to_decimal(*notional_usdc)? {
+            return Err(LiveProbeError::CapitalBound);
+        }
+        let worst_case_debit = worst_case_debit_with_fee(limit_notional, max_purchase_fee_bps)?;
+        if worst_case_debit > micros_to_decimal(*max_debit_usdc)? {
             return Err(LiveProbeError::CapitalBound);
         }
         Ok(Self {
@@ -387,6 +409,23 @@ fn atoms_to_decimal(atoms: HypeAtoms, atoms_per_hype: u64) -> Result<Decimal, Li
         ));
     }
     Ok(value)
+}
+
+/// Grosses up a raw limit notional by the worst-case aggregate purchase fee
+/// so the pre-submission debit-cap check binds the same total-debit ceiling
+/// that workflow reconciliation enforces after the fill, rather than only
+/// the fee-exclusive notional.
+fn worst_case_debit_with_fee(
+    limit_notional: Decimal,
+    max_purchase_fee_bps: u16,
+) -> Result<Decimal, LiveProbeError> {
+    let fee_multiplier = Decimal::from(BPS_DENOMINATOR)
+        .checked_add(Decimal::from(max_purchase_fee_bps))
+        .ok_or(LiveProbeError::CapitalBound)?;
+    limit_notional
+        .checked_mul(fee_multiplier)
+        .and_then(|value| value.checked_div(Decimal::from(BPS_DENOMINATOR)))
+        .ok_or(LiveProbeError::CapitalBound)
 }
 
 fn micros_to_decimal(value: UsdcMicros) -> Result<Decimal, LiveProbeError> {
@@ -487,7 +526,7 @@ mod tests {
 
     #[test]
     fn maps_exact_workflow_envelope_without_regeneration() {
-        let prepared = PreparedIocOrder::from_action(&order(), &binding(), at(1)).unwrap();
+        let prepared = PreparedIocOrder::from_action(&order(), &binding(), 0, at(1)).unwrap();
         assert_eq!(prepared.action_id, "action-a");
         assert_eq!(
             prepared.client_order_id,
@@ -510,7 +549,7 @@ mod tests {
             *execution_identity_hash = "other".to_string();
         }
         assert!(matches!(
-            PreparedIocOrder::from_action(&mismatched, &binding(), at(1)),
+            PreparedIocOrder::from_action(&mismatched, &binding(), 0, at(1)),
             Err(LiveProbeError::BindingMismatch("execution identity"))
         ));
 
@@ -522,7 +561,7 @@ mod tests {
             *signed_expiry_at = at(1);
         }
         assert!(matches!(
-            PreparedIocOrder::from_action(&expired, &binding(), at(1)),
+            PreparedIocOrder::from_action(&expired, &binding(), 0, at(1)),
             Err(LiveProbeError::InvalidExpiry)
         ));
 
@@ -531,14 +570,14 @@ mod tests {
             *notional_usdc = UsdcMicros::from_micros(24_999_999);
         }
         assert!(matches!(
-            PreparedIocOrder::from_action(&oversized, &binding(), at(1)),
+            PreparedIocOrder::from_action(&oversized, &binding(), 0, at(1)),
             Err(LiveProbeError::CapitalBound)
         ));
 
         let mut other_market = binding();
         other_market.symbol = "PURR/USDC".to_string();
         assert!(matches!(
-            PreparedIocOrder::from_action(&order(), &other_market, at(1)),
+            PreparedIocOrder::from_action(&order(), &other_market, 0, at(1)),
             Err(LiveProbeError::BindingMismatch("symbol"))
         ));
 
@@ -553,10 +592,24 @@ mod tests {
             *hype_atoms_per_hype = 3;
         }
         assert!(matches!(
-            PreparedIocOrder::from_action(&inexact_scale, &binding(), at(1)),
+            PreparedIocOrder::from_action(&inexact_scale, &binding(), 0, at(1)),
             Err(LiveProbeError::InvalidDecimal(
                 "HYPE atom scale is not exactly representable"
             ))
+        ));
+    }
+
+    #[test]
+    fn debit_cap_accounts_for_worst_case_purchase_fee() {
+        // order() carries a 100-bps margin between notional_usdc ($25) and
+        // max_debit_usdc ($25.10). A fee ceiling that exactly exhausts that
+        // margin must still pass; one basis point beyond it must not, since
+        // the actual fill's fee could otherwise push the debit past the
+        // durable committed cap that workflow reconciliation enforces.
+        assert!(PreparedIocOrder::from_action(&order(), &binding(), 40, at(1)).is_ok());
+        assert!(matches!(
+            PreparedIocOrder::from_action(&order(), &binding(), 41, at(1)),
+            Err(LiveProbeError::CapitalBound)
         ));
     }
 
@@ -592,7 +645,7 @@ mod tests {
                 &connector.api_wallet_address().unwrap()
             )
         );
-        assert!(HyperliquidLiveProbe::new(connector, binding).is_ok());
+        assert!(HyperliquidLiveProbe::new(connector, binding, 50).is_ok());
 
         let connector = test_connector(
             "0x2222222222222222222222222222222222222222",
@@ -601,7 +654,7 @@ mod tests {
         let mut stale = LiveProbeBinding::from_connector(&connector, "market-a").unwrap();
         stale.execution_identity_hash = "stale-account".to_string();
         assert!(matches!(
-            HyperliquidLiveProbe::new(connector, stale),
+            HyperliquidLiveProbe::new(connector, stale, 50),
             Err(LiveProbeError::BindingMismatch("execution identity"))
         ));
 
@@ -612,8 +665,22 @@ mod tests {
         let mut stale = LiveProbeBinding::from_connector(&connector, "market-a").unwrap();
         stale.signer_identity_hash = "stale-api-wallet".to_string();
         assert!(matches!(
-            HyperliquidLiveProbe::new(connector, stale),
+            HyperliquidLiveProbe::new(connector, stale, 50),
             Err(LiveProbeError::BindingMismatch("signer identity"))
+        ));
+    }
+
+    #[test]
+    fn rejects_a_fee_ceiling_at_or_above_10000_bps() {
+        let temp = tempfile::tempdir().unwrap();
+        let connector = test_connector(
+            "0x4444444444444444444444444444444444444444",
+            &temp.path().join("nonce-d.json"),
+        );
+        let binding = LiveProbeBinding::from_connector(&connector, "market-a").unwrap();
+        assert!(matches!(
+            HyperliquidLiveProbe::new(connector, binding, 10_000),
+            Err(LiveProbeError::InvalidFeeCeiling)
         ));
     }
 }
