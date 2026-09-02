@@ -229,12 +229,12 @@ pub fn create_ledger_backup(
     }
 
     fs::rename(&temporary_bundle, bundle_directory)?;
-    if let Err(error) = fs::rename(&temporary_anchor, anchor_export_path) {
+    if let Err(error) = publish_file_noreplace(&temporary_anchor, anchor_export_path) {
         // A two-path publication cannot be one filesystem transaction. Leave
         // the verified bundle for operator inspection instead of recursively
         // deleting a final path that could have been replaced concurrently.
         let _ = fs::remove_file(&temporary_anchor);
-        return Err(error.into());
+        return Err(error);
     }
     sync_parent(bundle_directory)?;
     sync_parent(anchor_export_path)?;
@@ -741,6 +741,14 @@ fn write_private_file(path: &Path, payload: &[u8]) -> Result<(), LedgerBackupErr
     Ok(())
 }
 
+fn publish_file_noreplace(source: &Path, destination: &Path) -> Result<(), LedgerBackupError> {
+    // Both paths are siblings by construction. A hard link therefore provides
+    // an atomic no-replace publication primitive on the same filesystem.
+    fs::hard_link(source, destination)?;
+    fs::remove_file(source)?;
+    Ok(())
+}
+
 fn sync_parent(path: &Path) -> Result<(), LedgerBackupError> {
     let parent = path.parent().ok_or_else(|| {
         LedgerBackupError::InvalidPath(format!("path has no parent: {}", path.display()))
@@ -754,4 +762,28 @@ fn sync_directory(path: &Path) -> Result<(), LedgerBackupError> {
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{publish_file_noreplace, LedgerBackupError};
+    use std::{fs, io};
+
+    #[test]
+    fn anchor_publication_never_replaces_an_existing_file() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let first = directory.path().join("first.tmp");
+        let second = directory.path().join("second.tmp");
+        let published = directory.path().join("anchor.json");
+        fs::write(&first, b"first").expect("write first anchor");
+        fs::write(&second, b"second").expect("write second anchor");
+
+        publish_file_noreplace(&first, &published).expect("publish first anchor");
+        assert!(matches!(
+            publish_file_noreplace(&second, &published),
+            Err(LedgerBackupError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(fs::read(&published).expect("read anchor"), b"first");
+        assert_eq!(fs::read(&second).expect("read staged anchor"), b"second");
+    }
 }

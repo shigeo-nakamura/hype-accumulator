@@ -12,9 +12,9 @@ The manifest records the exact size and SHA-256 digest of each payload file and
 the protected-head export. Creation checkpoints the source, stages both
 outputs with Unix mode `0700`/`0600`, replays the staged ledger against the
 exported protected head, and only then publishes each new output through an
-atomic rename. The two separate paths cannot form one filesystem transaction;
-an interrupted publication leaves an existing output for operator inspection
-and never overwrites it on a retry.
+atomic bundle rename or no-replace anchor link. The two separate paths cannot
+form one filesystem transaction; an interrupted publication leaves an existing
+output for operator inspection and never overwrites it on a retry.
 An existing output, unsafe link, aliased path, overlapping boundary, changed
 file, stale anchor, or unexpected bundle entry fails closed.
 
