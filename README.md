@@ -137,11 +137,13 @@ approval gate.
 
 The signer-free maintenance CLI can checkpoint the append-only ledger into a
 checksummed payload bundle and a separate protected-head export, verify a
-downloaded pair, and restore it only into a clean state/anchor scope. It has no
-S3, signer, exchange, service-lifecycle, or deployment capability. Keep the two
-outputs in independently versioned storage boundaries; see
-`docs/runbooks/ledger-backup.md` for the offline drill and operator-gated
-off-host transfer contract.
+downloaded pair, and restore it only into a clean state/anchor scope. The Rust
+CLI has no S3, signer, exchange, service-lifecycle, or deployment capability.
+The separate operator tool `scripts/ledger_backup_transfer.py` can pin those
+outputs to exact version IDs in two versioned, KMS-encrypted S3 buckets and
+download only the recorded versions. It performs no restore or service action;
+actual AWS use remains an explicit operator gate. See
+`docs/runbooks/ledger-backup.md`.
 
 ## Local development
 
