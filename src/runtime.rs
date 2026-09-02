@@ -37,7 +37,7 @@ use std::{
 use thiserror::Error;
 
 const RUNTIME_CONFIG_SCHEMA_VERSION: u8 = 1;
-const RUNTIME_STATE_SCHEMA_VERSION: u8 = 1;
+const RUNTIME_STATE_SCHEMA_VERSION: u8 = 2;
 const ADMISSION_SCHEMA_VERSION: u8 = 1;
 const CYCLE_REPORT_SCHEMA_VERSION: u8 = 1;
 const STATE_FILE_NAME: &str = "runtime-state.json";
@@ -418,6 +418,7 @@ struct RuntimeState {
     movement_history_start_ms: u64,
     last_complete_scan_end_ms: Option<u64>,
     pacing: PacingState,
+    decision_signal_available: BTreeMap<chrono::NaiveDate, bool>,
     api_errors_total: u64,
     stale_signal_events_total: u64,
     dry_run_actions_total: u64,
@@ -465,7 +466,7 @@ impl PendingRuntimeCycle {
         {
             return Err(RuntimeError::CorruptPendingCycle);
         }
-        Ok(())
+        ensure_decision_signal_evidence(&self.body.state)
     }
 }
 
@@ -476,6 +477,7 @@ impl RuntimeState {
             movement_history_start_ms,
             last_complete_scan_end_ms: None,
             pacing: PacingState::default(),
+            decision_signal_available: BTreeMap::new(),
             api_errors_total: 0,
             stale_signal_events_total: 0,
             dry_run_actions_total: 0,
@@ -571,6 +573,7 @@ impl SignerFreeRuntime {
         let state_path = config.state_directory.join(STATE_FILE_NAME);
         let mut state = load_runtime_state(&state_path, config.movement_history_start_ms)?;
         state.pacing.validate_for_limits(&limits)?;
+        ensure_decision_signal_evidence(&state)?;
         let anchor_store: Arc<dyn ProtectedAnchorStore> = Arc::new(FileProtectedAnchorStore::new(
             config.protected_anchor_path.clone(),
         )?);
@@ -899,6 +902,24 @@ impl SignerFreeRuntime {
             ));
             None
         };
+        let signal_available = match &decision_result {
+            Some(result) => {
+                let decision_date = result.decision().decision_date;
+                if result.is_new()
+                    && next_state
+                        .decision_signal_available
+                        .insert(decision_date, decision_signal.is_some())
+                        .is_some()
+                {
+                    return Err(RuntimeError::IncompatibleRuntimeState);
+                }
+                *next_state
+                    .decision_signal_available
+                    .get(&decision_date)
+                    .ok_or(RuntimeError::IncompatibleRuntimeState)?
+            }
+            None => decision_signal.is_some(),
+        };
         if let Some(result) = &decision_result {
             if result.is_new() && !result.decision().planned_usdc.is_zero() {
                 next_state.dry_run_actions_total = next_state
@@ -950,7 +971,7 @@ impl SignerFreeRuntime {
             new_decision: decision_result.as_ref().is_some_and(DecisionResult::is_new),
             economic_action_suppressed: true,
             signed_action_created: false,
-            signal_available: decision_signal.is_some(),
+            signal_available,
             boundary_balance_available,
         };
         let pending = PendingRuntimeCycle::new(input.observed_at, next_state, ledger_events)?;
@@ -1606,6 +1627,17 @@ fn ensure_runtime_head_matches(
 ) -> Result<(), RuntimeError> {
     if state.last_committed_cycle_hash.as_deref() != ledger.last_runtime_cycle_hash() {
         return Err(RuntimeError::RuntimeStateRollback);
+    }
+    Ok(())
+}
+
+fn ensure_decision_signal_evidence(state: &RuntimeState) -> Result<(), RuntimeError> {
+    if !state
+        .decision_signal_available
+        .keys()
+        .eq(state.pacing.decisions().keys())
+    {
+        return Err(RuntimeError::IncompatibleRuntimeState);
     }
     Ok(())
 }

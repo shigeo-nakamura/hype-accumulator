@@ -517,14 +517,15 @@ fn boundary_mismatched_signal_becomes_a_durable_unavailable_skip() {
     let runtime_config = config(directory.path(), ms(start));
     let movement = deposit("deposit-with-old-signal", deposit_at, 100);
     let admission = approvals("deposit-with-old-signal", deposit_at, deposit_at);
-    let mut runtime = SignerFreeRuntime::open(runtime_config, limits()).expect("open runtime");
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
 
     let report = runtime
         .apply_cycle(RuntimeCycleInput {
             observed_at: decision_at,
             scan_start_ms: ms(start),
             scan_end_ms: ms(decision_at),
-            movements: &[movement],
+            movements: std::slice::from_ref(&movement),
             approvals: &admission,
             signal: Some(&previous_signal),
             accumulator: status(decision_at, 100.0),
@@ -544,6 +545,38 @@ fn boundary_mismatched_signal_becomes_a_durable_unavailable_skip() {
         Some(ms(decision_at))
     );
     assert_eq!(runtime.state.stale_signal_events_total, 1);
+    assert_eq!(
+        runtime
+            .state
+            .decision_signal_available
+            .get(&decision_at.date_naive()),
+        Some(&false)
+    );
+    drop(runtime);
+
+    let replay_at = decision_at + TimeDelta::minutes(5);
+    let valid_signal = signal(decision_at);
+    let mut reopened = SignerFreeRuntime::open(runtime_config, limits()).expect("reopen runtime");
+    let replay = reopened
+        .apply_cycle(RuntimeCycleInput {
+            observed_at: replay_at,
+            scan_start_ms: reopened.next_scan_start_ms(),
+            scan_end_ms: ms(replay_at),
+            movements: std::slice::from_ref(&movement),
+            approvals: &admission,
+            signal: Some(&valid_signal),
+            accumulator: status(replay_at, 100.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+        })
+        .expect("later valid signal cannot replace decision-time evidence");
+    assert!(!replay.is_new_decision());
+    assert_eq!(
+        replay.decision().expect("existing unavailable skip").reason,
+        DecisionReason::CoreSignalUnavailable
+    );
+    assert!(!replay.signal_available);
 }
 
 #[test]
@@ -685,6 +718,7 @@ fn delayed_cycle_preserves_a_preboundary_withdrawal_identity() {
         })
         .expect("overlap replay keeps the boundary reconciliation timestamp");
     assert!(!replay.is_new_decision());
+    assert!(replay.signal_available);
     assert_eq!(reopened.ledger.state().withdrawn_usdc(), usd(40));
 }
 
