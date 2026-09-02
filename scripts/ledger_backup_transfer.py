@@ -238,6 +238,8 @@ def require_trusted_directory_chain(path: Path, label: str) -> None:
 def require_bundle(bundle: Path, anchor: Path) -> tuple[str, dict[str, str]]:
     bundle = require_absolute_canonical(bundle, "bundle directory", exists=True)
     anchor = require_absolute_canonical(anchor, "anchor export", exists=True)
+    require_trusted_directory_chain(bundle, "bundle directory")
+    require_trusted_directory_chain(anchor.parent, "anchor parent")
     bundle_info = bundle.stat()
     if (
         not bundle.is_dir()
@@ -345,6 +347,7 @@ def captured_backup(
             or staging_info.st_mode & 0o077
         ):
             raise TransferError("staging root must be owner-controlled and private")
+        require_trusted_directory_chain(staging_root, "staging root")
         if staging_root == bundle or bundle in staging_root.parents:
             raise TransferError("staging root must not overlap the source bundle")
         temporary_parent = str(staging_root)
@@ -423,6 +426,7 @@ def rename_noreplace(source: Path, destination: Path) -> None:
 def write_private_json(path: Path, document: dict[str, object]) -> None:
     path = require_absolute_canonical(path, "receipt path", exists=False)
     parent = require_absolute_canonical(path.parent, "receipt parent", exists=True)
+    require_trusted_directory_chain(parent, "receipt parent")
     if path.exists() or path.is_symlink():
         raise TransferError("receipt output already exists")
     payload = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode()
@@ -461,7 +465,10 @@ def validate_receipt_output(receipt: Path, bundle: Path, anchor: Path) -> None:
     receipt = require_absolute_canonical(receipt, "receipt path", exists=False)
     bundle = require_absolute_canonical(bundle, "bundle directory", exists=True)
     anchor = require_absolute_canonical(anchor, "anchor export", exists=True)
-    require_absolute_canonical(receipt.parent, "receipt parent", exists=True)
+    receipt_parent = require_absolute_canonical(
+        receipt.parent, "receipt parent", exists=True
+    )
+    require_trusted_directory_chain(receipt_parent, "receipt parent")
     if receipt.exists() or receipt.is_symlink():
         raise TransferError("receipt output already exists")
     if receipt == anchor or receipt == bundle or bundle in receipt.parents:
@@ -569,6 +576,7 @@ def parse_stored_object(value: object, label: str) -> StoredObject:
 
 def load_receipt(path: Path) -> tuple[str, dict[str, StoredObject], StoredObject]:
     path = require_absolute_canonical(path, "receipt", exists=True)
+    require_trusted_directory_chain(path.parent, "receipt parent")
     try:
         document = json.loads(read_private_file(path, "receipt").decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as error:

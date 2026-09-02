@@ -190,6 +190,25 @@ class LedgerBackupTransferTests(unittest.TestCase):
             transfer.BUNDLE_FILES,
         )
 
+    def test_upload_rejects_source_beneath_untrusted_writable_parent(self) -> None:
+        os.chmod(self.root, 0o777)
+        try:
+            with self.assertRaisesRegex(transfer.TransferError, "untrusted writable"):
+                self.upload()
+        finally:
+            os.chmod(self.root, 0o700)
+        self.assertEqual(self.aws.put_calls, 0)
+
+    def test_upload_rejects_staging_beneath_untrusted_writable_parent(self) -> None:
+        unsafe_parent = self.root / "unsafe-staging-parent"
+        unsafe_parent.mkdir(mode=0o700)
+        staging_root = unsafe_parent / "staging"
+        staging_root.mkdir(mode=0o700)
+        os.chmod(unsafe_parent, 0o777)
+        with self.assertRaisesRegex(transfer.TransferError, "untrusted writable"):
+            self.upload(staging_root=staging_root)
+        self.assertEqual(self.aws.put_calls, 0)
+
     def test_upload_rejects_one_storage_boundary(self) -> None:
         with self.assertRaisesRegex(transfer.TransferError, "different buckets"):
             self.upload(anchor_bucket=PAYLOAD_BUCKET)
@@ -212,6 +231,14 @@ class LedgerBackupTransferTests(unittest.TestCase):
             self.upload(receipt=receipt)
         self.assertEqual(self.aws.put_calls, 0)
         self.assertEqual(receipt.read_text(encoding="utf-8"), "existing\n")
+
+    def test_upload_rejects_receipt_beneath_untrusted_writable_parent(self) -> None:
+        unsafe_parent = self.root / "unsafe-receipt-parent"
+        unsafe_parent.mkdir(mode=0o700)
+        os.chmod(unsafe_parent, 0o777)
+        with self.assertRaisesRegex(transfer.TransferError, "untrusted writable"):
+            self.upload(receipt=unsafe_parent / "receipt.json")
+        self.assertEqual(self.aws.put_calls, 0)
 
     def test_receipt_fsync_failure_never_reserves_final_path(self) -> None:
         receipt = self.root / "receipt.json"
@@ -389,6 +416,16 @@ class LedgerBackupTransferTests(unittest.TestCase):
         receipt.write_text(json.dumps(document), encoding="utf-8")
         os.chmod(receipt, 0o600)
         with self.assertRaisesRegex(transfer.TransferError, "invalid field types"):
+            transfer.load_receipt(receipt)
+
+    def test_load_receipt_rejects_untrusted_writable_parent(self) -> None:
+        self.upload()
+        unsafe_parent = self.root / "unsafe-receipt-read-parent"
+        unsafe_parent.mkdir(mode=0o700)
+        receipt = unsafe_parent / "receipt.json"
+        (self.root / "receipt.json").replace(receipt)
+        os.chmod(unsafe_parent, 0o777)
+        with self.assertRaisesRegex(transfer.TransferError, "untrusted writable"):
             transfer.load_receipt(receipt)
 
     def test_aws_subprocess_does_not_inherit_bot_signing_material(self) -> None:
