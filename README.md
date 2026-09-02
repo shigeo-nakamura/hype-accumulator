@@ -23,6 +23,7 @@ paths. `config/example.toml` is safe and non-routable.
 - `clock` / `exchange`: deterministic boundaries and test doubles
 - `execution`: order limits and exchange workflow
 - `ledger`: durable-ledger interface
+- `backup`: checksummed ledger backup verification and clean restore
 - `metrics`: stable metrics snapshot types
 - `status`: validated, dashboard-safe balance and activity payload
 
@@ -133,6 +134,14 @@ populated signing-key environment variable and never constructs an economic
 action. See `docs/runbooks/signer-free-runtime.md` for the closed input and
 persistence contract. Service installation or start remains a separate
 approval gate.
+
+The signer-free maintenance CLI can checkpoint the append-only ledger into a
+checksummed payload bundle and a separate protected-head export, verify a
+downloaded pair, and restore it only into a clean state/anchor scope. It has no
+S3, signer, exchange, service-lifecycle, or deployment capability. Keep the two
+outputs in independently versioned storage boundaries; see
+`docs/runbooks/ledger-backup.md` for the offline drill and operator-gated
+off-host transfer contract.
 
 ## Local development
 
