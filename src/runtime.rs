@@ -37,7 +37,7 @@ use std::{
 use thiserror::Error;
 
 const RUNTIME_CONFIG_SCHEMA_VERSION: u8 = 1;
-const RUNTIME_STATE_SCHEMA_VERSION: u8 = 2;
+const RUNTIME_STATE_SCHEMA_VERSION: u8 = 3;
 const ADMISSION_SCHEMA_VERSION: u8 = 1;
 const CYCLE_REPORT_SCHEMA_VERSION: u8 = 1;
 const STATE_FILE_NAME: &str = "runtime-state.json";
@@ -418,12 +418,18 @@ struct RuntimeState {
     movement_history_start_ms: u64,
     last_complete_scan_end_ms: Option<u64>,
     pacing: PacingState,
-    decision_signal_available: BTreeMap<chrono::NaiveDate, bool>,
+    decision_evidence: BTreeMap<chrono::NaiveDate, RuntimeDecisionEvidence>,
     api_errors_total: u64,
     stale_signal_events_total: u64,
     dry_run_actions_total: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_committed_cycle_hash: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct RuntimeDecisionEvidence {
+    signal_available: bool,
+    boundary_balance_available: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -466,7 +472,7 @@ impl PendingRuntimeCycle {
         {
             return Err(RuntimeError::CorruptPendingCycle);
         }
-        ensure_decision_signal_evidence(&self.body.state)
+        ensure_decision_evidence(&self.body.state)
     }
 }
 
@@ -477,7 +483,7 @@ impl RuntimeState {
             movement_history_start_ms,
             last_complete_scan_end_ms: None,
             pacing: PacingState::default(),
-            decision_signal_available: BTreeMap::new(),
+            decision_evidence: BTreeMap::new(),
             api_errors_total: 0,
             stale_signal_events_total: 0,
             dry_run_actions_total: 0,
@@ -573,7 +579,7 @@ impl SignerFreeRuntime {
         let state_path = config.state_directory.join(STATE_FILE_NAME);
         let mut state = load_runtime_state(&state_path, config.movement_history_start_ms)?;
         state.pacing.validate_for_limits(&limits)?;
-        ensure_decision_signal_evidence(&state)?;
+        ensure_decision_evidence(&state)?;
         let anchor_store: Arc<dyn ProtectedAnchorStore> = Arc::new(FileProtectedAnchorStore::new(
             config.protected_anchor_path.clone(),
         )?);
@@ -722,13 +728,21 @@ impl SignerFreeRuntime {
                         },
                     });
                     let approval = input.approvals.get(&movement.event_id);
+                    let durable_tranche = self.state.pacing.deposits().get(&movement.event_id);
                     capital_events.push(CapitalEvent::Deposit(DepositEvent {
                         event_id: movement.event_id.clone(),
                         amount_usdc: amount,
                         received_at: occurred_at,
-                        confirmed_at: approval.map(|value| value.confirmed_at),
-                        confirmation_count: approval.map_or(0, |value| value.confirmation_count),
-                        admission_approved_at: approval.map(|value| value.approved_at),
+                        confirmed_at: approval
+                            .map(|value| value.confirmed_at)
+                            .or_else(|| durable_tranche.and_then(|tranche| tranche.confirmed_at)),
+                        confirmation_count: approval.map_or_else(
+                            || durable_tranche.map_or(0, |tranche| tranche.confirmation_count),
+                            |value| value.confirmation_count,
+                        ),
+                        admission_approved_at: approval.map(|value| value.approved_at).or_else(
+                            || durable_tranche.and_then(|tranche| tranche.admission_approved_at),
+                        ),
                     }));
                     observed_deposit_ids.insert(movement.event_id.clone());
                     if !self
@@ -805,7 +819,7 @@ impl SignerFreeRuntime {
         let mut next_state = self.state.clone();
         let mut ledger_events = Vec::new();
         let decision_result = if let Some(decision) = existing_decision {
-            next_state.pacing.reconcile_capital(
+            next_state.pacing.reconcile_capital_preserving_admissions(
                 &capital_events,
                 input.observed_at,
                 &self.limits,
@@ -829,7 +843,7 @@ impl SignerFreeRuntime {
             let (boundary_movements, later_movements): (Vec<_>, Vec<_>) = movement_ledger_events
                 .into_iter()
                 .partition(|event| event.occurred_at <= boundary);
-            next_state.pacing.reconcile_capital(
+            next_state.pacing.reconcile_capital_preserving_admissions(
                 &boundary_capital_events,
                 boundary,
                 &self.limits,
@@ -869,7 +883,7 @@ impl SignerFreeRuntime {
             if let Some(result) = &mut decision {
                 ledger_events.extend(dry_run_decision_events(&mut next_state.pacing, result)?);
             }
-            next_state.pacing.reconcile_capital(
+            next_state.pacing.reconcile_capital_preserving_admissions(
                 &capital_events,
                 input.observed_at,
                 &self.limits,
@@ -885,7 +899,7 @@ impl SignerFreeRuntime {
             ));
             decision
         } else {
-            next_state.pacing.reconcile_capital(
+            next_state.pacing.reconcile_capital_preserving_admissions(
                 &capital_events,
                 input.observed_at,
                 &self.limits,
@@ -902,23 +916,32 @@ impl SignerFreeRuntime {
             ));
             None
         };
-        let signal_available = match &decision_result {
+        let decision_evidence = match &decision_result {
             Some(result) => {
                 let decision_date = result.decision().decision_date;
                 if result.is_new()
                     && next_state
-                        .decision_signal_available
-                        .insert(decision_date, decision_signal.is_some())
+                        .decision_evidence
+                        .insert(
+                            decision_date,
+                            RuntimeDecisionEvidence {
+                                signal_available: decision_signal.is_some(),
+                                boundary_balance_available,
+                            },
+                        )
                         .is_some()
                 {
                     return Err(RuntimeError::IncompatibleRuntimeState);
                 }
                 *next_state
-                    .decision_signal_available
+                    .decision_evidence
                     .get(&decision_date)
                     .ok_or(RuntimeError::IncompatibleRuntimeState)?
             }
-            None => decision_signal.is_some(),
+            None => RuntimeDecisionEvidence {
+                signal_available: decision_signal.is_some(),
+                boundary_balance_available,
+            },
         };
         if let Some(result) = &decision_result {
             if result.is_new() && !result.decision().planned_usdc.is_zero() {
@@ -971,8 +994,8 @@ impl SignerFreeRuntime {
             new_decision: decision_result.as_ref().is_some_and(DecisionResult::is_new),
             economic_action_suppressed: true,
             signed_action_created: false,
-            signal_available,
-            boundary_balance_available,
+            signal_available: decision_evidence.signal_available,
+            boundary_balance_available: decision_evidence.boundary_balance_available,
         };
         let pending = PendingRuntimeCycle::new(input.observed_at, next_state, ledger_events)?;
         write_private_json_atomic(
@@ -1631,9 +1654,9 @@ fn ensure_runtime_head_matches(
     Ok(())
 }
 
-fn ensure_decision_signal_evidence(state: &RuntimeState) -> Result<(), RuntimeError> {
+fn ensure_decision_evidence(state: &RuntimeState) -> Result<(), RuntimeError> {
     if !state
-        .decision_signal_available
+        .decision_evidence
         .keys()
         .eq(state.pacing.decisions().keys())
     {

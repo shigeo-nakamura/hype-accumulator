@@ -38,6 +38,9 @@ action.
 - Newly admitted capital is journaled at its first usable timestamp, after its
   authoritative deposit and before any later withdrawal that depends on it.
   This ordering is preserved when both movements are discovered in one scan.
+- Journaled admission is append-only per deposit event ID. Approving an older
+  tranche later can use only remaining admission capacity; it cannot move
+  admission already journaled for another tranche.
 - The movement cursor re-reads a 24-hour overlap by default; ledger event IDs
   make replay idempotent. An incomplete history query never advances the
   cursor and forces the day's decision to fail closed.
@@ -47,7 +50,9 @@ action.
 - A missing, invalid, or boundary-mismatched signal snapshot produces a
   durable `core_signal_unavailable` skip. A stale snapshot left from another
   decision day cannot wedge the movement cursor, and a later same-day snapshot
-  cannot replace the recorded skip.
+  cannot replace the recorded skip. Signal and boundary-balance availability
+  are authenticated decision-time evidence and remain unchanged on same-day
+  recurring cycles.
 - A valid signal snapshot must bind to that day's configured UTC hour/minute,
   with seconds set to zero. Delayed timer execution still records the decision
   at that boundary. The balance API request start and response time form a

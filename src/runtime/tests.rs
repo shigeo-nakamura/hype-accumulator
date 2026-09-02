@@ -548,9 +548,12 @@ fn boundary_mismatched_signal_becomes_a_durable_unavailable_skip() {
     assert_eq!(
         runtime
             .state
-            .decision_signal_available
+            .decision_evidence
             .get(&decision_at.date_naive()),
-        Some(&false)
+        Some(&RuntimeDecisionEvidence {
+            signal_available: false,
+            boundary_balance_available: true,
+        })
     );
     drop(runtime);
 
@@ -577,6 +580,129 @@ fn boundary_mismatched_signal_becomes_a_durable_unavailable_skip() {
         DecisionReason::CoreSignalUnavailable
     );
     assert!(!replay.signal_available);
+}
+
+#[test]
+fn existing_decision_preserves_missing_boundary_balance_evidence() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 7, 8, 0);
+    let decision_at = at(2026, 7, 7, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let signal = signal(decision_at);
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
+
+    let first = runtime
+        .apply_cycle(RuntimeCycleInput {
+            observed_at: decision_at,
+            scan_start_ms: ms(start),
+            scan_end_ms: ms(decision_at),
+            movements: &[],
+            approvals: &AdmissionApprovals::empty(),
+            signal: Some(&signal),
+            accumulator: status(decision_at, 0.0),
+            capital_history_complete: false,
+            manual_pause: false,
+            api_errors: 1,
+        })
+        .expect("incomplete history records a durable skip");
+    assert_eq!(
+        first.decision().expect("missing history decision").reason,
+        DecisionReason::MissingCapitalHistory
+    );
+    assert!(!first.boundary_balance_available);
+    drop(runtime);
+
+    let replay_at = decision_at + TimeDelta::minutes(5);
+    let mut reopened = SignerFreeRuntime::open(runtime_config, limits()).expect("reopen runtime");
+    let replay = reopened
+        .apply_cycle(RuntimeCycleInput {
+            observed_at: replay_at,
+            scan_start_ms: reopened.next_scan_start_ms(),
+            scan_end_ms: ms(replay_at),
+            movements: &[],
+            approvals: &AdmissionApprovals::empty(),
+            signal: Some(&signal),
+            accumulator: status(replay_at, 0.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+        })
+        .expect("complete retry keeps decision-time boundary evidence");
+    assert!(!replay.is_new_decision());
+    assert!(!replay.boundary_balance_available);
+}
+
+#[test]
+fn later_approval_cannot_redistribute_journaled_admission() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 7, 8, 0);
+    let earlier_at = at(2026, 7, 7, 8, 30);
+    let later_at = at(2026, 7, 7, 9, 0);
+    let first_observed_at = at(2026, 7, 7, 10, 0);
+    let second_observed_at = at(2026, 7, 7, 11, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movements = vec![
+        deposit("earlier-approved-later", earlier_at, 100),
+        deposit("later-admitted-first", later_at, 100),
+    ];
+    let later_approval = approvals("later-admitted-first", later_at, later_at);
+    let earlier_approval = approvals("earlier-approved-later", earlier_at, earlier_at);
+    let mut capped_limits = limits();
+    capped_limits.max_automatically_admitted_usdc = usd(100);
+    capped_limits.yearly_admission_cap_usdc = usd(100);
+    capped_limits.cumulative_admission_cap_usdc = usd(100);
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config, capped_limits).expect("open capped runtime");
+
+    runtime
+        .apply_cycle(RuntimeCycleInput {
+            observed_at: first_observed_at,
+            scan_start_ms: ms(start),
+            scan_end_ms: ms(first_observed_at),
+            movements: &movements,
+            approvals: &later_approval,
+            signal: None,
+            accumulator: status(first_observed_at, 200.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+        })
+        .expect("later tranche consumes the append-only admission cap");
+    assert_eq!(
+        runtime
+            .ledger
+            .state()
+            .admitted_deposit_usdc("later-admitted-first"),
+        Some(usd(100))
+    );
+
+    runtime
+        .apply_cycle(RuntimeCycleInput {
+            observed_at: second_observed_at,
+            scan_start_ms: runtime.next_scan_start_ms(),
+            scan_end_ms: ms(second_observed_at),
+            movements: &movements,
+            approvals: &earlier_approval,
+            signal: None,
+            accumulator: status(second_observed_at, 200.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+        })
+        .expect("older approval preserves the journaled admission allocation");
+    assert_eq!(
+        runtime.state.pacing.deposits()["earlier-approved-later"].admitted_usdc,
+        UsdcMicros::default()
+    );
+    assert_eq!(
+        runtime.state.pacing.deposits()["later-admitted-first"].admitted_usdc,
+        usd(100)
+    );
+    assert_eq!(
+        runtime.state.last_complete_scan_end_ms,
+        Some(ms(second_observed_at))
+    );
 }
 
 #[test]
