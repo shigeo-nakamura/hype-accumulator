@@ -10,7 +10,7 @@ live-probe = []
 
 [dependencies]
 chrono = { version = "=0.4.41", default-features = false, features = ["clock", "serde"] }
-dex-connector = { git = "https://github.com/shigeo-nakamura/dex-connector", rev = "6dfcac55bda62ebb8276ccea17f365e6e5c097a4", default-features = false, features = ["hyperliquid-sdk"] }
+dex-connector = { git = "https://github.com/shigeo-nakamura/dex-connector", rev = "83a4c29644ea5b2ebbeade10c88b5dc2e1c85dca", default-features = false, features = ["hyperliquid-sdk"] }
 fs2 = "=0.4.3"
 libc = "=0.2.189"
 reqwest = { version = "=0.11.27", default-features = false, features = ["json", "rustls-tls"] }
