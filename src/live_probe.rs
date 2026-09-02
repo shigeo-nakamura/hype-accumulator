@@ -18,10 +18,13 @@ use dex_connector::{
     OrderSide,
 };
 use rust_decimal::{prelude::ToPrimitive, Decimal};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const USDC_MICROS_PER_USDC: u64 = 1_000_000;
 const HYPE_SPOT_MARKET: &str = "HYPE/USDC";
+const EXECUTION_IDENTITY_DOMAIN: &[u8] = b"hype-accumulator/execution-account-identity/v1";
+const SIGNER_IDENTITY_DOMAIN: &[u8] = b"hype-accumulator/api-wallet-identity/v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LiveProbeBinding {
@@ -29,6 +32,53 @@ pub struct LiveProbeBinding {
     pub execution_identity_hash: String,
     pub signer_identity_hash: String,
     pub market_metadata_digest: String,
+}
+
+impl LiveProbeBinding {
+    /// Derives the durable execution and signer identities from the connector's
+    /// configured public addresses. No private signing material is exposed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the connector is missing an execution account or
+    /// API-wallet signer, or when the metadata digest is non-canonical.
+    pub fn from_connector(
+        connector: &HyperliquidConnector,
+        market_metadata_digest: impl Into<String>,
+    ) -> Result<Self, LiveProbeError> {
+        let market_metadata_digest = market_metadata_digest.into();
+        if market_metadata_digest.trim().is_empty()
+            || market_metadata_digest != market_metadata_digest.trim()
+        {
+            return Err(LiveProbeError::BindingMismatch("market metadata"));
+        }
+        let (execution_identity_hash, signer_identity_hash) = connector_identity_hashes(connector)?;
+        Ok(Self {
+            symbol: HYPE_SPOT_MARKET.to_string(),
+            execution_identity_hash,
+            signer_identity_hash,
+            market_metadata_digest,
+        })
+    }
+
+    fn validate_connector(&self, connector: &HyperliquidConnector) -> Result<(), LiveProbeError> {
+        let (execution_identity_hash, signer_identity_hash) = connector_identity_hashes(connector)?;
+        if self.execution_identity_hash != execution_identity_hash {
+            return Err(LiveProbeError::BindingMismatch("execution identity"));
+        }
+        if self.signer_identity_hash != signer_identity_hash {
+            return Err(LiveProbeError::BindingMismatch("signer identity"));
+        }
+        if self.symbol != HYPE_SPOT_MARKET {
+            return Err(LiveProbeError::BindingMismatch("symbol"));
+        }
+        if self.market_metadata_digest.trim().is_empty()
+            || self.market_metadata_digest != self.market_metadata_digest.trim()
+        {
+            return Err(LiveProbeError::BindingMismatch("market metadata"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,9 +130,19 @@ pub struct HyperliquidLiveProbe {
 }
 
 impl HyperliquidLiveProbe {
-    #[must_use]
-    pub fn new(connector: HyperliquidConnector, binding: LiveProbeBinding) -> Self {
-        Self { connector, binding }
+    /// Constructs a probe only when its durable identity binding matches the
+    /// connector's actual execution account and API-wallet signer.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing or mismatched connector identities and invalid binding
+    /// metadata before any nonce can be reserved or action submitted.
+    pub fn new(
+        connector: HyperliquidConnector,
+        binding: LiveProbeBinding,
+    ) -> Result<Self, LiveProbeError> {
+        binding.validate_connector(&connector)?;
+        Ok(Self { connector, binding })
     }
 
     /// Durably reserves one API-wallet nonce without signing or submitting.
@@ -286,6 +346,25 @@ fn validate_binding(
     Ok(())
 }
 
+fn connector_identity_hashes(
+    connector: &HyperliquidConnector,
+) -> Result<(String, String), LiveProbeError> {
+    let execution_account = connector.execution_account_address()?;
+    let api_wallet = connector.api_wallet_address()?;
+    Ok((
+        identity_hash(EXECUTION_IDENTITY_DOMAIN, execution_account),
+        identity_hash(SIGNER_IDENTITY_DOMAIN, &api_wallet),
+    ))
+}
+
+fn identity_hash(domain: &[u8], canonical_address: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update([0]);
+    hasher.update(canonical_address.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 fn atoms_to_decimal(atoms: HypeAtoms, atoms_per_hype: u64) -> Result<Decimal, LiveProbeError> {
     if atoms.is_zero() || atoms_per_hype == 0 {
         return Err(LiveProbeError::InvalidDecimal("HYPE quantity"));
@@ -344,6 +423,11 @@ fn reconciliation_from_connector(
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use dex_connector::{HyperliquidAccountConfig, HyperliquidConnectorConfig};
+    use std::path::Path;
+
+    const TEST_SIGNER_KEY: &str =
+        "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
     fn at(second: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(second, 0).single().unwrap()
@@ -356,6 +440,25 @@ mod tests {
             signer_identity_hash: "signer-a".to_string(),
             market_metadata_digest: "market-a".to_string(),
         }
+    }
+
+    fn test_connector(account: &str, nonce_path: &Path) -> HyperliquidConnector {
+        HyperliquidConnector::new(HyperliquidConnectorConfig {
+            base_url: "http://127.0.0.1:1".to_string(),
+            tracked_symbols: vec![HYPE_SPOT_MARKET.to_string()],
+        })
+        .unwrap()
+        .with_account(HyperliquidAccountConfig {
+            account_address: account.to_string(),
+            signer_private_key: Some(TEST_SIGNER_KEY.to_string()),
+            vault_address: None,
+            is_mainnet: false,
+            nonce_state_path: Some(nonce_path.to_path_buf()),
+            max_taker_notional: Some(Decimal::from(25)),
+            max_taker_slippage_bps: Some(50),
+            max_taker_book_age_ms: 1_000,
+        })
+        .unwrap()
     }
 
     fn order() -> ExternalAction {
@@ -458,5 +561,52 @@ mod tests {
         );
         assert!(decimal_to_atoms(Decimal::new(1231, 3), 100).is_err());
         assert!(decimal_to_atoms(Decimal::NEGATIVE_ONE, 100).is_err());
+    }
+
+    #[test]
+    fn derives_and_enforces_actual_connector_identities() {
+        let temp = tempfile::tempdir().unwrap();
+        let connector = test_connector(
+            "0x1111111111111111111111111111111111111111",
+            &temp.path().join("nonce-a.json"),
+        );
+        let binding = LiveProbeBinding::from_connector(&connector, "market-a").unwrap();
+        assert_eq!(
+            binding.execution_identity_hash,
+            identity_hash(
+                EXECUTION_IDENTITY_DOMAIN,
+                connector.execution_account_address().unwrap()
+            )
+        );
+        assert_eq!(
+            binding.signer_identity_hash,
+            identity_hash(
+                SIGNER_IDENTITY_DOMAIN,
+                &connector.api_wallet_address().unwrap()
+            )
+        );
+        assert!(HyperliquidLiveProbe::new(connector, binding).is_ok());
+
+        let connector = test_connector(
+            "0x2222222222222222222222222222222222222222",
+            &temp.path().join("nonce-b.json"),
+        );
+        let mut stale = LiveProbeBinding::from_connector(&connector, "market-a").unwrap();
+        stale.execution_identity_hash = "stale-account".to_string();
+        assert!(matches!(
+            HyperliquidLiveProbe::new(connector, stale),
+            Err(LiveProbeError::BindingMismatch("execution identity"))
+        ));
+
+        let connector = test_connector(
+            "0x3333333333333333333333333333333333333333",
+            &temp.path().join("nonce-c.json"),
+        );
+        let mut stale = LiveProbeBinding::from_connector(&connector, "market-a").unwrap();
+        stale.signer_identity_hash = "stale-api-wallet".to_string();
+        assert!(matches!(
+            HyperliquidLiveProbe::new(connector, stale),
+            Err(LiveProbeError::BindingMismatch("signer identity"))
+        ));
     }
 }
