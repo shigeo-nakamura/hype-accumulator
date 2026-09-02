@@ -4,13 +4,15 @@
 //! This module deliberately has no scheduler, config loader, secret loader, or
 //! retry loop. A caller must first obtain [`ExternalAction::SubmitOrder`] from
 //! [`DurableWorkflow::prepare_order`](crate::workflow::DurableWorkflow::prepare_order),
-//! which fsyncs the exact CLOID, nonce, and expiry. Once this method is invoked,
+//! which fsyncs the exact CLOID, nonce, and expiry, then pass that same
+//! [`DurableWorkflow`](crate::workflow::DurableWorkflow) to this adapter. The
+//! adapter never accepts a caller-supplied action. Once submission is invoked,
 //! every error is reconciliation-only: the caller must query by CLOID and must
-//! never call `submit` again for the same prepared action.
+//! never call `submit` again for the same prepared workflow.
 
 use crate::{
     pacing::UsdcMicros,
-    workflow::{ExternalAction, HypeAtoms},
+    workflow::{DurableWorkflow, ExternalAction, HypeAtoms, WorkflowError},
 };
 use chrono::{DateTime, Utc};
 use dex_connector::{
@@ -120,6 +122,8 @@ pub enum LiveProbeError {
     InvalidDecimal(&'static str),
     #[error("prepared order limit notional exceeds its durable capital bounds")]
     CapitalBound,
+    #[error("durable workflow does not expose the authorized pending order: {0}")]
+    Workflow(#[from] WorkflowError),
     #[error("Hyperliquid action requires CLOID reconciliation: {0}")]
     Connector(#[from] DexError),
 }
@@ -166,9 +170,10 @@ impl HyperliquidLiveProbe {
     /// envelope, or a reservation that was already consumed.
     pub async fn abandon_expired(
         &self,
-        action: &ExternalAction,
+        workflow: &DurableWorkflow,
         now: DateTime<Utc>,
     ) -> Result<(), LiveProbeError> {
+        let action = workflow.pending_prepared_order()?;
         let ExternalAction::SubmitOrder {
             execution_identity_hash,
             signer_identity_hash,
@@ -209,9 +214,10 @@ impl HyperliquidLiveProbe {
     /// reconciliation-only; callers must never resubmit the action.
     pub async fn submit(
         &self,
-        action: &ExternalAction,
+        workflow: &DurableWorkflow,
         now: DateTime<Utc>,
     ) -> Result<ProbeSubmission, LiveProbeError> {
+        let action = workflow.pending_prepared_order()?;
         let prepared = PreparedIocOrder::from_action(action, &self.binding, now)?;
         let response = self
             .connector
@@ -242,8 +248,9 @@ impl HyperliquidLiveProbe {
     /// Returns an error for malformed quantities or connector failures.
     pub async fn reconcile(
         &self,
-        action: &ExternalAction,
+        workflow: &DurableWorkflow,
     ) -> Result<ProbeReconciliation, LiveProbeError> {
+        let action = workflow.pending_prepared_order()?;
         let ExternalAction::SubmitOrder {
             client_order_id,
             execution_identity_hash,

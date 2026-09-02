@@ -2206,6 +2206,24 @@ impl DurableWorkflow {
         &self.state
     }
 
+    /// Returns the currently pending order action only after revalidating it
+    /// against the replayed durable workflow state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the journal's current pending action is the
+    /// deterministic order envelope authorized by this workflow binding.
+    pub fn pending_prepared_order(&self) -> Result<&ExternalAction, WorkflowError> {
+        let Some(action @ ExternalAction::SubmitOrder { .. }) = self.state.pending_action.as_ref()
+        else {
+            return Err(WorkflowError::InvalidTransition(
+                "no journal-backed order action is pending".into(),
+            ));
+        };
+        self.state.validate_prepared_action(action)?;
+        Ok(action)
+    }
+
     #[must_use]
     pub fn record_count(&self) -> usize {
         self.records.len()

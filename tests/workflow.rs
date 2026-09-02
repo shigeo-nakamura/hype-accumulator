@@ -1785,6 +1785,12 @@ fn prepared_order_is_durable_and_restart_is_reconciliation_only() {
     let mut restarted = reopen(&path, &binding);
     assert_eq!(restarted.state().pending_action(), Some(&prepared));
     assert_eq!(
+        restarted
+            .pending_prepared_order()
+            .expect("journal-backed order"),
+        &prepared
+    );
+    assert_eq!(
         restarted.prepare_order(at(2)).expect("order reconciled"),
         PrepareOutcome::ReconcileOnly {
             action_id,
@@ -1800,6 +1806,10 @@ fn an_unprepared_order_is_rejected_at_both_bound_expiries_without_journaling() {
     let path = temp.path().join("expired-before-prepare.jsonl");
     let binding = binding();
     let mut workflow = reopen(&path, &binding);
+    assert!(matches!(
+        workflow.pending_prepared_order(),
+        Err(WorkflowError::InvalidTransition(_))
+    ));
     let durable_before = fs::read(&path).expect("decision journal read");
 
     for expired_at in [
