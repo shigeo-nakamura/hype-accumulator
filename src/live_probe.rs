@@ -21,6 +21,7 @@ use rust_decimal::{prelude::ToPrimitive, Decimal};
 use thiserror::Error;
 
 const USDC_MICROS_PER_USDC: u64 = 1_000_000;
+const HYPE_SPOT_MARKET: &str = "HYPE/USDC";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LiveProbeBinding {
@@ -235,7 +236,7 @@ fn validate_binding(
     if market_metadata_digest != binding.market_metadata_digest {
         return Err(LiveProbeError::BindingMismatch("market metadata"));
     }
-    if binding.symbol.trim().is_empty() || binding.symbol != binding.symbol.trim() {
+    if binding.symbol != HYPE_SPOT_MARKET {
         return Err(LiveProbeError::BindingMismatch("symbol"));
     }
     Ok(())
@@ -245,10 +246,17 @@ fn atoms_to_decimal(atoms: HypeAtoms, atoms_per_hype: u64) -> Result<Decimal, Li
     if atoms.is_zero() || atoms_per_hype == 0 {
         return Err(LiveProbeError::InvalidDecimal("HYPE quantity"));
     }
-    Decimal::from(atoms.as_atoms())
+    let original = Decimal::from(atoms.as_atoms());
+    let value = original
         .checked_div(Decimal::from(atoms_per_hype))
         .filter(|value| *value > Decimal::ZERO)
-        .ok_or(LiveProbeError::InvalidDecimal("HYPE quantity"))
+        .ok_or(LiveProbeError::InvalidDecimal("HYPE quantity"))?;
+    if value.checked_mul(Decimal::from(atoms_per_hype)) != Some(original) {
+        return Err(LiveProbeError::InvalidDecimal(
+            "HYPE atom scale is not exactly representable",
+        ));
+    }
+    Ok(value)
 }
 
 fn micros_to_decimal(value: UsdcMicros) -> Result<Decimal, LiveProbeError> {
@@ -371,6 +379,30 @@ mod tests {
         assert!(matches!(
             PreparedIocOrder::from_action(&oversized, &binding(), at(1)),
             Err(LiveProbeError::CapitalBound)
+        ));
+
+        let mut other_market = binding();
+        other_market.symbol = "PURR/USDC".to_string();
+        assert!(matches!(
+            PreparedIocOrder::from_action(&order(), &other_market, at(1)),
+            Err(LiveProbeError::BindingMismatch("symbol"))
+        ));
+
+        let mut inexact_scale = order();
+        if let ExternalAction::SubmitOrder {
+            original_quantity_hype,
+            hype_atoms_per_hype,
+            ..
+        } = &mut inexact_scale
+        {
+            *original_quantity_hype = HypeAtoms::from_atoms(1);
+            *hype_atoms_per_hype = 3;
+        }
+        assert!(matches!(
+            PreparedIocOrder::from_action(&inexact_scale, &binding(), at(1)),
+            Err(LiveProbeError::InvalidDecimal(
+                "HYPE atom scale is not exactly representable"
+            ))
         ));
     }
 
