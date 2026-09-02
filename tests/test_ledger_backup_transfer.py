@@ -172,6 +172,15 @@ class LedgerBackupTransferTests(unittest.TestCase):
             self.upload(anchor_bucket=PAYLOAD_BUCKET)
         self.assertEqual(self.aws.put_calls, 0)
 
+    def test_upload_rejects_receipt_inside_bundle_before_aws(self) -> None:
+        with self.assertRaisesRegex(transfer.TransferError, "must not overlap"):
+            self.upload(receipt=self.bundle / "receipt.json")
+        self.assertEqual(self.aws.put_calls, 0)
+        self.assertEqual(
+            tuple(sorted(path.name for path in self.bundle.iterdir())),
+            transfer.BUNDLE_FILES,
+        )
+
     def test_upload_rejects_suspended_versioning_before_put(self) -> None:
         self.aws.versioned.remove(ANCHOR_BUCKET)
         with self.assertRaisesRegex(transfer.TransferError, "versioning"):
@@ -341,6 +350,101 @@ class LedgerBackupTransferTests(unittest.TestCase):
                 backup_id=BACKUP_ID,
                 sha256=transfer.sha256_file(self.anchor),
             )
+
+    def test_large_object_branch_uses_multipart_and_reconciles_one_version(self) -> None:
+        kms_key = f"arn:aws:kms:eu-central-1:{OWNER}:key/payload"
+        digest = transfer.sha256_file(self.anchor)
+        head_response = {
+            "VersionId": "version-1",
+            "ChecksumSHA256": transfer.checksum_b64(self.anchor),
+            "ContentLength": self.anchor.stat().st_size,
+            "ServerSideEncryption": "aws:kms",
+            "SSEKMSKeyId": kms_key,
+            "Metadata": {"backup-id": BACKUP_ID, "sha256": digest},
+            "ETag": '"etag"',
+        }
+        cli = transfer.AwsCli(
+            Path("/usr/bin/true"),
+            "eu-central-1",
+            put_object_limit_bytes=1,
+        )
+        with (
+            mock.patch.object(cli, "_key_history", side_effect=[([], []), (["version-1"], [])]),
+            mock.patch.object(cli, "_head", side_effect=[None, head_response]),
+            mock.patch.object(cli, "_put_multipart") as multipart,
+        ):
+            stored = cli.put_immutable(
+                bucket=PAYLOAD_BUCKET,
+                key="backup/ledger",
+                source=self.anchor,
+                owner=OWNER,
+                kms_key_id=kms_key,
+                backup_id=BACKUP_ID,
+                sha256=digest,
+            )
+        multipart.assert_called_once()
+        self.assertEqual(stored.version_id, "version-1")
+
+    def test_multipart_uses_full_sha256_and_conditional_complete(self) -> None:
+        kms_key = f"arn:aws:kms:eu-central-1:{OWNER}:key/payload"
+        cli = transfer.AwsCli(
+            Path("/usr/bin/true"),
+            "eu-central-1",
+            multipart_part_bytes=transfer.MIN_MULTIPART_PART_BYTES,
+        )
+        commands: list[list[str]] = []
+
+        def fake_json(arguments: list[str], _label: str, *, transfer: bool = False) -> dict[str, object]:
+            commands.append(arguments)
+            operation = arguments[1]
+            if operation == "list-multipart-uploads":
+                return {}
+            if operation == "create-multipart-upload":
+                self.assertIn("FULL_OBJECT", arguments)
+                self.assertIn(kms_key, arguments)
+                return {"UploadId": "upload-1"}
+            if operation == "upload-part":
+                part_path = Path(arguments[arguments.index("--body") + 1])
+                expected = transfer_module.checksum_b64(part_path)
+                self.assertTrue(transfer)
+                return {"ETag": '"part-etag"', "ChecksumSHA256": expected}
+            if operation == "complete-multipart-upload":
+                self.assertTrue(transfer)
+                self.assertIn("--if-none-match", arguments)
+                self.assertIn("FULL_OBJECT", arguments)
+                completion = arguments[arguments.index("--multipart-upload") + 1]
+                self.assertTrue(completion.startswith("file://"))
+                self.assertEqual(
+                    len(json.loads(Path(completion[7:]).read_text())["Parts"]),
+                    1,
+                )
+                return {}
+            self.fail(f"unexpected AWS operation: {operation}")
+
+        transfer_module = transfer
+        with (
+            mock.patch.object(cli, "_json", side_effect=fake_json),
+            mock.patch.object(cli, "_abort_multipart") as abort,
+        ):
+            cli._put_multipart(
+                bucket=PAYLOAD_BUCKET,
+                key="backup/ledger",
+                source=self.anchor,
+                owner=OWNER,
+                kms_key_id=kms_key,
+                backup_id=BACKUP_ID,
+                sha256=transfer.sha256_file(self.anchor),
+            )
+        abort.assert_not_called()
+        self.assertEqual(
+            [command[1] for command in commands],
+            [
+                "list-multipart-uploads",
+                "create-multipart-upload",
+                "upload-part",
+                "complete-multipart-upload",
+            ],
+        )
 
 
 if __name__ == "__main__":

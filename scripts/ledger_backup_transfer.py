@@ -41,6 +41,10 @@ PREFIX_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,510}")
 KMS_KEY_ARN_RE = re.compile(
     r"arn:(?:aws|aws-us-gov|aws-cn):kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]{1,128}"
 )
+SINGLE_PUT_LIMIT_BYTES = 5_000_000_000
+DEFAULT_MULTIPART_PART_BYTES = 64 * 1024 * 1024
+MIN_MULTIPART_PART_BYTES = 5 * 1024 * 1024
+MAX_MULTIPART_PARTS = 10_000
 
 
 class TransferError(RuntimeError):
@@ -340,6 +344,15 @@ def write_private_json(path: Path, document: dict[str, object]) -> None:
         raise TransferError(f"receipt cannot be published: {error}") from error
 
 
+def validate_receipt_output(receipt: Path, bundle: Path, anchor: Path) -> None:
+    receipt = require_absolute_canonical(receipt, "receipt path", exists=False)
+    bundle = require_absolute_canonical(bundle, "bundle directory", exists=True)
+    anchor = require_absolute_canonical(anchor, "anchor export", exists=True)
+    require_absolute_canonical(receipt.parent, "receipt parent", exists=True)
+    if receipt == anchor or receipt == bundle or bundle in receipt.parents:
+        raise TransferError("receipt output must not overlap the source backup")
+
+
 def upload_backup(
     *,
     bundle: Path,
@@ -365,6 +378,7 @@ def upload_backup(
     validate_remote_name(payload_kms_key, KMS_KEY_ARN_RE, "payload KMS key ARN")
     validate_remote_name(anchor_kms_key, KMS_KEY_ARN_RE, "anchor KMS key ARN")
     prefix = validate_remote_name(prefix.strip("/"), PREFIX_RE, "object prefix")
+    validate_receipt_output(receipt, bundle, anchor)
     with captured_backup(bundle, anchor) as (captured_bundle, captured_anchor, backup_id, digests):
         verify(verifier, captured_bundle, captured_anchor)
         aws.require_versioning(payload_bucket, payload_owner)
@@ -531,6 +545,8 @@ class AwsCli:
         region: str,
         control_timeout_seconds: float = 120,
         transfer_timeout_seconds: float | None = None,
+        put_object_limit_bytes: int = SINGLE_PUT_LIMIT_BYTES,
+        multipart_part_bytes: int = DEFAULT_MULTIPART_PART_BYTES,
     ) -> None:
         aws_path = require_absolute_canonical(aws_bin, "AWS CLI", exists=True)
         require_executable_file(aws_path, "AWS CLI")
@@ -538,6 +554,8 @@ class AwsCli:
         self.region = region
         self.control_timeout_seconds = control_timeout_seconds
         self.transfer_timeout_seconds = transfer_timeout_seconds
+        self.put_object_limit_bytes = put_object_limit_bytes
+        self.multipart_part_bytes = multipart_part_bytes
 
     def _json(
         self,
@@ -650,6 +668,26 @@ class AwsCli:
             raise TransferError(f"remote object history is malformed for {bucket}/{key}")
         return versions, delete_markers  # type: ignore[return-value]
 
+    def _require_no_pending_multipart(self, bucket: str, key: str, owner: str) -> None:
+        result = self._json(
+            [
+                "s3api",
+                "list-multipart-uploads",
+                "--bucket",
+                bucket,
+                "--prefix",
+                key,
+                "--expected-bucket-owner",
+                owner,
+            ],
+            f"multipart upload history for {bucket}/{key}",
+        )
+        uploads = result.get("Uploads", [])
+        if not isinstance(uploads, list) or any(not isinstance(item, dict) for item in uploads):
+            raise TransferError(f"multipart upload history is malformed for {bucket}/{key}")
+        if any(item.get("Key") == key for item in uploads):
+            raise TransferError(f"an incomplete multipart upload exists for {bucket}/{key}")
+
     @staticmethod
     def _require_single_history(
         bucket: str,
@@ -690,6 +728,151 @@ class AwsCli:
             kms_key_id=str(response["SSEKMSKeyId"]),
         )
 
+    def _put_single(
+        self,
+        *,
+        bucket: str,
+        key: str,
+        source: Path,
+        owner: str,
+        kms_key_id: str,
+        backup_id: str,
+        sha256: str,
+    ) -> None:
+        self._json(
+            ["s3api", "put-object", "--bucket", bucket, "--key", key,
+             "--body", str(source), "--if-none-match", "*",
+             "--checksum-algorithm", "SHA256", "--checksum-sha256", checksum_b64(source),
+             "--server-side-encryption", "aws:kms", "--ssekms-key-id", kms_key_id,
+             "--bucket-key-enabled", "--expected-bucket-owner", owner,
+             "--metadata", f"backup-id={backup_id},sha256={sha256}"],
+            f"immutable upload for {bucket}/{key}",
+            transfer=True,
+        )
+
+    def _abort_multipart(
+        self, bucket: str, key: str, owner: str, upload_id: str
+    ) -> None:
+        try:
+            self._json(
+                [
+                    "s3api",
+                    "abort-multipart-upload",
+                    "--bucket",
+                    bucket,
+                    "--key",
+                    key,
+                    "--upload-id",
+                    upload_id,
+                    "--expected-bucket-owner",
+                    owner,
+                ],
+                f"multipart abort for {bucket}/{key}",
+            )
+        except TransferError:
+            # The complete request may have succeeded despite a lost response.
+            # A later retry reconciles exact version history and object bytes.
+            pass
+
+    def _put_multipart(
+        self,
+        *,
+        bucket: str,
+        key: str,
+        source: Path,
+        owner: str,
+        kms_key_id: str,
+        backup_id: str,
+        sha256: str,
+    ) -> None:
+        self._require_no_pending_multipart(bucket, key, owner)
+        size = source.stat().st_size
+        part_size = max(
+            self.multipart_part_bytes,
+            (size + MAX_MULTIPART_PARTS - 1) // MAX_MULTIPART_PARTS,
+        )
+        if part_size < MIN_MULTIPART_PART_BYTES or part_size > SINGLE_PUT_LIMIT_BYTES:
+            raise TransferError("multipart part size cannot satisfy S3 limits")
+        created = self._json(
+            [
+                "s3api", "create-multipart-upload", "--bucket", bucket, "--key", key,
+                "--checksum-algorithm", "SHA256", "--checksum-type", "FULL_OBJECT",
+                "--server-side-encryption", "aws:kms", "--ssekms-key-id", kms_key_id,
+                "--bucket-key-enabled", "--expected-bucket-owner", owner,
+                "--metadata", f"backup-id={backup_id},sha256={sha256}",
+            ],
+            f"multipart create for {bucket}/{key}",
+        )
+        upload_id = created.get("UploadId")
+        if not isinstance(upload_id, str) or not upload_id:
+            raise TransferError(f"multipart upload ID is missing for {bucket}/{key}")
+        completed = False
+        try:
+            parts: list[dict[str, object]] = []
+            with tempfile.TemporaryDirectory(prefix="hype-ledger-part-") as temporary:
+                temporary_root = Path(temporary)
+                os.chmod(temporary_root, 0o700)
+                with source.open("rb") as source_handle:
+                    part_number = 1
+                    while True:
+                        payload = source_handle.read(part_size)
+                        if not payload:
+                            break
+                        part_path = temporary_root / "part"
+                        descriptor = os.open(
+                            part_path,
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+                            0o600,
+                        )
+                        with os.fdopen(descriptor, "wb") as part_handle:
+                            part_handle.write(payload)
+                            part_handle.flush()
+                            os.fchmod(part_handle.fileno(), 0o600)
+                            os.fsync(part_handle.fileno())
+                        part_checksum = checksum_b64(part_path)
+                        response = self._json(
+                            [
+                                "s3api", "upload-part", "--bucket", bucket, "--key", key,
+                                "--upload-id", upload_id, "--part-number", str(part_number),
+                                "--body", str(part_path), "--checksum-algorithm", "SHA256",
+                                "--checksum-sha256", part_checksum,
+                                "--expected-bucket-owner", owner,
+                            ],
+                            f"multipart part {part_number} for {bucket}/{key}",
+                            transfer=True,
+                        )
+                        etag = response.get("ETag")
+                        if not isinstance(etag, str) or not etag or response.get("ChecksumSHA256") != part_checksum:
+                            raise TransferError(
+                                f"multipart part {part_number} verification failed for {bucket}/{key}"
+                            )
+                        parts.append(
+                            {"ETag": etag, "PartNumber": part_number, "ChecksumSHA256": part_checksum}
+                        )
+                        part_path.unlink()
+                        part_number += 1
+                if not parts or len(parts) > MAX_MULTIPART_PARTS:
+                    raise TransferError("multipart upload has an invalid part count")
+                completion_path = temporary_root / "completion.json"
+                write_private_json(completion_path, {"Parts": parts})
+                self._json(
+                    [
+                        "s3api", "complete-multipart-upload", "--bucket", bucket, "--key", key,
+                        "--upload-id", upload_id,
+                        "--multipart-upload", f"file://{completion_path}",
+                        "--checksum-type", "FULL_OBJECT",
+                        "--checksum-sha256", checksum_b64(source),
+                        "--if-none-match", "*",
+                        "--expected-bucket-owner", owner,
+                    ],
+                    f"multipart complete for {bucket}/{key}",
+                    transfer=True,
+                )
+                completed = True
+        finally:
+            if not completed:
+                self._abort_multipart(bucket, key, owner, upload_id)
+
     def put_immutable(
         self, *, bucket: str, key: str, source: Path, owner: str,
         kms_key_id: str, backup_id: str, sha256: str
@@ -706,15 +889,15 @@ class AwsCli:
         elif existing is not None:
             raise TransferError(f"remote object exists without version history for {bucket}/{key}")
         else:
-            self._json(
-                ["s3api", "put-object", "--bucket", bucket, "--key", key,
-                 "--body", str(source), "--if-none-match", "*",
-                 "--checksum-algorithm", "SHA256", "--checksum-sha256", checksum_b64(source),
-                 "--server-side-encryption", "aws:kms", "--ssekms-key-id", kms_key_id,
-                 "--bucket-key-enabled", "--expected-bucket-owner", owner,
-                 "--metadata", f"backup-id={backup_id},sha256={sha256}"],
-                f"immutable upload for {bucket}/{key}",
-                transfer=True,
+            put = self._put_single if source.stat().st_size <= self.put_object_limit_bytes else self._put_multipart
+            put(
+                bucket=bucket,
+                key=key,
+                source=source,
+                owner=owner,
+                kms_key_id=kms_key_id,
+                backup_id=backup_id,
+                sha256=sha256,
             )
             existing = self._head(bucket, key, owner)
             versions, delete_markers = self._key_history(bucket, key, owner)
