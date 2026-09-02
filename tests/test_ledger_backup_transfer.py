@@ -517,6 +517,42 @@ class LedgerBackupTransferTests(unittest.TestCase):
                 response=response,
             )
 
+    def test_exact_download_enforces_recorded_kms_boundary(self) -> None:
+        kms_key = f"arn:aws:kms:eu-central-1:{OWNER}:key/expected"
+        stored = transfer.StoredObject(
+            bucket=ANCHOR_BUCKET,
+            key="backup/anchor",
+            version_id="version-1",
+            etag='"etag"',
+            checksum_sha256="checksum",
+            sha256="a" * 64,
+            size_bytes=1,
+            expected_bucket_owner=OWNER,
+            kms_key_id=kms_key,
+        )
+        invalid_boundaries = (
+            {"ServerSideEncryption": "AES256", "SSEKMSKeyId": kms_key},
+            {
+                "ServerSideEncryption": "aws:kms",
+                "SSEKMSKeyId": f"arn:aws:kms:eu-central-1:{OWNER}:key/unexpected",
+            },
+        )
+        cli = transfer.AwsCli(Path("/usr/bin/true"), "eu-central-1")
+        for index, boundary in enumerate(invalid_boundaries):
+            with self.subTest(boundary=boundary):
+                destination = self.root / f"download-{index}"
+                destination.write_bytes(b"x")
+                response = {
+                    "VersionId": stored.version_id,
+                    "ChecksumSHA256": stored.checksum_sha256,
+                    **boundary,
+                }
+                with (
+                    mock.patch.object(cli, "_json", return_value=response),
+                    self.assertRaisesRegex(transfer.TransferError, "response mismatch"),
+                ):
+                    cli.get_exact(stored, destination)
+
     def test_aws_cli_rejects_delete_marker_before_any_put(self) -> None:
         cli = transfer.AwsCli(Path("/usr/bin/true"), "eu-central-1")
         with (

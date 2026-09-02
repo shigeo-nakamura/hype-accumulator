@@ -1104,7 +1104,12 @@ class AwsCli:
             transfer=True,
         )
         os.chmod(destination, 0o600)
-        if response.get("VersionId") != stored.version_id or response.get("ChecksumSHA256") != stored.checksum_sha256:
+        if (
+            response.get("VersionId") != stored.version_id
+            or response.get("ChecksumSHA256") != stored.checksum_sha256
+            or response.get("ServerSideEncryption") != "aws:kms"
+            or response.get("SSEKMSKeyId") != stored.kms_key_id
+        ):
             raise TransferError(f"download response mismatch for {stored.bucket}/{stored.key}")
 
 
