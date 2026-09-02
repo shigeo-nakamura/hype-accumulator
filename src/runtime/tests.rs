@@ -246,6 +246,139 @@ movement_history_start_ms = 1
     ));
 }
 
+#[test]
+fn runtime_config_rejects_configured_file_ancestor_relationships() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let status_path = directory.path().join("public/status");
+    let input = format!(
+        r#"
+schema_version = 1
+state_directory = "{}"
+protected_anchor_path = "{}"
+admission_approvals_path = "{}"
+signal_snapshot_path = "{}"
+status_path = "{}"
+metrics_path = "{}"
+cycle_report_path = "{}"
+movement_history_start_ms = 1
+"#,
+        directory.path().join("state").display(),
+        directory.path().join("protected/anchor.json").display(),
+        directory.path().join("inputs/admissions.json").display(),
+        directory.path().join("inputs/signal.json").display(),
+        status_path.display(),
+        status_path.join("metrics.prom").display(),
+        directory.path().join("private/cycle.json").display(),
+    );
+
+    assert!(matches!(
+        RuntimeConfig::from_toml(&input),
+        Err(RuntimeError::InvalidConfig(message)) if message.contains("ancestors")
+    ));
+    assert!(!status_path.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_lock_replacement_blocks_a_second_runtime_and_stops_the_holder() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let observed_at = at(2026, 7, 6, 10, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
+    let lock_path = runtime_config.state_directory.join(RUNTIME_LOCK_FILE_NAME);
+    fs::remove_file(&lock_path).expect("unlink held runtime lock");
+    fs::write(&lock_path, b"replacement").expect("replace runtime lock");
+
+    assert!(matches!(
+        SignerFreeRuntime::open(runtime_config.clone(), limits()),
+        Err(RuntimeError::AlreadyRunning)
+    ));
+    let error = runtime
+        .apply_cycle(RuntimeCycleInput {
+            observed_at,
+            scan_start_ms: ms(start),
+            scan_end_ms: ms(observed_at),
+            movements: &[],
+            approvals: &AdmissionApprovals::empty(),
+            signal: None,
+            accumulator: status(observed_at, 0.0),
+            capital_history_complete: true,
+            manual_pause: true,
+            api_errors: 0,
+        })
+        .expect_err("holder fails closed after runtime lock replacement");
+    assert!(matches!(error, RuntimeError::UnsafeRuntimeLock));
+    assert!(!runtime_config
+        .state_directory
+        .join(STATE_FILE_NAME)
+        .exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_open_rejects_a_symlinked_runtime_lock() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let runtime_config = config(directory.path(), 1);
+    fs::create_dir_all(&runtime_config.state_directory).expect("state directory");
+    let target = directory.path().join("lock-target");
+    fs::write(&target, b"").expect("lock target");
+    symlink(
+        &target,
+        runtime_config.state_directory.join(RUNTIME_LOCK_FILE_NAME),
+    )
+    .expect("symlinked runtime lock");
+
+    assert!(matches!(
+        SignerFreeRuntime::open(runtime_config, limits()),
+        Err(RuntimeError::UnsafeRuntimeLock)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_open_rejects_a_hard_linked_runtime_lock() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let runtime_config = config(directory.path(), 1);
+    fs::create_dir_all(&runtime_config.state_directory).expect("state directory");
+    let target = directory.path().join("lock-target");
+    fs::write(&target, b"").expect("lock target");
+    fs::hard_link(
+        &target,
+        runtime_config.state_directory.join(RUNTIME_LOCK_FILE_NAME),
+    )
+    .expect("hard-linked runtime lock");
+
+    assert!(matches!(
+        SignerFreeRuntime::open(runtime_config, limits()),
+        Err(RuntimeError::UnsafeRuntimeLock)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_open_rejects_canonical_file_ancestors_before_creating_them() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let public = directory.path().join("public");
+    fs::create_dir_all(&public).expect("public directory");
+    symlink(&public, directory.path().join("public-alias")).expect("public parent alias");
+    let mut runtime_config = config(directory.path(), 1);
+    let status_path = public.join("status");
+    runtime_config.status_path = status_path.clone();
+    runtime_config.metrics_path = directory.path().join("public-alias/status/metrics.prom");
+
+    assert!(matches!(
+        SignerFreeRuntime::open(runtime_config, limits()),
+        Err(RuntimeError::InvalidConfig(message)) if message.contains("ancestor")
+    ));
+    assert!(!status_path.exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn runtime_open_rejects_anchor_parent_symlinked_into_mutable_state() {

@@ -118,6 +118,107 @@ fn reject_multiple_links(file: &File) -> Result<(), io::Error> {
     Ok(())
 }
 
+fn validate_runtime_lock(path: &Path, file: &File) -> Result<(), RuntimeError> {
+    let path_metadata = fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == ErrorKind::NotFound {
+            RuntimeError::UnsafeRuntimeLock
+        } else {
+            RuntimeError::Io(error)
+        }
+    })?;
+    let file_metadata = file.metadata()?;
+    if !path_metadata.file_type().is_file() || !file_metadata.file_type().is_file() {
+        return Err(RuntimeError::UnsafeRuntimeLock);
+    }
+    validate_runtime_lock_identity(&path_metadata, &file_metadata)
+}
+
+#[cfg(unix)]
+fn validate_runtime_lock_identity(
+    path_metadata: &fs::Metadata,
+    file_metadata: &fs::Metadata,
+) -> Result<(), RuntimeError> {
+    use std::os::unix::fs::MetadataExt;
+
+    if path_metadata.dev() != file_metadata.dev()
+        || path_metadata.ino() != file_metadata.ino()
+        || path_metadata.nlink() != 1
+        || file_metadata.nlink() != 1
+    {
+        return Err(RuntimeError::UnsafeRuntimeLock);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_runtime_lock_identity(
+    _path_metadata: &fs::Metadata,
+    _file_metadata: &fs::Metadata,
+) -> Result<(), RuntimeError> {
+    Ok(())
+}
+
+fn open_runtime_lock(path: &Path) -> Result<File, RuntimeError> {
+    reject_linked_file(path).map_err(|_| RuntimeError::UnsafeRuntimeLock)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let mut create_options = OpenOptions::new();
+            create_options.read(true).write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+
+                create_options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
+            }
+            match create_options.open(path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => options.open(path)?,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(error) => return Err(error.into()),
+    };
+    validate_runtime_lock(path, &file)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn acquire_runtime_directory_lock(state_directory: &Path) -> Result<File, RuntimeError> {
+    let directory = File::open(fs::canonicalize(state_directory)?)?;
+    directory.try_lock_exclusive().map_err(|error| {
+        if error.kind() == ErrorKind::WouldBlock {
+            RuntimeError::AlreadyRunning
+        } else {
+            RuntimeError::Io(error)
+        }
+    })?;
+    Ok(directory)
+}
+
+fn acquire_runtime_lock(state_directory: &Path) -> Result<File, RuntimeError> {
+    let path = state_directory.join(RUNTIME_LOCK_FILE_NAME);
+    let lock = open_runtime_lock(&path)?;
+    validate_runtime_lock(&path, &lock)?;
+    lock.try_lock_exclusive().map_err(|error| {
+        if error.kind() == ErrorKind::WouldBlock {
+            RuntimeError::AlreadyRunning
+        } else {
+            RuntimeError::Io(error)
+        }
+    })?;
+    validate_runtime_lock(&path, &lock)?;
+    Ok(lock)
+}
+
 /// Filesystem and history boundaries for the recurring dry-run process.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
@@ -174,11 +275,22 @@ impl RuntimeConfig {
             ));
         }
         let mut unique_paths = BTreeSet::new();
-        for path in paths {
+        for path in &paths {
             if !unique_paths.insert((*path).clone()) {
                 return Err(RuntimeError::InvalidConfig(
                     "runtime paths must be distinct".to_owned(),
                 ));
+            }
+        }
+        for (index, path) in paths.iter().enumerate() {
+            for other in &paths[index + 1..] {
+                if path.as_path().starts_with(other.as_path())
+                    || other.as_path().starts_with(path.as_path())
+                {
+                    return Err(RuntimeError::InvalidConfig(
+                        "runtime paths may not be ancestors of one another".to_owned(),
+                    ));
+                }
             }
         }
         if wire.movement_history_start_ms == 0
@@ -544,7 +656,9 @@ pub struct SignerFreeRuntime {
     state: RuntimeState,
     ledger: DurableLedger,
     process_started_at: DateTime<Utc>,
-    _lock: File,
+    lock: File,
+    #[cfg(unix)]
+    _directory_lock: File,
 }
 
 impl SignerFreeRuntime {
@@ -560,22 +674,9 @@ impl SignerFreeRuntime {
         fs::create_dir_all(&config.state_directory)?;
         ensure_configured_files_outside_state(&config)?;
         ensure_protected_boundary(&config)?;
-        let lock_path = config.state_directory.join(RUNTIME_LOCK_FILE_NAME);
-        let mut options = OpenOptions::new();
-        options.create(true).read(true).write(true);
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let lock = options.open(lock_path)?;
-        lock.try_lock_exclusive().map_err(|error| {
-            if error.kind() == ErrorKind::WouldBlock {
-                RuntimeError::AlreadyRunning
-            } else {
-                RuntimeError::Io(error)
-            }
-        })?;
+        let directory_lock = acquire_runtime_directory_lock(&config.state_directory)?;
+        let lock = acquire_runtime_lock(&config.state_directory)?;
         let state_path = config.state_directory.join(STATE_FILE_NAME);
         let mut state = load_runtime_state(&state_path, config.movement_history_start_ms)?;
         state.pacing.validate_for_limits(&limits)?;
@@ -597,7 +698,9 @@ impl SignerFreeRuntime {
             state,
             ledger,
             process_started_at: Utc::now(),
-            _lock: lock,
+            lock,
+            #[cfg(unix)]
+            _directory_lock: directory_lock,
         })
     }
 
@@ -625,6 +728,7 @@ impl SignerFreeRuntime {
         &mut self,
         input: RuntimeCycleInput<'_>,
     ) -> Result<RuntimeCycleReport, RuntimeError> {
+        self.ensure_runtime_lock_current()?;
         validate_cycle_range(
             &input,
             self.next_scan_start_ms(),
@@ -1005,10 +1109,12 @@ impl SignerFreeRuntime {
             boundary_balance_available: decision_evidence.boundary_balance_available,
         };
         let pending = PendingRuntimeCycle::new(input.observed_at, next_state, ledger_events)?;
+        self.ensure_runtime_lock_current()?;
         write_private_json_atomic(
             self.config.state_directory.join(PENDING_CYCLE_FILE_NAME),
             &pending,
         )?;
+        self.ensure_runtime_lock_current()?;
         self.state = commit_pending_cycle(&self.config, &self.limits, &mut self.ledger, &pending)?;
         let metrics = MetricsSnapshot::from_runtime(
             input.observed_at,
@@ -1034,6 +1140,13 @@ impl SignerFreeRuntime {
         write_status_atomic(&self.config.status_path, &status)?;
         Ok(report)
     }
+
+    fn ensure_runtime_lock_current(&self) -> Result<(), RuntimeError> {
+        validate_runtime_lock(
+            &self.config.state_directory.join(RUNTIME_LOCK_FILE_NAME),
+            &self.lock,
+        )
+    }
 }
 
 fn ensure_protected_boundary(config: &RuntimeConfig) -> Result<(), RuntimeError> {
@@ -1054,14 +1167,14 @@ fn ensure_protected_boundary(config: &RuntimeConfig) -> Result<(), RuntimeError>
 
 fn ensure_configured_files_outside_state(config: &RuntimeConfig) -> Result<(), RuntimeError> {
     let canonical_state = fs::canonicalize(&config.state_directory)?;
-    let mut resolved_paths = BTreeSet::new();
+    let mut resolved_paths = Vec::new();
+    let mut resolved_parents = Vec::new();
     for path in config.configured_file_paths() {
         let parent = path.parent().ok_or_else(|| {
             RuntimeError::InvalidConfig("configured runtime file has no parent".to_owned())
         })?;
-        fs::create_dir_all(parent)?;
-        let canonical_parent = fs::canonicalize(parent)?;
-        if canonical_parent.starts_with(&canonical_state) {
+        let resolved_parent = resolve_without_creating(parent)?;
+        if resolved_parent.starts_with(&canonical_state) {
             return Err(RuntimeError::InvalidConfig(
                 "configured runtime file resolves inside the reserved state directory".to_owned(),
             ));
@@ -1069,14 +1182,72 @@ fn ensure_configured_files_outside_state(config: &RuntimeConfig) -> Result<(), R
         let file_name = path.file_name().ok_or_else(|| {
             RuntimeError::InvalidConfig("configured runtime file has no file name".to_owned())
         })?;
-        if !resolved_paths.insert(canonical_parent.join(file_name)) {
+        let resolved_path = resolved_parent.join(file_name);
+        if resolved_paths.iter().any(|existing: &PathBuf| {
+            existing == &resolved_path
+                || existing.starts_with(&resolved_path)
+                || resolved_path.starts_with(existing)
+        }) {
             return Err(RuntimeError::InvalidConfig(
-                "configured runtime files resolve to the same path".to_owned(),
+                "configured runtime files resolve to the same path or an ancestor relationship"
+                    .to_owned(),
+            ));
+        }
+        resolved_paths.push(resolved_path);
+        resolved_parents.push(resolved_parent);
+    }
+    for (path, resolved_parent) in config
+        .configured_file_paths()
+        .into_iter()
+        .zip(resolved_parents)
+    {
+        let parent = path.parent().ok_or_else(|| {
+            RuntimeError::InvalidConfig("configured runtime file has no parent".to_owned())
+        })?;
+        fs::create_dir_all(parent)?;
+        if fs::canonicalize(parent)? != resolved_parent {
+            return Err(RuntimeError::InvalidConfig(
+                "configured runtime file parent changed during validation".to_owned(),
             ));
         }
         reject_linked_file(path)?;
     }
     Ok(())
+}
+
+fn resolve_without_creating(path: &Path) -> Result<PathBuf, RuntimeError> {
+    let mut existing = path;
+    let mut missing = Vec::new();
+    loop {
+        match fs::metadata(existing) {
+            Ok(metadata) => {
+                if !metadata.is_dir() {
+                    return Err(RuntimeError::InvalidConfig(
+                        "configured runtime file parent is not a directory".to_owned(),
+                    ));
+                }
+                let mut resolved = fs::canonicalize(existing)?;
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                let component = existing.file_name().ok_or_else(|| {
+                    RuntimeError::InvalidConfig(
+                        "configured runtime file has no existing path ancestor".to_owned(),
+                    )
+                })?;
+                missing.push(component.to_os_string());
+                existing = existing.parent().ok_or_else(|| {
+                    RuntimeError::InvalidConfig(
+                        "configured runtime file has no existing path ancestor".to_owned(),
+                    )
+                })?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 fn recover_pending_cycle(
@@ -1801,6 +1972,8 @@ pub enum RuntimeError {
     CommittedCycleProofMismatch,
     #[error("another runtime cycle already holds the state lock")]
     AlreadyRunning,
+    #[error("runtime lock is not the current safe state-directory entry")]
+    UnsafeRuntimeLock,
     #[error("runtime counter overflowed")]
     CounterOverflow,
     #[error(transparent)]
