@@ -94,7 +94,8 @@ python3 scripts/ledger_backup_transfer.py \
   --payload-kms-key <full-payload-kms-key-arn> \
   --anchor-bucket <separately-protected-anchor-bucket> \
   --anchor-owner <12-digit-account-id> \
-  --anchor-kms-key <full-anchor-kms-key-arn>
+  --anchor-kms-key <full-anchor-kms-key-arn> \
+  --staging-root <absolute-private-capacity-checked-directory>
 ```
 
 The tool first captures the private source files, then runs the Rust full-replay
@@ -108,6 +109,12 @@ identifiers, but never wallet addresses, credentials, ciphertext, or signed
 payloads. Successful upload stdout contains only the backup ID and receipt
 path; the full infrastructure identifiers remain exclusively in the private
 receipt.
+
+`--staging-root` is optional, but should point to a mode-0700 operator-owned
+directory on capacity-checked storage when the bundle might not fit in the
+system temporary filesystem. The per-run capture directory is removed after
+the operation. AWS CLI and verifier binaries must also be beneath root- or
+operator-owned ancestor directories that are not group/world writable.
 
 Full replay and S3 `put-object`/`get-object` transfers have no wall-clock
 timeout by default, so backup size or recovery-host bandwidth alone cannot

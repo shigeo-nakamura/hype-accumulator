@@ -204,6 +204,19 @@ def require_executable_file(path: Path, label: str) -> None:
         raise TransferError(f"{label} must be a root- or owner-controlled regular file")
     if info.st_mode & 0o022 or not os.access(path, os.X_OK):
         raise TransferError(f"{label} must be executable and not group/world writable")
+    for ancestor in path.parents:
+        try:
+            ancestor_info = ancestor.lstat()
+        except OSError as error:
+            raise TransferError(f"{label} ancestor cannot be inspected: {error}") from error
+        if (
+            not stat.S_ISDIR(ancestor_info.st_mode)
+            or ancestor_info.st_uid not in {0, os.geteuid()}
+            or ancestor_info.st_mode & 0o022
+        ):
+            raise TransferError(
+                f"{label} must not be beneath an untrusted writable directory"
+            )
 
 
 def require_bundle(bundle: Path, anchor: Path) -> tuple[str, dict[str, str]]:
@@ -297,9 +310,28 @@ def capture_private_file(source: Path, destination: Path, label: str) -> None:
 
 
 @contextmanager
-def captured_backup(bundle: Path, anchor: Path) -> Iterator[tuple[Path, Path, str, dict[str, str]]]:
+def captured_backup(
+    bundle: Path,
+    anchor: Path,
+    staging_root: Path | None = None,
+) -> Iterator[tuple[Path, Path, str, dict[str, str]]]:
     require_bundle(bundle, anchor)
-    with tempfile.TemporaryDirectory(prefix="hype-ledger-transfer-") as temporary:
+    temporary_parent: str | None = None
+    if staging_root is not None:
+        staging_root = require_absolute_canonical(
+            staging_root, "staging root", exists=True
+        )
+        staging_info = staging_root.stat()
+        if (
+            not staging_root.is_dir()
+            or staging_info.st_uid != os.geteuid()
+            or staging_info.st_mode & 0o077
+        ):
+            raise TransferError("staging root must be owner-controlled and private")
+        temporary_parent = str(staging_root)
+    with tempfile.TemporaryDirectory(
+        prefix="hype-ledger-transfer-", dir=temporary_parent
+    ) as temporary:
         root = Path(temporary)
         os.chmod(root, 0o700)
         captured_bundle = root / "payload"
@@ -431,6 +463,7 @@ def upload_backup(
     anchor_owner: str,
     anchor_kms_key: str,
     prefix: str,
+    staging_root: Path | None = None,
     verify: Callable[[Path, Path, Path], None] = run_verifier,
 ) -> dict[str, object]:
     payload_bucket = validate_remote_name(payload_bucket, BUCKET_RE, "payload bucket")
@@ -443,7 +476,12 @@ def upload_backup(
     validate_remote_name(anchor_kms_key, KMS_KEY_ARN_RE, "anchor KMS key ARN")
     prefix = validate_remote_name(prefix.strip("/"), PREFIX_RE, "object prefix")
     validate_receipt_output(receipt, bundle, anchor)
-    with captured_backup(bundle, anchor) as (captured_bundle, captured_anchor, backup_id, digests):
+    with captured_backup(bundle, anchor, staging_root) as (
+        captured_bundle,
+        captured_anchor,
+        backup_id,
+        digests,
+    ):
         verify(verifier, captured_bundle, captured_anchor)
         aws.require_versioning(payload_bucket, payload_owner)
         aws.require_versioning(anchor_bucket, anchor_owner)
@@ -638,6 +676,10 @@ class AwsCli:
             "AWS_ACCESS_KEY_ID",
             "AWS_CA_BUNDLE",
             "AWS_CONFIG_FILE",
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
             "AWS_DEFAULT_PROFILE",
             "AWS_EC2_METADATA_DISABLED",
             "AWS_PROFILE",
@@ -1044,6 +1086,7 @@ def build_parser() -> argparse.ArgumentParser:
     upload.add_argument("--anchor-bucket", required=True)
     upload.add_argument("--anchor-owner", required=True)
     upload.add_argument("--anchor-kms-key", required=True)
+    upload.add_argument("--staging-root")
     upload.add_argument("--prefix", default="hype-accumulator/ledger-backups")
     download = subparsers.add_parser("download")
     download.add_argument("--receipt", required=True)
@@ -1072,7 +1115,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 verifier=Path(args.verifier), aws=aws, payload_bucket=args.payload_bucket,
                 payload_owner=args.payload_owner, payload_kms_key=args.payload_kms_key,
                 anchor_bucket=args.anchor_bucket, anchor_owner=args.anchor_owner,
-                anchor_kms_key=args.anchor_kms_key, prefix=args.prefix, verify=verify,
+                anchor_kms_key=args.anchor_kms_key, prefix=args.prefix,
+                staging_root=Path(args.staging_root) if args.staging_root else None,
+                verify=verify,
             )
             result = {"backup_id": document["backup_id"], "receipt": str(receipt)}
         else:

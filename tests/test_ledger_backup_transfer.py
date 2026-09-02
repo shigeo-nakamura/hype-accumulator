@@ -168,6 +168,18 @@ class LedgerBackupTransferTests(unittest.TestCase):
         _, uploaded = self.aws.objects[(ledger["bucket"], ledger["key"])]  # type: ignore[index]
         self.assertEqual(uploaded, original)
 
+    def test_upload_captures_under_configured_private_staging_root(self) -> None:
+        staging_root = self.root / "staging"
+        staging_root.mkdir(mode=0o700)
+
+        def verify_staging(_verifier: Path, bundle: Path, anchor: Path) -> None:
+            self.assertIn(staging_root, bundle.parents)
+            self.assertIn(staging_root, anchor.parents)
+            fake_verify(_verifier, bundle, anchor)
+
+        self.upload(staging_root=staging_root, verify=verify_staging)
+        self.assertEqual(tuple(staging_root.iterdir()), ())
+
     def test_upload_rejects_one_storage_boundary(self) -> None:
         with self.assertRaisesRegex(transfer.TransferError, "different buckets"):
             self.upload(anchor_bucket=PAYLOAD_BUCKET)
@@ -359,7 +371,12 @@ class LedgerBackupTransferTests(unittest.TestCase):
         with (
             mock.patch.dict(
                 os.environ,
-                {"HYPE_SIGNING_KEY": "secret", "AWS_SESSION_TOKEN": "session"},
+                {
+                    "HYPE_SIGNING_KEY": "secret",
+                    "AWS_SESSION_TOKEN": "session",
+                    "AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://169.254.170.23/v1/credentials",
+                    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE": "/var/run/secrets/token",
+                },
                 clear=True,
             ),
             mock.patch.object(transfer.subprocess, "run", return_value=completed) as run,
@@ -372,8 +389,26 @@ class LedgerBackupTransferTests(unittest.TestCase):
         environment = run.call_args_list[0].kwargs["env"]
         self.assertNotIn("HYPE_SIGNING_KEY", environment)
         self.assertEqual(environment["AWS_SESSION_TOKEN"], "session")
+        self.assertEqual(
+            environment["AWS_CONTAINER_CREDENTIALS_FULL_URI"],
+            "http://169.254.170.23/v1/credentials",
+        )
+        self.assertEqual(
+            environment["AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"],
+            "/var/run/secrets/token",
+        )
         self.assertEqual(run.call_args_list[0].kwargs["timeout"], 120)
         self.assertIsNone(run.call_args_list[1].kwargs["timeout"])
+
+    def test_executable_beneath_untrusted_writable_ancestor_is_rejected(self) -> None:
+        unsafe = self.root / "unsafe"
+        unsafe.mkdir(mode=0o700)
+        executable = unsafe / "tool"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        os.chmod(executable, 0o700)
+        os.chmod(unsafe, 0o777)
+        with self.assertRaisesRegex(transfer.TransferError, "untrusted writable"):
+            transfer.require_executable_file(executable, "test executable")
 
     def test_full_replay_has_no_default_timeout(self) -> None:
         completed = SimpleNamespace(returncode=0, stdout="verified", stderr="")
