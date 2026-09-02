@@ -52,39 +52,113 @@ to its exported point-in-time head.
 
 ## Transfer to versioned off-host storage
 
-Transfer is an operator/deployment gate and is intentionally absent from this
-CLI. Use the existing fleet-approved S3 encryption, retention, and audit
-policy. Upload the bundle contents under one immutable payload prefix and the
-protected-head export to a separately protected bucket or IAM boundary. Enable
-bucket versioning and retain both returned object version IDs. Object Lock is
-preferred where the fleet policy supports it.
+Transfer remains an operator/deployment gate and is intentionally absent from
+the Rust CLI. `scripts/ledger_backup_transfer.py` provides an explicit AWS CLI
+transport contract, but running its `upload` command against production AWS is
+itself an approval-gated operation. It requires:
 
-A schematic operator sequence is:
+- two different S3 buckets so the payload and protected anchor can have
+  separate IAM/delete boundaries;
+- versioning in the `Enabled` state on both buckets and permission to inspect
+  the complete object-version/delete-marker history;
+- expected 12-digit bucket-owner IDs and explicit full KMS key ARNs;
+- immutable conditional puts (`If-None-Match: *`), S3 SHA-256 checksums, KMS
+  encryption, and a read-after-write check;
+- a private, no-replace receipt containing the exact version ID, checksum,
+  size, ETag, key, bucket owner, and returned KMS key ID for all six objects.
+
+The receipt is written and fsynced through a mode-0600 sibling temporary file,
+then atomically moved into place with Linux `renameat2(RENAME_NOREPLACE)`. A
+pre-publication crash or I/O failure therefore cannot reserve the final receipt
+path with partial or multiply-linked content. An unsupported filesystem fails
+closed without publishing the final path.
+
+Object Lock is preferred where fleet policy supports it. The runtime principal
+must not have delete access to both boundaries. A single bucket with different
+prefixes is rejected because it does not prove an independent protected-anchor
+boundary.
+
+After separately approving the AWS target and action, upload with:
 
 ```text
-aws s3 cp <absolute-new-bundle-directory>/ \
-  s3://<versioned-payload-bucket>/<immutable-backup-id>/ \
-  --recursive --no-follow-symlinks
-
-aws s3 cp <absolute-new-anchor-export> \
-  s3://<separately-protected-anchor-bucket>/<immutable-backup-id>.json
+python3 scripts/ledger_backup_transfer.py \
+  --aws-bin <absolute-canonical-aws-cli-binary> \
+  --region <region> \
+  upload \
+  --bundle <absolute-new-bundle-directory> \
+  --anchor <absolute-new-anchor-export> \
+  --receipt <absolute-new-private-receipt.json> \
+  --verifier <absolute-hype-accumulator-binary> \
+  --payload-bucket <versioned-payload-bucket> \
+  --payload-owner <12-digit-account-id> \
+  --payload-kms-key <full-payload-kms-key-arn> \
+  --anchor-bucket <separately-protected-anchor-bucket> \
+  --anchor-owner <12-digit-account-id> \
+  --anchor-kms-key <full-anchor-kms-key-arn> \
+  --staging-root <absolute-private-capacity-checked-directory>
 ```
 
-Do not upload the protected-head export into the payload prefix. Do not reuse
-an object key, overwrite a prior version intentionally, or grant the runtime
-principal delete access to both boundaries.
+The tool first captures the private source files, then runs the Rust full-replay
+verifier and uploads only those exact captured bytes. Object keys are derived
+from the verified backup ID. A retry accepts a pre-existing object only when it
+has exactly one version, no delete marker, the configured KMS key ARN, and exact
+backup metadata, size, SHA-256, and content. Any deletion or replacement
+history fails closed instead of creating another version. Keep the receipt
+outside the repository and operator logs. It contains infrastructure
+identifiers, but never wallet addresses, credentials, ciphertext, or signed
+payloads. Successful upload stdout contains only the backup ID and receipt
+path; the full infrastructure identifiers remain exclusively in the private
+receipt.
+
+`--staging-root` is optional, but should point to a mode-0700 operator-owned
+directory on capacity-checked storage when the bundle might not fit in the
+system temporary filesystem. It must not be the source bundle or a directory
+inside that bundle. Both the full capture and bounded multipart scratch files
+remain under the per-run capture root, which is removed after the operation.
+AWS CLI and verifier binaries must also be beneath root- or operator-owned
+ancestor directories that are not group/world writable.
+
+Full replay and S3 `put-object`/`get-object` transfers have no wall-clock
+timeout by default, so backup size or recovery-host bandwidth alone cannot
+invalidate a correct backup. Control-plane calls retain a 120-second timeout.
+An operator may add `--verifier-timeout-seconds`,
+`--transfer-timeout-seconds`, or `--control-timeout-seconds` before the
+subcommand when an environment requires explicit positive bounds.
+
+Objects up to the conservative single-request limit use `PutObject`. Larger
+ledger or snapshot files use a bounded, private-part multipart upload with
+per-part SHA-256, S3's SHA-256 composite checksum, KMS encryption, and
+conditional `CompleteMultipartUpload`. The direct full-object SHA-256 remains
+bound in immutable object metadata and the receipt; the receipt's S3 checksum
+preserves the returned multipart `-N` part-count suffix. At most 10,000
+dynamically sized parts are used.
+Existing incomplete multipart uploads, delete markers, or prior versions fail
+closed; an interrupted upload must be inspected/aborted before retry.
 
 ## Clean-directory restore drill
 
-Download one payload version and its exact protected-head export version into
-fresh local paths. The downloaded bundle directory must contain exactly the
-five documented files. Verify it before selecting any restore target:
+Download every exact version from the private receipt into a new local root:
 
 ```text
-hype-accumulator --ledger-backup-verify \
-  <absolute-downloaded-bundle-directory> \
-  <absolute-downloaded-anchor-export>
+python3 scripts/ledger_backup_transfer.py \
+  --aws-bin <absolute-canonical-aws-cli-binary> \
+  --region <region> \
+  download \
+  --receipt <absolute-private-receipt.json> \
+  --destination-root <absolute-new-download-root> \
+  --verifier <absolute-hype-accumulator-binary>
 ```
+
+The destination parent and its ancestor chain must be root/operator controlled
+and non-writable by untrusted users; root/operator-owned sticky directories are
+accepted where they provide rename protection. The tool rejects the destination
+before creating it when that boundary is unsafe.
+
+The destination must not exist. The tool reserves it with mode `0700`, requests
+every recorded object version explicitly, checks the S3 and local SHA-256
+values, and runs the Rust full-replay verifier before returning paths. A
+failure leaves the private directory for operator inspection and never
+publishes it over another destination.
 
 Restore only into a missing or ledger-clean destination and a distinct,
 previously unused protected-anchor scope:
@@ -110,10 +184,13 @@ For a repository-only rehearsal, run:
 
 ```text
 cargo test --test backup --locked
+python3 -m unittest tests.test_ledger_backup_transfer -v
 ```
 
 The test covers exact round-trip restore, permissions, payload tampering,
 anchor substitution, unexpected entries, overlapping paths, symbolic links,
-and multiple hard links. Passing it demonstrates the local backup contract; it
-does not claim that an off-host upload, retention policy, or production restore
-drill has occurred.
+and multiple hard links. The Python tests use an in-memory fake AWS client to
+cover immutable retry, separate boundaries, versioning, exact-version download,
+damage detection, and no-replace destinations. Passing these tests demonstrates
+the local and transport contracts; it does not claim that an off-host upload,
+retention policy, IAM boundary, or production restore drill has occurred.
