@@ -1020,13 +1020,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             timeout_seconds=args.verifier_timeout_seconds,
         )
         if args.command == "upload":
-            result = upload_backup(
+            receipt = Path(args.receipt)
+            document = upload_backup(
                 bundle=Path(args.bundle), anchor=Path(args.anchor), receipt=Path(args.receipt),
                 verifier=Path(args.verifier), aws=aws, payload_bucket=args.payload_bucket,
                 payload_owner=args.payload_owner, payload_kms_key=args.payload_kms_key,
                 anchor_bucket=args.anchor_bucket, anchor_owner=args.anchor_owner,
                 anchor_kms_key=args.anchor_kms_key, prefix=args.prefix, verify=verify,
             )
+            result = {"backup_id": document["backup_id"], "receipt": str(receipt)}
         else:
             result = download_backup(
                 receipt=Path(args.receipt), destination_root=Path(args.destination_root),

@@ -99,7 +99,9 @@ backup metadata, size, SHA-256, and content. Any deletion or replacement
 history fails closed instead of creating another version. Keep the receipt
 outside the repository and operator logs. It contains infrastructure
 identifiers, but never wallet addresses, credentials, ciphertext, or signed
-payloads.
+payloads. Successful upload stdout contains only the backup ID and receipt
+path; the full infrastructure identifiers remain exclusively in the private
+receipt.
 
 Full replay and S3 `put-object`/`get-object` transfers have no wall-clock
 timeout by default, so backup size or recovery-host bandwidth alone cannot

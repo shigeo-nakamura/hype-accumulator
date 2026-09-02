@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import io
 import json
 import os
 import tempfile
@@ -195,6 +196,37 @@ class LedgerBackupTransferTests(unittest.TestCase):
         with self.assertRaisesRegex(transfer.TransferError, "versioning"):
             self.upload()
         self.assertEqual(self.aws.put_calls, 0)
+
+    def test_upload_cli_prints_only_a_non_sensitive_summary(self) -> None:
+        receipt = self.root / "receipt.json"
+        full_receipt = {
+            "backup_id": BACKUP_ID,
+            "payload_objects": {"secret": "s3://private/version-id"},
+            "protected_anchor": {"kms_key_id": "arn:aws:kms:secret"},
+        }
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(transfer, "AwsCli"),
+            mock.patch.object(transfer, "upload_backup", return_value=full_receipt),
+            mock.patch("sys.stdout", stdout),
+        ):
+            status = transfer.main(
+                [
+                    "--aws-bin", "/bin/true", "--region", "eu-central-1", "upload",
+                    "--bundle", str(self.bundle), "--anchor", str(self.anchor),
+                    "--receipt", str(receipt), "--verifier", "/bin/true",
+                    "--payload-bucket", PAYLOAD_BUCKET, "--payload-owner", OWNER,
+                    "--payload-kms-key", "payload-key", "--anchor-bucket", ANCHOR_BUCKET,
+                    "--anchor-owner", OWNER, "--anchor-kms-key", "anchor-key",
+                ]
+            )
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {"backup_id": BACKUP_ID, "receipt": str(receipt)},
+        )
+        self.assertNotIn("version-id", stdout.getvalue())
+        self.assertNotIn("kms", stdout.getvalue())
 
     def test_download_uses_receipt_versions_and_verifies_payload(self) -> None:
         self.upload()
