@@ -519,6 +519,29 @@ impl PacingState {
         at: DateTime<Utc>,
         limits: &PacingLimits,
     ) -> Result<(), PacingError> {
+        self.reconcile_capital_with_admission_floors(events, at, limits, &BTreeMap::new())
+    }
+
+    /// Reconciles capital without reducing any admission already present in
+    /// this state. The signer-free runtime uses this to stay consistent with
+    /// its append-only protected admission ledger.
+    pub(crate) fn reconcile_capital_preserving_admissions(
+        &mut self,
+        events: &[CapitalEvent],
+        at: DateTime<Utc>,
+        limits: &PacingLimits,
+    ) -> Result<(), PacingError> {
+        let admission_floors = self.admission_floors();
+        self.reconcile_capital_with_admission_floors(events, at, limits, &admission_floors)
+    }
+
+    fn reconcile_capital_with_admission_floors(
+        &mut self,
+        events: &[CapitalEvent],
+        at: DateTime<Utc>,
+        limits: &PacingLimits,
+        admission_floors: &BTreeMap<String, UsdcMicros>,
+    ) -> Result<(), PacingError> {
         limits.validate()?;
         self.validate_invariants()?;
         self.validate_for_limits(limits)?;
@@ -542,7 +565,7 @@ impl PacingState {
                 CapitalEvent::Withdrawal(withdrawal) => next.upsert_withdrawal(withdrawal)?,
             }
         }
-        next.replay_ready_capital(at, limits)?;
+        next.replay_ready_capital(at, limits, admission_floors)?;
         next.capital_reconciled_through = Some(at);
         next.validate_invariants()?;
         next.validate_for_limits(limits)?;
@@ -601,6 +624,25 @@ impl PacingState {
         )
     }
 
+    /// Records a durable, fail-closed skip when the required core signal is
+    /// unavailable at the decision boundary.
+    ///
+    /// The absence marker is part of the bound input hash, so a later same-day
+    /// signal cannot replace the recorded skip after a restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns ordinary pacing validation, schedule, or replay-conflict
+    /// errors.
+    pub fn decide_with_unavailable_signal(
+        &mut self,
+        input: &DecisionInput,
+        limits: &PacingLimits,
+    ) -> Result<DecisionResult, PacingError> {
+        let input_snapshot_hash = snapshot_hash(&("core_signal_unavailable/v1", input, limits))?;
+        self.decide_bound(input, limits, input_snapshot_hash, false, true)
+    }
+
     fn decide_bound(
         &mut self,
         input: &DecisionInput,
@@ -619,7 +661,8 @@ impl PacingState {
             return Err(PacingError::ReconciliationTimeRegressed);
         }
         let mut next = self.clone();
-        next.replay_ready_capital(input.at, limits)?;
+        let admission_floors = next.admission_floors();
+        next.replay_ready_capital(input.at, limits, &admission_floors)?;
         next.capital_reconciled_through = Some(input.at);
         next.validate_invariants()?;
         next.validate_for_limits(limits)?;
@@ -1082,24 +1125,37 @@ impl PacingState {
         &mut self,
         at: DateTime<Utc>,
         limits: &PacingLimits,
+        admission_floors: &BTreeMap<String, UsdcMicros>,
     ) -> Result<(), PacingError> {
         // Rebuild from every durable event on each call. This is necessary for
         // a withdrawal that is reconciled late: a deposit admitted by an
         // earlier call must not remain available before its actual usable time.
+        if admission_floors
+            .keys()
+            .any(|event_id| !self.deposits.contains_key(event_id))
+        {
+            return Err(PacingError::CorruptState);
+        }
         for tranche in self.deposits.values_mut() {
             let durable_backing = checked_add(tranche.invested_usdc, tranche.committed_usdc)?;
-            if durable_backing > tranche.source_amount_usdc
-                || (!durable_backing.is_zero()
+            let admission_floor = admission_floors
+                .get(&tranche.event_id)
+                .copied()
+                .unwrap_or_default();
+            let preserved_admission = durable_backing.max(admission_floor);
+            if preserved_admission > tranche.source_amount_usdc
+                || (!preserved_admission.is_zero()
                     && tranche
                         .first_usable_at
                         .is_none_or(|usable_at| usable_at > at))
             {
                 return Err(PacingError::CorruptState);
             }
-            // Immutable commitments and fills keep first claim on admission
-            // capacity. A newly learned earlier event may redistribute only
-            // the unused admission around that durable economic history.
-            tranche.admitted_usdc = durable_backing;
+            // Immutable commitments/fills and any caller-supplied append-only
+            // admission floor keep first claim on capacity. Without a floor,
+            // a newly learned earlier event may redistribute only unused
+            // admission around durable economic history.
+            tranche.admitted_usdc = preserved_admission;
             tranche.withdrawn_usdc = UsdcMicros::default();
             tranche.status = status_before_admission(tranche, limits, at);
         }
@@ -1150,6 +1206,13 @@ impl PacingState {
             }
         }
         Ok(())
+    }
+
+    fn admission_floors(&self) -> BTreeMap<String, UsdcMicros> {
+        self.deposits
+            .iter()
+            .map(|(event_id, tranche)| (event_id.clone(), tranche.admitted_usdc))
+            .collect()
     }
 
     fn admit_ready_deposit(&mut self, id: &str, limits: &PacingLimits) -> Result<(), PacingError> {

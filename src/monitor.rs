@@ -4,7 +4,7 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use dex_connector::{
-    create_hyperliquid_account_connector, DexConnector, HyperliquidAccountConfig,
+    DexConnector, HyperliquidAccountConfig, HyperliquidAccountMovement, HyperliquidConnector,
     HyperliquidConnectorConfig,
 };
 use reqwest::Client;
@@ -72,7 +72,7 @@ struct DelegationWire {
 }
 
 pub struct HyperliquidObserver {
-    connector: Box<dyn DexConnector>,
+    connector: HyperliquidConnector,
     client: Client,
     info_url: String,
     account: String,
@@ -94,12 +94,12 @@ impl HyperliquidObserver {
             .timeout(Duration::from_secs(15))
             .build()
             .map_err(|error| MonitorError::Http(error.to_string()))?;
-        let connector = create_hyperliquid_account_connector(
-            HyperliquidConnectorConfig {
-                base_url: base_url.clone(),
-                tracked_symbols: vec![HYPE_SPOT_SYMBOL.to_owned()],
-            },
-            HyperliquidAccountConfig {
+        let connector = HyperliquidConnector::new(HyperliquidConnectorConfig {
+            base_url: base_url.clone(),
+            tracked_symbols: vec![HYPE_SPOT_SYMBOL.to_owned()],
+        })
+        .and_then(|connector| {
+            connector.with_account(HyperliquidAccountConfig {
                 account_address: account.clone(),
                 signer_private_key: None,
                 vault_address: None,
@@ -108,8 +108,8 @@ impl HyperliquidObserver {
                 max_taker_notional: None,
                 max_taker_slippage_bps: None,
                 max_taker_book_age_ms: 0,
-            },
-        )
+            })
+        })
         .map_err(|error| MonitorError::Connector(error.to_string()))?;
         Ok(Self {
             connector,
@@ -117,6 +117,25 @@ impl HyperliquidObserver {
             info_url: format!("{base_url}/info"),
             account,
         })
+    }
+
+    /// Reads normalized authoritative account movements without constructing
+    /// a signer. The caller supplies a closed millisecond range and persists
+    /// its own overlap cursor for idempotent replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MonitorError::Connector`] when the read-only history query or
+    /// normalization fails.
+    pub async fn account_movements(
+        &self,
+        start_time_ms: u64,
+        end_time_ms: u64,
+    ) -> Result<Vec<HyperliquidAccountMovement>, MonitorError> {
+        self.connector
+            .get_account_movements(start_time_ms, Some(end_time_ms))
+            .await
+            .map_err(|error| MonitorError::Connector(error.to_string()))
     }
 
     /// Reads spot balances, current HYPE mark, staking summary, and staking
@@ -130,11 +149,13 @@ impl HyperliquidObserver {
         attribution: &HypeAttribution,
         trade_cadence: impl Into<String>,
     ) -> Result<AccumulatorStatus, MonitorError> {
+        let balance_observation_started_at = Utc::now();
         let combined = self
             .connector
             .get_combined_balance()
             .await
             .map_err(|error| MonitorError::Connector(error.to_string()))?;
+        let balance_observed_at = Utc::now();
         let ticker = self
             .connector
             .get_ticker(HYPE_SPOT_SYMBOL, None)
@@ -166,7 +187,14 @@ impl HyperliquidObserver {
                 },
             )?,
         };
-        reconcile_status(&balances, &staking, attribution, Utc::now(), trade_cadence)
+        reconcile_status_with_balance_window(
+            &balances,
+            &staking,
+            attribution,
+            balance_observation_started_at,
+            balance_observed_at,
+            trade_cadence,
+        )
     }
 
     async fn post_info<T: DeserializeOwned>(&self, body: Value) -> Result<T, MonitorError> {
@@ -198,6 +226,24 @@ pub fn reconcile_status(
     staking: &StakingObservation,
     attribution: &HypeAttribution,
     observed_at: DateTime<Utc>,
+    trade_cadence: impl Into<String>,
+) -> Result<AccumulatorStatus, MonitorError> {
+    reconcile_status_with_balance_window(
+        balances,
+        staking,
+        attribution,
+        observed_at,
+        observed_at,
+        trade_cadence,
+    )
+}
+
+fn reconcile_status_with_balance_window(
+    balances: &BalanceObservation,
+    staking: &StakingObservation,
+    attribution: &HypeAttribution,
+    balance_observation_started_at: DateTime<Utc>,
+    balance_observed_at: DateTime<Utc>,
     trade_cadence: impl Into<String>,
 ) -> Result<AccumulatorStatus, MonitorError> {
     for (label, value) in [
@@ -243,11 +289,12 @@ pub fn reconcile_status(
         }
     };
     let health_reason = (!health_reasons.is_empty()).then(|| health_reasons.join("; "));
-    AccumulatorStatus::new(
+    AccumulatorStatus::new_with_balance_window(
         balances.spot_usdc,
         attributed_hype,
         balances.hype_price_usdc,
-        observed_at,
+        balance_observation_started_at,
+        balance_observed_at,
         last_trade_at,
         trade_cadence,
         health_reason,

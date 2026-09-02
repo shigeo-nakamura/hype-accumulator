@@ -37,6 +37,9 @@ fn dashboard_status_derives_equity_and_serializes_activity() {
         value["accumulator"]["last_trade_at"],
         "2026-08-24T10:00:00Z"
     );
+    assert!(value["accumulator"]
+        .get("balance_observation_started_at")
+        .is_none());
     assert!(value["accumulator"].get("health_reason").is_none());
 }
 
@@ -89,5 +92,18 @@ fn invalid_or_future_measurements_fail_closed() {
     assert_eq!(
         AccumulatorStatus::new(1.0, 1.0, 40.0, at(11), Some(at(12)), "daily", None),
         Err(StatusError::FutureLastTrade)
+    );
+    assert_eq!(
+        AccumulatorStatus::new_with_balance_window(
+            1.0,
+            1.0,
+            40.0,
+            at(12),
+            at(11),
+            None,
+            "daily",
+            None,
+        ),
+        Err(StatusError::InvalidBalanceObservationWindow)
     );
 }

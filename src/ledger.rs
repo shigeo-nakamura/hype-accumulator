@@ -140,6 +140,12 @@ pub enum LedgerEventKind {
         observed_hype_atoms: u64,
         reason: String,
     },
+    RuntimeCyclePrepared {
+        cycle_hash: String,
+    },
+    RuntimeCycleCommitted {
+        cycle_hash: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -214,6 +220,10 @@ pub struct ReplayState {
     decision_commitment_ids: BTreeSet<String>,
     orders: BTreeMap<String, OrderReplay>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    runtime_cycles: BTreeMap<String, bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_runtime_cycle_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     fills: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     fees: BTreeMap<String, String>,
@@ -244,6 +254,15 @@ impl ReplayState {
     #[must_use]
     pub const fn admitted_usdc(&self) -> UsdcMicros {
         self.admitted_usdc
+    }
+
+    /// Returns the cumulative admission recorded for one authoritative
+    /// deposit, or `None` when the deposit is absent from the protected ledger.
+    #[must_use]
+    pub fn admitted_deposit_usdc(&self, event_id: &str) -> Option<UsdcMicros> {
+        self.deposits
+            .get(event_id)
+            .map(|deposit| deposit.admitted_usdc)
     }
 
     #[must_use]
@@ -317,6 +336,26 @@ impl ReplayState {
             .saturating_add(self.committed_usdc.as_micros())
             .saturating_add(self.spent_usdc.as_micros());
         UsdcMicros::from_micros(self.admitted_usdc.as_micros().saturating_sub(used))
+    }
+
+    #[must_use]
+    pub fn runtime_cycle_prepared(&self, cycle_hash: &str) -> bool {
+        self.runtime_cycles.contains_key(cycle_hash)
+    }
+
+    #[must_use]
+    pub fn runtime_cycle_committed(&self, cycle_hash: &str) -> bool {
+        self.runtime_cycles.get(cycle_hash) == Some(&true)
+    }
+
+    #[must_use]
+    pub fn has_uncommitted_runtime_cycle(&self) -> bool {
+        self.runtime_cycles.values().any(|committed| !committed)
+    }
+
+    #[must_use]
+    pub fn last_runtime_cycle_hash(&self) -> Option<&str> {
+        self.last_runtime_cycle_hash.as_deref()
     }
 }
 
@@ -991,6 +1030,7 @@ fn replay(events: &[LedgerEvent]) -> Result<ReplayState, LedgerError> {
     Ok(state)
 }
 
+#[allow(clippy::too_many_lines)]
 fn apply_event(state: &mut ReplayState, event: &LedgerEvent) -> Result<(), LedgerError> {
     match &event.kind {
         LedgerEventKind::AuthoritativeDeposit { amount_usdc } => {
@@ -1074,6 +1114,26 @@ fn apply_event(state: &mut ReplayState, event: &LedgerEvent) -> Result<(), Ledge
             fee_usdc,
         } => {
             record_fee(state, event.occurred_at, fee_id, order_id, *fee_usdc)?;
+        }
+        LedgerEventKind::RuntimeCyclePrepared { cycle_hash } => {
+            if state
+                .runtime_cycles
+                .insert(cycle_hash.clone(), false)
+                .is_some()
+            {
+                return Err(LedgerError::RuntimeCycleCollision(cycle_hash.clone()));
+            }
+        }
+        LedgerEventKind::RuntimeCycleCommitted { cycle_hash } => {
+            let committed = state
+                .runtime_cycles
+                .get_mut(cycle_hash)
+                .ok_or_else(|| LedgerError::UnknownRuntimeCycle(cycle_hash.clone()))?;
+            if *committed {
+                return Err(LedgerError::RuntimeCycleCollision(cycle_hash.clone()));
+            }
+            *committed = true;
+            state.last_runtime_cycle_hash = Some(cycle_hash.clone());
         }
         LedgerEventKind::StakingDepositRecorded { .. }
         | LedgerEventKind::DelegationRecorded { .. }
@@ -1467,6 +1527,7 @@ fn require_unsettled_decision_backing(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_event(event: &LedgerEvent) -> Result<(), LedgerError> {
     validate_id("event_id", &event.event_id)?;
     match &event.kind {
@@ -1564,6 +1625,10 @@ fn validate_event(event: &LedgerEvent) -> Result<(), LedgerError> {
         } => {
             validate_id("correction_id", correction_id)?;
             validate_text("reason", reason)?;
+        }
+        LedgerEventKind::RuntimeCyclePrepared { cycle_hash }
+        | LedgerEventKind::RuntimeCycleCommitted { cycle_hash } => {
+            validate_sha256("cycle_hash", cycle_hash)?;
         }
     }
     Ok(())
@@ -2208,6 +2273,20 @@ fn validate_text(name: &str, value: &str) -> Result<(), LedgerError> {
         )))
     } else {
         Ok(())
+    }
+}
+
+fn validate_sha256(name: &str, value: &str) -> Result<(), LedgerError> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(LedgerError::InvalidEvent(format!(
+            "{name} must be canonical lowercase SHA-256"
+        )))
     }
 }
 
@@ -2909,6 +2988,10 @@ pub enum LedgerError {
     RewardIdCollision(String),
     #[error("reconciliation correction ID collision: {0}")]
     CorrectionIdCollision(String),
+    #[error("runtime cycle hash already exists: {0}")]
+    RuntimeCycleCollision(String),
+    #[error("runtime cycle was not prepared: {0}")]
+    UnknownRuntimeCycle(String),
     #[error("daily decision outcome already exists for {0}")]
     DecisionDateCollision(NaiveDate),
     #[error("daily decision ID already exists: {0}")]
