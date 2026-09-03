@@ -1,0 +1,36 @@
+# Operational parameters for `hype-live-probe` (bot-strategy#845 Stage 4).
+#
+# These are NOT security-policy values (SecurityPolicy has no field for
+# any of these) — they are execution/venue parameters the operator supplies
+# directly for each invocation, reviewed before every run rather than baked
+# into the binary. See `EffectiveLiveOrderPolicy`'s doc comment in
+# src/config.rs for why these live here instead.
+#
+# Safe placeholder values below (testnet, tiny notional). An operator must
+# deliberately edit every field before a live (`is_mainnet = true`)
+# invocation — copy this file, never point directly at it.
+
+# false = Hyperliquid testnet, true = mainnet (real funds).
+is_mainnet = false
+
+# Hard ceiling on the taker order's worst-case notional (USDC), enforced by
+# dex-connector's `HyperliquidAccountConfig::max_taker_notional` independent
+# of everything else this bot computes.
+max_taker_notional_usdc = "25.0"
+
+# IOC slippage protection bps, enforced by the connector at submission time.
+max_taker_slippage_bps = 20
+
+# Maximum age (ms) of the exchange book timestamp the connector will price a
+# taker order against.
+max_taker_book_age_ms = 5000
+
+# How long (seconds from `prepare` time) the prepared order's effective
+# expiry window may extend, before the venue-clock-lag deduction that
+# produces `signed_expiry_at` (see order_envelope.rs). Keep small: this is
+# a one-shot IOC probe, not a resting order.
+order_timeout_seconds = 10
+
+# Order book depth requested from the connector for the worst-case price
+# computation.
+order_book_depth = 5

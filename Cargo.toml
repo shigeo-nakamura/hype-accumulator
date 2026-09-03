@@ -8,6 +8,11 @@ publish = false
 offline-staking-simulation = []
 live-probe = ["dep:debot-utils"]
 
+[[bin]]
+name = "hype-live-probe"
+path = "src/bin/hype-live-probe.rs"
+required-features = ["live-probe"]
+
 [dependencies]
 chrono = { version = "=0.4.41", default-features = false, features = ["clock", "serde"] }
 debot-utils = { version = "=1.0.34", optional = true }

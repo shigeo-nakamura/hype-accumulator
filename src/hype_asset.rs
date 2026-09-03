@@ -17,7 +17,17 @@ pub(crate) const HYPE_WEI_DECIMALS: u32 = 8;
 pub(crate) const HYPE_ATOMS_PER_HYPE: u64 = 100_000_000;
 const MARKET_METADATA_DOMAIN: &[u8] = b"hype-accumulator/hyperliquid-hype-usdc-spot-metadata/v1";
 
-pub(crate) fn hype_usdc_market_metadata_digest() -> String {
+/// Canonical digest binding [`crate::order_envelope::assemble_order_envelope_binding`]'s
+/// `OrderEnvelopeBinding::market_metadata_digest` and
+/// [`crate::live_probe::LiveProbeBinding`]'s `market_metadata_digest` to the
+/// same market identity. A caller constructing a `LiveProbeBinding`
+/// independently (e.g. the live-probe binary, at submit time) must pass
+/// this exact value, not any other digest (in particular, not
+/// `Config::effective_security_policy_digest`, which is a different,
+/// policy-fingerprint concept) — passing a different value here silently
+/// produces a `BindingMismatch` against the durably prepared action.
+#[must_use]
+pub fn hype_usdc_market_metadata_digest() -> String {
     let mut hasher = Sha256::new();
     hasher.update(MARKET_METADATA_DOMAIN);
     hasher.update([0]);
