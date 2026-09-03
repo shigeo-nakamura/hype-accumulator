@@ -13,6 +13,8 @@ pub mod monitor;
 pub mod pacing;
 pub mod runtime;
 pub mod signal;
+#[cfg(feature = "live-probe")]
+pub mod signer;
 pub mod status;
 pub mod status_io;
 pub mod workflow;
