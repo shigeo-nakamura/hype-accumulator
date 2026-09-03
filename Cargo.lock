@@ -1807,6 +1807,7 @@ name = "hype-accumulator"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "debot-utils",
  "dex-connector",
  "fs2",
  "libc",
