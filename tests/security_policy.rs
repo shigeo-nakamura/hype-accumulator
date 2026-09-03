@@ -699,3 +699,93 @@ fn noncanonical_expiry_is_rejected_during_policy_parse() {
         Err(ConfigError::SecurityPolicy(SecurityPolicyError::Invalid(_)))
     ));
 }
+
+#[test]
+fn effective_live_order_policy_extracts_the_approved_values() {
+    let env = live_environment();
+    let policy = acknowledged_policy(&live_policy_template(), &env);
+    let before_expiry = at(EXPIRY) - chrono::TimeDelta::seconds(1);
+    let effective = config_with_policy(&policy)
+        .effective_live_order_policy(&env, before_expiry)
+        .expect("live-approved policy yields an effective order policy");
+
+    assert_eq!(effective.max_slippage_bps, 20);
+    assert_eq!(effective.max_purchase_fee_bps, 5);
+    assert_eq!(effective.max_venue_clock_lag_ms, 500);
+    assert_eq!(effective.venue_clock_evidence_stale_after_seconds, 30);
+    assert_eq!(effective.book_stale_after_seconds, 15);
+    assert_eq!(effective.account_history_stale_after_seconds, 30);
+    assert_eq!(effective.fee_schedule_stale_after_seconds, 3600);
+    assert_eq!(effective.signal_stale_after_seconds, 86400);
+    assert_eq!(effective.validator_allowlist, vec![VALIDATOR.to_owned()]);
+    assert_eq!(effective.residual_hype_wei, 1000);
+    assert_eq!(effective.fill_registration_deadline_seconds, 300);
+    assert_eq!(effective.lot_eligibility_max_age_seconds, 86400);
+    assert_eq!(
+        effective.policy_acknowledgement_valid_through_at,
+        at(EXPIRY)
+    );
+}
+
+#[test]
+fn effective_live_order_policy_fails_the_same_way_as_the_acknowledgement() {
+    let env = live_environment();
+    let before_expiry = at(EXPIRY) - chrono::TimeDelta::seconds(1);
+    // Reuses the same invalid-policy fixture exercised above for
+    // `expected_live_acknowledgement`: an execution account kind that is
+    // still "unapproved" must fail identically for this accessor, since
+    // both share the same underlying live-contract validation.
+    let unapproved = live_policy_template().replace(
+        "execution_account_kind = \"dedicated_master\"",
+        "execution_account_kind = \"unapproved\"",
+    );
+    assert!(matches!(
+        config_with_policy(&unapproved).effective_live_order_policy(&env, before_expiry),
+        Err(ConfigError::SecurityPolicy(SecurityPolicyError::Invalid(_)))
+    ));
+
+    let no_policy = Config::from_toml(&live_runtime_toml()).expect("runtime-only config parses");
+    assert!(matches!(
+        no_policy.effective_live_order_policy(&env, before_expiry),
+        Err(ConfigError::MissingSecurityPolicy)
+    ));
+}
+
+#[test]
+fn effective_live_order_policy_rejects_an_expired_acknowledgement() {
+    // Regression: `effective_live_order_policy` previously only called the
+    // structural `live_context` check, not `validate_live`'s expiry check,
+    // so a fully-formed but expired acknowledgement would still yield real
+    // slippage/fee/staleness/validator values.
+    let env = live_environment();
+    let policy = acknowledged_policy(&live_policy_template(), &env);
+    let at_or_after_expiry = at(EXPIRY);
+    assert!(matches!(
+        config_with_policy(&policy).effective_live_order_policy(&env, at_or_after_expiry),
+        Err(ConfigError::SecurityPolicy(
+            SecurityPolicyError::AcknowledgementExpired
+        ))
+    ));
+}
+
+#[test]
+fn effective_live_order_policy_rejects_a_digest_mismatched_acknowledgement() {
+    // Regression: same gap as above, for the case where the recorded
+    // acknowledgement no longer matches the current effective policy (e.g.
+    // a staking field changed after the acknowledgement was computed and
+    // written). Mutates `residual_hype_wei` specifically because it is not
+    // cross-checked against the runtime config the way e.g.
+    // `max_slippage_bps` is (`validate_live_execution` would otherwise
+    // reject a runtime/policy mismatch before ever reaching the digest
+    // check this test targets).
+    let env = live_environment();
+    let policy = acknowledged_policy(&live_policy_template(), &env);
+    let before_expiry = at(EXPIRY) - chrono::TimeDelta::seconds(1);
+    let changed_after_ack = policy.replace("residual_hype_wei = 1000", "residual_hype_wei = 2000");
+    assert!(matches!(
+        config_with_policy(&changed_after_ack).effective_live_order_policy(&env, before_expiry),
+        Err(ConfigError::SecurityPolicy(
+            SecurityPolicyError::AcknowledgementMismatch
+        ))
+    ));
+}

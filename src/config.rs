@@ -145,6 +145,36 @@ pub(crate) struct RuntimeActionPolicy {
     pub acknowledgement_expires_at: Option<DateTime<Utc>>,
 }
 
+/// Live-order policy values extracted from an approved `SecurityPolicy`.
+/// Returned only by [`Config::effective_live_order_policy`], which requires
+/// full live-contract validation to succeed first — every field here is
+/// therefore already known to come from an approved, live-ready, currently
+/// (not expired, not digest-mismatched) acknowledged policy.
+///
+/// Unlike the `live-probe`-gated modules that consume this type
+/// (`order_envelope`, `live_decision`, `live_probe`, `signer`), this type
+/// and the config-parsing/validation machinery around it are not
+/// feature-gated: `config.rs` validates the same live contract
+/// unconditionally regardless of build features (`validate`/`validate_live`
+/// are also always compiled). A default build can construct this value but
+/// has no code path that acts on it.
+#[derive(Clone, Debug)]
+pub struct EffectiveLiveOrderPolicy {
+    pub max_slippage_bps: u16,
+    pub max_purchase_fee_bps: u16,
+    pub max_venue_clock_lag_ms: u64,
+    pub venue_clock_evidence_stale_after_seconds: u64,
+    pub book_stale_after_seconds: u64,
+    pub account_history_stale_after_seconds: u64,
+    pub fee_schedule_stale_after_seconds: u64,
+    pub signal_stale_after_seconds: u64,
+    pub validator_allowlist: Vec<String>,
+    pub residual_hype_wei: u64,
+    pub fill_registration_deadline_seconds: u64,
+    pub lot_eligibility_max_age_seconds: u64,
+    pub policy_acknowledgement_valid_through_at: DateTime<Utc>,
+}
+
 impl Config {
     /// Parses a complete configuration from TOML.
     ///
@@ -383,6 +413,46 @@ impl Config {
             .as_ref()
             .ok_or(ConfigError::MissingSecurityPolicy)?
             .expected_acknowledgement(self, env)
+            .map_err(ConfigError::from)
+    }
+
+    /// Extracts the live-order policy values a live-capable caller (e.g. the
+    /// one-shot live-probe binary) needs to build most of
+    /// `order_envelope::OrderEnvelopeFreshnessPolicy` and
+    /// `workflow::EligibilityPolicyBinding`, plus the validator/residual
+    /// inputs to `live_decision::prepare_first_live_order_workflow`. Two
+    /// values these callers also need are deliberately absent because
+    /// `SecurityPolicy` has no field for either: `order_timeout_seconds`/
+    /// `order_book_depth` are operational parameters, not security policy,
+    /// and belong to the caller; `EligibilityPolicyBinding::policy_version`
+    /// has no dedicated field either — pair this call with
+    /// [`Self::effective_security_policy_digest`], whose whole purpose is a
+    /// canonical fingerprint of the active policy.
+    ///
+    /// Requires full live-contract validation at `now` — unlike
+    /// [`Self::expected_live_acknowledgement`] (which computes what an
+    /// acknowledgement *should* be, before one is even set, and so cannot
+    /// check expiry or a match against a not-yet-written value), this
+    /// method's whole purpose is to hand real values to something about to
+    /// prepare a live order, so it enforces the same expiry and
+    /// acknowledgement-match checks as [`Self::validate`]. It never returns
+    /// a value derived from an invalid, expired, digest-mismatched, or
+    /// otherwise non-live/unapproved policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no policy is attached, the policy/config is
+    /// not live-ready, the acknowledgement is expired, or it no longer
+    /// matches the current effective policy's expected digest.
+    pub fn effective_live_order_policy<E: Environment>(
+        &self,
+        env: &E,
+        now: DateTime<Utc>,
+    ) -> Result<EffectiveLiveOrderPolicy, ConfigError> {
+        self.security_policy
+            .as_ref()
+            .ok_or(ConfigError::MissingSecurityPolicy)?
+            .effective_live_order_policy(self, env, now)
             .map_err(ConfigError::from)
     }
 
@@ -936,6 +1006,39 @@ impl SecurityPolicy {
             return Err(SecurityPolicyError::AcknowledgementMismatch);
         }
         Ok(())
+    }
+
+    fn effective_live_order_policy<E: Environment>(
+        &self,
+        config: &Config,
+        env: &E,
+        now: DateTime<Utc>,
+    ) -> Result<EffectiveLiveOrderPolicy, SecurityPolicyError> {
+        // `live_context` alone is only structural validation. The
+        // expiry and acknowledgement-digest-mismatch checks live in
+        // `validate_live`, not here — this must call it explicitly, or an
+        // expired or since-changed (digest-mismatched) policy would still
+        // yield real, usable slippage/fee/staleness/validator values.
+        self.validate_live(config, env, now)?;
+        let context = self.live_context(config, env)?;
+        let execution = &self.wire.execution;
+        let staking = &self.wire.staking;
+        Ok(EffectiveLiveOrderPolicy {
+            max_slippage_bps: execution.max_slippage_bps,
+            max_purchase_fee_bps: execution.max_purchase_fee_bps,
+            max_venue_clock_lag_ms: execution.max_venue_clock_lag_ms,
+            venue_clock_evidence_stale_after_seconds: execution
+                .venue_clock_evidence_stale_after_seconds,
+            book_stale_after_seconds: execution.book_stale_after_seconds,
+            account_history_stale_after_seconds: execution.account_history_stale_after_seconds,
+            fee_schedule_stale_after_seconds: execution.fee_schedule_stale_after_seconds,
+            signal_stale_after_seconds: execution.signal_stale_after_seconds,
+            validator_allowlist: context.validator_allowlist,
+            residual_hype_wei: staking.residual_hype_wei,
+            fill_registration_deadline_seconds: staking.fill_registration_deadline_seconds,
+            lot_eligibility_max_age_seconds: staking.lot_eligibility_max_age_seconds,
+            policy_acknowledgement_valid_through_at: context.acknowledgement_expiry,
+        })
     }
 
     fn expected_acknowledgement<E: Environment>(
