@@ -4472,3 +4472,68 @@ fn durable_workflow_operates_with_the_file_backed_exchange_order_owner_store() {
         Err(WorkflowError::ContradictoryObservation(_))
     ));
 }
+
+#[test]
+fn peek_committed_binding_is_none_before_the_journal_exists() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("not-yet-created.jsonl");
+    assert_eq!(
+        DurableWorkflow::peek_committed_binding(&path).expect("peek succeeds"),
+        None
+    );
+}
+
+#[test]
+fn peek_committed_binding_returns_the_exact_committed_binding() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("peek.jsonl");
+    let binding = binding();
+    let workflow = reopen(&path, &binding);
+    drop(workflow);
+
+    assert_eq!(
+        DurableWorkflow::peek_committed_binding(&path).expect("peek succeeds"),
+        Some(binding)
+    );
+}
+
+#[test]
+fn peek_committed_binding_lets_a_retry_reuse_the_first_attempts_binding() {
+    // Simulates a crash between `open_or_create` committing the initial
+    // `DecisionRecorded` event and a later `prepare_order` completing: a
+    // second binding built from different (later) market inputs must be
+    // discarded in favor of the one already on disk, or `open_or_create`
+    // would permanently reject it as a mismatch.
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("retry.jsonl");
+    let first_attempt_binding = binding();
+    drop(DurableWorkflow::open_or_create(
+        &path,
+        &first_attempt_binding,
+        protected_head_store(&path),
+        exchange_order_owner_store(&path),
+    ));
+
+    let mut second_attempt_binding = binding();
+    second_attempt_binding
+        .order_envelope
+        .limit_price_usdc_per_hype = usdc(999_000_000);
+
+    let resumed_binding = DurableWorkflow::peek_committed_binding(&path)
+        .expect("peek succeeds")
+        .expect("first attempt's binding was committed");
+    assert_ne!(resumed_binding, second_attempt_binding);
+    assert_eq!(resumed_binding, first_attempt_binding);
+
+    let mut workflow = DurableWorkflow::open_or_create(
+        &path,
+        &resumed_binding,
+        protected_head_store(&path),
+        exchange_order_owner_store(&path),
+    )
+    .expect("retry succeeds using the durably committed binding");
+    assert!(matches!(
+        workflow.prepare_order(at(1)),
+        Ok(PrepareOutcome::Ready(_))
+    ));
+}

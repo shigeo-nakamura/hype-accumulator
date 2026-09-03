@@ -33,6 +33,7 @@
 //!   `max_purchase_fee_bps`.
 
 use crate::{
+    hype_asset::{hype_usdc_market_metadata_digest, HYPE_ATOMS_PER_HYPE, HYPE_SPOT_MARKET},
     pacing::UsdcMicros,
     workflow::{AuthorizationInputFreshness, HypeAtoms, OrderEnvelopeBinding},
 };
@@ -41,14 +42,6 @@ use dex_connector::{DexConnector, DexError, HyperliquidConnector};
 use rust_decimal::{prelude::ToPrimitive, Decimal};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-
-const HYPE_SPOT_MARKET: &str = "HYPE/USDC";
-/// Hyperliquid HYPE spot asset decimals (`weiDecimals`). Protocol-fixed, not
-/// queried live: spot asset metadata is not currently exposed as a public
-/// dex-connector API, and this value does not change for an existing asset.
-const HYPE_WEI_DECIMALS: u32 = 8;
-const HYPE_ATOMS_PER_HYPE: u64 = 100_000_000;
-const MARKET_METADATA_DOMAIN: &[u8] = b"hype-accumulator/hyperliquid-hype-usdc-spot-metadata/v1";
 
 /// Read-only freshness/pricing policy this assembly binds against. Every
 /// field is sourced from the operator's approved `SecurityPolicy`
@@ -282,16 +275,6 @@ fn quantity_for_budget(
 
 fn decimal_to_usdc_micros(value: Decimal) -> Result<UsdcMicros, OrderEnvelopeError> {
     UsdcMicros::from_decimal(value).ok_or(OrderEnvelopeError::InvalidDecimal("usdc micros"))
-}
-
-fn hype_usdc_market_metadata_digest() -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(MARKET_METADATA_DOMAIN);
-    hasher.update([0]);
-    hasher.update(HYPE_SPOT_MARKET.as_bytes());
-    hasher.update([0]);
-    hasher.update(HYPE_WEI_DECIMALS.to_be_bytes());
-    format!("{:x}", hasher.finalize())
 }
 
 fn venue_clock_evidence_digest(venue_time_ms: u64) -> String {
