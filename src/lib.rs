@@ -1,5 +1,7 @@
 pub mod account;
 pub mod backup;
+#[cfg(feature = "live-probe")]
+pub(crate) mod bps;
 pub mod capital;
 pub mod clock;
 pub mod config;

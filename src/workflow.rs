@@ -92,7 +92,11 @@ pub struct AuthorizationInputFreshness {
 }
 
 impl AuthorizationInputFreshness {
-    fn earliest_deadline(&self) -> DateTime<Utc> {
+    /// Earliest of the six freshness horizons. `pub(crate)` so envelope
+    /// assembly (`order_envelope.rs`) can compute the same effective-expiry
+    /// cap this struct's own validation (`valid_expiry_binding`) enforces,
+    /// without hand-duplicating the field list.
+    pub(crate) fn earliest_deadline(&self) -> DateTime<Utc> {
         [
             self.decision_valid_through_at,
             self.signal_evidence_valid_through_at,

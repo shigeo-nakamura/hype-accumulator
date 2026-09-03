@@ -48,8 +48,6 @@ const HYPE_SPOT_MARKET: &str = "HYPE/USDC";
 /// dex-connector API, and this value does not change for an existing asset.
 const HYPE_WEI_DECIMALS: u32 = 8;
 const HYPE_ATOMS_PER_HYPE: u64 = 100_000_000;
-const USDC_MICROS_PER_USDC: u64 = 1_000_000;
-const BPS_DENOMINATOR: u16 = 10_000;
 const MARKET_METADATA_DOMAIN: &[u8] = b"hype-accumulator/hyperliquid-hype-usdc-spot-metadata/v1";
 
 /// Read-only freshness/pricing policy this assembly binds against. Every
@@ -132,9 +130,10 @@ pub async fn assemble_order_envelope_binding(
         .first()
         .ok_or(OrderEnvelopeError::EmptyBook)?;
 
-    // Read-only reachability attestations; their content is not otherwise used.
-    connector.get_combined_balance().await?;
-    connector.get_user_fees().await?;
+    // Read-only reachability attestations; their content is not otherwise
+    // used. Independent of each other and of the book/price computation
+    // above, so run them concurrently.
+    tokio::try_join!(connector.get_combined_balance(), connector.get_user_fees())?;
 
     let limit_price = worst_case_price_with_slippage(best_ask.price, policy.max_slippage_bps)?;
     let original_quantity_hype = quantity_for_budget(planned_usdc, limit_price)?;
@@ -172,17 +171,7 @@ pub async fn assemble_order_envelope_binding(
         fee_schedule_valid_through_at,
         policy_acknowledgement_valid_through_at,
     };
-    let earliest_deadline = [
-        input_freshness.decision_valid_through_at,
-        input_freshness.signal_evidence_valid_through_at,
-        input_freshness.book_evidence_valid_through_at,
-        input_freshness.account_evidence_valid_through_at,
-        input_freshness.fee_schedule_valid_through_at,
-        input_freshness.policy_acknowledgement_valid_through_at,
-    ]
-    .into_iter()
-    .min()
-    .expect("fixed non-empty field set");
+    let earliest_deadline = input_freshness.earliest_deadline();
 
     let requested_expiry = now + seconds(policy.order_timeout_seconds, "order_timeout_seconds")?;
     let effective_expiry_at = requested_expiry.min(earliest_deadline);
@@ -207,6 +196,19 @@ pub async fn assemble_order_envelope_binding(
     let signed_expiry_at = effective_expiry_at.checked_sub_signed(offset).ok_or(
         OrderEnvelopeError::InvalidExpiryWindow("signed expiry underflow"),
     )?;
+    // `workflow.rs::valid_expiry_binding` additionally requires
+    // `signed_expiry_at > decided_at`, which this module cannot check (see
+    // module doc: decided_at is a caller obligation). It DOES require
+    // `signed_expiry_at` to be in the future relative to assembly time,
+    // which is checkable here: a policy where `order_timeout_seconds` is too
+    // small relative to `max_venue_clock_lag_ms` would otherwise silently
+    // produce an already-expired envelope.
+    if signed_expiry_at <= now {
+        return Err(OrderEnvelopeError::InvalidExpiryWindow(
+            "signed expiry is not after assembly time; order_timeout_seconds is too small \
+             relative to max_venue_clock_lag_ms",
+        ));
+    }
 
     let l1_nonce = connector.reserve_l1_action_nonce().await?;
 
@@ -247,12 +249,7 @@ fn worst_case_price_with_slippage(
     best_ask: Decimal,
     max_slippage_bps: u16,
 ) -> Result<Decimal, OrderEnvelopeError> {
-    let multiplier = Decimal::from(BPS_DENOMINATOR)
-        .checked_add(Decimal::from(max_slippage_bps))
-        .ok_or(OrderEnvelopeError::InvalidDecimal("slippage multiplier"))?;
-    best_ask
-        .checked_mul(multiplier)
-        .and_then(|value| value.checked_div(Decimal::from(BPS_DENOMINATOR)))
+    crate::bps::apply_bps_markup(best_ask, max_slippage_bps)
         .ok_or(OrderEnvelopeError::InvalidDecimal("limit price"))
 }
 
@@ -263,16 +260,14 @@ fn quantity_for_budget(
     if limit_price <= Decimal::ZERO {
         return Err(OrderEnvelopeError::InvalidDecimal("limit price"));
     }
-    let planned = Decimal::from(planned_usdc.as_micros())
-        .checked_div(Decimal::from(USDC_MICROS_PER_USDC))
-        .ok_or(OrderEnvelopeError::InvalidDecimal("planned notional"))?;
-    let quantity_hype = planned
+    let quantity_hype = planned_usdc
+        .as_decimal()
         .checked_div(limit_price)
         .ok_or(OrderEnvelopeError::InvalidDecimal("quantity"))?;
     // Always round the quantity down: overspending the planned budget is
     // never acceptable, and the live-probe's own debit-cap check
-    // (`live_probe.rs::worst_case_debit_with_fee`) independently re-bounds
-    // this at submission time regardless.
+    // (`live_probe.rs`'s `apply_bps_markup`-based debit bound) independently
+    // re-bounds this at submission time regardless.
     let atoms = quantity_hype
         .checked_mul(Decimal::from(HYPE_ATOMS_PER_HYPE))
         .ok_or(OrderEnvelopeError::InvalidDecimal("quantity atoms"))?
@@ -286,13 +281,7 @@ fn quantity_for_budget(
 }
 
 fn decimal_to_usdc_micros(value: Decimal) -> Result<UsdcMicros, OrderEnvelopeError> {
-    let micros = value
-        .checked_mul(Decimal::from(USDC_MICROS_PER_USDC))
-        .ok_or(OrderEnvelopeError::InvalidDecimal("usdc micros"))?
-        .round()
-        .to_u64()
-        .ok_or(OrderEnvelopeError::InvalidDecimal("usdc micros"))?;
-    Ok(UsdcMicros::from_micros(micros))
+    UsdcMicros::from_decimal(value).ok_or(OrderEnvelopeError::InvalidDecimal("usdc micros"))
 }
 
 fn hype_usdc_market_metadata_digest() -> String {
@@ -424,31 +413,49 @@ mod tests {
         ))
     }
 
-    /// Responds to a fixed, ordered sequence of `/info` POSTs with canned
-    /// bodies, one connection per request (matching this crate's existing
-    /// "Connection: close" mock-server tests). This mirrors
-    /// `assemble_order_envelope_binding`'s exact current call sequence
-    /// (spotMeta, l2Book, spotClearinghouseState, spotMeta, allMids,
-    /// userFees) rather than dispatching by request type, so it is
-    /// intentionally coupled to dex-connector's present internals; a
-    /// reordering there is expected to require updating this list, not a
-    /// sign this test is wrong.
-    async fn spawn_ordered_mock_server(
-        responses: Vec<String>,
+    /// Responds to `/info` POSTs by dispatching on the request body's
+    /// `"type"` field, one accepted connection handled concurrently per
+    /// request. Order-independent by design: `assemble_order_envelope_binding`
+    /// now issues some requests concurrently (`tokio::try_join!`), and a
+    /// position-ordered mock would be an inaccurate, fragile stand-in for
+    /// what dex-connector's internals actually request.
+    async fn spawn_typed_mock_server(
+        responses: std::collections::HashMap<&'static str, String>,
+        expected_requests: usize,
     ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
-            for body in responses {
+            // Accept and hand off each connection to its own task as soon as
+            // it arrives, rather than pre-accepting a fixed batch: some
+            // requests are only sent after an earlier one's response is
+            // received (e.g. `l2Book` waits on a prior `spotMeta`), so
+            // accepting up front would deadlock waiting for a connection the
+            // client has not opened yet.
+            let mut tasks = Vec::with_capacity(expected_requests);
+            for _ in 0..expected_requests {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = [0_u8; 8192];
-                assert!(socket.read(&mut request).await.unwrap() > 0);
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                socket.write_all(response.as_bytes()).await.unwrap();
+                let responses = responses.clone();
+                tasks.push(tokio::spawn(async move {
+                    let mut buffer = vec![0_u8; 8192];
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    let request = String::from_utf8_lossy(&buffer[..n]);
+                    let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+                    let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+                    let request_type = parsed["type"].as_str().unwrap_or_default();
+                    let body = responses
+                        .get(request_type)
+                        .unwrap_or_else(|| panic!("unexpected /info type: {request_type}"));
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                }));
+            }
+            for task in tasks {
+                task.await.unwrap();
             }
         });
         (address, handle)
@@ -477,15 +484,16 @@ mod tests {
         let all_mids = serde_json::json!({}).to_string();
         let user_fees = serde_json::json!({}).to_string();
 
-        let (address, server) = spawn_ordered_mock_server(vec![
-            spot_meta.clone(),
-            l2_book,
-            spot_state,
-            spot_meta,
-            all_mids,
-            user_fees,
-        ])
-        .await;
+        let responses = std::collections::HashMap::from([
+            ("spotMeta", spot_meta),
+            ("l2Book", l2_book),
+            ("spotClearinghouseState", spot_state),
+            ("allMids", all_mids),
+            ("userFees", user_fees),
+        ]);
+        // spotMeta is requested twice (l2Book's spot-symbol resolution, and
+        // get_combined_balance's unconditional refresh); every other type once.
+        let (address, server) = spawn_typed_mock_server(responses, 6).await;
 
         let nonce_path = test_nonce_path();
         let connector = HyperliquidConnector::new(HyperliquidConnectorConfig {
