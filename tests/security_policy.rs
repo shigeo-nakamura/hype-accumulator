@@ -699,3 +699,52 @@ fn noncanonical_expiry_is_rejected_during_policy_parse() {
         Err(ConfigError::SecurityPolicy(SecurityPolicyError::Invalid(_)))
     ));
 }
+
+#[test]
+fn effective_live_order_policy_extracts_the_approved_values() {
+    let env = live_environment();
+    let policy = acknowledged_policy(&live_policy_template(), &env);
+    let effective = config_with_policy(&policy)
+        .effective_live_order_policy(&env)
+        .expect("live-approved policy yields an effective order policy");
+
+    assert_eq!(effective.max_slippage_bps, 20);
+    assert_eq!(effective.max_purchase_fee_bps, 5);
+    assert_eq!(effective.max_venue_clock_lag_ms, 500);
+    assert_eq!(effective.venue_clock_evidence_stale_after_seconds, 30);
+    assert_eq!(effective.book_stale_after_seconds, 15);
+    assert_eq!(effective.account_history_stale_after_seconds, 30);
+    assert_eq!(effective.fee_schedule_stale_after_seconds, 3600);
+    assert_eq!(effective.signal_stale_after_seconds, 86400);
+    assert_eq!(effective.validator_allowlist, vec![VALIDATOR.to_owned()]);
+    assert_eq!(effective.residual_hype_wei, 1000);
+    assert_eq!(effective.fill_registration_deadline_seconds, 300);
+    assert_eq!(effective.lot_eligibility_max_age_seconds, 86400);
+    assert_eq!(
+        effective.policy_acknowledgement_valid_through_at,
+        at(EXPIRY)
+    );
+}
+
+#[test]
+fn effective_live_order_policy_fails_the_same_way_as_the_acknowledgement() {
+    let env = live_environment();
+    // Reuses the same invalid-policy fixture exercised above for
+    // `expected_live_acknowledgement`: an execution account kind that is
+    // still "unapproved" must fail identically for this accessor, since
+    // both share the same underlying live-contract validation.
+    let unapproved = live_policy_template().replace(
+        "execution_account_kind = \"dedicated_master\"",
+        "execution_account_kind = \"unapproved\"",
+    );
+    assert!(matches!(
+        config_with_policy(&unapproved).effective_live_order_policy(&env),
+        Err(ConfigError::SecurityPolicy(SecurityPolicyError::Invalid(_)))
+    ));
+
+    let no_policy = Config::from_toml(&live_runtime_toml()).expect("runtime-only config parses");
+    assert!(matches!(
+        no_policy.effective_live_order_policy(&env),
+        Err(ConfigError::MissingSecurityPolicy)
+    ));
+}

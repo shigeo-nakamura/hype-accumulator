@@ -145,6 +145,27 @@ pub(crate) struct RuntimeActionPolicy {
     pub acknowledgement_expires_at: Option<DateTime<Utc>>,
 }
 
+/// Live-order policy values extracted from an approved `SecurityPolicy`.
+/// Returned only by [`Config::effective_live_order_policy`], which requires
+/// full live-contract validation to succeed first — every field here is
+/// therefore already known to come from an approved, live-ready policy.
+#[derive(Clone, Debug)]
+pub struct EffectiveLiveOrderPolicy {
+    pub max_slippage_bps: u16,
+    pub max_purchase_fee_bps: u16,
+    pub max_venue_clock_lag_ms: u64,
+    pub venue_clock_evidence_stale_after_seconds: u64,
+    pub book_stale_after_seconds: u64,
+    pub account_history_stale_after_seconds: u64,
+    pub fee_schedule_stale_after_seconds: u64,
+    pub signal_stale_after_seconds: u64,
+    pub validator_allowlist: Vec<String>,
+    pub residual_hype_wei: u64,
+    pub fill_registration_deadline_seconds: u64,
+    pub lot_eligibility_max_age_seconds: u64,
+    pub policy_acknowledgement_valid_through_at: DateTime<Utc>,
+}
+
 impl Config {
     /// Parses a complete configuration from TOML.
     ///
@@ -383,6 +404,32 @@ impl Config {
             .as_ref()
             .ok_or(ConfigError::MissingSecurityPolicy)?
             .expected_acknowledgement(self, env)
+            .map_err(ConfigError::from)
+    }
+
+    /// Extracts the live-order policy values a live-capable caller (e.g. the
+    /// one-shot live-probe binary) needs to build
+    /// `order_envelope::OrderEnvelopeFreshnessPolicy`,
+    /// `workflow::EligibilityPolicyBinding`, and the validator/residual
+    /// inputs to `live_decision::prepare_first_live_order_workflow`.
+    ///
+    /// Requires the same full live-contract validation as
+    /// [`Self::expected_live_acknowledgement`] — this never returns a value
+    /// derived from an invalid, non-live, or unapproved policy/config
+    /// pairing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no policy is attached, or under the same
+    /// conditions as [`Self::expected_live_acknowledgement`].
+    pub fn effective_live_order_policy<E: Environment>(
+        &self,
+        env: &E,
+    ) -> Result<EffectiveLiveOrderPolicy, ConfigError> {
+        self.security_policy
+            .as_ref()
+            .ok_or(ConfigError::MissingSecurityPolicy)?
+            .effective_live_order_policy(self, env)
             .map_err(ConfigError::from)
     }
 
@@ -936,6 +983,32 @@ impl SecurityPolicy {
             return Err(SecurityPolicyError::AcknowledgementMismatch);
         }
         Ok(())
+    }
+
+    fn effective_live_order_policy<E: Environment>(
+        &self,
+        config: &Config,
+        env: &E,
+    ) -> Result<EffectiveLiveOrderPolicy, SecurityPolicyError> {
+        let context = self.live_context(config, env)?;
+        let execution = &self.wire.execution;
+        let staking = &self.wire.staking;
+        Ok(EffectiveLiveOrderPolicy {
+            max_slippage_bps: execution.max_slippage_bps,
+            max_purchase_fee_bps: execution.max_purchase_fee_bps,
+            max_venue_clock_lag_ms: execution.max_venue_clock_lag_ms,
+            venue_clock_evidence_stale_after_seconds: execution
+                .venue_clock_evidence_stale_after_seconds,
+            book_stale_after_seconds: execution.book_stale_after_seconds,
+            account_history_stale_after_seconds: execution.account_history_stale_after_seconds,
+            fee_schedule_stale_after_seconds: execution.fee_schedule_stale_after_seconds,
+            signal_stale_after_seconds: execution.signal_stale_after_seconds,
+            validator_allowlist: context.validator_allowlist,
+            residual_hype_wei: staking.residual_hype_wei,
+            fill_registration_deadline_seconds: staking.fill_registration_deadline_seconds,
+            lot_eligibility_max_age_seconds: staking.lot_eligibility_max_age_seconds,
+            policy_acknowledgement_valid_through_at: context.acknowledgement_expiry,
+        })
     }
 
     fn expected_acknowledgement<E: Environment>(
