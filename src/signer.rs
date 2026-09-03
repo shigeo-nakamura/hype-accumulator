@@ -22,8 +22,10 @@ pub enum SignerError {
     EmptyKeyName,
     #[error("signing-key environment variable is not set")]
     MissingSecret,
-    #[error("KMS decrypt failed")]
-    Decrypt,
+    #[error("KMS decrypt failed: {0}")]
+    Decrypt(String),
+    #[error("decrypted signing key is not valid UTF-8")]
+    InvalidPlaintext,
 }
 
 /// Resolves the Hyperliquid signer's private key by decrypting the
@@ -34,9 +36,11 @@ pub enum SignerError {
 /// # Errors
 ///
 /// Returns an error when either environment variable is missing or empty,
-/// or when the KMS decrypt/AES-unwrap fails. Error variants deliberately
-/// omit the underlying KMS/AES failure detail to avoid leaking ciphertext
-/// or key-material metadata into logs.
+/// or when the KMS decrypt/AES-unwrap fails. [`SignerError::Decrypt`] carries
+/// the underlying KMS/base64/AES failure's message (an AWS error code or a
+/// generic "bad decrypt"/encoding failure) for operator diagnosis; none of
+/// `debot_utils::decrypt_data_with_kms`'s failure paths include the
+/// ciphertext or plaintext key material in that message.
 pub async fn resolve_signer_private_key<E: Environment>(
     env: &E,
     signing_key_env: &str,
@@ -55,8 +59,8 @@ pub async fn resolve_signer_private_key<E: Environment>(
         .ok_or(SignerError::MissingSecret)?;
     let key_hex = decrypt_data_with_kms(&encrypted_data_key, ciphertext, true)
         .await
-        .map_err(|_| SignerError::Decrypt)?;
-    String::from_utf8(key_hex).map_err(|_| SignerError::Decrypt)
+        .map_err(|error| SignerError::Decrypt(error.to_string()))?;
+    String::from_utf8(key_hex).map_err(|_| SignerError::InvalidPlaintext)
 }
 
 #[cfg(test)]
