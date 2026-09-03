@@ -58,6 +58,30 @@ impl UsdcMicros {
     pub const fn is_zero(self) -> bool {
         self.0 == 0
     }
+
+    /// Exact decimal USDC value (six-decimal-precision), for callers that
+    /// need fractional-USDC math (e.g. price/quantity computation) rather
+    /// than the integer-microunit accounting this type otherwise favors.
+    #[must_use]
+    pub fn as_decimal(self) -> Decimal {
+        Decimal::from(self.0) / Decimal::from(USDC_MICROS_PER_UNIT)
+    }
+
+    /// Converts a decimal USDC amount to exact microunits, rounding to the
+    /// nearest microunit.
+    ///
+    /// # Errors
+    ///
+    /// Returns `None` on overflow or on a value that does not fit `u64`
+    /// microunits (including negative values).
+    #[must_use]
+    pub fn from_decimal(value: Decimal) -> Option<Self> {
+        value
+            .checked_mul(Decimal::from(USDC_MICROS_PER_UNIT))?
+            .round()
+            .to_u64()
+            .map(Self)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

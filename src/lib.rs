@@ -1,5 +1,7 @@
 pub mod account;
 pub mod backup;
+#[cfg(feature = "live-probe")]
+pub(crate) mod bps;
 pub mod capital;
 pub mod clock;
 pub mod config;
@@ -10,6 +12,8 @@ pub mod ledger;
 pub mod live_probe;
 pub mod metrics;
 pub mod monitor;
+#[cfg(feature = "live-probe")]
+pub mod order_envelope;
 pub mod pacing;
 pub mod runtime;
 pub mod signal;

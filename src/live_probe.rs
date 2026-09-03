@@ -10,10 +10,9 @@
 //! every error is reconciliation-only: the caller must query by CLOID and must
 //! never call `submit` again for the same prepared workflow.
 
-use crate::{
-    pacing::UsdcMicros,
-    workflow::{DurableWorkflow, ExternalAction, HypeAtoms, WorkflowError},
-};
+#[cfg(test)]
+use crate::pacing::UsdcMicros;
+use crate::workflow::{DurableWorkflow, ExternalAction, HypeAtoms, WorkflowError};
 use chrono::{DateTime, Utc};
 use dex_connector::{
     DexError, HyperliquidConnector, HyperliquidL1ActionEnvelope, HyperliquidOrderReconciliation,
@@ -23,8 +22,6 @@ use rust_decimal::{prelude::ToPrimitive, Decimal};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const USDC_MICROS_PER_USDC: u64 = 1_000_000;
-const BPS_DENOMINATOR: u16 = 10_000;
 const HYPE_SPOT_MARKET: &str = "HYPE/USDC";
 const EXECUTION_IDENTITY_DOMAIN: &[u8] = b"hype-accumulator/execution-account-identity/v1";
 const SIGNER_IDENTITY_DOMAIN: &[u8] = b"hype-accumulator/api-wallet-identity/v1";
@@ -157,7 +154,7 @@ impl HyperliquidLiveProbe {
         max_purchase_fee_bps: u16,
     ) -> Result<Self, LiveProbeError> {
         binding.validate_connector(&connector)?;
-        if max_purchase_fee_bps >= BPS_DENOMINATOR {
+        if max_purchase_fee_bps >= crate::bps::BPS_DENOMINATOR {
             return Err(LiveProbeError::InvalidFeeCeiling);
         }
         Ok(Self {
@@ -331,15 +328,16 @@ impl PreparedIocOrder {
             return Err(LiveProbeError::InvalidExpiry);
         }
         let quantity = atoms_to_decimal(*original_quantity_hype, *hype_atoms_per_hype)?;
-        let limit_price = micros_to_decimal(*limit_price_usdc_per_hype)?;
+        let limit_price = limit_price_usdc_per_hype.as_decimal();
         let limit_notional = quantity
             .checked_mul(limit_price)
             .ok_or(LiveProbeError::CapitalBound)?;
-        if limit_notional > micros_to_decimal(*notional_usdc)? {
+        if limit_notional > notional_usdc.as_decimal() {
             return Err(LiveProbeError::CapitalBound);
         }
-        let worst_case_debit = worst_case_debit_with_fee(limit_notional, max_purchase_fee_bps)?;
-        if worst_case_debit > micros_to_decimal(*max_debit_usdc)? {
+        let worst_case_debit = crate::bps::apply_bps_markup(limit_notional, max_purchase_fee_bps)
+            .ok_or(LiveProbeError::CapitalBound)?;
+        if worst_case_debit > max_debit_usdc.as_decimal() {
             return Err(LiveProbeError::CapitalBound);
         }
         Ok(Self {
@@ -409,29 +407,6 @@ fn atoms_to_decimal(atoms: HypeAtoms, atoms_per_hype: u64) -> Result<Decimal, Li
         ));
     }
     Ok(value)
-}
-
-/// Grosses up a raw limit notional by the worst-case aggregate purchase fee
-/// so the pre-submission debit-cap check binds the same total-debit ceiling
-/// that workflow reconciliation enforces after the fill, rather than only
-/// the fee-exclusive notional.
-fn worst_case_debit_with_fee(
-    limit_notional: Decimal,
-    max_purchase_fee_bps: u16,
-) -> Result<Decimal, LiveProbeError> {
-    let fee_multiplier = Decimal::from(BPS_DENOMINATOR)
-        .checked_add(Decimal::from(max_purchase_fee_bps))
-        .ok_or(LiveProbeError::CapitalBound)?;
-    limit_notional
-        .checked_mul(fee_multiplier)
-        .and_then(|value| value.checked_div(Decimal::from(BPS_DENOMINATOR)))
-        .ok_or(LiveProbeError::CapitalBound)
-}
-
-fn micros_to_decimal(value: UsdcMicros) -> Result<Decimal, LiveProbeError> {
-    Decimal::from(value.as_micros())
-        .checked_div(Decimal::from(USDC_MICROS_PER_USDC))
-        .ok_or(LiveProbeError::InvalidDecimal("USDC amount"))
 }
 
 fn decimal_to_atoms(value: Decimal, atoms_per_hype: u64) -> Result<HypeAtoms, LiveProbeError> {

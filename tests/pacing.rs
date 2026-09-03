@@ -12,6 +12,7 @@ use hype_accumulator::{
     },
 };
 use proptest::prelude::*;
+use rust_decimal::Decimal;
 use std::collections::{BTreeSet, HashMap};
 
 const RAW_SIGNALS: &str = include_str!("../fixtures/signal-snapshots-v1/raw.json");
@@ -1311,5 +1312,37 @@ proptest! {
             .filter(|decision| !decision.planned_usdc.is_zero())
             .count();
         prop_assert_eq!(economic_days.len(), economic_count);
+    }
+}
+
+#[test]
+fn usdc_micros_as_decimal_is_exact() {
+    assert_eq!(
+        UsdcMicros::from_micros(25_000_000).as_decimal(),
+        Decimal::from(25)
+    );
+    assert_eq!(UsdcMicros::from_micros(1).as_decimal(), Decimal::new(1, 6));
+    assert_eq!(UsdcMicros::from_micros(0).as_decimal(), Decimal::ZERO);
+}
+
+#[test]
+fn usdc_micros_from_decimal_rounds_to_the_nearest_microunit() {
+    assert_eq!(
+        UsdcMicros::from_decimal(Decimal::from(25)),
+        Some(UsdcMicros::from_micros(25_000_000))
+    );
+    // 0.0000005 rounds to the nearest microunit (banker's rounding: to even).
+    assert_eq!(
+        UsdcMicros::from_decimal(Decimal::new(15, 7)),
+        Some(UsdcMicros::from_micros(2))
+    );
+    assert_eq!(UsdcMicros::from_decimal(Decimal::from(-1)), None);
+}
+
+#[test]
+fn usdc_micros_decimal_round_trips_through_whole_amounts() {
+    for whole in [0_u64, 1, 100, 1_000_000] {
+        let micros = UsdcMicros::checked_from_whole_usdc(whole).expect("small test amount");
+        assert_eq!(UsdcMicros::from_decimal(micros.as_decimal()), Some(micros));
     }
 }
