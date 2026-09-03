@@ -10,8 +10,8 @@ use hype_accumulator::{
         ActionKind, AppendOutcome, AuthenticatedOrderSubmission, AuthorizationInputFreshness,
         BoundFillEvidence, BoundMovementEvidence, ConclusiveAbsenceEvidence, DecisionBinding,
         DurableWorkflow, EligibilityPolicyBinding, ExchangeFillOwner, ExchangeOrderOwner,
-        ExchangeOrderOwnerStore, ExternalAction, ExternalReceipt, GapFreeHistoryWatermark,
-        HistoryDomain, HypeAtoms, InventoryBaseline, JournalCommitStatus,
+        ExchangeOrderOwnerStore, ExternalAction, ExternalReceipt, FileProtectedWorkflowHeadStore,
+        GapFreeHistoryWatermark, HistoryDomain, HypeAtoms, InventoryBaseline, JournalCommitStatus,
         OrderBoundEligibilityEvidence, OrderEnvelopeBinding, OrderFinality, OwnershipCommitOutcome,
         PrepareOutcome, ProtectedWorkflowHead, ProtectedWorkflowHeadStore, WorkflowError,
         WorkflowStage,
@@ -4092,4 +4092,113 @@ fn bootstrap_head_recovers_initial_journal_fsync_crash_window() {
         ),
         Err(WorkflowError::RollbackDetected(_))
     ));
+}
+
+fn workflow_head(sequence: u64) -> ProtectedWorkflowHead {
+    ProtectedWorkflowHead {
+        schema_version: 1,
+        workflow_id: "workflow-a".to_owned(),
+        sequence,
+        record_hash: format!("record-hash-{sequence}"),
+        journal_len: sequence * 100,
+    }
+}
+
+#[test]
+fn file_protected_workflow_head_store_loads_none_before_any_swap() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("head.json");
+    let store = FileProtectedWorkflowHeadStore::new(&path).expect("store constructs");
+    assert_eq!(store.load().expect("load succeeds"), None);
+}
+
+#[test]
+fn file_protected_workflow_head_store_swaps_and_rejects_stale_expected() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("head.json");
+    let store = FileProtectedWorkflowHeadStore::new(&path).expect("store constructs");
+
+    let first = workflow_head(1);
+    assert!(store
+        .compare_and_swap(None, &first)
+        .expect("first swap succeeds"));
+    assert_eq!(store.load().expect("load succeeds"), Some(first.clone()));
+
+    // A stale `expected` must be rejected without changing the stored head.
+    let second = workflow_head(2);
+    assert!(!store
+        .compare_and_swap(None, &second)
+        .expect("stale swap is rejected, not erred"));
+    assert_eq!(store.load().expect("load succeeds"), Some(first.clone()));
+
+    // The correct `expected` advances the head.
+    assert!(store
+        .compare_and_swap(Some(&first), &second)
+        .expect("second swap succeeds"));
+    assert_eq!(store.load().expect("load succeeds"), Some(second));
+}
+
+#[test]
+fn file_protected_workflow_head_store_persists_across_new_instances() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("head.json");
+    let head = workflow_head(1);
+    {
+        let store = FileProtectedWorkflowHeadStore::new(&path).expect("store constructs");
+        assert!(store.compare_and_swap(None, &head).expect("swap succeeds"));
+    }
+    // A fresh instance over the same path must observe the durably written head
+    // — this is the exact crash-recovery shape a restarted process relies on.
+    let reopened = FileProtectedWorkflowHeadStore::new(&path).expect("store reconstructs");
+    assert_eq!(reopened.load().expect("load succeeds"), Some(head));
+}
+
+#[test]
+fn file_protected_workflow_head_store_rejects_a_relative_path() {
+    assert!(FileProtectedWorkflowHeadStore::new(PathBuf::from("relative/head.json")).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn file_protected_workflow_head_store_refuses_a_symlinked_path() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let real = temp.path().join("real-head.json");
+    let linked = temp.path().join("linked-head.json");
+    fs::write(&real, b"{}").expect("real file writes");
+    std::os::unix::fs::symlink(&real, &linked).expect("symlink creates");
+
+    let store = FileProtectedWorkflowHeadStore::new(&linked).expect("store constructs");
+    assert!(store.load().is_err());
+    assert!(store.compare_and_swap(None, &workflow_head(1)).is_err());
+}
+
+#[test]
+fn durable_workflow_operates_with_the_file_backed_protected_head_store() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let journal_path = temp.path().join("file-backed-head.jsonl");
+    let head_path = temp.path().join("file-backed-head.protected-head.json");
+    let binding = binding();
+
+    let mut workflow = DurableWorkflow::open_or_create(
+        &journal_path,
+        &binding,
+        Arc::new(FileProtectedWorkflowHeadStore::new(&head_path).expect("store constructs")),
+        exchange_order_owner_store(&journal_path),
+    )
+    .expect("workflow opens with the file-backed head store");
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    let workflow_id = workflow.state().workflow_id().to_owned();
+    drop(workflow);
+
+    // Reopening with a brand-new store instance over the same path proves the
+    // protected head was durably persisted to disk, not merely held in memory.
+    let reopened = DurableWorkflow::open_or_create(
+        &journal_path,
+        &binding,
+        Arc::new(FileProtectedWorkflowHeadStore::new(&head_path).expect("store reconstructs")),
+        exchange_order_owner_store(&journal_path),
+    )
+    .expect("workflow reopens with the file-backed head store");
+    assert_eq!(reopened.state().workflow_id(), workflow_id);
+    assert!(reopened.pending_prepared_order().is_ok());
 }
