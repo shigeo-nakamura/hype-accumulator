@@ -39,7 +39,7 @@ use hype_accumulator::{
     },
 };
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{env, fs, path::PathBuf, process, str::FromStr, sync::Arc};
 
 #[tokio::main]
@@ -69,6 +69,82 @@ struct OperationalParams {
 impl OperationalParams {
     fn from_toml(input: &str) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(toml::from_str(input)?)
+    }
+}
+
+/// Durably records exactly which venue endpoint and network `prepare`
+/// resolved its quantity/price/inventory from, at the same path every
+/// `submit` for this journal must independently re-derive and match.
+///
+/// Nothing in `DecisionBinding`/`OrderEnvelopeBinding`/`InventoryBaseline`
+/// records network selection — `config.toml`'s `hyperliquid.endpoint` and
+/// `operational.toml`'s `is_mainnet` are read completely independently by
+/// each subcommand invocation. Without this check, an operator could
+/// `prepare` against testnet, then edit either file to point at mainnet
+/// before running `submit` for the *same already-fsynced journal*, and the
+/// mainnet-priced submission would silently use testnet-derived quantity,
+/// price, and inventory — never re-validated against the network it is
+/// actually about to hit.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct NetworkBinding {
+    endpoint: String,
+    is_mainnet: bool,
+}
+
+impl NetworkBinding {
+    fn path(journal_path: &str) -> PathBuf {
+        let mut path = PathBuf::from(journal_path);
+        path.set_extension("network-binding.json");
+        path
+    }
+
+    fn resolved(config: &Config, operational: &OperationalParams) -> Self {
+        Self {
+            endpoint: config.hyperliquid.endpoint.clone(),
+            is_mainnet: operational.is_mainnet,
+        }
+    }
+
+    /// Durably writes this binding, refusing to silently overwrite a
+    /// different one already recorded for this journal (that would defeat
+    /// the entire point: it must be fixed at `prepare` time and never
+    /// change underneath a later `submit`).
+    fn write_once(&self, journal_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let path = Self::path(journal_path);
+        if let Ok(existing) = fs::read_to_string(&path) {
+            let existing: Self = serde_json::from_str(&existing)?;
+            if existing != *self {
+                return Err(format!(
+                    "network binding already recorded for this journal ({existing:?}) does not \
+                     match this prepare attempt ({self:?}); a journal's network selection is \
+                     fixed at first prepare and must never change"
+                )
+                .into());
+            }
+            return Ok(());
+        }
+        fs::write(&path, serde_json::to_string_pretty(self)?)?;
+        Ok(())
+    }
+
+    fn verify(journal_path: &str, current: &Self) -> Result<(), Box<dyn std::error::Error>> {
+        let path = Self::path(journal_path);
+        let recorded: Self = serde_json::from_str(&fs::read_to_string(&path).map_err(|_| {
+            format!(
+                "no network binding recorded at {}; run `prepare` first",
+                path.display()
+            )
+        })?)?;
+        if recorded != *current {
+            return Err(format!(
+                "config.toml/operational.toml now resolve to {current:?}, but this journal was \
+                 prepared against {recorded:?}; refusing to submit a testnet-derived (or \
+                 otherwise different-network) order against a different network. Re-run \
+                 `prepare` with the network you intend to submit to."
+            )
+            .into());
+        }
+        Ok(())
     }
 }
 
@@ -175,6 +251,11 @@ async fn prepare(
     let config = load_config(config_path, security_policy_path)?;
     config.validate_at(&ProcessEnvironment, now)?;
     let operational = OperationalParams::from_toml(&fs::read_to_string(operational_params_path)?)?;
+    // Fixes the network this journal is bound to before anything else reads
+    // `config`/`operational` for a network-dependent value: refuses to
+    // silently re-bind an already-prepared journal to a different network on
+    // a later `prepare` retry.
+    NetworkBinding::resolved(&config, &operational).write_once(journal_path)?;
 
     // Decrypts the signer now, even though the signal-free
     // `SignerFreeRuntime::apply_cycle` below (inside
@@ -184,6 +265,16 @@ async fn prepare(
     // and signer-requiring halves of that flow is out of this binary's
     // scope (it would mean revisiting `live_decision.rs`, already merged).
     let connector = build_signed_connector(&config, &operational, journal_path).await?;
+
+    // Re-reads the clock here, after the KMS-backed signer decrypt above
+    // (a network round trip whose latency is outside this binary's control)
+    // rather than reusing the `now` captured before it. Every freshness/
+    // expiry computation below — policy acknowledgement validity, the
+    // movement-scan window, signal evidence, and the order envelope's
+    // `signed_expiry_at` — should be judged against a clock read as close as
+    // practical to the decision it gates, not one that already has an
+    // unbounded KMS round trip baked into its staleness.
+    let now = Utc::now();
     let effective = config.effective_live_order_policy(&ProcessEnvironment, now)?;
     let policy_version = config.effective_security_policy_digest(&ProcessEnvironment)?;
     let envelope_policy = OrderEnvelopeFreshnessPolicy {
@@ -294,6 +385,13 @@ async fn submit(
     config.validate_at(&ProcessEnvironment, now)?;
     let effective = config.effective_live_order_policy(&ProcessEnvironment, now)?;
     let operational = OperationalParams::from_toml(&fs::read_to_string(operational_params_path)?)?;
+    // Refuses to submit if `config.toml`/`operational.toml` now resolve to a
+    // different network than the one this journal was `prepare`d against —
+    // see `NetworkBinding`'s doc comment for the exact danger this closes.
+    NetworkBinding::verify(
+        journal_path,
+        &NetworkBinding::resolved(&config, &operational),
+    )?;
 
     let binding = DurableWorkflow::peek_committed_binding(journal_path)?
         .ok_or("no prepared order found at this journal path; run `prepare` first")?;
@@ -349,7 +447,7 @@ fn build_stores(journal_path: &str) -> Result<WorkflowStores, Box<dyn std::error
     let mut head_path = PathBuf::from(journal_path);
     head_path.set_extension("protected-head.json");
     let protected_head_store: Arc<dyn ProtectedWorkflowHeadStore> =
-        Arc::new(FileProtectedWorkflowHeadStore::new(head_path).map_err(box_string_error)?);
+        Arc::new(FileProtectedWorkflowHeadStore::new(head_path)?);
     // Deliberately outside the per-journal path: this store must be shared
     // across every workflow for this execution identity, never scoped to
     // one decision's journal (see `FileExchangeOrderOwnerStore`'s doc
@@ -359,12 +457,8 @@ fn build_stores(journal_path: &str) -> Result<WorkflowStores, Box<dyn std::error
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("exchange-order-owners.json");
     let owner_store: Arc<dyn ExchangeOrderOwnerStore> =
-        Arc::new(FileExchangeOrderOwnerStore::new(owner_store_path).map_err(box_string_error)?);
+        Arc::new(FileExchangeOrderOwnerStore::new(owner_store_path)?);
     Ok((protected_head_store, owner_store))
-}
-
-fn box_string_error(message: String) -> Box<dyn std::error::Error> {
-    message.into()
 }
 
 fn box_error<E: std::error::Error + 'static>(error: E) -> Box<dyn std::error::Error> {
