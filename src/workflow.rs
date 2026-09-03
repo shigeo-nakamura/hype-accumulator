@@ -2557,6 +2557,38 @@ pub struct DurableWorkflow {
 }
 
 impl DurableWorkflow {
+    /// Reads the decision binding already durably committed to this
+    /// journal, if any, without a lock or a caller-supplied binding to
+    /// validate against.
+    ///
+    /// A caller whose binding recomputes time-varying inputs (price, nonce,
+    /// expiry) on every call must use this first and, when it returns
+    /// `Some`, pass that exact binding to [`Self::open_or_create`] instead
+    /// of a freshly recomputed one. A crash between the initial commit and
+    /// a later append (e.g. before [`Self::prepare_order`] runs) otherwise
+    /// leaves the journal durably bound to the *first* attempt's values;
+    /// every retry that recomputes fresh values would then permanently fail
+    /// `open_or_create`'s binding-match check.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a truncated or hash-invalid journal. Returns
+    /// `Ok(None)` when the journal does not yet exist or is empty.
+    pub fn peek_committed_binding(
+        path: impl AsRef<Path>,
+    ) -> Result<Option<DecisionBinding>, WorkflowError> {
+        let records = load_records(path.as_ref())?;
+        if records.is_empty() {
+            return Ok(None);
+        }
+        let events = records
+            .iter()
+            .map(|record| record.event.clone())
+            .collect::<Vec<_>>();
+        let state = WorkflowState::replay(&events)?;
+        Ok(Some(state.binding))
+    }
+
     /// Opens or creates one append-only workflow journal.
     ///
     /// # Errors
