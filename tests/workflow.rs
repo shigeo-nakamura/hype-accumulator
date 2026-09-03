@@ -10,11 +10,11 @@ use hype_accumulator::{
         ActionKind, AppendOutcome, AuthenticatedOrderSubmission, AuthorizationInputFreshness,
         BoundFillEvidence, BoundMovementEvidence, ConclusiveAbsenceEvidence, DecisionBinding,
         DurableWorkflow, EligibilityPolicyBinding, ExchangeFillOwner, ExchangeOrderOwner,
-        ExchangeOrderOwnerStore, ExternalAction, ExternalReceipt, FileProtectedWorkflowHeadStore,
-        GapFreeHistoryWatermark, HistoryDomain, HypeAtoms, InventoryBaseline, JournalCommitStatus,
-        OrderBoundEligibilityEvidence, OrderEnvelopeBinding, OrderFinality, OwnershipCommitOutcome,
-        PrepareOutcome, ProtectedWorkflowHead, ProtectedWorkflowHeadStore, WorkflowError,
-        WorkflowStage,
+        ExchangeOrderOwnerStore, ExternalAction, ExternalReceipt, FileExchangeOrderOwnerStore,
+        FileProtectedWorkflowHeadStore, GapFreeHistoryWatermark, HistoryDomain, HypeAtoms,
+        InventoryBaseline, JournalCommitStatus, OrderBoundEligibilityEvidence,
+        OrderEnvelopeBinding, OrderFinality, OwnershipCommitOutcome, PrepareOutcome,
+        ProtectedWorkflowHead, ProtectedWorkflowHeadStore, WorkflowError, WorkflowStage,
     },
 };
 use std::{
@@ -4201,4 +4201,248 @@ fn durable_workflow_operates_with_the_file_backed_protected_head_store() {
     .expect("workflow reopens with the file-backed head store");
     assert_eq!(reopened.state().workflow_id(), workflow_id);
     assert!(reopened.pending_prepared_order().is_ok());
+}
+
+fn order_owner(exchange_order_id: &str) -> ExchangeOrderOwner {
+    ExchangeOrderOwner {
+        schema_version: 1,
+        execution_identity_hash: "signer-identity-hash-a".to_owned(),
+        exchange_order_id: exchange_order_id.to_owned(),
+        decision_id: "decision-a".to_owned(),
+        workflow_id: "workflow-a".to_owned(),
+        client_order_id: "0x00112233445566778899aabbccddeeff".to_owned(),
+        canonical_order_envelope_hash: "envelope-hash-a".to_owned(),
+    }
+}
+
+fn fill_owner(fill_id: &str) -> ExchangeFillOwner {
+    ExchangeFillOwner {
+        schema_version: 1,
+        execution_identity_hash: "signer-identity-hash-a".to_owned(),
+        fill_id: fill_id.to_owned(),
+        decision_id: "decision-a".to_owned(),
+        workflow_id: "workflow-a".to_owned(),
+        authorization_id: "authorization-a".to_owned(),
+        authorization_record_hash: "authorization-hash-a".to_owned(),
+        exchange_order_id: "exchange-order-a".to_owned(),
+        client_order_id: "0x00112233445566778899aabbccddeeff".to_owned(),
+        canonical_order_envelope_hash: "envelope-hash-a".to_owned(),
+    }
+}
+
+#[test]
+fn file_exchange_order_owner_store_claim_is_idempotent_and_conflict_free() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("owners.json");
+    let store = FileExchangeOrderOwnerStore::new(&path).expect("store constructs");
+    let owner = order_owner("exchange-order-a");
+
+    assert!(store.claim(&owner).expect("first claim succeeds"));
+    // Claiming the exact same owner again is an idempotent retry, not a conflict.
+    assert!(store.claim(&owner).expect("retry claim succeeds"));
+
+    let mut conflicting = owner.clone();
+    conflicting.workflow_id = "workflow-b".to_owned();
+    assert!(!store
+        .claim(&conflicting)
+        .expect("conflicting claim is rejected, not erred"));
+}
+
+#[test]
+fn file_exchange_order_owner_store_claim_persists_across_new_instances() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("owners.json");
+    let owner = order_owner("exchange-order-a");
+    {
+        let store = FileExchangeOrderOwnerStore::new(&path).expect("store constructs");
+        assert!(store.claim(&owner).expect("claim succeeds"));
+    }
+    let reopened = FileExchangeOrderOwnerStore::new(&path).expect("store reconstructs");
+    assert!(reopened
+        .claim(&owner)
+        .expect("idempotent retry succeeds after reopen"));
+    let mut conflicting = owner;
+    conflicting.workflow_id = "workflow-b".to_owned();
+    assert!(!reopened
+        .claim(&conflicting)
+        .expect("conflict is still detected after reopen"));
+}
+
+#[test]
+fn file_exchange_order_owner_store_claim_and_commit_rolls_back_only_a_fresh_intent() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("owners.json");
+    let store = FileExchangeOrderOwnerStore::new(&path).expect("store constructs");
+    let owner = order_owner("exchange-order-a");
+
+    // A rejected commit must remove the intent this call durably inserted.
+    let outcome = store
+        .claim_and_commit(&owner, &mut || JournalCommitStatus::Rejected)
+        .expect("claim_and_commit succeeds");
+    assert_eq!(outcome, OwnershipCommitOutcome::CommitRejected);
+    assert!(store
+        .claim(&order_owner("exchange-order-b"))
+        .expect("store is usable after rollback"));
+    // The rolled-back owner must be gone: claiming a *different* owner under
+    // the same exchange_order_id now succeeds cleanly.
+    let mut replacement = owner.clone();
+    replacement.workflow_id = "workflow-c".to_owned();
+    assert!(store
+        .claim(&replacement)
+        .expect("claim after rollback succeeds"));
+
+    // A committed claim must survive and conflict with a different owner.
+    let committed = order_owner("exchange-order-committed");
+    let outcome = store
+        .claim_and_commit(&committed, &mut || JournalCommitStatus::Committed)
+        .expect("claim_and_commit succeeds");
+    assert_eq!(outcome, OwnershipCommitOutcome::Committed);
+    let mut conflicting = committed;
+    conflicting.workflow_id = "workflow-d".to_owned();
+    assert!(matches!(
+        store.claim_and_commit(&conflicting, &mut || {
+            panic!("commit must not run on a pre-existing conflict")
+        }),
+        Ok(OwnershipCommitOutcome::Conflict)
+    ));
+}
+
+#[test]
+fn file_exchange_order_owner_store_claim_and_commit_retries_an_ambiguous_intent() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("owners.json");
+    let store = FileExchangeOrderOwnerStore::new(&path).expect("store constructs");
+    let owner = order_owner("exchange-order-a");
+
+    // A crash between the durable intent write and the journal commit must be
+    // retryable: the exact same owner is retained and the caller invokes
+    // commit() again on the same call.
+    let outcome = store
+        .claim_and_commit(&owner, &mut || JournalCommitStatus::Ambiguous)
+        .expect("claim_and_commit succeeds");
+    assert_eq!(outcome, OwnershipCommitOutcome::CommitAmbiguous);
+
+    let mut committed = false;
+    let outcome = store
+        .claim_and_commit(&owner, &mut || {
+            committed = true;
+            JournalCommitStatus::Committed
+        })
+        .expect("retry succeeds");
+    assert!(committed, "retry must invoke commit again");
+    assert_eq!(outcome, OwnershipCommitOutcome::Committed);
+}
+
+#[test]
+fn file_exchange_order_owner_store_claim_fills_is_all_or_nothing() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("owners.json");
+    let store = FileExchangeOrderOwnerStore::new(&path).expect("store constructs");
+    let existing = fill_owner("fill-a");
+    assert!(store.claim_fills(&[existing.clone()]).expect("claims"));
+
+    let mut conflicting = existing;
+    conflicting.workflow_id = "workflow-b".to_owned();
+    let fresh = fill_owner("fill-b");
+    assert!(!store
+        .claim_fills(&[fresh.clone(), conflicting])
+        .expect("bundle with one conflict is rejected, not erred"));
+    // The conflict must not have leaked the unrelated fresh owner into the store.
+    assert!(store
+        .claim_fills(&[fresh])
+        .expect("fresh owner from the rejected bundle can still be claimed cleanly"));
+}
+
+#[test]
+fn file_exchange_order_owner_store_claim_fills_rejects_an_inconsistent_bundle() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("owners.json");
+    let store = FileExchangeOrderOwnerStore::new(&path).expect("store constructs");
+    let mut duplicate = fill_owner("fill-a");
+    duplicate.workflow_id = "workflow-b".to_owned();
+    assert!(!store
+        .claim_fills(&[fill_owner("fill-a"), duplicate])
+        .expect("self-conflicting bundle is rejected, not erred"));
+}
+
+#[test]
+fn file_exchange_order_owner_store_claim_fills_and_commit_rolls_back_the_whole_bundle() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("owners.json");
+    let store = FileExchangeOrderOwnerStore::new(&path).expect("store constructs");
+    let bundle = vec![fill_owner("fill-a"), fill_owner("fill-b")];
+
+    let outcome = store
+        .claim_fills_and_commit(&bundle, &mut || JournalCommitStatus::Rejected)
+        .expect("claim_fills_and_commit succeeds");
+    assert_eq!(outcome, OwnershipCommitOutcome::CommitRejected);
+
+    // Both fills in the rejected bundle must be gone, not just the first.
+    let mut replacement_a = fill_owner("fill-a");
+    replacement_a.workflow_id = "workflow-e".to_owned();
+    let mut replacement_b = fill_owner("fill-b");
+    replacement_b.workflow_id = "workflow-e".to_owned();
+    assert!(store
+        .claim_fills(&[replacement_a, replacement_b])
+        .expect("bundle claims cleanly after full rollback"));
+}
+
+#[test]
+fn durable_workflow_operates_with_the_file_backed_exchange_order_owner_store() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let journal_path = temp.path().join("file-backed-owners.jsonl");
+    let head_path = temp.path().join("file-backed-owners.protected-head.json");
+    let owner_path = temp.path().join("file-backed-owners.owners.json");
+    let binding = binding();
+    let head_store = || {
+        Arc::new(FileProtectedWorkflowHeadStore::new(&head_path).expect("head store constructs"))
+    };
+    let owner_store =
+        || Arc::new(FileExchangeOrderOwnerStore::new(&owner_path).expect("owner store constructs"));
+
+    let mut workflow =
+        DurableWorkflow::open_or_create(&journal_path, &binding, head_store(), owner_store())
+            .expect("workflow opens with both file-backed stores");
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    observe_submission(&mut workflow, "exchange-order-a", at(2)).expect("submission reconciled");
+    drop(workflow);
+
+    // A second, independent workflow (distinct decision/workflow identity,
+    // same execution identity) claiming the same exchange_order_id via a
+    // fresh store instance over the same owner-store file must be refused:
+    // the file store durably remembers the first workflow's ownership
+    // across restarts.
+    // `workflow_id_for` derives its identity from `decision_id` alone, so
+    // changing only that field (keeping every other field, including dates,
+    // identical to `binding`) is sufficient to produce a distinct workflow
+    // while keeping the rest of `DecisionBinding::validate`'s cross-field
+    // checks (expiry-vs-decided_at, decided_at-vs-decision_date) satisfied.
+    let mut other_decision = decision();
+    other_decision.decision_id = "decision-2026-08-25".to_owned();
+    let other_binding = DecisionBinding::from_pacing_decision(
+        &other_decision,
+        binding.inventory_before.clone(),
+        binding.order_envelope.clone(),
+        binding.eligibility_policy.clone(),
+    )
+    .expect("valid second workflow binding");
+    let other_journal_path = temp.path().join("file-backed-owners-other.jsonl");
+    let mut other = DurableWorkflow::open_or_create(
+        &other_journal_path,
+        &other_binding,
+        Arc::new(
+            FileProtectedWorkflowHeadStore::new(
+                temp.path()
+                    .join("file-backed-owners-other.protected-head.json"),
+            )
+            .expect("other head store constructs"),
+        ),
+        owner_store(),
+    )
+    .expect("other workflow opens");
+    ready(other.prepare_order(at(1)).expect("other order prepared"));
+    assert!(matches!(
+        observe_submission(&mut other, "exchange-order-a", at(2)),
+        Err(WorkflowError::ContradictoryObservation(_))
+    ));
 }

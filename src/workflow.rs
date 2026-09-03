@@ -2233,6 +2233,303 @@ pub trait ExchangeOrderOwnerStore: Send + Sync {
     ) -> Result<OwnershipCommitOutcome, String>;
 }
 
+const EXCHANGE_OWNER_FILE_SCHEMA_VERSION: u8 = 1;
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct ExchangeOwnerFile {
+    #[serde(default)]
+    schema_version: u8,
+    #[serde(default)]
+    order_owners: Vec<ExchangeOrderOwner>,
+    #[serde(default)]
+    fill_owners: Vec<ExchangeFillOwner>,
+}
+
+/// File-backed [`ExchangeOrderOwnerStore`]. Unlike
+/// [`FileProtectedWorkflowHeadStore`], exactly one instance must be shared by
+/// every workflow for the execution identities it serves — never scope it to
+/// a decision or journal path. Ownership records are logically append-only
+/// (an owner, once committed, is never overwritten or removed); the on-disk
+/// representation is a single JSON document holding both owner lists,
+/// rewritten atomically on every change. One exclusive lock file serializes
+/// every claim across all execution identities this store instance serves,
+/// which satisfies the trait's required execution-identity-wide boundary
+/// (a coarser, whole-store boundary is a strict superset of a per-identity
+/// one) at the cost of not letting unrelated identities claim concurrently —
+/// an acceptable tradeoff for this single-process bot's claim volume.
+pub struct FileExchangeOrderOwnerStore {
+    path: PathBuf,
+    lock_path: PathBuf,
+}
+
+impl FileExchangeOrderOwnerStore {
+    /// Constructs a store without reading or creating its backing file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path does not name a normal absolute file.
+    pub fn new(path: impl Into<PathBuf>) -> Result<Self, String> {
+        let path = path.into();
+        if !normal_absolute_path(&path) {
+            return Err("exchange order owner path must name a normal absolute file".into());
+        }
+        let mut lock_name = path
+            .file_name()
+            .ok_or_else(|| "exchange order owner store has no file name".to_owned())?
+            .to_os_string();
+        lock_name.push(".lock");
+        let lock_path = path
+            .parent()
+            .ok_or_else(|| "exchange order owner store has no parent".to_owned())?
+            .join(lock_name);
+        Ok(Self { path, lock_path })
+    }
+
+    fn read(&self) -> Result<ExchangeOwnerFile, String> {
+        reject_linked_file(&self.path)
+            .map_err(|error| format!("unsafe exchange order owner store: {error}"))?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        match options.open(&self.path) {
+            Ok(mut file) => {
+                reject_multiple_links(&file)
+                    .map_err(|error| format!("unsafe exchange order owner store: {error}"))?;
+                let mut payload = String::new();
+                file.read_to_string(&mut payload)
+                    .map_err(|error| format!("exchange order owner store read failed: {error}"))?;
+                let data: ExchangeOwnerFile = serde_json::from_str(&payload)
+                    .map_err(|error| format!("invalid exchange order owner store: {error}"))?;
+                if data.schema_version != EXCHANGE_OWNER_FILE_SCHEMA_VERSION {
+                    return Err(format!(
+                        "unsupported exchange order owner store schema version {}",
+                        data.schema_version
+                    ));
+                }
+                Ok(data)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(ExchangeOwnerFile {
+                schema_version: EXCHANGE_OWNER_FILE_SCHEMA_VERSION,
+                ..ExchangeOwnerFile::default()
+            }),
+            Err(error) => Err(format!("exchange order owner store read failed: {error}")),
+        }
+    }
+
+    fn write(&self, data: &ExchangeOwnerFile) -> Result<(), String> {
+        crate::status_io::write_private_json_atomic(&self.path, data)
+            .map_err(|error| format!("exchange order owner store write failed: {error}"))
+    }
+
+    fn lock(&self) -> Result<File, String> {
+        let parent = self
+            .lock_path
+            .parent()
+            .ok_or_else(|| "exchange order owner store lock has no parent".to_owned())?;
+        fs::create_dir_all(parent).map_err(|error| {
+            format!("exchange order owner store directory create failed: {error}")
+        })?;
+        reject_linked_file(&self.lock_path)
+            .map_err(|error| format!("unsafe exchange order owner store lock: {error}"))?;
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let lock = options
+            .open(&self.lock_path)
+            .map_err(|error| format!("exchange order owner store lock open failed: {error}"))?;
+        reject_multiple_links(&lock)
+            .map_err(|error| format!("unsafe exchange order owner store lock: {error}"))?;
+        lock.lock_exclusive()
+            .map_err(|error| format!("exchange order owner store lock failed: {error}"))?;
+        Ok(lock)
+    }
+}
+
+fn order_owner_key(owner: &ExchangeOrderOwner) -> (&str, &str) {
+    (&owner.execution_identity_hash, &owner.exchange_order_id)
+}
+
+fn fill_owner_key(owner: &ExchangeFillOwner) -> (&str, &str) {
+    (&owner.execution_identity_hash, &owner.fill_id)
+}
+
+/// Groups a fill bundle by key, rejecting an internally inconsistent bundle
+/// (the same key claimed twice with different values) the same way the
+/// in-memory reference store does.
+fn fill_bundle_claims(
+    owners: &[ExchangeFillOwner],
+) -> Option<BTreeMap<(String, String), ExchangeFillOwner>> {
+    let mut claims = BTreeMap::new();
+    for owner in owners {
+        let key = (owner.execution_identity_hash.clone(), owner.fill_id.clone());
+        if claims
+            .insert(key, owner.clone())
+            .is_some_and(|existing| existing != *owner)
+        {
+            return None;
+        }
+    }
+    Some(claims)
+}
+
+impl ExchangeOrderOwnerStore for FileExchangeOrderOwnerStore {
+    fn claim(&self, owner: &ExchangeOrderOwner) -> Result<bool, String> {
+        let lock = self.lock()?;
+        let mut data = self.read()?;
+        let key = order_owner_key(owner);
+        let result = if let Some(existing) = data
+            .order_owners
+            .iter()
+            .find(|candidate| order_owner_key(candidate) == key)
+        {
+            existing == owner
+        } else {
+            data.order_owners.push(owner.clone());
+            self.write(&data)?;
+            true
+        };
+        fs2::FileExt::unlock(&lock)
+            .map_err(|error| format!("exchange order owner store unlock failed: {error}"))?;
+        Ok(result)
+    }
+
+    fn claim_and_commit(
+        &self,
+        owner: &ExchangeOrderOwner,
+        commit: &mut dyn FnMut() -> JournalCommitStatus,
+    ) -> Result<OwnershipCommitOutcome, String> {
+        let lock = self.lock()?;
+        let mut data = self.read()?;
+        let key = order_owner_key(owner);
+        let existing = data
+            .order_owners
+            .iter()
+            .find(|candidate| order_owner_key(candidate) == key);
+        if existing.is_some_and(|candidate| candidate != owner) {
+            fs2::FileExt::unlock(&lock)
+                .map_err(|error| format!("exchange order owner store unlock failed: {error}"))?;
+            return Ok(OwnershipCommitOutcome::Conflict);
+        }
+        let inserted = existing.is_none();
+        if inserted {
+            data.order_owners.push(owner.clone());
+            self.write(&data)?;
+        }
+        let outcome = match commit() {
+            JournalCommitStatus::Committed => OwnershipCommitOutcome::Committed,
+            JournalCommitStatus::Ambiguous => OwnershipCommitOutcome::CommitAmbiguous,
+            JournalCommitStatus::Rejected => {
+                if inserted {
+                    data.order_owners
+                        .retain(|candidate| order_owner_key(candidate) != key);
+                    self.write(&data)?;
+                }
+                OwnershipCommitOutcome::CommitRejected
+            }
+        };
+        fs2::FileExt::unlock(&lock)
+            .map_err(|error| format!("exchange order owner store unlock failed: {error}"))?;
+        Ok(outcome)
+    }
+
+    fn claim_fills(&self, owners: &[ExchangeFillOwner]) -> Result<bool, String> {
+        let Some(claims) = fill_bundle_claims(owners) else {
+            return Ok(false);
+        };
+        let lock = self.lock()?;
+        let mut data = self.read()?;
+        let conflict = claims.iter().any(|(key, owner)| {
+            data.fill_owners.iter().any(|candidate| {
+                fill_owner_key(candidate) == (key.0.as_str(), key.1.as_str()) && candidate != owner
+            })
+        });
+        if conflict {
+            fs2::FileExt::unlock(&lock)
+                .map_err(|error| format!("exchange order owner store unlock failed: {error}"))?;
+            return Ok(false);
+        }
+        for (key, owner) in &claims {
+            let already_present = data
+                .fill_owners
+                .iter()
+                .any(|candidate| fill_owner_key(candidate) == (key.0.as_str(), key.1.as_str()));
+            if !already_present {
+                data.fill_owners.push(owner.clone());
+            }
+        }
+        self.write(&data)?;
+        fs2::FileExt::unlock(&lock)
+            .map_err(|error| format!("exchange order owner store unlock failed: {error}"))?;
+        Ok(true)
+    }
+
+    fn claim_fills_and_commit(
+        &self,
+        owners: &[ExchangeFillOwner],
+        commit: &mut dyn FnMut() -> JournalCommitStatus,
+    ) -> Result<OwnershipCommitOutcome, String> {
+        let Some(claims) = fill_bundle_claims(owners) else {
+            return Ok(OwnershipCommitOutcome::Conflict);
+        };
+        let lock = self.lock()?;
+        let mut data = self.read()?;
+        let conflict = claims.iter().any(|(key, owner)| {
+            data.fill_owners.iter().any(|candidate| {
+                fill_owner_key(candidate) == (key.0.as_str(), key.1.as_str()) && candidate != owner
+            })
+        });
+        if conflict {
+            fs2::FileExt::unlock(&lock)
+                .map_err(|error| format!("exchange order owner store unlock failed: {error}"))?;
+            return Ok(OwnershipCommitOutcome::Conflict);
+        }
+        let inserted_keys = claims
+            .iter()
+            .filter(|(key, _)| {
+                !data
+                    .fill_owners
+                    .iter()
+                    .any(|candidate| fill_owner_key(candidate) == (key.0.as_str(), key.1.as_str()))
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        if !inserted_keys.is_empty() {
+            for (key, owner) in &claims {
+                if inserted_keys.contains(key) {
+                    data.fill_owners.push(owner.clone());
+                }
+            }
+            self.write(&data)?;
+        }
+        let outcome = match commit() {
+            JournalCommitStatus::Committed => OwnershipCommitOutcome::Committed,
+            JournalCommitStatus::Ambiguous => OwnershipCommitOutcome::CommitAmbiguous,
+            JournalCommitStatus::Rejected => {
+                if !inserted_keys.is_empty() {
+                    data.fill_owners.retain(|candidate| {
+                        !inserted_keys.iter().any(|key| {
+                            fill_owner_key(candidate) == (key.0.as_str(), key.1.as_str())
+                        })
+                    });
+                    self.write(&data)?;
+                }
+                OwnershipCommitOutcome::CommitRejected
+            }
+        };
+        fs2::FileExt::unlock(&lock)
+            .map_err(|error| format!("exchange order owner store unlock failed: {error}"))?;
+        Ok(outcome)
+    }
+}
+
 #[derive(Serialize)]
 struct RecordHashInput<'a> {
     schema_version: u8,
