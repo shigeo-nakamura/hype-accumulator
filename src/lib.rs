@@ -10,6 +10,8 @@ pub mod ledger;
 pub mod live_probe;
 pub mod metrics;
 pub mod monitor;
+#[cfg(feature = "live-probe")]
+pub mod order_envelope;
 pub mod pacing;
 pub mod runtime;
 pub mod signal;
