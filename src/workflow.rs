@@ -2361,6 +2361,15 @@ fn fill_owner_key(owner: &ExchangeFillOwner) -> (&str, &str) {
     (&owner.execution_identity_hash, &owner.fill_id)
 }
 
+fn find_fill_owner<'a>(
+    data: &'a ExchangeOwnerFile,
+    key: (&str, &str),
+) -> Option<&'a ExchangeFillOwner> {
+    data.fill_owners
+        .iter()
+        .find(|candidate| fill_owner_key(candidate) == key)
+}
+
 /// Groups a fill bundle by key, rejecting an internally inconsistent bundle
 /// (the same key claimed twice with different values) the same way the
 /// in-memory reference store does.
@@ -2447,25 +2456,26 @@ impl ExchangeOrderOwnerStore for FileExchangeOrderOwnerStore {
         let lock = self.lock()?;
         let mut data = self.read()?;
         let conflict = claims.iter().any(|(key, owner)| {
-            data.fill_owners.iter().any(|candidate| {
-                fill_owner_key(candidate) == (key.0.as_str(), key.1.as_str()) && candidate != owner
-            })
+            find_fill_owner(&data, (key.0.as_str(), key.1.as_str())).is_some_and(|e| e != owner)
         });
         if conflict {
             fs2::FileExt::unlock(&lock)
                 .map_err(|error| format!("exchange order owner store unlock failed: {error}"))?;
             return Ok(false);
         }
-        for (key, owner) in &claims {
-            let already_present = data
-                .fill_owners
-                .iter()
-                .any(|candidate| fill_owner_key(candidate) == (key.0.as_str(), key.1.as_str()));
-            if !already_present {
-                data.fill_owners.push(owner.clone());
+        let inserted_keys = claims
+            .iter()
+            .filter(|(key, _)| find_fill_owner(&data, (key.0.as_str(), key.1.as_str())).is_none())
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        if !inserted_keys.is_empty() {
+            for (key, owner) in &claims {
+                if inserted_keys.contains(key) {
+                    data.fill_owners.push(owner.clone());
+                }
             }
+            self.write(&data)?;
         }
-        self.write(&data)?;
         fs2::FileExt::unlock(&lock)
             .map_err(|error| format!("exchange order owner store unlock failed: {error}"))?;
         Ok(true)
@@ -2482,9 +2492,7 @@ impl ExchangeOrderOwnerStore for FileExchangeOrderOwnerStore {
         let lock = self.lock()?;
         let mut data = self.read()?;
         let conflict = claims.iter().any(|(key, owner)| {
-            data.fill_owners.iter().any(|candidate| {
-                fill_owner_key(candidate) == (key.0.as_str(), key.1.as_str()) && candidate != owner
-            })
+            find_fill_owner(&data, (key.0.as_str(), key.1.as_str())).is_some_and(|e| e != owner)
         });
         if conflict {
             fs2::FileExt::unlock(&lock)
@@ -2493,12 +2501,7 @@ impl ExchangeOrderOwnerStore for FileExchangeOrderOwnerStore {
         }
         let inserted_keys = claims
             .iter()
-            .filter(|(key, _)| {
-                !data
-                    .fill_owners
-                    .iter()
-                    .any(|candidate| fill_owner_key(candidate) == (key.0.as_str(), key.1.as_str()))
-            })
+            .filter(|(key, _)| find_fill_owner(&data, (key.0.as_str(), key.1.as_str())).is_none())
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         if !inserted_keys.is_empty() {

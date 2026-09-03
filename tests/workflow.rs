@@ -4354,6 +4354,32 @@ fn file_exchange_order_owner_store_claim_fills_is_all_or_nothing() {
 }
 
 #[test]
+fn file_exchange_order_owner_store_claim_fills_skips_the_write_on_an_idempotent_replay() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("owners.json");
+    let store = FileExchangeOrderOwnerStore::new(&path).expect("store constructs");
+    let bundle = vec![fill_owner("fill-a"), fill_owner("fill-b")];
+    assert!(store.claim_fills(&bundle).expect("first claim succeeds"));
+
+    let modified_at = fs::metadata(&path)
+        .expect("store file exists")
+        .modified()
+        .expect("mtime available");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    assert!(store
+        .claim_fills(&bundle)
+        .expect("idempotent replay succeeds"));
+    let replayed_modified_at = fs::metadata(&path)
+        .expect("store file still exists")
+        .modified()
+        .expect("mtime available");
+    assert_eq!(
+        modified_at, replayed_modified_at,
+        "a fully idempotent bundle replay must not rewrite the store"
+    );
+}
+
+#[test]
 fn file_exchange_order_owner_store_claim_fills_rejects_an_inconsistent_bundle() {
     let temp = tempfile::tempdir().expect("temp directory");
     let path = temp.path().join("owners.json");
