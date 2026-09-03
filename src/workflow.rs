@@ -18,7 +18,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -1963,6 +1963,160 @@ pub trait ProtectedWorkflowHeadStore: Send + Sync {
         expected: Option<&ProtectedWorkflowHead>,
         next: &ProtectedWorkflowHead,
     ) -> Result<bool, String>;
+}
+
+/// File-backed [`ProtectedWorkflowHeadStore`], one instance per stable
+/// decision identity (construct with a path derived from that identity, e.g.
+/// `<state_dir>/workflow-heads/<decision_id>.json`; never share one instance
+/// or path across decisions). Mirrors the ledger's
+/// `FileProtectedAnchorStore` durability pattern: an exclusive lock file
+/// serializes readers/writers, symlinks and hard-linked paths are refused,
+/// and every write is an atomic create-temp-then-rename with a directory
+/// fsync, so a crash between write and rename never leaves a partial file
+/// and a crash after rename is indistinguishable from a completed swap.
+pub struct FileProtectedWorkflowHeadStore {
+    path: PathBuf,
+    lock_path: PathBuf,
+}
+
+impl FileProtectedWorkflowHeadStore {
+    /// Constructs a store without reading or creating the protected head.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path does not name a normal absolute file.
+    pub fn new(path: impl Into<PathBuf>) -> Result<Self, String> {
+        let path = path.into();
+        if !normal_absolute_path(&path) {
+            return Err("protected workflow head path must name a normal absolute file".into());
+        }
+        let mut lock_name = path
+            .file_name()
+            .ok_or_else(|| "protected workflow head has no file name".to_owned())?
+            .to_os_string();
+        lock_name.push(".lock");
+        let lock_path = path
+            .parent()
+            .ok_or_else(|| "protected workflow head has no parent".to_owned())?
+            .join(lock_name);
+        Ok(Self { path, lock_path })
+    }
+
+    fn read(&self) -> Result<Option<ProtectedWorkflowHead>, String> {
+        reject_linked_file(&self.path)
+            .map_err(|error| format!("unsafe protected workflow head: {error}"))?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        match options.open(&self.path) {
+            Ok(mut file) => {
+                reject_multiple_links(&file)
+                    .map_err(|error| format!("unsafe protected workflow head: {error}"))?;
+                let mut payload = String::new();
+                file.read_to_string(&mut payload)
+                    .map_err(|error| format!("protected workflow head read failed: {error}"))?;
+                serde_json::from_str(&payload)
+                    .map(Some)
+                    .map_err(|error| format!("invalid protected workflow head: {error}"))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("protected workflow head read failed: {error}")),
+        }
+    }
+
+    fn lock(&self) -> Result<File, String> {
+        let parent = self
+            .lock_path
+            .parent()
+            .ok_or_else(|| "protected workflow head lock has no parent".to_owned())?;
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("protected workflow head directory create failed: {error}"))?;
+        reject_linked_file(&self.lock_path)
+            .map_err(|error| format!("unsafe protected workflow head lock: {error}"))?;
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let lock = options
+            .open(&self.lock_path)
+            .map_err(|error| format!("protected workflow head lock open failed: {error}"))?;
+        reject_multiple_links(&lock)
+            .map_err(|error| format!("unsafe protected workflow head lock: {error}"))?;
+        lock.lock_exclusive()
+            .map_err(|error| format!("protected workflow head lock failed: {error}"))?;
+        Ok(lock)
+    }
+}
+
+impl ProtectedWorkflowHeadStore for FileProtectedWorkflowHeadStore {
+    fn load(&self) -> Result<Option<ProtectedWorkflowHead>, String> {
+        self.read()
+    }
+
+    fn compare_and_swap(
+        &self,
+        expected: Option<&ProtectedWorkflowHead>,
+        next: &ProtectedWorkflowHead,
+    ) -> Result<bool, String> {
+        let lock = self.lock()?;
+        let current = self.read()?;
+        if current.as_ref() != expected {
+            fs2::FileExt::unlock(&lock)
+                .map_err(|error| format!("protected workflow head unlock failed: {error}"))?;
+            return Ok(false);
+        }
+        crate::status_io::write_private_json_atomic(&self.path, next)
+            .map_err(|error| format!("protected workflow head write failed: {error}"))?;
+        fs2::FileExt::unlock(&lock)
+            .map_err(|error| format!("protected workflow head unlock failed: {error}"))?;
+        Ok(true)
+    }
+}
+
+fn normal_absolute_path(path: &Path) -> bool {
+    path.is_absolute()
+        && path.file_name().is_some()
+        && path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::Prefix(_)
+                    | std::path::Component::RootDir
+                    | std::path::Component::Normal(_)
+            )
+        })
+}
+
+fn reject_linked_file(path: &Path) -> Result<(), io::Error> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "symbolic links are forbidden",
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn reject_multiple_links(file: &File) -> Result<(), io::Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if file.metadata()?.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "multiple hard links are forbidden",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Immutable ownership of one stable venue order identity.
