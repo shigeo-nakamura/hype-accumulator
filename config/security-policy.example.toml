@@ -27,8 +27,10 @@ require_dedicated_execution_account = true
 # classifies the isolated trading account only; no account kind enables automatic
 # staking under this model. "unapproved" and unknown values fail closed.
 execution_account_kind = "unapproved"
-# Operational halt/alert while enforcement is unapproved. With approved external
-# enforcement, this is the acknowledged hard maximum.
+# Operational halt/alert while enforcement is unapproved. With
+# "externally_enforced_bounded", this is the acknowledged hard maximum; with
+# "accepted_uncapped_authority" (see below) it is only an operational alert
+# threshold, never a mechanical cap.
 max_hot_trading_balance_microusd = 0
 # Safe default; live mode rejects it. Live values are
 # "externally_enforced_bounded" (requires the sweep threshold, headroom, and
