@@ -1506,3 +1506,34 @@ fn missing_committed_cycle_proof_fails_closed() {
         Err(RuntimeError::MissingCommittedCycleProof)
     ));
 }
+
+#[test]
+fn f64_usdc_micros_floors_sub_microunit_precision_from_the_live_venue() {
+    // Observed live on Hyperliquid's spotClearinghouseState for a real
+    // account (2026-09-04): the venue's own USDC balance precision exceeds
+    // USDC's 6-decimal on-chain precision. This must floor, not reject.
+    assert_eq!(
+        f64_usdc_micros(24_098.690_000_62).expect("floors instead of rejecting"),
+        UsdcMicros::from_micros(24_098_690_000)
+    );
+}
+
+#[test]
+fn f64_usdc_micros_floors_never_rounds_up() {
+    assert_eq!(
+        f64_usdc_micros(1.999_999_9).expect("floors down"),
+        UsdcMicros::from_micros(1_999_999)
+    );
+}
+
+#[test]
+fn f64_usdc_micros_rejects_non_finite_or_negative() {
+    assert!(f64_usdc_micros(f64::NAN).is_err());
+    assert!(f64_usdc_micros(f64::INFINITY).is_err());
+    assert!(f64_usdc_micros(-0.01).is_err());
+}
+
+#[test]
+fn f64_usdc_micros_rejects_overflow() {
+    assert!(f64_usdc_micros(f64::MAX).is_err());
+}

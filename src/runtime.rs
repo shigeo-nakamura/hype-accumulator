@@ -1931,13 +1931,20 @@ fn f64_usdc_micros(value: f64) -> Result<UsdcMicros, RuntimeError> {
         ));
     }
     let scaled = value * 1_000_000.0;
-    let rounded = scaled.round();
-    if (scaled - rounded).abs() > 1e-4 || rounded > u64::MAX as f64 {
+    // Floors rather than requiring near-exact microunit representability.
+    // Hyperliquid's spot USDC balance is observed at up to 8 decimal places
+    // (verified against the live venue: e.g. "24098.69000062"), finer than
+    // USDC's own 6-decimal on-chain precision, so real accounts routinely
+    // carry sub-microunit residue that can never itself be spendable
+    // capital. Flooring is the conservative direction: it can only ever
+    // understate observed capital, never overstate it.
+    let floored = scaled.floor();
+    if floored > u64::MAX as f64 {
         return Err(RuntimeError::InvalidCycle(
-            "observed USDC balance is not representable in microunits".to_owned(),
+            "observed USDC balance overflows microunits".to_owned(),
         ));
     }
-    Ok(UsdcMicros::from_micros(rounded as u64))
+    Ok(UsdcMicros::from_micros(floored as u64))
 }
 
 #[derive(Debug, Error)]
