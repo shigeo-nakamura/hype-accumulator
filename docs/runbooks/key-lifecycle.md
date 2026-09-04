@@ -138,7 +138,12 @@ ciphertext, host alias, or production filesystem path.
    operational alert and reject live mode while enforcement is `unapproved`.
    Verify the sweep threshold plus worst-case headroom does not exceed the hard
    maximum, and verify the acknowledged evidence SHA-256 and private change-record
-   reference before enabling live mode.
+   reference before enabling live mode. Under `accepted_uncapped_authority` there
+   is no enforcement to prove; instead verify the private change record states
+   the user's explicit acceptance that the maximum loss is the full account
+   value, confirm the sweep threshold, headroom, and evidence digest are absent,
+   and confirm the account holds only the near-term deployable balance the
+   operator intends to keep hot.
 11. At the exact `utc_calendar_year_v1` and lifetime admission-allocation
     boundaries, race direct and separately recorded operator admissions and
     verify the exact admitted amount moves once from `confirmed_unallocated` to
