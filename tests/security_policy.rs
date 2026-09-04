@@ -691,6 +691,124 @@ fn unsafe_custody_and_staking_modes_fail_before_live() {
     ));
 }
 
+/// The bounded live template with the enforcement claim removed: the user
+/// explicitly accepts uncapped API-wallet authority instead of claiming a cap.
+fn uncapped_policy_template() -> String {
+    live_policy_template()
+        .replace(
+            "hot_balance_enforcement = \"externally_enforced_bounded\"",
+            "hot_balance_enforcement = \"accepted_uncapped_authority\"",
+        )
+        .replace(
+            "hot_balance_sweep_threshold_microusd = 150000000",
+            "hot_balance_sweep_threshold_microusd = 0",
+        )
+        .replace(
+            "hot_balance_worst_case_headroom_microusd = 25000000",
+            "hot_balance_worst_case_headroom_microusd = 0",
+        )
+        .replace(
+            &format!("hot_balance_enforcement_evidence_sha256 = \"{EVIDENCE_HASH}\""),
+            "hot_balance_enforcement_evidence_sha256 = \"\"",
+        )
+}
+
+#[test]
+fn accepted_uncapped_authority_is_acknowledged_and_digest_bound() {
+    let env = live_environment();
+    let uncapped = uncapped_policy_template();
+    let acknowledged = acknowledged_policy(&uncapped, &env);
+    config_with_policy(&acknowledged)
+        .validate_at(&env, at("2026-08-31T23:59:59Z"))
+        .expect("explicitly accepted uncapped authority validates for live");
+
+    // An acknowledgement issued for bounded enforcement must never validate
+    // an uncapped policy. The mode string, the (absent) sweep/headroom/
+    // evidence fields, and the change record are all digest-bound, and
+    // validation forbids two live-valid policies that differ only in the
+    // mode string, so the divergence below is guaranteed by several bound
+    // fields at once rather than by the mode string alone.
+    let bounded_ack = config_with_policy(&live_policy_template())
+        .expected_live_acknowledgement(&env)
+        .expect("bounded acknowledgement");
+    let uncapped_ack = config_with_policy(&uncapped)
+        .expected_live_acknowledgement(&env)
+        .expect("uncapped acknowledgement");
+    assert_ne!(bounded_ack, uncapped_ack);
+    let cross_signed = uncapped.replace(
+        "live_acknowledgement = \"\"",
+        &format!("live_acknowledgement = \"{bounded_ack}\""),
+    );
+    assert_eq!(
+        config_with_policy(&cross_signed).validate_at(&env, at("2026-08-31T23:59:59Z")),
+        Err(ConfigError::SecurityPolicy(
+            SecurityPolicyError::AcknowledgementMismatch
+        ))
+    );
+
+    // So is the private acceptance record.
+    let tampered = acknowledged.replace(
+        "hot_balance_enforcement_change_ref = \"test-change-record\"",
+        "hot_balance_enforcement_change_ref = \"other-change-record\"",
+    );
+    assert_eq!(
+        config_with_policy(&tampered).validate_at(&env, at("2026-08-31T23:59:59Z")),
+        Err(ConfigError::SecurityPolicy(
+            SecurityPolicyError::AcknowledgementMismatch
+        ))
+    );
+}
+
+#[test]
+fn accepted_uncapped_authority_must_not_claim_bounded_evidence() {
+    let env = live_environment();
+    let evidence = format!("hot_balance_enforcement_evidence_sha256 = \"{EVIDENCE_HASH}\"");
+    for (from, to) in [
+        (
+            "hot_balance_sweep_threshold_microusd = 0",
+            "hot_balance_sweep_threshold_microusd = 1",
+        ),
+        (
+            "hot_balance_worst_case_headroom_microusd = 0",
+            "hot_balance_worst_case_headroom_microusd = 1",
+        ),
+        (
+            "hot_balance_enforcement_evidence_sha256 = \"\"",
+            evidence.as_str(),
+        ),
+    ] {
+        let policy = uncapped_policy_template().replace(from, to);
+        assert!(
+            matches!(
+                config_with_policy(&policy).expected_live_acknowledgement(&env),
+                Err(ConfigError::SecurityPolicy(SecurityPolicyError::Invalid(_)))
+            ),
+            "`{to}` must not be claimable under accepted uncapped authority"
+        );
+    }
+}
+
+#[test]
+fn accepted_uncapped_authority_requires_an_acceptance_record_and_alert_threshold() {
+    let env = live_environment();
+    let no_record = uncapped_policy_template().replace(
+        "hot_balance_enforcement_change_ref = \"test-change-record\"",
+        "hot_balance_enforcement_change_ref = \"\"",
+    );
+    assert!(matches!(
+        config_with_policy(&no_record).expected_live_acknowledgement(&env),
+        Err(ConfigError::SecurityPolicy(SecurityPolicyError::Invalid(_)))
+    ));
+    let no_threshold = uncapped_policy_template().replace(
+        "max_hot_trading_balance_microusd = 200000000",
+        "max_hot_trading_balance_microusd = 0",
+    );
+    assert!(matches!(
+        config_with_policy(&no_threshold).expected_live_acknowledgement(&env),
+        Err(ConfigError::SecurityPolicy(SecurityPolicyError::Invalid(_)))
+    ));
+}
+
 #[test]
 fn noncanonical_expiry_is_rejected_during_policy_parse() {
     let policy = live_policy_template().replace(EXPIRY, "2026-09-01T01:00:00+01:00");

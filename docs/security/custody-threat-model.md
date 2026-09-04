@@ -44,8 +44,23 @@ enforcement is proven, `hot_balance_enforcement` remains `unapproved`, live mode
 is rejected, and the configured threshold is only an operational halt/alert.
 Venue-enforced agent restrictions receive credit only after capability tests.
 Accepting full authority over the account's actual uncapped value instead of
-claiming a cap requires a separate explicit policy mode and user approval; this
-document does not grant it.
+claiming a cap is the separate explicit policy mode
+`hot_balance_enforcement = "accepted_uncapped_authority"`. It claims no bound:
+the leaked-key maximum loss is the execution account's complete marked-to-market
+value at the time of compromise, including later deposits and appreciation. The
+mode is live-valid only when the sweep threshold, worst-case headroom, and
+enforcement-evidence digest are all absent (zero or empty — a value there would
+assert an enforcement that does not exist), the change-record reference names
+the private record of the user's explicit acceptance, and
+`max_hot_trading_balance_microusd` is positive as the declared operational alert
+threshold, not a cap. The mode string, threshold, and change record are bound
+into the effective-policy digest, so an acknowledgement issued for bounded
+enforcement never validates an uncapped policy or vice versa. No other gate is
+weakened by this mode. Because nothing bounds the hot balance mechanically, the
+operator bounds it procedurally: keep only near-term deployable capital in the
+execution account and top it up from cold custody as the deposit-aware pacing
+admits and re-paces each new tranche. An automated sweep is not an alternative —
+moving funds out requires the user-signed path this model keeps offline.
 
 The effective-policy digest binds the enforcement mode, hard maximum, sweep
 threshold, worst-case outage headroom, lowercase SHA-256 evidence digest, opaque
@@ -597,7 +612,8 @@ configuration must set all of these explicitly:
   expiration policy;
 - mandatory `staking.enabled = false` with no runtime staking signer or client;
 - externally enforced hot-balance mode, limit, sweep threshold, and worst-case
-  headroom evidence, or separately approved uncapped-authority acceptance;
+  headroom evidence, or the explicit `accepted_uncapped_authority` mode with
+  its private acceptance change record and operational alert threshold;
 - mandatory cancel-only containment throughout `halt_draining` and `halted`;
 - execution-account kind and funding mode, parent-account identity, and whether
   traced transfer admission inheritance is enabled;

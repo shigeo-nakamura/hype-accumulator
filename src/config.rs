@@ -773,6 +773,13 @@ enum ExecutionAccountKind {
 enum HotBalanceEnforcement {
     Unapproved,
     ExternallyEnforcedBounded,
+    /// The user explicitly accepts that nothing bounds the API wallet's
+    /// authority: the leaked-key maximum loss is the execution account's full
+    /// marked-to-market value. Live-valid only with no bounded-enforcement
+    /// claims (zero sweep/headroom, empty evidence digest), a private change
+    /// record naming the acceptance, and a positive operational alert
+    /// threshold. No other gate is weakened.
+    AcceptedUncappedAuthority,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -1071,7 +1078,18 @@ impl SecurityPolicy {
                     ExecutionAccountKind::Vault => "vault",
                 },
                 max_hot_trading_balance_microusd: custody.max_hot_trading_balance_microusd,
-                hot_balance_enforcement: "externally_enforced_bounded",
+                // Bound as the actual mode: an acknowledgement issued for
+                // bounded enforcement must never validate an uncapped policy,
+                // or vice versa.
+                hot_balance_enforcement: match custody.hot_balance_enforcement {
+                    HotBalanceEnforcement::Unapproved => "unapproved",
+                    HotBalanceEnforcement::ExternallyEnforcedBounded => {
+                        "externally_enforced_bounded"
+                    }
+                    HotBalanceEnforcement::AcceptedUncappedAuthority => {
+                        "accepted_uncapped_authority"
+                    }
+                },
                 hot_balance_sweep_threshold_microusd: custody.hot_balance_sweep_threshold_microusd,
                 hot_balance_worst_case_headroom_microusd: custody
                     .hot_balance_worst_case_headroom_microusd,
@@ -1270,23 +1288,54 @@ impl SecurityPolicy {
                 "live custody requires an approved isolated account and spot-only API wallet",
             );
         }
-        if custody.hot_balance_enforcement != HotBalanceEnforcement::ExternallyEnforcedBounded {
-            return invalid_policy("live mode requires approved bounded hot-balance enforcement");
+        match custody.hot_balance_enforcement {
+            HotBalanceEnforcement::Unapproved => invalid_policy(
+                "live mode requires approved bounded hot-balance enforcement or explicitly \
+                 accepted uncapped authority",
+            ),
+            HotBalanceEnforcement::ExternallyEnforcedBounded => {
+                let threshold_with_headroom = custody
+                    .hot_balance_sweep_threshold_microusd
+                    .checked_add(custody.hot_balance_worst_case_headroom_microusd)
+                    .ok_or_else(|| {
+                        SecurityPolicyError::Invalid("hot-balance bound overflow".to_owned())
+                    })?;
+                if custody.max_hot_trading_balance_microusd == 0
+                    || custody.hot_balance_sweep_threshold_microusd == 0
+                    || custody.hot_balance_worst_case_headroom_microusd == 0
+                    || threshold_with_headroom > custody.max_hot_trading_balance_microusd
+                    || !is_lower_sha256(&custody.hot_balance_enforcement_evidence_sha256)
+                    || custody.hot_balance_enforcement_change_ref.trim().is_empty()
+                {
+                    return invalid_policy("bounded hot-balance evidence is incomplete");
+                }
+                Ok(())
+            }
+            HotBalanceEnforcement::AcceptedUncappedAuthority => {
+                // A nonzero sweep/headroom or an evidence digest would assert
+                // an enforcement that this mode, by definition, does not have.
+                if custody.hot_balance_sweep_threshold_microusd != 0
+                    || custody.hot_balance_worst_case_headroom_microusd != 0
+                    || !custody.hot_balance_enforcement_evidence_sha256.is_empty()
+                {
+                    return invalid_policy(
+                        "accepted uncapped authority must not claim bounded enforcement \
+                         evidence",
+                    );
+                }
+                // The change record is the user's explicit acceptance; the
+                // threshold is the declared operational alert level, not a cap.
+                if custody.max_hot_trading_balance_microusd == 0
+                    || custody.hot_balance_enforcement_change_ref.trim().is_empty()
+                {
+                    return invalid_policy(
+                        "accepted uncapped authority requires a private acceptance change \
+                         record and an operational alert threshold",
+                    );
+                }
+                Ok(())
+            }
         }
-        let threshold_with_headroom = custody
-            .hot_balance_sweep_threshold_microusd
-            .checked_add(custody.hot_balance_worst_case_headroom_microusd)
-            .ok_or_else(|| SecurityPolicyError::Invalid("hot-balance bound overflow".to_owned()))?;
-        if custody.max_hot_trading_balance_microusd == 0
-            || custody.hot_balance_sweep_threshold_microusd == 0
-            || custody.hot_balance_worst_case_headroom_microusd == 0
-            || threshold_with_headroom > custody.max_hot_trading_balance_microusd
-            || !is_lower_sha256(&custody.hot_balance_enforcement_evidence_sha256)
-            || custody.hot_balance_enforcement_change_ref.trim().is_empty()
-        {
-            return invalid_policy("bounded hot-balance evidence is incomplete");
-        }
-        Ok(())
     }
 
     fn validate_live_capital(&self, config: &Config) -> Result<(), SecurityPolicyError> {

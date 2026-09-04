@@ -30,9 +30,13 @@ execution_account_kind = "unapproved"
 # Operational halt/alert while enforcement is unapproved. With approved external
 # enforcement, this is the acknowledged hard maximum.
 max_hot_trading_balance_microusd = 0
-# Safe default. Live mode rejects this. Any externally enforced or explicitly
-# accepted uncapped-authority mode requires separate evidence and must be bound
-# into the effective-policy acknowledgement.
+# Safe default; live mode rejects it. Live values are
+# "externally_enforced_bounded" (requires the sweep threshold, headroom, and
+# evidence digest below) or "accepted_uncapped_authority" (the user explicitly
+# accepts that the leaked-key maximum loss is the full account value; the sweep
+# threshold, headroom, and evidence digest must then be zero/empty, the change
+# record must name the acceptance, and the threshold above is only an
+# operational alert). Both are bound into the effective-policy acknowledgement.
 hot_balance_enforcement = "unapproved"
 # Zero disables external enforcement; it never means unlimited. An approved
 # bounded mode requires threshold + worst-case headroom <= hard maximum.
