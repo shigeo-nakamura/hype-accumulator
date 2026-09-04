@@ -478,6 +478,13 @@ async fn build_signed_connector(
     let max_taker_notional = Decimal::from_str(&operational.max_taker_notional_usdc)?;
     let mut nonce_state_path = PathBuf::from(journal_path);
     nonce_state_path.set_extension("nonce-state.json");
+    // A subaccount/vault execution account requires dex-connector's
+    // vault_address to be set (and equal to account_address) so the signed
+    // action's vaultAddress field routes it there — see
+    // Config::requires_vault_address_routing's doc comment.
+    let vault_address = config
+        .requires_vault_address_routing()?
+        .then(|| account_address.clone());
     let connector = HyperliquidConnector::new(HyperliquidConnectorConfig {
         base_url: config.hyperliquid.endpoint.clone(),
         tracked_symbols: Vec::new(),
@@ -486,7 +493,7 @@ async fn build_signed_connector(
     .with_account(HyperliquidAccountConfig {
         account_address,
         signer_private_key: Some(signer_private_key),
-        vault_address: None,
+        vault_address,
         is_mainnet: operational.is_mainnet,
         nonce_state_path: Some(nonce_state_path),
         max_taker_notional: Some(max_taker_notional),
