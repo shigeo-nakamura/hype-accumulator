@@ -1,8 +1,9 @@
 use super::*;
 use crate::{
-    config::CarryOverPolicy,
+    config::{CarryOverPolicy, UtcSchedule},
     pacing::DecisionReason,
     signal::{FreshnessRequirement, LiveSignalNormalizer, RevisionQuery, SnapshotRequest},
+    signal_source::{build_snapshot, plan_snapshot, TopOfBookObservation},
 };
 use chrono::{NaiveDate, TimeDelta, TimeZone};
 use rust_decimal::Decimal;
@@ -168,6 +169,123 @@ fn signal_for(decision_at: DateTime<Utc>, core_date: &str) -> SignalSnapshot {
             FreshnessRequirement::new(auxiliary, 604_800).expect("auxiliary freshness"),
         ))
         .expect("signal snapshot")
+}
+
+#[test]
+fn runtime_config_defaults_and_bounds_the_signal_snapshot_freshness() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    assert_eq!(
+        config(directory.path(), 1).signal_snapshot_stale_after_seconds(),
+        900
+    );
+    let explicit = |value: &str| {
+        RuntimeConfig::from_toml(&format!(
+            r#"
+schema_version = 1
+state_directory = "{}"
+protected_anchor_path = "{}"
+admission_approvals_path = "{}"
+signal_snapshot_path = "{}"
+status_path = "{}"
+metrics_path = "{}"
+cycle_report_path = "{}"
+movement_history_start_ms = 1
+signal_snapshot_stale_after_seconds = {value}
+"#,
+            directory.path().join("state").display(),
+            directory
+                .path()
+                .join("protected/ledger-anchor.json")
+                .display(),
+            directory.path().join("inputs/admissions.json").display(),
+            directory.path().join("inputs/signal.json").display(),
+            directory.path().join("public/status.json").display(),
+            directory.path().join("public/metrics.prom").display(),
+            directory.path().join("private/cycle.json").display(),
+        ))
+    };
+    assert_eq!(
+        explicit("120")
+            .expect("explicit freshness")
+            .signal_snapshot_stale_after_seconds(),
+        120
+    );
+    assert!(matches!(explicit("0"), Err(RuntimeError::InvalidConfig(_))));
+}
+
+#[test]
+fn producer_snapshot_makes_the_boundary_decision_purchase_eligible() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = at(2026, 7, 6, 9, 0);
+    let boundary = at(2026, 7, 6, 12, 0);
+    let produced_at = boundary - TimeDelta::seconds(90);
+    let observed_at = boundary + TimeDelta::seconds(4);
+    let schedule = UtcSchedule {
+        utc_hour: 12,
+        utc_minute: 0,
+        weekdays: (1..=7).collect(),
+    };
+    let plan = plan_snapshot(produced_at, &schedule, 900).expect("producer plan");
+    assert_eq!(plan.decision_at, boundary);
+    let signal = build_snapshot(
+        &plan,
+        &TopOfBookObservation {
+            bid_price: Decimal::new(85_008, 3),
+            ask_price: Decimal::new(85_009, 3),
+            venue_time_ms: ms(produced_at),
+            fetched_at: produced_at + TimeDelta::milliseconds(400),
+        },
+    )
+    .expect("producer snapshot");
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-with-producer-signal", deposit_at, 100);
+    let admission = approvals("deposit-with-producer-signal", deposit_at, deposit_at);
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
+
+    let report = runtime
+        .apply_cycle(RuntimeCycleInput {
+            observed_at,
+            scan_start_ms: ms(start),
+            scan_end_ms: ms(observed_at),
+            movements: std::slice::from_ref(&movement),
+            approvals: &admission,
+            signal: Some(&signal),
+            accumulator: status(observed_at, 100.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+        })
+        .expect("producer snapshot binds to the configured boundary");
+
+    assert!(report.is_new_decision());
+    assert!(report.signal_available);
+    let decision = report.decision().expect("durable boundary decision");
+    assert_eq!(decision.reason, DecisionReason::Planned);
+    assert!(!decision.planned_usdc.is_zero());
+    assert_eq!(runtime.state.stale_signal_events_total, 0);
+
+    let missing_signal = at(2026, 7, 7, 12, 0);
+    let stale_report = runtime
+        .apply_cycle(RuntimeCycleInput {
+            observed_at: missing_signal,
+            scan_start_ms: runtime.next_scan_start_ms(),
+            scan_end_ms: ms(missing_signal),
+            movements: std::slice::from_ref(&movement),
+            approvals: &admission,
+            signal: Some(&signal),
+            accumulator: status(missing_signal, 100.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+        })
+        .expect("yesterday's snapshot cannot serve today's boundary");
+    assert!(!stale_report.signal_available);
+    assert_eq!(
+        stale_report.decision().expect("durable skip").reason,
+        DecisionReason::CoreSignalUnavailable
+    );
 }
 
 #[test]

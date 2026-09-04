@@ -7,7 +7,11 @@ use hype_accumulator::{
     monitor::{trade_cadence_label, HypeAttribution, HyperliquidObserver},
     pacing::PacingLimits,
     runtime::{AdmissionApprovals, RuntimeConfig, RuntimeCycleInput, SignerFreeRuntime},
-    signal::SignalSnapshot,
+    signal::{CoreHealth, SignalSnapshot},
+    signal_source::{
+        build_snapshot, plan_snapshot, publish_snapshot, HyperliquidCoreSignalSource,
+        PublishOutcome,
+    },
 };
 use std::{
     env, fs,
@@ -49,6 +53,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             runtime_config_path,
         } => {
             run_dry_run_cycle(&config_path, &security_policy_path, &runtime_config_path).await?;
+        }
+        Invocation::SignalSnapshot {
+            config_path,
+            security_policy_path,
+            runtime_config_path,
+        } => {
+            run_signal_snapshot(&config_path, &security_policy_path, &runtime_config_path).await?;
         }
         Invocation::LedgerBackupCreate {
             ledger_directory,
@@ -114,6 +125,11 @@ enum Invocation {
         security_policy_path: PathBuf,
         runtime_config_path: PathBuf,
     },
+    SignalSnapshot {
+        config_path: PathBuf,
+        security_policy_path: PathBuf,
+        runtime_config_path: PathBuf,
+    },
     LedgerBackupCreate {
         ledger_directory: PathBuf,
         source_anchor_path: PathBuf,
@@ -167,6 +183,15 @@ where
                 runtime_config_path: PathBuf::from(runtime_config_path),
             })
         }
+        [command, config_path, security_policy_path, runtime_config_path]
+            if command == "--signal-snapshot" =>
+        {
+            Ok(Invocation::SignalSnapshot {
+                config_path: PathBuf::from(config_path),
+                security_policy_path: PathBuf::from(security_policy_path),
+                runtime_config_path: PathBuf::from(runtime_config_path),
+            })
+        }
         [command, ledger_directory, source_anchor_path, bundle_directory, anchor_export_path]
             if command == "--ledger-backup-create" =>
         {
@@ -198,7 +223,7 @@ where
             destination_anchor_path: PathBuf::from(destination_anchor_path),
         }),
         _ => Err(
-            "usage: hype-accumulator [config.toml] [security-policy.toml] | --install-preflight config.toml security-policy.toml | --dry-run-cycle config.toml security-policy.toml runtime.toml | --ledger-backup-create LEDGER_DIR SOURCE_ANCHOR BUNDLE_DIR ANCHOR_EXPORT | --ledger-backup-verify BUNDLE_DIR ANCHOR_EXPORT | --ledger-backup-restore BUNDLE_DIR ANCHOR_EXPORT DESTINATION_DIR DESTINATION_ANCHOR",
+            "usage: hype-accumulator [config.toml] [security-policy.toml] | --install-preflight config.toml security-policy.toml | --dry-run-cycle config.toml security-policy.toml runtime.toml | --signal-snapshot config.toml security-policy.toml runtime.toml | --ledger-backup-create LEDGER_DIR SOURCE_ANCHOR BUNDLE_DIR ANCHOR_EXPORT | --ledger-backup-verify BUNDLE_DIR ANCHOR_EXPORT | --ledger-backup-restore BUNDLE_DIR ANCHOR_EXPORT DESTINATION_DIR DESTINATION_ANCHOR",
         ),
     }
 }
@@ -276,6 +301,39 @@ async fn run_dry_run_cycle(
     Ok(())
 }
 
+async fn run_signal_snapshot(
+    config_path: &Path,
+    security_policy_path: &Path,
+    runtime_config_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = load_config(config_path, Some(security_policy_path))?;
+    let runtime_config = RuntimeConfig::from_toml(&fs::read_to_string(runtime_config_path)?)?;
+    let plan = plan_snapshot(
+        Utc::now(),
+        &config.schedule,
+        runtime_config.signal_snapshot_stale_after_seconds(),
+    )?;
+    let source = HyperliquidCoreSignalSource::new(&config.hyperliquid.endpoint)?;
+    let observation = source.observe_top_of_book().await?;
+    let snapshot = build_snapshot(&plan, &observation)?;
+    let core_age_seconds = match snapshot.core_health() {
+        CoreHealth::Healthy { age_seconds } => *age_seconds,
+        CoreHealth::Missing | CoreHealth::Future { .. } | CoreHealth::Stale { .. } => {
+            return Err("produced snapshot is not purchase-eligible".into());
+        }
+    };
+    let (outcome, snapshot_hash) =
+        match publish_snapshot(runtime_config.signal_snapshot_path(), &snapshot)? {
+            PublishOutcome::Written => ("written", snapshot.snapshot_hash().to_owned()),
+            PublishOutcome::Existing { snapshot_hash } => ("existing", snapshot_hash),
+        };
+    println!(
+        "mode=signal-snapshot decision_at={} core_health=healthy core_age_seconds={core_age_seconds} outcome={outcome} snapshot_hash={snapshot_hash} signed_action_created=false",
+        plan.decision_at.to_rfc3339(),
+    );
+    Ok(())
+}
+
 fn load_config(
     config_path: &Path,
     security_policy_path: Option<&Path>,
@@ -347,6 +405,33 @@ mod tests {
             ]
             .into_iter()
             .map(str::to_owned)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn signal_snapshot_requires_all_three_explicit_documents() {
+        assert_eq!(
+            invocation(
+                [
+                    "--signal-snapshot",
+                    "config.toml",
+                    "security-policy.toml",
+                    "runtime.toml",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+            ),
+            Ok(Invocation::SignalSnapshot {
+                config_path: PathBuf::from("config.toml"),
+                security_policy_path: PathBuf::from("security-policy.toml"),
+                runtime_config_path: PathBuf::from("runtime.toml"),
+            })
+        );
+        assert!(invocation(
+            ["--signal-snapshot", "config.toml", "security-policy.toml"]
+                .into_iter()
+                .map(str::to_owned)
         )
         .is_err());
     }

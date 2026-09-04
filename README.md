@@ -148,6 +148,15 @@ action. See `docs/runbooks/signer-free-runtime.md` for the closed input and
 persistence contract. Service installation or start remains a separate
 approval gate.
 
+`hype-accumulator --signal-snapshot` is the signer-free producer of the daily
+signal snapshot those cycles bind to. It reads only the public HYPE/USDC book
+from Hyperliquid, normalizes it through the same replay-safe signal path,
+binds it to the next configured UTC boundary, refuses to run outside the
+configured freshness window, and publishes the first snapshot per UTC day
+immutably. Without it every scheduled decision is a durable
+`core_signal_unavailable` skip. The auxiliary ETF-flow input is recorded as
+missing (neutral) until a production adapter exists.
+
 The signer-free maintenance CLI can checkpoint the append-only ledger into a
 checksummed payload bundle and a separate protected-head export, verify a
 downloaded pair, and restore it only into a clean state/anchor scope. The Rust

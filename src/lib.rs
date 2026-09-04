@@ -21,6 +21,7 @@ pub mod order_envelope;
 pub mod pacing;
 pub mod runtime;
 pub mod signal;
+pub mod signal_source;
 #[cfg(feature = "live-probe")]
 pub mod signer;
 pub mod status;
