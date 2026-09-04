@@ -24,6 +24,10 @@ jobs:
         run: cargo test --test workflow --features offline-staking-simulation --locked
       - name: Lint offline-only staking workflow
         run: cargo clippy --test workflow --features offline-staking-simulation --locked -- -D warnings
+      - name: Test live-probe feature
+        run: cargo test --all-targets --features live-probe --locked
+      - name: Lint live-probe feature
+        run: cargo clippy --all-targets --features live-probe --locked -- -D warnings
       - run: cargo build --locked
 
   arm64-release:
@@ -222,6 +226,8 @@ jobs:
           key: al2023-arm64-live-probe-release-v1
       - name: Verify native ARM64 runner
         run: test "$(uname -m)" = aarch64
+      - name: Test locked ARM64 live-probe target
+        run: cargo test --locked --features live-probe --bin hype-live-probe --target "$TARGET"
       - name: Build locked ARM64 live-probe binary
         run: cargo build --release --locked --features live-probe --bin hype-live-probe --target "$TARGET"
       - name: Verify AL2023 ABI
