@@ -6,6 +6,7 @@
 //! It deliberately has no order, staking, signing, or submission dependency.
 
 use crate::{
+    fs_safety::{normal_absolute_path, reject_linked_file, reject_multiple_links},
     ledger::{
         DurableLedger, LedgerError, LedgerEvent, LedgerEventKind, ProtectedAnchorStore,
         ProtectedHeadAnchor,
@@ -31,7 +32,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{self, ErrorKind, Read},
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::Arc,
 };
 use thiserror::Error;
@@ -79,43 +80,6 @@ const fn default_stuck_after_seconds() -> u64 {
 
 const fn default_account_observation_max_age_seconds() -> u64 {
     DEFAULT_ACCOUNT_OBSERVATION_MAX_AGE_SECONDS
-}
-
-fn normal_absolute_path(path: &Path) -> bool {
-    path.is_absolute()
-        && path.file_name().is_some()
-        && path.components().all(|component| {
-            matches!(
-                component,
-                Component::Prefix(_) | Component::RootDir | Component::Normal(_)
-            )
-        })
-}
-
-fn reject_linked_file(path: &Path) -> Result<(), io::Error> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
-            ErrorKind::PermissionDenied,
-            "symbolic links are forbidden",
-        )),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-fn reject_multiple_links(file: &File) -> Result<(), io::Error> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if file.metadata()?.nlink() != 1 {
-            return Err(io::Error::new(
-                ErrorKind::PermissionDenied,
-                "multiple hard links are forbidden",
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn validate_runtime_lock(path: &Path, file: &File) -> Result<(), RuntimeError> {
