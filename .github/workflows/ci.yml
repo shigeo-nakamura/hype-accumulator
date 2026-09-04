@@ -180,3 +180,136 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
+
+  arm64-live-probe-release:
+    name: AL2023-compatible locked ARM64 live-probe artifact
+    needs: quality
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: amazonlinux:2023.12.20260817.0@sha256:2a7009e43cb69708fe603eff85c1c905ffc371f8e1ed017d7628c2bf30fcbf3e
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      TARGET: aarch64-unknown-linux-gnu
+      CARGO_TARGET_DIR: target/al2023-live-probe
+      BUILD_IMAGE: amazonlinux:2023.12.20260817.0@sha256:2a7009e43cb69708fe603eff85c1c905ffc371f8e1ed017d7628c2bf30fcbf3e
+    steps:
+      - name: Install pinned-AL2023 build dependencies
+        run: |
+          dnf install -y \
+            binutils \
+            file \
+            gcc \
+            gcc-c++ \
+            git \
+            gzip \
+            make \
+            openssl-devel \
+            perl \
+            pkgconf-pkg-config \
+            tar
+          dnf clean all
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.85.1
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: al2023-arm64-live-probe-release-v1
+      - name: Verify native ARM64 runner
+        run: test "$(uname -m)" = aarch64
+      - name: Build locked ARM64 live-probe binary
+        run: cargo build --release --locked --features live-probe --bin hype-live-probe --target "$TARGET"
+      - name: Verify AL2023 ABI
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          test "$(rpm --eval "%{_arch}")" = aarch64
+          mkdir -p dist
+          {
+            printf "build_image=%s\n" "$BUILD_IMAGE"
+            printf "system_release=%s\n" "$(cat /etc/system-release)"
+            printf "libc=%s\n" "$(getconf GNU_LIBC_VERSION)"
+            rpm -q glibc openssl-libs
+          } > dist/AL2023-ABI.txt
+
+          binary="target/al2023-live-probe/${TARGET}/release/hype-live-probe"
+          file "$binary" | tee -a dist/AL2023-ABI.txt
+          ldd "$binary" | tee -a dist/AL2023-ABI.txt
+          if ldd "$binary" | grep -q "not found"; then
+            printf "unresolved shared library in %s\n" "$binary" >&2
+            exit 1
+          fi
+          {
+            printf "%s required glibc symbol versions:\n" "$binary"
+            readelf --version-info "$binary" \
+              | sed -n "s/.*Name: \(GLIBC_[^ ]*\).*/\1/p" \
+              | sort -Vu
+          } >> dist/AL2023-ABI.txt
+      - name: Package checksummed live-probe artifact
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          archive="hype-live-probe-${COMMIT_SHA}-${TARGET}.tar.gz"
+          stage="dist/stage"
+          mkdir -p "$stage"
+
+          install -m 0755 "target/al2023-live-probe/${TARGET}/release/hype-live-probe" "$stage/hype-live-probe"
+          install -m 0644 dist/AL2023-ABI.txt "$stage/AL2023-ABI.txt"
+          {
+            printf 'repository=%s\n' "$REPOSITORY"
+            printf 'commit=%s\n' "$COMMIT_SHA"
+            printf 'target=%s\n' "$TARGET"
+            printf "build_image=%s\n" "$BUILD_IMAGE"
+            printf "system_release=%s\n" "$(cat /etc/system-release)"
+            printf "libc=%s\n" "$(getconf GNU_LIBC_VERSION)"
+            rpm -q glibc glibc-devel openssl-libs openssl-devel
+            rustc --version --verbose
+            cargo --version --verbose
+            sha256sum Cargo.lock
+          } > "$stage/BUILD-PROVENANCE.txt"
+          (
+            cd "$stage"
+            sha256sum \
+              AL2023-ABI.txt \
+              BUILD-PROVENANCE.txt \
+              hype-live-probe \
+              > SHA256SUMS
+          )
+
+          tar \
+            --sort=name \
+            --mtime='@0' \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -C "$stage" \
+            -czf "dist/$archive" \
+            AL2023-ABI.txt BUILD-PROVENANCE.txt SHA256SUMS \
+            hype-live-probe
+          (
+            cd dist
+            sha256sum "$archive" > "$archive.sha256"
+            sha256sum --check "$archive.sha256"
+          )
+      - name: Attest release provenance
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: dist/*.tar.gz
+      - name: Upload immutable ARM64 live-probe artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hype-live-probe-${{ github.sha }}-aarch64
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
