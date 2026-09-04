@@ -1,11 +1,18 @@
 //! Shared HYPE/USDC spot asset constants and conversions.
 //!
-//! Kept in one place so `order_envelope.rs` (envelope assembly) and
-//! `live_decision.rs` (inventory/decision wiring) agree on exactly the same
+//! Kept in one place so `order_envelope.rs` (envelope assembly),
+//! `live_decision.rs` (inventory/decision wiring), `live_probe.rs` (probe
+//! binding), and `monitor.rs` (read-only observer) agree on exactly the same
 //! market identity, atom scale, and metadata digest — a mismatch between
 //! them would make every `DecisionBinding`/`LiveProbeBinding` pairing
-//! silently fail its equality check downstream.
+//! silently fail its equality check downstream, or point the observer at a
+//! different market than the executor.
+//!
+//! The market identity and metadata digest are available in every build;
+//! the atom-scale conversion is only compiled with the `live-probe` feature
+//! because no default-build caller consumes it.
 
+#[cfg(feature = "live-probe")]
 use rust_decimal::{prelude::ToPrimitive, Decimal};
 use sha2::{Digest, Sha256};
 
@@ -14,6 +21,7 @@ pub(crate) const HYPE_SPOT_MARKET: &str = "HYPE/USDC";
 /// queried live: spot asset metadata is not currently exposed as a public
 /// dex-connector API, and this value does not change for an existing asset.
 pub(crate) const HYPE_WEI_DECIMALS: u32 = 8;
+#[cfg(feature = "live-probe")]
 pub(crate) const HYPE_ATOMS_PER_HYPE: u64 = 100_000_000;
 const MARKET_METADATA_DOMAIN: &[u8] = b"hype-accumulator/hyperliquid-hype-usdc-spot-metadata/v1";
 
@@ -37,6 +45,7 @@ pub fn hype_usdc_market_metadata_digest() -> String {
     format!("{:x}", hasher.finalize())
 }
 
+#[cfg(feature = "live-probe")]
 /// Converts a decimal HYPE quantity to atoms, rounding toward zero.
 ///
 /// Returns `None` on overflow or a negative input.
@@ -63,6 +72,7 @@ mod tests {
         assert_eq!(hype_usdc_market_metadata_digest().len(), 64);
     }
 
+    #[cfg(feature = "live-probe")]
     #[test]
     fn atoms_conversion_floors_and_rejects_negative() {
         assert_eq!(

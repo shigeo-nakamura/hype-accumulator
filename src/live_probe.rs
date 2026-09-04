@@ -12,7 +12,10 @@
 
 #[cfg(test)]
 use crate::pacing::UsdcMicros;
-use crate::workflow::{DurableWorkflow, ExternalAction, HypeAtoms, WorkflowError};
+use crate::{
+    hype_asset::HYPE_SPOT_MARKET,
+    workflow::{DurableWorkflow, ExternalAction, HypeAtoms, WorkflowError},
+};
 use chrono::{DateTime, Utc};
 use dex_connector::{
     DexError, HyperliquidConnector, HyperliquidL1ActionEnvelope, HyperliquidOrderReconciliation,
@@ -22,7 +25,6 @@ use rust_decimal::{prelude::ToPrimitive, Decimal};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const HYPE_SPOT_MARKET: &str = "HYPE/USDC";
 const EXECUTION_IDENTITY_DOMAIN: &[u8] = b"hype-accumulator/execution-account-identity/v1";
 const SIGNER_IDENTITY_DOMAIN: &[u8] = b"hype-accumulator/api-wallet-identity/v1";
 
