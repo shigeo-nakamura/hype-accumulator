@@ -1,4 +1,8 @@
-use crate::{metrics::MetricsSnapshot, status::DashboardStatus};
+use crate::{
+    metrics::MetricsSnapshot,
+    signal::{SignalError, SignalSnapshot},
+    status::DashboardStatus,
+};
 use serde::Serialize;
 use std::{
     fs::{self, OpenOptions},
@@ -16,6 +20,8 @@ pub enum StatusIoError {
     Io(#[from] io::Error),
     #[error("status output path must name a file")]
     InvalidPath,
+    #[error(transparent)]
+    Signal(#[from] SignalError),
 }
 
 /// Atomically rewrites a local dashboard status file in the target directory.
@@ -42,6 +48,19 @@ pub fn write_metrics_atomic(
     metrics: &MetricsSnapshot,
 ) -> Result<(), StatusIoError> {
     write_text_atomic(path.as_ref(), &metrics.to_prometheus(), 0o640)
+}
+
+/// Atomically publishes a validated signal snapshot in canonical JSON.
+///
+/// # Errors
+///
+/// Returns [`StatusIoError`] when the snapshot fails validation, or when
+/// directory creation, durable temporary-file write, or atomic rename fails.
+pub fn write_signal_snapshot_atomic(
+    path: impl AsRef<Path>,
+    snapshot: &SignalSnapshot,
+) -> Result<(), StatusIoError> {
+    write_text_atomic(path.as_ref(), &snapshot.to_canonical_json()?, 0o640)
 }
 
 /// Atomically rewrites a pretty-printed JSON document with owner-only mode.

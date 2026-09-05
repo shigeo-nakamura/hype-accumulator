@@ -49,6 +49,7 @@ const RUNTIME_LOCK_FILE_NAME: &str = ".runtime.lock";
 const DEFAULT_MOVEMENT_OVERLAP_MS: u64 = 86_400_000;
 const DEFAULT_STUCK_AFTER_SECONDS: u64 = 3_600;
 const DEFAULT_ACCOUNT_OBSERVATION_MAX_AGE_SECONDS: u64 = 60;
+const DEFAULT_SIGNAL_SNAPSHOT_STALE_AFTER_SECONDS: u64 = 900;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -68,6 +69,12 @@ struct RuntimeConfigWire {
     stuck_after_seconds: u64,
     #[serde(default = "default_account_observation_max_age_seconds")]
     account_observation_max_age_seconds: u64,
+    #[serde(default = "default_signal_snapshot_stale_after_seconds")]
+    signal_snapshot_stale_after_seconds: u64,
+}
+
+const fn default_signal_snapshot_stale_after_seconds() -> u64 {
+    DEFAULT_SIGNAL_SNAPSHOT_STALE_AFTER_SECONDS
 }
 
 const fn default_movement_overlap_ms() -> u64 {
@@ -197,6 +204,7 @@ pub struct RuntimeConfig {
     movement_overlap_ms: u64,
     stuck_after_seconds: u64,
     account_observation_max_age_seconds: u64,
+    signal_snapshot_stale_after_seconds: u64,
 }
 
 impl RuntimeConfig {
@@ -262,6 +270,8 @@ impl RuntimeConfig {
             || wire.stuck_after_seconds == 0
             || wire.account_observation_max_age_seconds == 0
             || i64::try_from(wire.account_observation_max_age_seconds).is_err()
+            || wire.signal_snapshot_stale_after_seconds == 0
+            || i64::try_from(wire.signal_snapshot_stale_after_seconds).is_err()
         {
             return Err(RuntimeError::InvalidConfig(
                 "runtime history and alert bounds must be positive".to_owned(),
@@ -279,6 +289,7 @@ impl RuntimeConfig {
             movement_overlap_ms: wire.movement_overlap_ms,
             stuck_after_seconds: wire.stuck_after_seconds,
             account_observation_max_age_seconds: wire.account_observation_max_age_seconds,
+            signal_snapshot_stale_after_seconds: wire.signal_snapshot_stale_after_seconds,
         })
     }
 
@@ -290,6 +301,12 @@ impl RuntimeConfig {
     #[must_use]
     pub fn signal_snapshot_path(&self) -> &Path {
         &self.signal_snapshot_path
+    }
+
+    /// Core freshness limit the snapshot producer binds to the decision boundary.
+    #[must_use]
+    pub const fn signal_snapshot_stale_after_seconds(&self) -> u64 {
+        self.signal_snapshot_stale_after_seconds
     }
 
     fn configured_file_paths(&self) -> [&Path; 6] {

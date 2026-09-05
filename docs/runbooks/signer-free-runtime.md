@@ -29,6 +29,53 @@ still requires `dry_run=true`, `live_approved=false`, and an empty signing-key
 environment. Clearing the runtime planning pause never enables an economic
 action.
 
+## Core-signal snapshot producer
+
+`hype-accumulator --signal-snapshot` writes the immutable daily signal
+snapshot that `--dry-run-cycle` (and the live probe) bind to the configured
+UTC decision boundary. Without it every due day is durably recorded as a
+`core_signal_unavailable` skip and nothing is ever purchase-eligible.
+
+```text
+hype-accumulator --signal-snapshot \
+  /etc/hype-accumulator/config.toml \
+  /etc/hype-accumulator/security-policy.toml \
+  /etc/hype-accumulator/runtime.toml
+```
+
+- It reads only the public HYPE/USDC `l2Book` from the configured
+  Hyperliquid endpoint, together with the venue's own book generation time.
+  No account identity, environment secret, signer, nonce, or submission
+  client is constructed.
+- The core observation is `execution_price = best ask`, `reference_price =
+  floored bid/ask midpoint`, plus the verbatim top of book, all as exact
+  microunits. An empty or crossed book, a price finer than one microunit, a
+  venue clock ahead of the local fetch time, or a fetch after the boundary
+  fails closed with a non-zero exit and writes nothing.
+- The auxiliary (BTC spot ETF flow) input has no production adapter yet and is
+  recorded as `missing`, which the fixed-DCA-safe slice treats as neutral.
+- The snapshot binds to the next configured `schedule.utc_hour:utc_minute:00`
+  boundary. The command refuses to run when that boundary is
+  `signal_snapshot_stale_after_seconds` (runtime document, default 900) or
+  more away, so a late run, a persistent-timer catch-up after boot, or a
+  manual run at the wrong time cannot publish a stale or future-bound
+  snapshot; the observation would not be `healthy` at the boundary.
+- The canonical JSON is written atomically to `signal_snapshot_path`. An
+  existing valid snapshot already bound to the same boundary is left
+  untouched (`outcome=existing`); a snapshot for another boundary or an
+  unparsable file is replaced. The first snapshot per UTC day is therefore
+  immutable, matching the runtime's own same-day evidence rules.
+- Output is one line, for example
+  `mode=signal-snapshot decision_at=2026-09-05T12:00:00+00:00 core_health=healthy core_age_seconds=89 outcome=written snapshot_hash=... signed_action_created=false`.
+
+Schedule it as a separate oneshot unit that fires shortly before the decision
+boundary and finishes before the first `--dry-run-cycle` of that boundary.
+With the default 12:00 UTC boundary and the 5-minute cycle timer, a
+`hype-accumulator-signal.timer` with `OnCalendar=*-*-* 11:58:30 UTC`,
+`AccuracySec=5s`, and the same hardening as the cycle unit is sufficient; it
+needs write access only to the parent directory of `signal_snapshot_path`.
+Timer/unit creation on a host remains a separate explicit approval gate.
+
 ## Capital and decision behavior
 
 - Only normalized external USDC deposits and withdrawals enter capital state.

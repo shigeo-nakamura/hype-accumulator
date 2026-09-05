@@ -13,7 +13,7 @@ use std::{
 };
 use thiserror::Error;
 
-const SIGNAL_SCHEMA_VERSION: u8 = 1;
+pub(crate) const SIGNAL_SCHEMA_VERSION: u8 = 1;
 pub const NEUTRAL_MULTIPLIER_BPS: u16 = 10_000;
 
 /// A positive market price represented in integer microunits.
