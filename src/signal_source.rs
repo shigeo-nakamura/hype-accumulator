@@ -33,9 +33,14 @@ use crate::{
 };
 use chrono::{DateTime, Days, TimeZone, Utc};
 use dex_connector::{HyperliquidConnector, HyperliquidConnectorConfig, OrderBookSnapshot};
+use fs2::FileExt as _;
 use rust_decimal::{prelude::ToPrimitive, Decimal};
 use serde_json::json;
-use std::{fs, io, path::Path};
+use std::{
+    fs::{self, OpenOptions},
+    io,
+    path::{Path, PathBuf},
+};
 use thiserror::Error;
 
 /// Revision identity of the core market observation.
@@ -46,6 +51,13 @@ pub const CORE_SIGNAL_SERIES: &str = HYPE_SPOT_MARKET;
 pub const AUXILIARY_SIGNAL_SOURCE: &str = "unconfigured";
 pub const AUXILIARY_SIGNAL_SOURCE_VERSION: &str = "v0";
 pub const AUXILIARY_SIGNAL_SERIES: &str = "btc_etf_net_flow";
+/// Placeholder freshness for the always-empty auxiliary query. No revision
+/// is ever inserted for [`AUXILIARY_SIGNAL_SOURCE`], so `select_auxiliary`
+/// reports `Missing` (neutral) regardless of this value; it exists only so
+/// `FreshnessRequirement::new` has a positive limit to validate. Deliberately
+/// independent of the core freshness window: a future production auxiliary
+/// adapter must choose its own value rather than inherit this one.
+const AUXILIARY_PLACEHOLDER_STALE_AFTER_SECONDS: u64 = 900;
 
 const SIGNAL_SCHEMA_VERSION: u8 = 1;
 const PRICE_MICROUNITS_PER_UNIT: u64 = 1_000_000;
@@ -71,6 +83,8 @@ pub enum SignalSourceError {
     EmptyBook(&'static str),
     #[error("book price is not an exact positive microunit value: {0}")]
     InexactPrice(Decimal),
+    #[error("bid {bid} plus ask {ask} overflows the microunit midpoint computation")]
+    MidpointOverflow { bid: Decimal, ask: Decimal },
     #[error("invalid venue timestamp: {0}")]
     InvalidVenueTime(u64),
     #[error("venue clock {venue} is ahead of the local fetch time {fetched}")]
@@ -265,7 +279,10 @@ pub fn build_snapshot(
         .get()
         .checked_add(ask.get())
         .map(|total| total / 2)
-        .ok_or(SignalSourceError::InexactPrice(observation.ask_price))?;
+        .ok_or(SignalSourceError::MidpointOverflow {
+            bid: observation.bid_price,
+            ask: observation.ask_price,
+        })?;
     let core = CoreMarketData::new(ask, PriceMicrounits::new(mid)?, bid, ask)?;
     let decision_date = plan.decision_at.date_naive();
     let identity = RevisionIdentity::new(
@@ -302,7 +319,7 @@ pub fn build_snapshot(
     let snapshot = LiveSignalNormalizer::normalize_json(&raw)?.snapshot(&SnapshotRequest::new(
         plan.decision_at,
         FreshnessRequirement::new(core_query, plan.stale_after_seconds)?,
-        FreshnessRequirement::new(auxiliary_query, plan.stale_after_seconds)?,
+        FreshnessRequirement::new(auxiliary_query, AUXILIARY_PLACEHOLDER_STALE_AFTER_SECONDS)?,
     ))?;
     if !snapshot.purchase_eligible() {
         return Err(SignalSourceError::NotEligible(
@@ -331,6 +348,25 @@ pub fn publish_snapshot(
     path: &Path,
     snapshot: &SignalSnapshot,
 ) -> Result<PublishOutcome, SignalSourceError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        fs::create_dir_all(parent)?;
+    }
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(signal_snapshot_lock_path(path))?;
+    // Held for the whole read-decide-write section below (released on drop
+    // at function return) so a concurrently triggered producer run — a
+    // manual invocation racing the scheduled timer, or two overlapping
+    // timer firings — cannot both observe "no existing snapshot for this
+    // boundary" and both proceed to write, which would silently replace the
+    // first published observation with a later one and break the "first
+    // snapshot per UTC day is immutable" guarantee.
+    lock_file.lock_exclusive()?;
     match fs::read_to_string(path) {
         Ok(payload) => {
             if let Ok(existing) = SignalSnapshot::from_json(&payload) {
@@ -346,6 +382,15 @@ pub fn publish_snapshot(
     }
     write_signal_snapshot_atomic(path, snapshot)?;
     Ok(PublishOutcome::Written)
+}
+
+fn signal_snapshot_lock_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().map_or_else(
+        || std::ffi::OsString::from("signal-snapshot"),
+        std::ffi::OsStr::to_os_string,
+    );
+    name.push(".lock");
+    path.with_file_name(name)
 }
 
 fn boundary_on(

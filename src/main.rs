@@ -307,6 +307,7 @@ async fn run_signal_snapshot(
     runtime_config_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config(config_path, Some(security_policy_path))?;
+    config.validate_signer_free_runtime(&ProcessEnvironment)?;
     let runtime_config = RuntimeConfig::from_toml(&fs::read_to_string(runtime_config_path)?)?;
     let plan = plan_snapshot(
         Utc::now(),
@@ -316,8 +317,8 @@ async fn run_signal_snapshot(
     let source = HyperliquidCoreSignalSource::new(&config.hyperliquid.endpoint)?;
     let observation = source.observe_top_of_book().await?;
     let snapshot = build_snapshot(&plan, &observation)?;
-    let core_age_seconds = match snapshot.core_health() {
-        CoreHealth::Healthy { age_seconds } => *age_seconds,
+    let (core_health_label, core_age_seconds) = match snapshot.core_health() {
+        CoreHealth::Healthy { age_seconds } => ("healthy", *age_seconds),
         CoreHealth::Missing | CoreHealth::Future { .. } | CoreHealth::Stale { .. } => {
             return Err("produced snapshot is not purchase-eligible".into());
         }
@@ -328,7 +329,7 @@ async fn run_signal_snapshot(
             PublishOutcome::Existing { snapshot_hash } => ("existing", snapshot_hash),
         };
     println!(
-        "mode=signal-snapshot decision_at={} core_health=healthy core_age_seconds={core_age_seconds} outcome={outcome} snapshot_hash={snapshot_hash} signed_action_created=false",
+        "mode=signal-snapshot decision_at={} core_health={core_health_label} core_age_seconds={core_age_seconds} outcome={outcome} snapshot_hash={snapshot_hash} signed_action_created=false",
         plan.decision_at.to_rfc3339(),
     );
     Ok(())
