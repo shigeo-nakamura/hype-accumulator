@@ -971,6 +971,7 @@ mod tests {
     fn admitted_capital_and_horizon_are_projected_from_consistent_states() {
         let limits = limits();
         let deposit = DepositEvent {
+            max_admitted_usdc: None,
             event_id: "deposit-1".into(),
             amount_usdc: usd(100),
             received_at: at(8),
@@ -1209,6 +1210,7 @@ mod tests {
         pacing
             .reconcile_capital(
                 &[CapitalEvent::Deposit(DepositEvent {
+                    max_admitted_usdc: None,
                     event_id: "future-pending-deposit".into(),
                     amount_usdc: usd(100),
                     received_at: at(13),
@@ -1320,6 +1322,7 @@ mod tests {
         pacing_only
             .reconcile_capital(
                 &[CapitalEvent::Deposit(DepositEvent {
+                    max_admitted_usdc: None,
                     event_id: "pending-pacing-deposit".into(),
                     amount_usdc: usd(100),
                     received_at: at(8),

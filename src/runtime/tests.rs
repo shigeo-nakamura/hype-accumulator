@@ -2223,3 +2223,138 @@ fn parent_funding_conflicting_withdrawal_ids_leave_no_pending_cycle_and_can_reco
     .unwrap();
     assert_eq!(runtime.ledger.state().deployable_usdc(), usd(900));
 }
+
+fn amount_approval(
+    id: &str,
+    confirmed: DateTime<Utc>,
+    approved: DateTime<Utc>,
+    amount: u64,
+) -> AdmissionApprovals {
+    AdmissionApprovals::from_json(
+        &serde_json::json!({
+            "schema_version": 1,
+            "approvals": [{"event_id": id, "confirmed_at": confirmed,
+                "confirmation_count": 2, "approved_at": approved,
+                "max_admitted_usdc": usd(amount)}]
+        })
+        .to_string(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn explicit_parent_admission_survives_restart_and_cannot_be_rewritten() {
+    let directory = tempfile::tempdir().unwrap();
+    let start = at(2026, 7, 6, 8, 0);
+    let now = at(2026, 7, 6, 12, 0);
+    let cfg = config(directory.path(), ms(start)).with_parent_funding_route(Some(parent_route()));
+    let mut cap = limits();
+    cap.max_automatically_admitted_usdc = usd(100);
+    cap.yearly_admission_cap_usdc = usd(100_000);
+    cap.cumulative_admission_cap_usdc = usd(100_000);
+    cap.max_daily_notional_usdc = usd(300);
+    let incoming = parent_transfer("operator-funds", start, 20_000);
+    let mut runtime = SignerFreeRuntime::open(cfg.clone(), cap.clone()).unwrap();
+    funding_cycle(
+        &mut runtime,
+        start + TimeDelta::minutes(1),
+        std::slice::from_ref(&incoming),
+        &AdmissionApprovals::empty(),
+        20_000.0,
+    )
+    .unwrap();
+    let approval = amount_approval("operator-funds", start, start + TimeDelta::hours(1), 10_000);
+    funding_cycle(
+        &mut runtime,
+        now,
+        std::slice::from_ref(&incoming),
+        &approval,
+        20_000.0,
+    )
+    .unwrap();
+    assert_eq!(runtime.ledger.state().admitted_usdc(), usd(10_000));
+    drop(runtime);
+    let mut runtime = SignerFreeRuntime::open(cfg, cap).unwrap();
+    funding_cycle(
+        &mut runtime,
+        now + TimeDelta::minutes(5),
+        &[],
+        &AdmissionApprovals::empty(),
+        20_000.0,
+    )
+    .unwrap();
+    assert_eq!(runtime.ledger.state().admitted_usdc(), usd(10_000));
+    let before = runtime.state.clone();
+    for altered in [
+        amount_approval("operator-funds", start, start + TimeDelta::hours(1), 11_000),
+        amount_approval("operator-funds", start, start + TimeDelta::hours(1), 9_000),
+        approvals("operator-funds", start, start + TimeDelta::hours(1)),
+    ] {
+        assert!(funding_cycle(
+            &mut runtime,
+            now + TimeDelta::minutes(10),
+            &[],
+            &altered,
+            20_000.0
+        )
+        .is_err());
+        assert_eq!(runtime.state, before);
+        assert!(!runtime
+            .config
+            .state_directory
+            .join(PENDING_CYCLE_FILE_NAME)
+            .exists());
+    }
+}
+
+#[test]
+fn late_explicit_admission_does_not_rewrite_the_daily_decision() {
+    let directory = tempfile::tempdir().unwrap();
+    let start = at(2026, 7, 6, 8, 0);
+    let cfg = config(directory.path(), ms(start)).with_parent_funding_route(Some(parent_route()));
+    let mut cap = limits();
+    cap.max_automatically_admitted_usdc = usd(100);
+    let mut runtime = SignerFreeRuntime::open(cfg, cap).unwrap();
+    let approval = amount_approval("late-approved", start, at(2026, 7, 6, 13, 0), 900);
+    let movement = parent_transfer("late-approved", start, 1_000);
+    let report = funding_cycle(
+        &mut runtime,
+        at(2026, 7, 6, 13, 5),
+        &[movement],
+        &approval,
+        1_000.0,
+    )
+    .unwrap();
+    assert_eq!(
+        report.decision().unwrap().explanation.admitted_unspent_usdc,
+        usd(0)
+    );
+    assert_eq!(runtime.ledger.state().admitted_usdc(), usd(900));
+    let again = funding_cycle(
+        &mut runtime,
+        at(2026, 7, 6, 13, 10),
+        &[],
+        &approval,
+        1_000.0,
+    )
+    .unwrap();
+    assert!(!again.is_new_decision());
+    assert_eq!(report.decision(), again.decision());
+}
+
+#[test]
+fn explicit_admission_artifact_rejects_invalid_microunit_values() {
+    let now = at(2026, 7, 6, 8, 0);
+    for amount in [
+        serde_json::json!(0),
+        serde_json::json!(-1),
+        serde_json::json!(1.5),
+        serde_json::json!("1000000"),
+    ] {
+        let wire = serde_json::json!({"schema_version":1,"approvals":[{
+            "event_id":"invalid", "confirmed_at":now,"approved_at":now,
+            "confirmation_count":2,"max_admitted_usdc":amount
+        }]});
+        assert!(AdmissionApprovals::from_json(&wire.to_string()).is_err());
+    }
+}

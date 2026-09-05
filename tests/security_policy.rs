@@ -414,6 +414,7 @@ fn acknowledged_caps_and_reserve_drive_effective_pacing() {
     state
         .reconcile_capital(
             &[CapitalEvent::Deposit(DepositEvent {
+                max_admitted_usdc: None,
                 event_id: "policy-reserve".to_owned(),
                 amount_usdc: UsdcMicros::from_micros(5_500_000),
                 received_at,

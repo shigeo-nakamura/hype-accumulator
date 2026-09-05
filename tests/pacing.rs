@@ -48,6 +48,7 @@ fn limits() -> PacingLimits {
 
 fn deposit(id: impl Into<String>, amount: u64, received_at: DateTime<Utc>) -> CapitalEvent {
     CapitalEvent::Deposit(DepositEvent {
+        max_admitted_usdc: None,
         event_id: id.into(),
         amount_usdc: usd(amount),
         received_at,
@@ -63,6 +64,7 @@ fn unapproved_deposit(
     received_at: DateTime<Utc>,
 ) -> CapitalEvent {
     CapitalEvent::Deposit(DepositEvent {
+        max_admitted_usdc: None,
         event_id: id.into(),
         amount_usdc: usd(amount),
         received_at,
@@ -1353,4 +1355,131 @@ fn usdc_micros_decimal_round_trips_through_whole_amounts() {
         let micros = UsdcMicros::checked_from_whole_usdc(whole).expect("small test amount");
         assert_eq!(UsdcMicros::from_decimal(micros.as_decimal()), Some(micros));
     }
+}
+
+fn explicitly_approved(
+    id: &str,
+    source: u64,
+    amount: u64,
+    received: DateTime<Utc>,
+) -> CapitalEvent {
+    let CapitalEvent::Deposit(mut event) = deposit(id, source, received) else {
+        unreachable!()
+    };
+    event.max_admitted_usdc = Some(usd(amount));
+    CapitalEvent::Deposit(event)
+}
+
+#[test]
+fn explicit_admission_uses_shared_yearly_and_lifetime_capacity() {
+    let mut cap = limits();
+    cap.max_automatically_admitted_usdc = usd(100);
+    cap.yearly_admission_cap_usdc = usd(100_000);
+    cap.cumulative_admission_cap_usdc = usd(110_000);
+    cap.max_daily_notional_usdc = usd(300);
+    let start = at(2026, 7, 6, 8);
+    let mut state = PacingState::default();
+    state
+        .reconcile_capital(
+            &[
+                explicitly_approved("first", 90_000, 90_000, start),
+                explicitly_approved("second", 20_000, 20_000, start + TimeDelta::hours(1)),
+            ],
+            start + TimeDelta::hours(2),
+            &cap,
+        )
+        .unwrap();
+    assert_eq!(state.deposits()["first"].admitted_usdc, usd(90_000));
+    assert_eq!(state.deposits()["second"].admitted_usdc, usd(10_000));
+    let decision = state
+        .decide(&input(at(2026, 7, 6, 12), 110_000), &cap)
+        .unwrap();
+    assert_eq!(decision.decision().planned_usdc, usd(300));
+    let next = at(2027, 1, 1, 8);
+    state
+        .reconcile_capital(
+            &[explicitly_approved("next-year", 20_000, 20_000, next)],
+            next + TimeDelta::hours(1),
+            &cap,
+        )
+        .unwrap();
+    assert_eq!(state.deposits()["next-year"].admitted_usdc, usd(10_000));
+    state.validate_for_limits(&cap).unwrap();
+}
+
+#[test]
+fn explicit_limit_can_be_below_auto_cap_and_cannot_admit_returned_funds() {
+    let start = at(2026, 7, 6, 8);
+    let cap = limits();
+    let mut state = PacingState::default();
+    state
+        .reconcile_capital(&[unapproved_deposit("returned", 1_000, start)], start, &cap)
+        .unwrap();
+    let CapitalEvent::Withdrawal(mut out) =
+        withdrawal("return", 700, start + TimeDelta::minutes(1))
+    else {
+        unreachable!()
+    };
+    out.allow_unadmitted_funding = true;
+    state
+        .reconcile_capital(
+            &[CapitalEvent::Withdrawal(out)],
+            start + TimeDelta::minutes(2),
+            &cap,
+        )
+        .unwrap();
+    let CapitalEvent::Deposit(mut approved) = explicitly_approved("returned", 1_000, 500, start)
+    else {
+        unreachable!()
+    };
+    approved.admission_approved_at = Some(start + TimeDelta::minutes(3));
+    state
+        .reconcile_capital(
+            &[CapitalEvent::Deposit(approved)],
+            start + TimeDelta::minutes(4),
+            &cap,
+        )
+        .unwrap();
+    assert_eq!(state.deposits()["returned"].admitted_usdc, usd(300));
+    assert_eq!(
+        state.deposits()["returned"].returned_unadmitted_usdc,
+        usd(700)
+    );
+}
+
+#[test]
+fn malformed_explicit_admissions_leave_state_unchanged() {
+    let start = at(2026, 7, 6, 8);
+    for (limit, approved) in [(0, true), (1_001, true), (500, false)] {
+        let CapitalEvent::Deposit(mut event) = explicitly_approved("bad", 1_000, limit, start)
+        else {
+            unreachable!()
+        };
+        if !approved {
+            event.admission_approved_at = None;
+        }
+        let mut state = PacingState::default();
+        assert!(state
+            .reconcile_capital(
+                &[CapitalEvent::Deposit(event)],
+                start + TimeDelta::hours(1),
+                &limits()
+            )
+            .is_err());
+        assert_eq!(state, PacingState::default());
+    }
+}
+
+#[test]
+fn explicit_admission_ceiling_restricts_an_otherwise_larger_auto_allocation() {
+    let start = at(2026, 7, 6, 8);
+    let mut state = PacingState::default();
+    state
+        .reconcile_capital(
+            &[explicitly_approved("small", 1_000, 50, start)],
+            start + TimeDelta::hours(1),
+            &limits(),
+        )
+        .unwrap();
+    assert_eq!(state.deposits()["small"].admitted_usdc, usd(50));
 }
