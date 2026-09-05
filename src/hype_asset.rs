@@ -1,13 +1,14 @@
 //! Shared HYPE/USDC spot asset constants and conversions.
 //!
 //! Kept in one place so `order_envelope.rs` (envelope assembly),
-//! `live_decision.rs` (inventory/decision wiring), `live_probe.rs` (probe
-//! binding), and `workflow.rs` (durable order evidence) agree on exactly the
-//! same market identity, atom scale, and metadata digest — a mismatch
-//! between them would make every `DecisionBinding`/`LiveProbeBinding`
-//! pairing silently fail its equality check downstream. `monitor.rs`
-//! (read-only observer) shares only the market identity, not the atom scale
-//! or metadata digest.
+//! `live_decision.rs` (inventory/decision wiring), and the `hype-live-probe`
+//! binary agree on exactly the same market identity, atom scale, and
+//! metadata digest — a mismatch between them would make every
+//! `DecisionBinding`/`LiveProbeBinding` pairing silently fail its equality
+//! check downstream. `live_probe.rs` (probe binding) never imports this
+//! module: it receives the atom scale and digest as opaque values from
+//! those callers instead. `workflow.rs` (durable order evidence) and
+//! `monitor.rs` (read-only observer) each import only the market identity.
 //!
 //! The market identity and metadata digest are available in every build;
 //! the atom-scale conversion is only compiled with the `live-probe` feature
