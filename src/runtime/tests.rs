@@ -2009,8 +2009,29 @@ fn parent_funding_return_before_approval_cannot_be_admitted_later() {
             runtime.state.pacing.deposits()["not-yet-approved"].returned_unadmitted_usdc,
             usd(returned)
         );
+        let returned_at = funding_at + TimeDelta::minutes(30);
+        assert_eq!(
+            runtime.ledger.state().last_capital_event_at(),
+            Some(returned_at)
+        );
+        let public: Value =
+            serde_json::from_str(&fs::read_to_string(&runtime.config.status_path).unwrap())
+                .unwrap();
+        let published = public["operations"]["last_capital_event_at"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            DateTime::parse_from_rfc3339(published)
+                .unwrap()
+                .with_timezone(&Utc),
+            returned_at
+        );
         drop(runtime);
         let mut runtime = SignerFreeRuntime::open(cfg, limits()).unwrap();
+        assert_eq!(
+            runtime.ledger.state().last_capital_event_at(),
+            Some(returned_at)
+        );
         let later = now + TimeDelta::hours(1);
         let admission = approvals("not-yet-approved", funding_at, later);
         funding_cycle(

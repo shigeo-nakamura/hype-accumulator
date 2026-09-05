@@ -252,6 +252,8 @@ pub struct ReplayState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_decision_at: Option<DateTime<Utc>>,
     last_event_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_transfer_withdrawal_at: Option<DateTime<Utc>>,
 }
 
 // Serde skip predicates receive references.
@@ -347,6 +349,7 @@ impl ReplayState {
             .values()
             .map(|deposit| deposit.occurred_at)
             .chain(last_withdrawal)
+            .chain(self.last_transfer_withdrawal_at)
             .max()
     }
 
@@ -1114,6 +1117,13 @@ fn apply_event(state: &mut ReplayState, event: &LedgerEvent) -> Result<(), Ledge
                 admitted_withdrawal,
             )?;
             state.withdrawn_usdc = checked_add(state.withdrawn_usdc, admitted_withdrawal)?;
+            state.last_transfer_withdrawal_at = Some(
+                state
+                    .last_transfer_withdrawal_at
+                    .map_or(event.occurred_at, |previous| {
+                        previous.max(event.occurred_at)
+                    }),
+            );
         }
         LedgerEventKind::AuthoritativeWithdrawal { amount_usdc } => {
             record_capital_timeline_entry(
