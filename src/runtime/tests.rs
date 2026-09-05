@@ -109,6 +109,7 @@ fn deposit(event_id: &str, occurred_at: DateTime<Utc>, amount: u64) -> Hyperliqu
         token: "USDC".to_owned(),
         amount: Decimal::from(amount),
         transaction_hash: None,
+        counterparty: None,
     }
 }
 
@@ -124,6 +125,7 @@ fn withdrawal(
         token: "USDC".to_owned(),
         amount: -Decimal::from(amount),
         transaction_hash: None,
+        counterparty: None,
     }
 }
 
@@ -576,6 +578,58 @@ fn empty_ledger_requires_exact_pristine_runtime_state() {
     assert!(matches!(
         SignerFreeRuntime::open(runtime_config, limits()),
         Err(RuntimeError::RuntimeStateRollback)
+    ));
+}
+
+#[test]
+fn directional_send_counterparty_does_not_authorize_capital_admission() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let observed_at = at(2026, 7, 6, 12, 0);
+    let config = config(directory.path(), ms(start));
+    let mut runtime = SignerFreeRuntime::open(config, limits()).expect("open runtime");
+    let mut movement = deposit("send-from-parent", start + TimeDelta::hours(1), 100);
+    movement.kind = HyperliquidAccountMovementKind::InternalTransfer;
+    movement.counterparty = Some("0x1111111111111111111111111111111111111111".to_owned());
+    let snapshot = signal(observed_at);
+    let report = runtime
+        .apply_cycle(RuntimeCycleInput {
+            observed_at,
+            scan_start_ms: ms(start),
+            scan_end_ms: ms(observed_at),
+            movements: &[movement.clone()],
+            approvals: &AdmissionApprovals::empty(),
+            signal: Some(&snapshot),
+            accumulator: status(observed_at, 100.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+        })
+        .expect("known directional transfer can be observed");
+    assert!(report.capital_history_complete);
+    assert!(runtime.state.pacing.deposits().is_empty());
+    assert!(report.decision().unwrap().planned_usdc.is_zero());
+    assert!(!report.signed_action_created);
+
+    let transfer_approval = approvals(
+        "send-from-parent",
+        start + TimeDelta::hours(1),
+        start + TimeDelta::hours(2),
+    );
+    assert!(matches!(
+        runtime.apply_cycle(RuntimeCycleInput {
+            observed_at: observed_at + TimeDelta::minutes(5),
+            scan_start_ms: runtime.next_scan_start_ms(),
+            scan_end_ms: ms(observed_at + TimeDelta::minutes(5)),
+            movements: &[movement],
+            approvals: &transfer_approval,
+            signal: Some(&snapshot),
+            accumulator: status(observed_at + TimeDelta::minutes(5), 100.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+        }),
+        Err(RuntimeError::UnknownAdmissionApproval(_))
     ));
 }
 
