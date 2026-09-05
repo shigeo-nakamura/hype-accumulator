@@ -10,6 +10,7 @@
 //! stable venue order identity from settling more than one decision workflow.
 
 use crate::{
+    fs_safety::{normal_absolute_path, reject_linked_file, reject_multiple_links},
     hype_asset::HYPE_SPOT_MARKET,
     pacing::{DailyDecision, DecisionReason, UsdcMicros},
 };
@@ -2085,45 +2086,6 @@ impl ProtectedWorkflowHeadStore for FileProtectedWorkflowHeadStore {
             .map_err(|error| format!("protected workflow head unlock failed: {error}"))?;
         Ok(true)
     }
-}
-
-fn normal_absolute_path(path: &Path) -> bool {
-    path.is_absolute()
-        && path.file_name().is_some()
-        && path.components().all(|component| {
-            matches!(
-                component,
-                std::path::Component::Prefix(_)
-                    | std::path::Component::RootDir
-                    | std::path::Component::Normal(_)
-            )
-        })
-}
-
-fn reject_linked_file(path: &Path) -> Result<(), io::Error> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "symbolic links are forbidden",
-        )),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-fn reject_multiple_links(file: &File) -> Result<(), io::Error> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if file.metadata()?.nlink() != 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "multiple hard links are forbidden",
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// Immutable ownership of one stable venue order identity.

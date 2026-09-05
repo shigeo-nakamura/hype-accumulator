@@ -7,6 +7,7 @@ pub mod clock;
 pub mod config;
 pub mod exchange;
 pub mod execution;
+pub(crate) mod fs_safety;
 pub mod hype_asset;
 pub mod ledger;
 #[cfg(feature = "live-probe")]
