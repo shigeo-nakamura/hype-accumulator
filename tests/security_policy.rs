@@ -673,6 +673,33 @@ fn supported_isolated_account_kinds_are_acknowledged_and_digest_bound() {
 }
 
 #[test]
+fn vault_address_routing_is_required_only_for_subaccount_and_vault() {
+    let env = live_environment();
+    for (kind, expected) in [
+        ("dedicated_master", false),
+        ("subaccount", true),
+        ("vault", true),
+    ] {
+        let policy = live_policy_template().replace(
+            "execution_account_kind = \"dedicated_master\"",
+            &format!("execution_account_kind = \"{kind}\""),
+        );
+        let acknowledged = acknowledged_policy(&policy, &env);
+        let config = config_with_policy(&acknowledged);
+        config
+            .validate_at(&env, at("2026-08-31T23:59:59Z"))
+            .expect("supported isolated account kind validates");
+        assert_eq!(
+            config
+                .requires_vault_address_routing()
+                .expect("policy attached"),
+            expected,
+            "execution_account_kind={kind}"
+        );
+    }
+}
+
+#[test]
 fn unsafe_custody_and_staking_modes_fail_before_live() {
     let env = live_environment();
     let unapproved = live_policy_template().replace(

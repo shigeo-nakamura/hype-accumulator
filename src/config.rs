@@ -173,6 +173,13 @@ pub struct EffectiveLiveOrderPolicy {
     pub fill_registration_deadline_seconds: u64,
     pub lot_eligibility_max_age_seconds: u64,
     pub policy_acknowledgement_valid_through_at: DateTime<Utc>,
+    /// True when `execution_account_kind` is `subaccount` or `vault`: the
+    /// connector must set `vault_address` (dex-connector requires it equal
+    /// `account_address`) so Hyperliquid's signed action includes
+    /// `vaultAddress` and applies to that subaccount/vault rather than
+    /// whatever account the API-wallet signer might otherwise be associated
+    /// with. `dedicated_master` must leave it unset.
+    pub requires_vault_address_routing: bool,
 }
 
 impl Config {
@@ -454,6 +461,25 @@ impl Config {
             .ok_or(ConfigError::MissingSecurityPolicy)?
             .effective_live_order_policy(self, env, now)
             .map_err(ConfigError::from)
+    }
+
+    /// Whether the account is a Hyperliquid subaccount or vault, requiring
+    /// the connector to set `vault_address` (equal to `account_address`) so
+    /// a signed action's `vaultAddress` field routes it to that
+    /// subaccount/vault rather than whatever account the API-wallet signer
+    /// might otherwise be associated with. A static classification with no
+    /// freshness/expiry gate, unlike `effective_live_order_policy`, so it is
+    /// safe to call before decrypting a signer or validating live-readiness.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no security policy is attached.
+    pub fn requires_vault_address_routing(&self) -> Result<bool, ConfigError> {
+        Ok(self
+            .security_policy
+            .as_ref()
+            .ok_or(ConfigError::MissingSecurityPolicy)?
+            .requires_vault_address_routing())
     }
 
     /// Computes the lowercase SHA-256 digest of the canonical effective policy.
@@ -903,6 +929,17 @@ struct CanonicalResolvedIdentities<'a> {
 }
 
 impl SecurityPolicy {
+    /// Whether `execution_account_kind` is `subaccount` or `vault`. A static
+    /// classification with no freshness/expiry gate, unlike
+    /// `effective_live_order_policy`, so it is safe to read before decrypting
+    /// a signer or validating live-readiness.
+    pub(crate) fn requires_vault_address_routing(&self) -> bool {
+        matches!(
+            self.wire.custody.execution_account_kind,
+            ExecutionAccountKind::Subaccount | ExecutionAccountKind::Vault
+        )
+    }
+
     /// Parses and statically validates a complete security-policy TOML document.
     ///
     /// # Errors
@@ -1030,6 +1067,7 @@ impl SecurityPolicy {
         let context = self.live_context(config, env)?;
         let execution = &self.wire.execution;
         let staking = &self.wire.staking;
+        let requires_vault_address_routing = self.requires_vault_address_routing();
         Ok(EffectiveLiveOrderPolicy {
             max_slippage_bps: execution.max_slippage_bps,
             max_purchase_fee_bps: execution.max_purchase_fee_bps,
@@ -1045,6 +1083,7 @@ impl SecurityPolicy {
             fill_registration_deadline_seconds: staking.fill_registration_deadline_seconds,
             lot_eligibility_max_age_seconds: staking.lot_eligibility_max_age_seconds,
             policy_acknowledgement_valid_through_at: context.acknowledgement_expiry,
+            requires_vault_address_routing,
         })
     }
 
