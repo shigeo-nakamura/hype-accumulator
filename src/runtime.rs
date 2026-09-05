@@ -6,6 +6,7 @@
 //! It deliberately has no order, staking, signing, or submission dependency.
 
 use crate::{
+    config::ParentFundingRoute,
     fs_safety::{normal_absolute_path, reject_linked_file, reject_multiple_links},
     ledger::{
         DurableLedger, LedgerError, LedgerEvent, LedgerEventKind, ProtectedAnchorStore,
@@ -205,6 +206,7 @@ pub struct RuntimeConfig {
     stuck_after_seconds: u64,
     account_observation_max_age_seconds: u64,
     signal_snapshot_stale_after_seconds: u64,
+    parent_funding_route: Option<ParentFundingRoute>,
 }
 
 impl RuntimeConfig {
@@ -278,6 +280,7 @@ impl RuntimeConfig {
             ));
         }
         Ok(Self {
+            parent_funding_route: None,
             state_directory: wire.state_directory,
             protected_anchor_path: wire.protected_anchor_path,
             admission_approvals_path: wire.admission_approvals_path,
@@ -291,6 +294,13 @@ impl RuntimeConfig {
             account_observation_max_age_seconds: wire.account_observation_max_age_seconds,
             signal_snapshot_stale_after_seconds: wire.signal_snapshot_stale_after_seconds,
         })
+    }
+
+    /// Binds funding recognition to startup-resolved policy identities.
+    #[must_use]
+    pub fn with_parent_funding_route(mut self, route: Option<ParentFundingRoute>) -> Self {
+        self.parent_funding_route = route;
+        self
     }
 
     #[must_use]
@@ -526,6 +536,8 @@ struct RuntimeState {
     dry_run_actions_total: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_committed_cycle_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent_funding_route: Option<ParentFundingRoute>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -590,6 +602,7 @@ impl RuntimeState {
             stale_signal_events_total: 0,
             dry_run_actions_total: 0,
             last_committed_cycle_hash: None,
+            parent_funding_route: None,
         }
     }
 }
@@ -682,6 +695,14 @@ impl SignerFreeRuntime {
         ensure_capital_totals_match(&state.pacing, ledger.state())?;
         ensure_runtime_head_matches(&state, ledger.state())?;
         ensure_runtime_state_authenticated(&config, &state, ledger.state())?;
+        if state.last_committed_cycle_hash.is_some()
+            && state.parent_funding_route != config.parent_funding_route
+        {
+            return Err(RuntimeError::InvalidConfig(
+                "funding identity changed; use an explicitly migrated separate runtime ledger"
+                    .into(),
+            ));
+        }
         Ok(Self {
             config,
             limits,
@@ -782,8 +803,7 @@ impl SignerFreeRuntime {
         let mut new_authoritative_deposit_ids = BTreeSet::new();
         let mut movement_ledger_events = Vec::new();
 
-        let mut ordered_movements = input.movements.iter().collect::<Vec<_>>();
-        ordered_movements.sort_by_key(|movement| (movement.timestamp_ms, &movement.event_id));
+        let ordered_movements = unique_ordered_movements(input.movements)?;
         for movement in ordered_movements {
             validate_movement_range(movement, &input)?;
             let occurred_at = timestamp_ms(movement.timestamp_ms)?;
@@ -795,12 +815,28 @@ impl SignerFreeRuntime {
             let between_balance_and_boundary = scheduled_boundary.is_some_and(|boundary| {
                 boundary_balance_direction(occurred_at, balance_observed_at, boundary).is_some()
             });
+            let route = self.config.parent_funding_route.as_ref();
+            let internal_usdc = movement.kind == HyperliquidAccountMovementKind::InternalTransfer
+                && movement.token == "USDC";
+            let parent_funding = internal_usdc
+                && movement.amount > Decimal::ZERO
+                && route.is_some_and(|route| {
+                    movement.counterparty.as_deref() == Some(route.parent_account.as_str())
+                });
+            let transfer_withdrawal =
+                internal_usdc && movement.amount < Decimal::ZERO && route.is_some();
+            if internal_usdc && route.is_some() && !parent_funding && !transfer_withdrawal {
+                capital_history_complete = false;
+                boundary_balance_reconstructable = false;
+            }
             if matches!(
                 movement.kind,
                 HyperliquidAccountMovementKind::Unknown
                     | HyperliquidAccountMovementKind::InternalTransfer
                     | HyperliquidAccountMovementKind::TradingRelated
-            ) && (in_balance_request_window || between_balance_and_boundary)
+            ) && !parent_funding
+                && !transfer_withdrawal
+                && (in_balance_request_window || between_balance_and_boundary)
             {
                 boundary_balance_reconstructable = false;
             }
@@ -811,7 +847,11 @@ impl SignerFreeRuntime {
                 boundary_balance_reconstructable = false;
             }
             match movement.kind {
-                HyperliquidAccountMovementKind::ExternalDeposit => {
+                HyperliquidAccountMovementKind::ExternalDeposit
+                | HyperliquidAccountMovementKind::InternalTransfer
+                    if movement.kind == HyperliquidAccountMovementKind::ExternalDeposit
+                        || parent_funding =>
+                {
                     let amount = positive_usdc_micros(movement.amount)?;
                     record_boundary_balance_effect(
                         &mut boundary_balance_effects,
@@ -824,8 +864,19 @@ impl SignerFreeRuntime {
                     movement_ledger_events.push(LedgerEvent {
                         event_id: movement.event_id.clone(),
                         occurred_at,
-                        kind: LedgerEventKind::AuthoritativeDeposit {
-                            amount_usdc: amount,
+                        kind: if parent_funding {
+                            let route = route.ok_or_else(|| {
+                                RuntimeError::InvalidCycle("parent funding route missing".into())
+                            })?;
+                            LedgerEventKind::AuthoritativeParentFunding {
+                                amount_usdc: amount,
+                                parent_account: route.parent_account.clone(),
+                                execution_account: route.execution_account.clone(),
+                            }
+                        } else {
+                            LedgerEventKind::AuthoritativeDeposit {
+                                amount_usdc: amount,
+                            }
                         },
                     });
                     let approval = input.approvals.get(&movement.event_id);
@@ -855,7 +906,11 @@ impl SignerFreeRuntime {
                         new_authoritative_deposit_ids.insert(movement.event_id.clone());
                     }
                 }
-                HyperliquidAccountMovementKind::ExternalWithdrawal => {
+                HyperliquidAccountMovementKind::ExternalWithdrawal
+                | HyperliquidAccountMovementKind::InternalTransfer
+                    if movement.kind == HyperliquidAccountMovementKind::ExternalWithdrawal
+                        || transfer_withdrawal =>
+                {
                     let amount = positive_usdc_micros(movement.amount.abs())?;
                     record_boundary_balance_effect(
                         &mut boundary_balance_effects,
@@ -868,8 +923,34 @@ impl SignerFreeRuntime {
                     movement_ledger_events.push(LedgerEvent {
                         event_id: movement.event_id.clone(),
                         occurred_at,
-                        kind: LedgerEventKind::AuthoritativeWithdrawal {
-                            amount_usdc: amount,
+                        kind: if transfer_withdrawal {
+                            let route = route.ok_or_else(|| {
+                                RuntimeError::InvalidCycle(
+                                    "transfer withdrawal route missing".into(),
+                                )
+                            })?;
+                            let counterparty = movement.counterparty.as_ref().ok_or_else(|| {
+                                RuntimeError::InvalidCycle(
+                                    "internal withdrawal counterparty unavailable".into(),
+                                )
+                            })?;
+                            let validated =
+                                ParentFundingRoute::new(&route.execution_account, counterparty)
+                                    .map_err(|_| {
+                                        RuntimeError::InvalidCycle(
+                                            "invalid internal withdrawal counterparty".into(),
+                                        )
+                                    })?;
+                            LedgerEventKind::AuthoritativeTransferWithdrawal {
+                                unadmitted_allocations: Vec::new(),
+                                amount_usdc: amount,
+                                execution_account: validated.execution_account,
+                                counterparty: validated.parent_account,
+                            }
+                        } else {
+                            LedgerEventKind::AuthoritativeWithdrawal {
+                                amount_usdc: amount,
+                            }
                         },
                     });
                     let reconciled_at = self
@@ -888,6 +969,7 @@ impl SignerFreeRuntime {
                             |record| record.event.reconciled_at,
                         );
                     capital_events.push(CapitalEvent::Withdrawal(WithdrawalEvent {
+                        allow_unadmitted_funding: transfer_withdrawal,
                         event_id: movement.event_id.clone(),
                         amount_usdc: amount,
                         occurred_at,
@@ -900,6 +982,12 @@ impl SignerFreeRuntime {
                 }
                 HyperliquidAccountMovementKind::InternalTransfer
                 | HyperliquidAccountMovementKind::TradingRelated => {}
+                HyperliquidAccountMovementKind::ExternalDeposit
+                | HyperliquidAccountMovementKind::ExternalWithdrawal => {
+                    return Err(RuntimeError::InvalidCycle(
+                        "unhandled external movement".into(),
+                    ))
+                }
             }
         }
         for approval_id in input.approvals.0.keys() {
@@ -918,6 +1006,9 @@ impl SignerFreeRuntime {
                 &boundary_balance_effects,
             )?;
         let mut next_state = self.state.clone();
+        next_state
+            .parent_funding_route
+            .clone_from(&self.config.parent_funding_route);
         let mut ledger_events = Vec::new();
         let decision_result = if let Some(decision) = existing_decision {
             next_state.pacing.reconcile_capital_preserving_admissions(
@@ -934,6 +1025,7 @@ impl SignerFreeRuntime {
             ledger_events.extend(ordered_capital_ledger_events(
                 movement_ledger_events,
                 admission_events,
+                &next_state.pacing,
             ));
             Some(DecisionResult::Existing(decision))
         } else if boundary_replay_safe {
@@ -958,6 +1050,7 @@ impl SignerFreeRuntime {
             ledger_events.extend(ordered_capital_ledger_events(
                 boundary_movements,
                 boundary_admission_events,
+                &next_state.pacing,
             ));
             let boundary_pacing = next_state.pacing.clone();
             let decision_input = DecisionInput {
@@ -997,6 +1090,7 @@ impl SignerFreeRuntime {
             ledger_events.extend(ordered_capital_ledger_events(
                 later_movements,
                 later_admission_events,
+                &next_state.pacing,
             ));
             decision
         } else {
@@ -1014,6 +1108,7 @@ impl SignerFreeRuntime {
             ledger_events.extend(ordered_capital_ledger_events(
                 movement_ledger_events,
                 admission_events,
+                &next_state.pacing,
             ));
             None
         };
@@ -1099,6 +1194,10 @@ impl SignerFreeRuntime {
             boundary_balance_available: decision_evidence.boundary_balance_available,
         };
         let pending = PendingRuntimeCycle::new(input.observed_at, next_state, ledger_events)?;
+        let replayed = self
+            .ledger
+            .validate_append_batch(&pending_cycle_ledger_events(&pending))?;
+        ensure_capital_totals_match(&pending.body.state.pacing, &replayed)?;
         self.ensure_runtime_lock_current()?;
         write_private_json_atomic(
             self.config.state_directory.join(PENDING_CYCLE_FILE_NAME),
@@ -1271,6 +1370,25 @@ fn recover_pending_cycle(
     Ok(())
 }
 
+fn pending_cycle_ledger_events(pending: &PendingRuntimeCycle) -> Vec<LedgerEvent> {
+    let mut events = vec![LedgerEvent {
+        event_id: format!("runtime-cycle:{}:prepared", pending.cycle_hash),
+        occurred_at: pending.body.observed_at,
+        kind: LedgerEventKind::RuntimeCyclePrepared {
+            cycle_hash: pending.cycle_hash.clone(),
+        },
+    }];
+    events.extend(pending.body.ledger_events.iter().cloned());
+    events.push(LedgerEvent {
+        event_id: format!("runtime-cycle:{}:committed", pending.cycle_hash),
+        occurred_at: pending.body.observed_at,
+        kind: LedgerEventKind::RuntimeCycleCommitted {
+            cycle_hash: pending.cycle_hash.clone(),
+        },
+    });
+    events
+}
+
 fn commit_pending_cycle(
     config: &RuntimeConfig,
     limits: &PacingLimits,
@@ -1291,23 +1409,9 @@ fn commit_pending_cycle(
     {
         return Err(RuntimeError::PendingCycleConflict);
     }
-    ledger.append(LedgerEvent {
-        event_id: format!("runtime-cycle:{}:prepared", pending.cycle_hash),
-        occurred_at: pending.body.observed_at,
-        kind: LedgerEventKind::RuntimeCyclePrepared {
-            cycle_hash: pending.cycle_hash.clone(),
-        },
-    })?;
-    for event in &pending.body.ledger_events {
-        ledger.append(event.clone())?;
+    for event in pending_cycle_ledger_events(pending) {
+        ledger.append(event)?;
     }
-    ledger.append(LedgerEvent {
-        event_id: format!("runtime-cycle:{}:committed", pending.cycle_hash),
-        occurred_at: pending.body.observed_at,
-        kind: LedgerEventKind::RuntimeCycleCommitted {
-            cycle_hash: pending.cycle_hash.clone(),
-        },
-    })?;
     if !ledger.state().runtime_cycle_committed(&pending.cycle_hash) {
         return Err(RuntimeError::CorruptPendingCycle);
     }
@@ -1543,6 +1647,30 @@ fn capital_events_as_of(events: &[CapitalEvent], at: DateTime<Utc>) -> Vec<Capit
         .collect()
 }
 
+fn unique_ordered_movements(
+    movements: &[HyperliquidAccountMovement],
+) -> Result<Vec<&HyperliquidAccountMovement>, RuntimeError> {
+    let mut unique = BTreeMap::<&str, &HyperliquidAccountMovement>::new();
+    for movement in movements {
+        if let Some(previous) = unique.insert(&movement.event_id, movement) {
+            if previous.timestamp_ms != movement.timestamp_ms
+                || previous.kind != movement.kind
+                || previous.token != movement.token
+                || previous.amount != movement.amount
+                || previous.counterparty != movement.counterparty
+                || previous.transaction_hash != movement.transaction_hash
+            {
+                return Err(RuntimeError::InvalidCycle(
+                    "conflicting normalized movement ID".into(),
+                ));
+            }
+        }
+    }
+    let mut ordered = unique.into_values().collect::<Vec<_>>();
+    ordered.sort_by_key(|movement| (movement.timestamp_ms, &movement.event_id));
+    Ok(ordered)
+}
+
 fn validate_movement_range(
     movement: &HyperliquidAccountMovement,
     input: &RuntimeCycleInput<'_>,
@@ -1687,7 +1815,21 @@ fn admission_delta_events_between(
 fn ordered_capital_ledger_events(
     mut movement_events: Vec<LedgerEvent>,
     admission_events: Vec<LedgerEvent>,
+    pacing: &PacingState,
 ) -> Vec<LedgerEvent> {
+    for event in &mut movement_events {
+        if let LedgerEventKind::AuthoritativeTransferWithdrawal {
+            unadmitted_allocations,
+            ..
+        } = &mut event.kind
+        {
+            if let Some(record) = pacing.withdrawals().get(&event.event_id) {
+                if let Some(frozen) = &record.unadmitted_allocations {
+                    unadmitted_allocations.clone_from(frozen);
+                }
+            }
+        }
+    }
     movement_events.extend(admission_events);
     movement_events.sort_by(|left, right| {
         left.occurred_at
@@ -1702,9 +1844,11 @@ fn ordered_capital_ledger_events(
 
 fn capital_ledger_event_order(kind: &LedgerEventKind) -> u8 {
     match kind {
-        LedgerEventKind::AuthoritativeDeposit { .. } => 0,
+        LedgerEventKind::AuthoritativeDeposit { .. }
+        | LedgerEventKind::AuthoritativeParentFunding { .. } => 0,
         LedgerEventKind::DepositAdmission { .. } => 1,
-        LedgerEventKind::AuthoritativeWithdrawal { .. } => 2,
+        LedgerEventKind::AuthoritativeWithdrawal { .. }
+        | LedgerEventKind::AuthoritativeTransferWithdrawal { .. } => 2,
         _ => 3,
     }
 }

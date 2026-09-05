@@ -78,7 +78,13 @@ Timer/unit creation on a host remains a separate explicit approval gate.
 
 ## Capital and decision behavior
 
-- Only normalized external USDC deposits and withdrawals enter capital state.
+- By default, only normalized external USDC deposits and withdrawals enter
+  capital state. With `designated_parent_funding` enabled, positive USDC
+  internal transfers from the configured parent also enter as funding, and
+  negative USDC internal transfers with valid distinct counterparties enter as
+  withdrawals. Recognition does not grant admission; see the
+  [parent-funding runbook](parent-funding.md) for route binding, return
+  allocation, and migration requirements.
 - A deposit remains confirmed-but-unallocated until its exact movement event
   ID appears in the separately reviewed admission artifact with confirmation
   and approval timestamps. Future confirmation/approval evidence is rejected
@@ -107,9 +113,12 @@ Timer/unit creation on a host remains a separate explicit approval gate.
   at that boundary. The balance API request start and response time form a
   closed uncertainty window. With complete movement coverage and no USDC
   movement inside that window, an observation before or after the boundary is
-  adjusted to the boundary by applying or reversing only normalized external
-  USDC deposits and withdrawals. An internal, trading-related, unknown, or
-  request-window movement makes the boundary balance unavailable and durably
+  adjusted to the boundary by applying or reversing normalized external USDC
+  deposits and withdrawals. With `designated_parent_funding` enabled, recognized
+  parent funding and valid internal withdrawals also participate in this
+  reconstruction using their signed USDC amounts. Internal transfers without
+  that mode, transfers that fail its route/counterparty checks, trading-related,
+  unknown, or request-window movements make the boundary balance unavailable and durably
   skips with `missing_capital_history`; the runtime never substitutes an
   unadjusted current balance. Deposits, withdrawals, confirmations, and
   approvals after the boundary are reconciled only after the boundary decision

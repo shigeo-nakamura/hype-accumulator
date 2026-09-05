@@ -237,7 +237,8 @@ async fn run_dry_run_cycle(
     let config = load_config(config_path, Some(security_policy_path))?;
     config.validate_signer_free_runtime(&ProcessEnvironment)?;
     let limits = PacingLimits::from_config(&config)?;
-    let runtime_config = RuntimeConfig::from_toml(&fs::read_to_string(runtime_config_path)?)?;
+    let runtime_config = RuntimeConfig::from_toml(&fs::read_to_string(runtime_config_path)?)?
+        .with_parent_funding_route(config.parent_funding_route(&ProcessEnvironment)?);
     let approvals_path = runtime_config.admission_approvals_path().to_path_buf();
     let signal_path = runtime_config.signal_snapshot_path().to_path_buf();
     let status_path = runtime_config.status_path().to_path_buf();

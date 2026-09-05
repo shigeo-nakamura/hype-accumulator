@@ -450,11 +450,11 @@ All gates are conjunctive and fail closed:
    `staking.enabled = false` is mandatory for every account kind and both dry-run
    and live configuration; there is no automatic-staking acknowledgement or
    signer mode.
-2. System-wide deployable capital originates from authoritative external USDC
+2. For `external_deposit_only` and `traced_parent_transfer`, system-wide deployable capital originates from authoritative external USDC
    movement history with a stable event ID. Raw balance delta, order
    holds/releases, fills, fees, internal transfers, dust, and reconciliation
    corrections never create new admitted capital.
-3. An authoritative transfer into an approved isolated execution account may
+3. In `traced_parent_transfer` mode, an authoritative transfer into an approved isolated execution account may
    create a child tranche only by inheriting an already confirmed and admitted
    parent-account deposit. The ledger binds stable parent-deposit and transfer
    IDs, approved source and destination accounts, and an amount no greater than
@@ -462,18 +462,26 @@ All gates are conjunctive and fail closed:
    residual, including its originating admission-allocation IDs, to the child's
    `uncommitted` state exactly once; replay is idempotent, no admission counter is
    incremented, and system-wide admitted capital is unchanged.
-4. An untraced, mismatched, duplicate, or excess internal transfer remains visible
+4. In that inheritance mode, an untraced, mismatched, duplicate, or excess internal transfer remains visible
    but unallocated and halts new purchases pending reconciliation. Parent
    inheritance is disabled unless the approved funding mode and parent-account
    identity are explicitly configured. At startup the configured environment
    name is resolved to a canonical validated account address and included in the
    effective-policy digest before the acknowledgement is checked. Valid live
    combinations are
-   `external_deposit_only` with inheritance disabled and no parent, or
-   `traced_parent_transfer` with inheritance enabled and a non-empty approved
-   parent-account environment name; every other combination is rejected.
+   - `external_deposit_only`: inheritance disabled and no parent identity.
+   - `traced_parent_transfer`: inheritance enabled and a non-empty approved
+     parent-account environment name, using the conserved parent-allocation
+     contract above.
+   - `designated_parent_funding`: `execution_account_kind = "subaccount"`,
+     inheritance disabled, and a non-empty approved parent-account environment
+     name. This uses the separate account-local contract below; the resolved
+     parent and execution identities must be valid and distinct.
+
+   Every other combination is rejected. All three modes remain subject to the
+   other live gates; selecting a funding mode alone cannot authorize trading.
 5. Admission is the only transition that consumes yearly or lifetime
-   deployable-capital room. One serializable transaction locks a confirmed
+   deployable-capital room. For external-origin capital, one serializable transaction locks a confirmed
    external movement's stable ID and the current `utc_calendar_year_v1` plus
    lifetime admission-allocation rows, moves an exact amount from
    `confirmed_unallocated` to a tranche's `uncommitted` state, and increments
@@ -797,3 +805,21 @@ Before production secrets or funds are present, attach evidence for:
 - Hyperliquid, [Exchange endpoint](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/exchange-endpoint)
 - Hyperliquid, [Staking](https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/staking)
 - Hyperliquid, [Sub-accounts](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/sub-accounts)
+
+## Explicit account-local parent funding mode
+
+`designated_parent_funding` is a separate funding contract for a dedicated
+subaccount that receives operating capital from a designated main account.
+Positive authoritative USDC transfers from that exact source can originate
+account-local funding tranches. Each separately approved admission consumes the
+subaccount's annual and cumulative room once; it does not claim to inherit or
+conserve a parent ledger's allocation IDs. Existing external-only and traced
+inheritance contracts above remain unchanged. Parent and child capital metrics
+must not be summed as system-wide admission under this mode.
+
+The parent identity and mode are bound into the effective policy acknowledgement.
+The runtime persists the route in its authenticated state and refuses a changed
+or removed route. Transfers remain a distinct audit event, and outgoing transfers
+reduce available capital without refunding admission counters. Confirmation,
+admission evidence, cooldown, caps, and one decision per day remain required.
+See [the parent funding runbook](../runbooks/parent-funding.md).
