@@ -38,10 +38,16 @@ currently pending `SubmitOrder` read directly from a `DurableWorkflow` into an
 exact IOC request, and perform read-only reconciliation using that same
 journal-backed action's CLOID and identity bindings. The adapter never accepts
 a caller-constructed or cloned action for submission.
-It has no CLI, scheduler, config or secret loader, retry loop, staking action,
-deployment path, or live authorization. The default build does not expose the
-module. After any submission attempt, including any error, the durable action
-is reconciliation-only and must never be submitted again.
+The feature-gated `hype-live-probe` CLI provides operator-supervised `prepare`
+and `submit`, plus signer-free `reconcile` for a failed or interrupted attempt.
+The default build does not expose the module. After any submission attempt,
+including any error, the durable action is reconciliation-only and must never
+be submitted again. `submit` attempts a CLOID lookup even when submission
+fails; the standalone recovery command needs no KMS decrypt, active signing
+key, or unexpired live acknowledgement. Neither lookup records durable order
+finality or authorizes another purchase. See
+[the recovery runbook](docs/runbooks/live-probe-recovery.md).
+This remains a first-purchase probe, with no scheduled live or staking path.
 
 ## Offline fixed-DCA fallback
 

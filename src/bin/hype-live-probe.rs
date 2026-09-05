@@ -25,7 +25,7 @@ use dex_connector::{HyperliquidAccountConfig, HyperliquidConnector, HyperliquidC
 use hype_accumulator::{
     config::{Config, ProcessEnvironment},
     live_decision::prepare_first_live_order_workflow,
-    live_probe::{HyperliquidLiveProbe, LiveProbeBinding},
+    live_probe::{reconcile_prepared_order, HyperliquidLiveProbe, LiveProbeBinding},
     monitor::{trade_cadence_label, HypeAttribution, HyperliquidObserver},
     order_envelope::OrderEnvelopeFreshnessPolicy,
     pacing::PacingLimits,
@@ -186,10 +186,17 @@ impl PrepareTimeBinding {
 const USAGE: &str = "usage:\n  hype-live-probe prepare <config.toml> <security-policy.toml> \
      <runtime-config.toml> <operational.toml> <journal.jsonl>\n  hype-live-probe submit \
      <config.toml> <security-policy.toml> <operational.toml> <journal.jsonl> --confirm \
-     <client_order_id>";
+     <client_order_id>\n  hype-live-probe reconcile <config.toml> <security-policy.toml> \
+     <operational.toml> <journal.jsonl>";
 
 #[derive(Debug, Eq, PartialEq)]
 enum Invocation {
+    Reconcile {
+        config_path: String,
+        security_policy_path: String,
+        operational_params_path: String,
+        journal_path: String,
+    },
     Prepare {
         config_path: String,
         security_policy_path: String,
@@ -212,6 +219,17 @@ where
 {
     let args = args.collect::<Vec<_>>();
     match args.as_slice() {
+        [command, config_path, security_policy_path, operational_params_path, journal_path]
+            if command == "reconcile" =>
+        {
+            Ok(Invocation::Reconcile {
+                config_path: config_path.clone(),
+                security_policy_path: security_policy_path.clone(),
+                operational_params_path: operational_params_path.clone(),
+                journal_path: journal_path.clone(),
+            })
+        }
+
         [command, config_path, security_policy_path, runtime_config_path, operational_params_path, journal_path]
             if command == "prepare" =>
         {
@@ -240,6 +258,21 @@ where
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match invocation(env::args().skip(1))? {
+        Invocation::Reconcile {
+            config_path,
+            security_policy_path,
+            operational_params_path,
+            journal_path,
+        } => {
+            reconcile(
+                &config_path,
+                &security_policy_path,
+                &operational_params_path,
+                &journal_path,
+            )
+            .await
+        }
+
         Invocation::Prepare {
             config_path,
             security_policy_path,
@@ -458,11 +491,84 @@ async fn submit(
     let probe =
         HyperliquidLiveProbe::new(connector, probe_binding, effective.max_purchase_fee_bps)?;
 
-    let submission = probe.submit(&workflow, now).await?;
-    println!("mode=submitted {submission:#?}");
-    let reconciliation = probe.reconcile(&workflow).await?;
-    println!("mode=reconciled {reconciliation:#?}");
+    // KMS decryption may have consumed the prepared order's short lifetime.
+    // Never authorize submission using the clock captured before that I/O.
+    let submission = probe.submit(&workflow, Utc::now()).await;
+    match &submission {
+        Ok(receipt) => println!("mode=submitted {receipt:#?}"),
+        Err(_) => eprintln!(
+            "submission failed or is ambiguous; reconciling the durable CLOID; do not resubmit"
+        ),
+    }
+    // Even a transport error may follow venue acceptance. Recovery must run
+    // after every attempt, without allowing a second economic request.
+    let reconciliation = probe.reconcile(&workflow).await;
+    match &reconciliation {
+        Ok(observation) => print_observation(observation)?,
+        Err(_) => eprintln!(
+            "reconciliation unavailable; run the signer-free reconcile command; do not resubmit"
+        ),
+    }
+    submission?;
+    reconciliation?;
     Ok(())
+}
+
+fn print_observation(
+    observation: &hype_accumulator::live_probe::ProbeReconciliation,
+) -> Result<(), serde_json::Error> {
+    println!("mode=reconciled durable_finality=false retry_authorized=false");
+    println!("{}", serde_json::to_string(observation)?);
+    Ok(())
+}
+
+async fn reconcile(
+    config_path: &str,
+    security_policy_path: &str,
+    operational_params_path: &str,
+    journal_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = load_config(config_path, security_policy_path)?;
+    let operational = OperationalParams::from_toml(&fs::read_to_string(operational_params_path)?)?;
+    PrepareTimeBinding::verify(
+        journal_path,
+        &PrepareTimeBinding::resolved(&config, &operational)?,
+    )?;
+    let binding = DurableWorkflow::peek_committed_binding(journal_path)?
+        .ok_or("no committed workflow; reconciliation never prepares a new order")?;
+    let (protected_head_store, owner_store) = build_stores(journal_path)?;
+    let workflow =
+        DurableWorkflow::open_or_create(journal_path, &binding, protected_head_store, owner_store)?;
+    // Deliberately do not validate live approval or load/decrypt the signer.
+    // An expired approval and a revoked key must not prevent read-only recovery.
+    let connector = build_read_only_connector(&config, &operational, &ProcessEnvironment)?;
+    let observation = reconcile_prepared_order(&connector, &workflow).await?;
+    print_observation(&observation)?;
+    Ok(())
+}
+
+fn build_read_only_connector<E: hype_accumulator::config::Environment>(
+    config: &Config,
+    operational: &OperationalParams,
+    environment: &E,
+) -> Result<HyperliquidConnector, Box<dyn std::error::Error>> {
+    let account_address = config.observation_account(environment)?;
+    HyperliquidConnector::new(HyperliquidConnectorConfig {
+        base_url: config.hyperliquid.endpoint.clone(),
+        tracked_symbols: Vec::new(),
+    })
+    .map_err(box_error)?
+    .with_account(HyperliquidAccountConfig {
+        account_address,
+        signer_private_key: None,
+        vault_address: None,
+        is_mainnet: operational.is_mainnet,
+        nonce_state_path: None,
+        max_taker_notional: None,
+        max_taker_slippage_bps: None,
+        max_taker_book_age_ms: operational.max_taker_book_age_ms,
+    })
+    .map_err(box_error)
 }
 
 fn load_config(
@@ -592,6 +698,60 @@ mod tests {
                 journal_path: "journal.jsonl".to_owned(),
                 confirm_client_order_id: "0xabc123".to_owned(),
             })
+        );
+    }
+
+    #[test]
+    fn recovery_accepts_no_confirmation_or_runtime_arguments() {
+        assert!(matches!(
+            invocation(args(&[
+                "reconcile",
+                "config.toml",
+                "policy.toml",
+                "operational.toml",
+                "journal.jsonl"
+            ])),
+            Ok(Invocation::Reconcile { .. })
+        ));
+        assert!(invocation(args(&[
+            "reconcile",
+            "config.toml",
+            "policy.toml",
+            "operational.toml",
+            "journal.jsonl",
+            "--confirm",
+            "0xabc123"
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn read_only_recovery_never_reads_signing_material_or_requires_live_approval() {
+        struct AccountOnly;
+        impl hype_accumulator::config::Environment for AccountOnly {
+            fn get(&self, name: &str) -> Option<String> {
+                assert_eq!(
+                    name, "HYPE_ACCOUNT_ID",
+                    "recovery tried to read signing material"
+                );
+                Some("0x1111111111111111111111111111111111111111".to_owned())
+            }
+        }
+        let config =
+            hype_accumulator::config::Config::from_toml(include_str!("../../config/example.toml"))
+                .unwrap();
+        assert!(config.manual_halt);
+        assert!(!config.live_approved);
+        let operational = super::OperationalParams::from_toml(include_str!(
+            "../../config/live-probe-operational.example.toml"
+        ))
+        .unwrap();
+        let connector =
+            super::build_read_only_connector(&config, &operational, &AccountOnly).unwrap();
+        assert!(connector.api_wallet_address().is_err());
+        assert_eq!(
+            connector.execution_account_address().unwrap(),
+            "0x1111111111111111111111111111111111111111"
         );
     }
 
