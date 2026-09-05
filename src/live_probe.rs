@@ -101,7 +101,7 @@ pub struct ProbeSubmission {
     pub exchange_order_id: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct ProbeReconciliation {
     pub client_order_id: String,
     pub exchange_order_id: Option<String>,
@@ -292,6 +292,54 @@ impl HyperliquidLiveProbe {
             .await?;
         reconciliation_from_connector(evidence, *hype_atoms_per_hype)
     }
+}
+
+/// Reads the prepared order's exact CLOID using only its execution account.
+///
+/// No signer, nonce reservation, or live approval is needed: recovery must
+/// remain possible after key revocation, a manual halt, or approval expiry.
+/// This observation is not durable order finality or proof of absence. It
+/// never releases capital, authorizes a retry, or advances staking eligibility.
+///
+/// # Errors
+///
+/// Rejects an account/market mismatch before contacting the venue, and
+/// propagates invalid quantities, journal failures, and transport errors.
+pub async fn reconcile_prepared_order(
+    connector: &HyperliquidConnector,
+    workflow: &DurableWorkflow,
+) -> Result<ProbeReconciliation, LiveProbeError> {
+    reconcile_action_read_only(connector, workflow.pending_prepared_order()?).await
+}
+
+async fn reconcile_action_read_only(
+    connector: &HyperliquidConnector,
+    action: &ExternalAction,
+) -> Result<ProbeReconciliation, LiveProbeError> {
+    let ExternalAction::SubmitOrder {
+        execution_identity_hash,
+        market_metadata_digest,
+        client_order_id,
+        hype_atoms_per_hype,
+        ..
+    } = action
+    else {
+        return Err(LiveProbeError::NotOrder);
+    };
+    let account = connector.execution_account_address()?;
+    if *execution_identity_hash != identity_hash(EXECUTION_IDENTITY_DOMAIN, account) {
+        return Err(LiveProbeError::BindingMismatch("execution identity"));
+    }
+    if *market_metadata_digest != crate::hype_asset::hype_usdc_market_metadata_digest() {
+        return Err(LiveProbeError::BindingMismatch("market metadata"));
+    }
+    let evidence = connector
+        .reconcile_order_by_client_id(client_order_id)
+        .await?;
+    if evidence.client_order_id != *client_order_id {
+        return Err(LiveProbeError::BindingMismatch("client order ID"));
+    }
+    reconciliation_from_connector(evidence, *hype_atoms_per_hype)
 }
 
 impl PreparedIocOrder {
@@ -645,6 +693,154 @@ mod tests {
             HyperliquidLiveProbe::new(connector, stale, 50),
             Err(LiveProbeError::BindingMismatch("signer identity"))
         ));
+    }
+
+    fn unsigned_connector(base_url: String) -> HyperliquidConnector {
+        HyperliquidConnector::new(HyperliquidConnectorConfig {
+            base_url,
+            tracked_symbols: Vec::new(),
+        })
+        .unwrap()
+        .with_account(HyperliquidAccountConfig {
+            account_address: "0x1111111111111111111111111111111111111111".to_owned(),
+            signer_private_key: None,
+            vault_address: None,
+            is_mainnet: false,
+            nonce_state_path: None,
+            max_taker_notional: None,
+            max_taker_slippage_bps: None,
+            max_taker_book_age_ms: 1000,
+        })
+        .unwrap()
+    }
+
+    fn read_only_action(connector: &HyperliquidConnector) -> ExternalAction {
+        let mut action = order();
+        if let ExternalAction::SubmitOrder {
+            execution_identity_hash,
+            market_metadata_digest,
+            ..
+        } = &mut action
+        {
+            *execution_identity_hash = identity_hash(
+                EXECUTION_IDENTITY_DOMAIN,
+                connector.execution_account_address().unwrap(),
+            );
+            *market_metadata_digest = crate::hype_asset::hype_usdc_market_metadata_digest();
+        }
+        action
+    }
+
+    #[tokio::test]
+    async fn unsigned_recovery_rejects_wrong_account_and_market_before_network() {
+        let connector = unsigned_connector("http://127.0.0.1:1".to_owned());
+        assert!(matches!(
+            reconcile_action_read_only(&connector, &order()).await,
+            Err(LiveProbeError::BindingMismatch("execution identity"))
+        ));
+        let mut wrong_market = read_only_action(&connector);
+        if let ExternalAction::SubmitOrder {
+            market_metadata_digest,
+            ..
+        } = &mut wrong_market
+        {
+            *market_metadata_digest = "other-market".to_owned();
+        }
+        assert!(matches!(
+            reconcile_action_read_only(&connector, &wrong_market).await,
+            Err(LiveProbeError::BindingMismatch("market metadata"))
+        ));
+    }
+
+    // Capture the full HTTP body rather than assuming one TCP read contains it.
+    async fn unsigned_lookup_fixture(status: serde_json::Value) -> ProbeReconciliation {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connector = unsigned_connector(format!("http://{}", listener.local_addr().unwrap()));
+        assert!(connector.api_wallet_address().is_err());
+        let action = read_only_action(&connector);
+        let server = tokio::spawn(async move {
+            for request_type in ["userFillsByTime", "orderStatus"] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut data = Vec::new();
+                let (header_end, length) = loop {
+                    let mut buffer = [0; 2048];
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    data.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = data.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&data[..end]);
+                        assert!(headers.starts_with("POST /info HTTP/1.1"));
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (key, value) = line.split_once(':')?;
+                                key.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse().unwrap())
+                            })
+                            .unwrap();
+                        break (end + 4, length);
+                    }
+                };
+                while data.len() < header_end + length {
+                    let mut buffer = [0; 2048];
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    data.extend_from_slice(&buffer[..count]);
+                }
+                let request: serde_json::Value =
+                    serde_json::from_slice(&data[header_end..header_end + length]).unwrap();
+                assert_eq!(request["type"], request_type);
+                assert_eq!(
+                    request["user"],
+                    "0x1111111111111111111111111111111111111111"
+                );
+                assert!(request.get("signature").is_none());
+                assert!(request.get("action").is_none());
+                if request_type == "orderStatus" {
+                    assert_eq!(request["oid"], "0x00112233445566778899aabbccddeeff");
+                }
+                let body = if request_type == "orderStatus" {
+                    status.to_string()
+                } else {
+                    "[]".to_owned()
+                };
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let observed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reconcile_action_read_only(&connector, &action),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+        observed
+    }
+
+    #[tokio::test]
+    async fn unsigned_recovery_reads_exact_cloid_after_expiry_without_signer() {
+        let observed = unsigned_lookup_fixture(serde_json::json!({
+            "status": "order", "order": {
+                "order": {"oid": 42, "origSz": "1", "sz": "0.25"},
+                "status": "canceled"
+            }
+        }))
+        .await;
+        assert_eq!(observed.exchange_order_id.as_deref(), Some("42"));
+        assert_eq!(observed.filled_hype.as_atoms(), 75_000_000);
+        assert_eq!(observed.remaining_hype.as_atoms(), 25_000_000);
+        assert_eq!(observed.status, "canceled");
+    }
+
+    #[tokio::test]
+    async fn unsigned_unknown_cloid_remains_unknown_not_finalized_or_retryable() {
+        let observed = unsigned_lookup_fixture(serde_json::json!({"status": "unknownOid"})).await;
+        assert_eq!(observed.status, "unknownOid");
+        assert_eq!(observed.exchange_order_id, None);
+        assert!(observed.filled_hype.is_zero());
     }
 
     #[test]
