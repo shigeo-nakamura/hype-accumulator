@@ -469,9 +469,17 @@ All gates are conjunctive and fail closed:
    name is resolved to a canonical validated account address and included in the
    effective-policy digest before the acknowledgement is checked. Valid live
    combinations are
-   `external_deposit_only` with inheritance disabled and no parent, or
-   `traced_parent_transfer` with inheritance enabled and a non-empty approved
-   parent-account environment name; every other combination is rejected.
+   - `external_deposit_only`: inheritance disabled and no parent identity.
+   - `traced_parent_transfer`: inheritance enabled and a non-empty approved
+     parent-account environment name, using the conserved parent-allocation
+     contract above.
+   - `designated_parent_funding`: `execution_account_kind = "subaccount"`,
+     inheritance disabled, and a non-empty approved parent-account environment
+     name. This uses the separate account-local contract below; the resolved
+     parent and execution identities must be valid and distinct.
+
+   Every other combination is rejected. All three modes remain subject to the
+   other live gates; selecting a funding mode alone cannot authorize trading.
 5. Admission is the only transition that consumes yearly or lifetime
    deployable-capital room. For external-origin capital, one serializable transaction locks a confirmed
    external movement's stable ID and the current `utc_calendar_year_v1` plus
