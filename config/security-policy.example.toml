@@ -50,10 +50,13 @@ hot_balance_worst_case_headroom_microusd = 0
 hot_balance_enforcement_evidence_sha256 = ""
 hot_balance_enforcement_change_ref = ""
 # Safe default: only direct external deposits can originate admitted capital.
-# The only alternative is "traced_parent_transfer" with explicit approval.
+# "traced_parent_transfer" inherits existing parent allocations.
+# "designated_parent_funding" instead admits account-local funding from one main
+# account, requires subaccount + parent env + inheritance=false, and must not be
+# presented as conservation of system-wide parent/child admission counters.
 funding_mode = "external_deposit_only"
 allow_traced_parent_transfer_admission = false
-# Empty disables inheritance; never place an account address in this file. In
+# Empty disables parent funding/inheritance; never place an account address in this file. In
 # live mode the named variable must resolve at startup to a valid canonical
 # account address. The resolved value (not only this name) is included in the
 # effective-policy digest covered by the live acknowledgement.

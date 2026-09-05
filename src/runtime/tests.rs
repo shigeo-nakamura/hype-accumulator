@@ -1709,3 +1709,267 @@ fn f64_usdc_micros_rejects_non_finite_or_negative() {
 fn f64_usdc_micros_rejects_overflow() {
     assert!(f64_usdc_micros(f64::MAX).is_err());
 }
+
+const FUNDING_CHILD: &str = "0x1111111111111111111111111111111111111111";
+const FUNDING_PARENT: &str = "0x2222222222222222222222222222222222222222";
+
+fn parent_route() -> ParentFundingRoute {
+    ParentFundingRoute::new(FUNDING_CHILD, FUNDING_PARENT).expect("funding route")
+}
+
+fn parent_transfer(id: &str, timestamp: DateTime<Utc>, amount: u64) -> HyperliquidAccountMovement {
+    let mut value = deposit(id, timestamp, amount);
+    value.kind = HyperliquidAccountMovementKind::InternalTransfer;
+    value.counterparty = Some(FUNDING_PARENT.to_owned());
+    value
+}
+
+fn funding_cycle(
+    runtime: &mut SignerFreeRuntime,
+    now: DateTime<Utc>,
+    movements: &[HyperliquidAccountMovement],
+    admissions: &AdmissionApprovals,
+    balance: f64,
+) -> Result<RuntimeCycleReport, RuntimeError> {
+    runtime.apply_cycle(RuntimeCycleInput {
+        observed_at: now,
+        scan_start_ms: runtime.next_scan_start_ms(),
+        scan_end_ms: ms(now),
+        movements,
+        approvals: admissions,
+        signal: None,
+        accumulator: status(now, balance),
+        capital_history_complete: true,
+        manual_pause: true,
+        api_errors: 0,
+    })
+}
+
+#[test]
+fn parent_funding_is_visible_but_not_admitted_without_confirmation_and_approval() {
+    let directory = tempfile::tempdir().unwrap();
+    let start = at(2026, 7, 6, 8, 0);
+    let now = at(2026, 7, 6, 12, 0);
+    let cfg = config(directory.path(), ms(start)).with_parent_funding_route(Some(parent_route()));
+    let mut runtime = SignerFreeRuntime::open(cfg, limits()).unwrap();
+    let movement = parent_transfer("parent-funds", start + TimeDelta::hours(1), 100);
+    let report = funding_cycle(
+        &mut runtime,
+        now,
+        &[movement],
+        &AdmissionApprovals::default(),
+        100.0,
+    )
+    .unwrap();
+    assert!(report.capital_history_complete);
+    assert_eq!(
+        runtime.ledger.state().authoritative_deposits_usdc(),
+        Some(usd(100))
+    );
+    assert_eq!(runtime.ledger.state().admitted_usdc(), usd(0));
+    let journal = fs::read_to_string(directory.path().join("state/ledger/ledger.jsonl")).unwrap();
+    assert!(journal.contains("authoritative_parent_funding"));
+    assert!(!journal.contains("authoritative_deposit"));
+}
+
+#[test]
+fn parent_funding_replay_and_restart_do_not_double_admit_and_bind_route() {
+    let directory = tempfile::tempdir().unwrap();
+    let start = at(2026, 7, 6, 8, 0);
+    let now = at(2026, 7, 6, 12, 0);
+    let cfg = config(directory.path(), ms(start)).with_parent_funding_route(Some(parent_route()));
+    let movement = parent_transfer("parent-funds", start + TimeDelta::hours(1), 100);
+    let admission = approvals(
+        "parent-funds",
+        start + TimeDelta::hours(1),
+        start + TimeDelta::hours(1),
+    );
+    let mut runtime = SignerFreeRuntime::open(cfg.clone(), limits()).unwrap();
+    funding_cycle(
+        &mut runtime,
+        now,
+        &[movement.clone(), movement.clone()],
+        &admission,
+        100.0,
+    )
+    .unwrap();
+    assert_eq!(runtime.ledger.state().admitted_usdc(), usd(100));
+    drop(runtime);
+    let mut runtime = SignerFreeRuntime::open(cfg.clone(), limits()).unwrap();
+    funding_cycle(
+        &mut runtime,
+        now + TimeDelta::minutes(5),
+        &[movement],
+        &admission,
+        100.0,
+    )
+    .unwrap();
+    assert_eq!(runtime.ledger.state().admitted_usdc(), usd(100));
+    assert_eq!(runtime.state.pacing.deposits().len(), 1);
+    drop(runtime);
+    assert!(SignerFreeRuntime::open(cfg.with_parent_funding_route(None), limits()).is_err());
+    let changed =
+        ParentFundingRoute::new(FUNDING_CHILD, "0x3333333333333333333333333333333333333333")
+            .unwrap();
+    assert!(SignerFreeRuntime::open(
+        config(directory.path(), ms(start)).with_parent_funding_route(Some(changed)),
+        limits()
+    )
+    .is_err());
+}
+
+#[test]
+fn parent_funding_wrong_or_missing_sender_and_self_transfer_fail_closed() {
+    for sender in [
+        None,
+        Some(FUNDING_CHILD),
+        Some("0x3333333333333333333333333333333333333333"),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let start = at(2026, 7, 6, 8, 0);
+        let cfg =
+            config(directory.path(), ms(start)).with_parent_funding_route(Some(parent_route()));
+        let mut runtime = SignerFreeRuntime::open(cfg, limits()).unwrap();
+        let mut movement = parent_transfer("untrusted", start + TimeDelta::hours(1), 100);
+        movement.counterparty = sender.map(str::to_owned);
+        let report = funding_cycle(
+            &mut runtime,
+            at(2026, 7, 6, 12, 0),
+            &[movement],
+            &AdmissionApprovals::default(),
+            100.0,
+        )
+        .unwrap();
+        assert!(!report.capital_history_complete);
+        assert!(runtime.state.pacing.deposits().is_empty());
+        assert_eq!(runtime.ledger.state().admitted_usdc(), usd(0));
+    }
+}
+
+#[test]
+fn parent_funding_withdrawal_reduces_capital_and_redeposit_does_not_reset_year_cap() {
+    let directory = tempfile::tempdir().unwrap();
+    let start = at(2026, 7, 6, 8, 0);
+    let now = at(2026, 7, 6, 12, 0);
+    let cfg = config(directory.path(), ms(start)).with_parent_funding_route(Some(parent_route()));
+    let mut cap = limits();
+    cap.max_automatically_admitted_usdc = usd(100_000);
+    cap.yearly_admission_cap_usdc = usd(100_000);
+    cap.cumulative_admission_cap_usdc = usd(100_000);
+    cap.max_daily_notional_usdc = usd(300);
+    let mut runtime = SignerFreeRuntime::open(cfg, cap).unwrap();
+    let received = start + TimeDelta::hours(1);
+    let first = parent_transfer("first", received, 100_000);
+    let admission = approvals("first", received, received);
+    funding_cycle(
+        &mut runtime,
+        now,
+        std::slice::from_ref(&first),
+        &admission,
+        100_000.0,
+    )
+    .unwrap();
+    let mut outgoing = parent_transfer("return", now + TimeDelta::minutes(1), 10_000);
+    outgoing.amount = -outgoing.amount;
+    funding_cycle(
+        &mut runtime,
+        now + TimeDelta::minutes(2),
+        &[first, outgoing],
+        &admission,
+        90_000.0,
+    )
+    .unwrap();
+    assert_eq!(runtime.ledger.state().deployable_usdc(), usd(90_000));
+    let received = now + TimeDelta::minutes(3);
+    let again = parent_transfer("again", received, 10_000);
+    let admission = approvals("again", received, received);
+    funding_cycle(
+        &mut runtime,
+        now + TimeDelta::minutes(5),
+        &[again],
+        &admission,
+        100_000.0,
+    )
+    .unwrap();
+    assert_eq!(runtime.ledger.state().admitted_usdc(), usd(100_000));
+    assert_eq!(runtime.ledger.state().deployable_usdc(), usd(90_000));
+    assert_eq!(
+        runtime.state.pacing.deposits()["again"].admitted_usdc,
+        usd(0)
+    );
+}
+
+#[test]
+fn parent_funding_respects_300_daily_cap_and_late_funding_cannot_create_second_purchase() {
+    let directory = tempfile::tempdir().unwrap();
+    let start = at(2026, 7, 6, 8, 0);
+    let now = at(2026, 7, 6, 12, 0);
+    let cfg = config(directory.path(), ms(start)).with_parent_funding_route(Some(parent_route()));
+    let mut cap = limits();
+    cap.max_automatically_admitted_usdc = usd(100_000);
+    cap.yearly_admission_cap_usdc = usd(100_000);
+    cap.cumulative_admission_cap_usdc = usd(100_000);
+    cap.max_daily_notional_usdc = usd(300);
+    let mut runtime = SignerFreeRuntime::open(cfg, cap).unwrap();
+    let received = start + TimeDelta::hours(1);
+    let movement = parent_transfer("initial-capital", received, 90_000);
+    let admission = approvals("initial-capital", received, received);
+    let signal = signal(now);
+    let first = runtime
+        .apply_cycle(RuntimeCycleInput {
+            observed_at: now,
+            scan_start_ms: ms(start),
+            scan_end_ms: ms(now),
+            movements: std::slice::from_ref(&movement),
+            approvals: &admission,
+            signal: Some(&signal),
+            accumulator: status(now, 90_000.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+        })
+        .unwrap();
+    assert_eq!(first.decision().unwrap().planned_usdc, usd(300));
+    let received = now + TimeDelta::minutes(1);
+    let late = parent_transfer("late-capital", received, 10_000);
+    let admission = approvals("late-capital", received, received);
+    let next = funding_cycle(
+        &mut runtime,
+        now + TimeDelta::minutes(5),
+        &[movement, late],
+        &admission,
+        100_000.0,
+    )
+    .unwrap();
+    assert!(!next.is_new_decision());
+    assert_eq!(next.decision().unwrap(), first.decision().unwrap());
+    assert_eq!(runtime.ledger.state().admitted_usdc(), usd(100_000));
+    assert_eq!(runtime.state.dry_run_actions_total, 1);
+}
+
+#[test]
+fn parent_funding_malformed_withdrawal_is_rejected_before_any_pending_commit() {
+    let directory = tempfile::tempdir().unwrap();
+    let start = at(2026, 7, 6, 8, 0);
+    let cfg = config(directory.path(), ms(start)).with_parent_funding_route(Some(parent_route()));
+    let mut runtime = SignerFreeRuntime::open(cfg, limits()).unwrap();
+    for sender in [None, Some("not-an-account"), Some(FUNDING_CHILD)] {
+        let mut movement = parent_transfer("bad-withdrawal", start + TimeDelta::hours(1), 10);
+        movement.amount = -movement.amount;
+        movement.counterparty = sender.map(str::to_owned);
+        assert!(funding_cycle(
+            &mut runtime,
+            at(2026, 7, 6, 12, 0),
+            &[movement],
+            &AdmissionApprovals::default(),
+            0.0
+        )
+        .is_err());
+        assert!(!runtime
+            .config
+            .state_directory
+            .join(PENDING_CYCLE_FILE_NAME)
+            .exists());
+        assert!(runtime.ledger.state().last_event_at().is_none());
+    }
+}

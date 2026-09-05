@@ -75,6 +75,17 @@ pub enum LedgerEventKind {
     AuthoritativeDeposit {
         amount_usdc: UsdcMicros,
     },
+    /// Account-local capital input, distinct from an external deposit or inherited allocation.
+    AuthoritativeParentFunding {
+        amount_usdc: UsdcMicros,
+        parent_account: String,
+        execution_account: String,
+    },
+    AuthoritativeTransferWithdrawal {
+        amount_usdc: UsdcMicros,
+        execution_account: String,
+        counterparty: String,
+    },
     DepositAdmission {
         deposit_event_id: String,
         amount_usdc: UsdcMicros,
@@ -1033,7 +1044,8 @@ fn replay(events: &[LedgerEvent]) -> Result<ReplayState, LedgerError> {
 #[allow(clippy::too_many_lines)]
 fn apply_event(state: &mut ReplayState, event: &LedgerEvent) -> Result<(), LedgerError> {
     match &event.kind {
-        LedgerEventKind::AuthoritativeDeposit { amount_usdc } => {
+        LedgerEventKind::AuthoritativeDeposit { amount_usdc }
+        | LedgerEventKind::AuthoritativeParentFunding { amount_usdc, .. } => {
             state.deposits.insert(
                 event.event_id.clone(),
                 DepositReplay {
@@ -1047,7 +1059,8 @@ fn apply_event(state: &mut ReplayState, event: &LedgerEvent) -> Result<(), Ledge
             deposit_event_id,
             amount_usdc,
         } => record_deposit_admission(state, event.occurred_at, deposit_event_id, *amount_usdc)?,
-        LedgerEventKind::AuthoritativeWithdrawal { amount_usdc } => {
+        LedgerEventKind::AuthoritativeWithdrawal { amount_usdc }
+        | LedgerEventKind::AuthoritativeTransferWithdrawal { amount_usdc, .. } => {
             record_capital_timeline_entry(
                 state,
                 event.occurred_at,
@@ -1531,6 +1544,35 @@ fn require_unsettled_decision_backing(
 fn validate_event(event: &LedgerEvent) -> Result<(), LedgerError> {
     validate_id("event_id", &event.event_id)?;
     match &event.kind {
+        LedgerEventKind::AuthoritativeParentFunding {
+            amount_usdc,
+            parent_account,
+            execution_account,
+        }
+        | LedgerEventKind::AuthoritativeTransferWithdrawal {
+            amount_usdc,
+            counterparty: parent_account,
+            execution_account,
+        } => {
+            require_nonzero(*amount_usdc)?;
+            for account in [parent_account, execution_account] {
+                if account.len() != 42
+                    || !account.starts_with("0x")
+                    || !account[2..]
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                {
+                    return Err(LedgerError::CorruptLedger(
+                        "invalid funding account identity".into(),
+                    ));
+                }
+            }
+            if parent_account == execution_account {
+                return Err(LedgerError::CorruptLedger(
+                    "self funding is not capital".into(),
+                ));
+            }
+        }
         LedgerEventKind::AuthoritativeDeposit { amount_usdc }
         | LedgerEventKind::AuthoritativeWithdrawal { amount_usdc } => {
             require_nonzero(*amount_usdc)?;

@@ -934,3 +934,51 @@ fn effective_live_order_policy_rejects_a_digest_mismatched_acknowledgement() {
         ))
     ));
 }
+
+fn designated_parent_policy() -> String {
+    live_policy_template()
+        .replace(
+            "funding_mode = \"external_deposit_only\"",
+            "funding_mode = \"designated_parent_funding\"",
+        )
+        .replace(
+            "admitted_parent_account_env = \"\"",
+            "admitted_parent_account_env = \"HYPE_PARENT_ACCOUNT\"",
+        )
+        .replace(
+            "execution_account_kind = \"dedicated_master\"",
+            "execution_account_kind = \"subaccount\"",
+        )
+}
+
+#[test]
+fn designated_parent_funding_binds_the_source_and_rejects_inheritance_claims() {
+    let mut env = live_environment();
+    env.insert("HYPE_PARENT_ACCOUNT".to_owned(), PARENT_ACCOUNT.to_owned());
+    let policy = designated_parent_policy();
+    let cfg = config_with_policy(&policy);
+    assert!(cfg.parent_funding_route(&env).unwrap().is_some());
+    let acknowledged = acknowledged_policy(&policy, &env);
+    env.insert(
+        "HYPE_PARENT_ACCOUNT".to_owned(),
+        OTHER_PARENT_ACCOUNT.to_owned(),
+    );
+    assert_eq!(
+        config_with_policy(&acknowledged).validate_at(&env, at("2026-08-31T23:59:59Z")),
+        Err(ConfigError::SecurityPolicy(
+            SecurityPolicyError::AcknowledgementMismatch
+        ))
+    );
+    let bad = policy.replace(
+        "allow_traced_parent_transfer_admission = false",
+        "allow_traced_parent_transfer_admission = true",
+    );
+    assert!(config_with_policy(&bad).parent_funding_route(&env).is_err());
+    env.remove("HYPE_PARENT_ACCOUNT");
+    assert!(cfg.parent_funding_route(&env).is_err());
+    env.insert(
+        "HYPE_PARENT_ACCOUNT".to_owned(),
+        EXECUTION_ACCOUNT.to_owned(),
+    );
+    assert!(cfg.parent_funding_route(&env).is_err());
+}

@@ -6,6 +6,7 @@
 //! It deliberately has no order, staking, signing, or submission dependency.
 
 use crate::{
+    config::ParentFundingRoute,
     fs_safety::{normal_absolute_path, reject_linked_file, reject_multiple_links},
     ledger::{
         DurableLedger, LedgerError, LedgerEvent, LedgerEventKind, ProtectedAnchorStore,
@@ -205,6 +206,7 @@ pub struct RuntimeConfig {
     stuck_after_seconds: u64,
     account_observation_max_age_seconds: u64,
     signal_snapshot_stale_after_seconds: u64,
+    parent_funding_route: Option<ParentFundingRoute>,
 }
 
 impl RuntimeConfig {
@@ -278,6 +280,7 @@ impl RuntimeConfig {
             ));
         }
         Ok(Self {
+            parent_funding_route: None,
             state_directory: wire.state_directory,
             protected_anchor_path: wire.protected_anchor_path,
             admission_approvals_path: wire.admission_approvals_path,
@@ -291,6 +294,13 @@ impl RuntimeConfig {
             account_observation_max_age_seconds: wire.account_observation_max_age_seconds,
             signal_snapshot_stale_after_seconds: wire.signal_snapshot_stale_after_seconds,
         })
+    }
+
+    /// Binds funding recognition to startup-resolved policy identities.
+    #[must_use]
+    pub fn with_parent_funding_route(mut self, route: Option<ParentFundingRoute>) -> Self {
+        self.parent_funding_route = route;
+        self
     }
 
     #[must_use]
@@ -526,6 +536,8 @@ struct RuntimeState {
     dry_run_actions_total: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_committed_cycle_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent_funding_route: Option<ParentFundingRoute>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -590,6 +602,7 @@ impl RuntimeState {
             stale_signal_events_total: 0,
             dry_run_actions_total: 0,
             last_committed_cycle_hash: None,
+            parent_funding_route: None,
         }
     }
 }
@@ -682,6 +695,14 @@ impl SignerFreeRuntime {
         ensure_capital_totals_match(&state.pacing, ledger.state())?;
         ensure_runtime_head_matches(&state, ledger.state())?;
         ensure_runtime_state_authenticated(&config, &state, ledger.state())?;
+        if state.last_committed_cycle_hash.is_some()
+            && state.parent_funding_route != config.parent_funding_route
+        {
+            return Err(RuntimeError::InvalidConfig(
+                "funding identity changed; use an explicitly migrated separate runtime ledger"
+                    .into(),
+            ));
+        }
         Ok(Self {
             config,
             limits,
@@ -795,12 +816,28 @@ impl SignerFreeRuntime {
             let between_balance_and_boundary = scheduled_boundary.is_some_and(|boundary| {
                 boundary_balance_direction(occurred_at, balance_observed_at, boundary).is_some()
             });
+            let route = self.config.parent_funding_route.as_ref();
+            let internal_usdc = movement.kind == HyperliquidAccountMovementKind::InternalTransfer
+                && movement.token == "USDC";
+            let parent_funding = internal_usdc
+                && movement.amount > Decimal::ZERO
+                && route.is_some_and(|route| {
+                    movement.counterparty.as_deref() == Some(route.parent_account.as_str())
+                });
+            let transfer_withdrawal =
+                internal_usdc && movement.amount < Decimal::ZERO && route.is_some();
+            if internal_usdc && route.is_some() && !parent_funding && !transfer_withdrawal {
+                capital_history_complete = false;
+                boundary_balance_reconstructable = false;
+            }
             if matches!(
                 movement.kind,
                 HyperliquidAccountMovementKind::Unknown
                     | HyperliquidAccountMovementKind::InternalTransfer
                     | HyperliquidAccountMovementKind::TradingRelated
-            ) && (in_balance_request_window || between_balance_and_boundary)
+            ) && !parent_funding
+                && !transfer_withdrawal
+                && (in_balance_request_window || between_balance_and_boundary)
             {
                 boundary_balance_reconstructable = false;
             }
@@ -811,7 +848,11 @@ impl SignerFreeRuntime {
                 boundary_balance_reconstructable = false;
             }
             match movement.kind {
-                HyperliquidAccountMovementKind::ExternalDeposit => {
+                HyperliquidAccountMovementKind::ExternalDeposit
+                | HyperliquidAccountMovementKind::InternalTransfer
+                    if movement.kind == HyperliquidAccountMovementKind::ExternalDeposit
+                        || parent_funding =>
+                {
                     let amount = positive_usdc_micros(movement.amount)?;
                     record_boundary_balance_effect(
                         &mut boundary_balance_effects,
@@ -824,8 +865,19 @@ impl SignerFreeRuntime {
                     movement_ledger_events.push(LedgerEvent {
                         event_id: movement.event_id.clone(),
                         occurred_at,
-                        kind: LedgerEventKind::AuthoritativeDeposit {
-                            amount_usdc: amount,
+                        kind: if parent_funding {
+                            let route = route.ok_or_else(|| {
+                                RuntimeError::InvalidCycle("parent funding route missing".into())
+                            })?;
+                            LedgerEventKind::AuthoritativeParentFunding {
+                                amount_usdc: amount,
+                                parent_account: route.parent_account.clone(),
+                                execution_account: route.execution_account.clone(),
+                            }
+                        } else {
+                            LedgerEventKind::AuthoritativeDeposit {
+                                amount_usdc: amount,
+                            }
                         },
                     });
                     let approval = input.approvals.get(&movement.event_id);
@@ -855,7 +907,11 @@ impl SignerFreeRuntime {
                         new_authoritative_deposit_ids.insert(movement.event_id.clone());
                     }
                 }
-                HyperliquidAccountMovementKind::ExternalWithdrawal => {
+                HyperliquidAccountMovementKind::ExternalWithdrawal
+                | HyperliquidAccountMovementKind::InternalTransfer
+                    if movement.kind == HyperliquidAccountMovementKind::ExternalWithdrawal
+                        || transfer_withdrawal =>
+                {
                     let amount = positive_usdc_micros(movement.amount.abs())?;
                     record_boundary_balance_effect(
                         &mut boundary_balance_effects,
@@ -868,8 +924,33 @@ impl SignerFreeRuntime {
                     movement_ledger_events.push(LedgerEvent {
                         event_id: movement.event_id.clone(),
                         occurred_at,
-                        kind: LedgerEventKind::AuthoritativeWithdrawal {
-                            amount_usdc: amount,
+                        kind: if transfer_withdrawal {
+                            let route = route.ok_or_else(|| {
+                                RuntimeError::InvalidCycle(
+                                    "transfer withdrawal route missing".into(),
+                                )
+                            })?;
+                            let counterparty = movement.counterparty.as_ref().ok_or_else(|| {
+                                RuntimeError::InvalidCycle(
+                                    "internal withdrawal counterparty unavailable".into(),
+                                )
+                            })?;
+                            let validated =
+                                ParentFundingRoute::new(&route.execution_account, counterparty)
+                                    .map_err(|_| {
+                                        RuntimeError::InvalidCycle(
+                                            "invalid internal withdrawal counterparty".into(),
+                                        )
+                                    })?;
+                            LedgerEventKind::AuthoritativeTransferWithdrawal {
+                                amount_usdc: amount,
+                                execution_account: validated.execution_account,
+                                counterparty: validated.parent_account,
+                            }
+                        } else {
+                            LedgerEventKind::AuthoritativeWithdrawal {
+                                amount_usdc: amount,
+                            }
                         },
                     });
                     let reconciled_at = self
@@ -900,6 +981,12 @@ impl SignerFreeRuntime {
                 }
                 HyperliquidAccountMovementKind::InternalTransfer
                 | HyperliquidAccountMovementKind::TradingRelated => {}
+                HyperliquidAccountMovementKind::ExternalDeposit
+                | HyperliquidAccountMovementKind::ExternalWithdrawal => {
+                    return Err(RuntimeError::InvalidCycle(
+                        "unhandled external movement".into(),
+                    ))
+                }
             }
         }
         for approval_id in input.approvals.0.keys() {
@@ -918,6 +1005,9 @@ impl SignerFreeRuntime {
                 &boundary_balance_effects,
             )?;
         let mut next_state = self.state.clone();
+        next_state
+            .parent_funding_route
+            .clone_from(&self.config.parent_funding_route);
         let mut ledger_events = Vec::new();
         let decision_result = if let Some(decision) = existing_decision {
             next_state.pacing.reconcile_capital_preserving_admissions(
@@ -1702,9 +1792,11 @@ fn ordered_capital_ledger_events(
 
 fn capital_ledger_event_order(kind: &LedgerEventKind) -> u8 {
     match kind {
-        LedgerEventKind::AuthoritativeDeposit { .. } => 0,
+        LedgerEventKind::AuthoritativeDeposit { .. }
+        | LedgerEventKind::AuthoritativeParentFunding { .. } => 0,
         LedgerEventKind::DepositAdmission { .. } => 1,
-        LedgerEventKind::AuthoritativeWithdrawal { .. } => 2,
+        LedgerEventKind::AuthoritativeWithdrawal { .. }
+        | LedgerEventKind::AuthoritativeTransferWithdrawal { .. } => 2,
         _ => 3,
     }
 }

@@ -33,6 +33,34 @@ pub struct Config {
     security_policy: Option<SecurityPolicy>,
 }
 
+/// Approved source and account-local funding boundary. Kept out of public status.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParentFundingRoute {
+    pub(crate) execution_account: String,
+    pub(crate) parent_account: String,
+}
+
+impl ParentFundingRoute {
+    /// Constructs a canonical route; policy enablement is checked separately.
+    ///
+    /// # Errors
+    /// Rejects invalid addresses or a route back into the same account.
+    pub fn new(execution: &str, parent: &str) -> Result<Self, SecurityPolicyError> {
+        let execution_account =
+            normalized_addresses(&[execution.to_owned()], "execution account", true)?[0].clone();
+        let parent_account =
+            normalized_addresses(&[parent.to_owned()], "parent account", true)?[0].clone();
+        if execution_account == parent_account {
+            return invalid_policy("execution and funding parent accounts must differ");
+        }
+        Ok(Self {
+            execution_account,
+            parent_account,
+        })
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ConfigValidationMode {
     Standard,
@@ -281,6 +309,32 @@ impl Config {
             ));
         }
         self.validate_at_mode(env, Utc::now(), ConfigValidationMode::SignerFreeRuntime)
+    }
+
+    /// Resolves an explicitly enabled, account-local parent funding route.
+    /// This does not admit funds or authorize signatures.
+    ///
+    /// # Errors
+    /// Rejects missing/malformed identities, self-funding, or an invalid mode.
+    pub fn parent_funding_route<E: Environment>(
+        &self,
+        env: &E,
+    ) -> Result<Option<ParentFundingRoute>, ConfigError> {
+        let policy = self
+            .security_policy
+            .as_ref()
+            .ok_or(ConfigError::MissingSecurityPolicy)?;
+        if policy.wire.custody.funding_mode != FundingMode::DesignatedParentFunding {
+            return Ok(None);
+        }
+        policy.validate_designated_parent_mode()?;
+        let execution = resolved_address(env, &self.hyperliquid.account_env, "execution account")?;
+        let parent = resolved_address(
+            env,
+            &policy.wire.custody.admitted_parent_account_env,
+            "funding parent account",
+        )?;
+        Ok(Some(ParentFundingRoute::new(&execution, &parent)?))
     }
 
     /// Validates configuration at an injected UTC instant.
@@ -813,6 +867,7 @@ enum HotBalanceEnforcement {
 enum FundingMode {
     ExternalDepositOnly,
     TracedParentTransfer,
+    DesignatedParentFunding,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1140,6 +1195,7 @@ impl SecurityPolicy {
                 funding_mode: match custody.funding_mode {
                     FundingMode::ExternalDepositOnly => "external_deposit_only",
                     FundingMode::TracedParentTransfer => "traced_parent_transfer",
+                    FundingMode::DesignatedParentFunding => "designated_parent_funding",
                 },
                 allow_traced_parent_transfer_admission: custody
                     .allow_traced_parent_transfer_admission,
@@ -1201,6 +1257,17 @@ impl SecurityPolicy {
         Ok(format!("{LIVE_ACKNOWLEDGEMENT_PREFIX}{hex}"))
     }
 
+    fn validate_designated_parent_mode(&self) -> Result<(), SecurityPolicyError> {
+        let custody = &self.wire.custody;
+        if custody.execution_account_kind != ExecutionAccountKind::Subaccount
+            || custody.allow_traced_parent_transfer_admission
+            || custody.admitted_parent_account_env.trim().is_empty()
+        {
+            return invalid_policy("designated parent funding requires a subaccount, a parent identity, and no inheritance claims");
+        }
+        Ok(())
+    }
+
     fn live_context<E: Environment>(
         &self,
         config: &Config,
@@ -1220,6 +1287,14 @@ impl SecurityPolicy {
                     );
                 }
                 None
+            }
+            FundingMode::DesignatedParentFunding => {
+                self.validate_designated_parent_mode()?;
+                Some(resolved_address(
+                    env,
+                    &custody.admitted_parent_account_env,
+                    "funding parent account",
+                )?)
             }
             FundingMode::TracedParentTransfer => {
                 if !custody.allow_traced_parent_transfer_admission {
