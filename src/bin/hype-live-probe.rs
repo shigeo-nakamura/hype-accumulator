@@ -102,6 +102,14 @@ impl OperationalParams {
 struct PrepareTimeBinding {
     endpoint: String,
     is_mainnet: bool,
+    // A journal's binding file written before this field existed predates
+    // vault-address routing entirely, so its absence deserializes as the
+    // historically correct value (no routing) rather than failing to parse
+    // and permanently blocking `verify`/`write_once` for that journal. A
+    // legacy journal whose *current* policy now requires vault routing
+    // still correctly fails `verify`/`write_once` below: `false` will not
+    // equal the freshly resolved `true`.
+    #[serde(default)]
     requires_vault_address_routing: bool,
 }
 
@@ -657,6 +665,39 @@ mod tests {
         // The unchanged binding still verifies.
         PrepareTimeBinding::verify(journal_path, &prepared_with_vault_routing)
             .expect("matching binding verifies");
+    }
+
+    #[test]
+    fn prepare_time_binding_reads_a_legacy_binding_missing_the_routing_field() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let journal_path = directory.path().join("journal.jsonl");
+        let binding_path = directory.path().join("journal.network-binding.json");
+        // A journal written before requires_vault_address_routing existed.
+        std::fs::write(
+            &binding_path,
+            r#"{"endpoint":"https://api.hyperliquid.xyz","is_mainnet":true}"#,
+        )
+        .expect("legacy binding file");
+        let journal_path = journal_path.to_str().expect("utf8 path");
+
+        // The historical (pre-vault-routing) config still verifies.
+        let unchanged =
+            PrepareTimeBinding::new("https://api.hyperliquid.xyz".to_owned(), true, false);
+        PrepareTimeBinding::verify(journal_path, &unchanged)
+            .expect("legacy binding deserializes and matches the historical no-routing value");
+
+        // A config that now requires vault routing still correctly refuses:
+        // the legacy journal's absent field must not silently satisfy it.
+        let now_requires_routing =
+            PrepareTimeBinding::new("https://api.hyperliquid.xyz".to_owned(), true, true);
+        assert!(PrepareTimeBinding::verify(journal_path, &now_requires_routing).is_err());
+
+        // A retry of `prepare` against the same unchanged config is also
+        // still accepted (write_once must not choke on the legacy file
+        // either).
+        unchanged
+            .write_once(journal_path)
+            .expect("retrying prepare against an unchanged legacy binding succeeds");
     }
 
     #[test]
