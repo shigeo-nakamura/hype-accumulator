@@ -88,7 +88,9 @@ Timer/unit creation on a host remains a separate explicit approval gate.
 - A deposit remains confirmed-but-unallocated until its exact movement event
   ID appears in the separately reviewed admission artifact with confirmation
   and approval timestamps. Future confirmation/approval evidence is rejected
-  before persistence. An approval for an unknown event fails a complete scan;
+  before persistence. An optional [explicit admission amount](funding-admission.md)
+  binds a total per-event ceiling, sharing the yearly/lifetime limits.
+  An approval for an unknown event fails a complete scan;
   validation is deferred only while movement history itself is unavailable.
 - Newly admitted capital is journaled at its first usable timestamp, after its
   authoritative deposit and before any later withdrawal that depends on it.

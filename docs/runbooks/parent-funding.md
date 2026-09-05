@@ -50,7 +50,9 @@ backfill is needed so previously ignored transfers are not lost behind a cursor.
 - Recognition alone does **not** admit capital. The existing protected admission
   artifact must provide the movement's confirmation and approval evidence. The
   minimum confirmation count, cooldown, per-funding, annual, and cumulative caps
-  apply exactly as they do for other admitted tranches. No confirmations are
+  apply exactly as they do for other admitted tranches. An explicit per-event
+  [operator amount](funding-admission.md) can replace the automatic per-funding
+  ceiling while retaining the shared yearly/lifetime limits. No confirmations are
   fabricated from a balance change or a successful polling request.
 - Duplicate movement IDs, overlapping polls, and restarts cannot admit the same
   funding twice. Conflicting normalized movements within one scan are rejected

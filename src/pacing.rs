@@ -207,6 +207,9 @@ pub enum CapitalEvent {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DepositEvent {
+    /// Optional operator-approved total admission ceiling, in integer USDC micros.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_admitted_usdc: Option<UsdcMicros>,
     pub event_id: String,
     pub amount_usdc: UsdcMicros,
     pub received_at: DateTime<Utc>,
@@ -249,6 +252,9 @@ pub enum AdmissionStatus {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DepositTranche {
+    /// Optional operator-approved total admission ceiling, in integer USDC micros.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_admitted_usdc: Option<UsdcMicros>,
     pub event_id: String,
     pub source_amount_usdc: UsdcMicros,
     pub received_at: DateTime<Utc>,
@@ -267,6 +273,11 @@ pub struct DepositTranche {
 }
 
 impl DepositTranche {
+    fn admission_limit(&self, limits: &PacingLimits) -> UsdcMicros {
+        self.max_admitted_usdc
+            .unwrap_or(limits.max_automatically_admitted_usdc)
+    }
+
     #[must_use]
     pub fn residual_usdc(&self) -> UsdcMicros {
         UsdcMicros(
@@ -876,6 +887,7 @@ impl PacingState {
 
         for tranche in self.deposits.values() {
             let event = DepositEvent {
+                max_admitted_usdc: tranche.max_admitted_usdc,
                 event_id: tranche.event_id.clone(),
                 amount_usdc: tranche.source_amount_usdc,
                 received_at: tranche.received_at,
@@ -921,7 +933,7 @@ impl PacingState {
         if self
             .deposits
             .values()
-            .any(|tranche| tranche.admitted_usdc > limits.max_automatically_admitted_usdc)
+            .any(|tranche| tranche.admitted_usdc > tranche.admission_limit(limits))
         {
             return Err(PacingError::CorruptState);
         }
@@ -1148,9 +1160,12 @@ impl PacingState {
                 || event.confirmation_count < existing.confirmation_count
                 || !monotonic_timestamp(existing.confirmed_at, event.confirmed_at)
                 || !monotonic_timestamp(existing.admission_approved_at, event.admission_approved_at)
+                || (existing.admission_approved_at.is_some()
+                    && existing.max_admitted_usdc != event.max_admitted_usdc)
             {
                 return Err(PacingError::ConflictingCapitalEvent(event.event_id.clone()));
             }
+            existing.max_admitted_usdc = event.max_admitted_usdc;
             existing.confirmation_count = event.confirmation_count;
             existing.confirmed_at = event.confirmed_at;
             existing.admission_approved_at = event.admission_approved_at;
@@ -1165,6 +1180,7 @@ impl PacingState {
         self.deposits.insert(
             event.event_id.clone(),
             DepositTranche {
+                max_admitted_usdc: event.max_admitted_usdc,
                 event_id: event.event_id.clone(),
                 source_amount_usdc: event.amount_usdc,
                 received_at: event.received_at,
@@ -1257,7 +1273,7 @@ impl PacingState {
             || self
                 .deposits
                 .values()
-                .any(|tranche| tranche.admitted_usdc > limits.max_automatically_admitted_usdc)
+                .any(|tranche| tranche.admitted_usdc > tranche.admission_limit(limits))
         {
             return Err(PacingError::CorruptState);
         }
@@ -1313,10 +1329,7 @@ impl PacingState {
         let tranche = self.deposits.get_mut(id).ok_or(PacingError::CorruptState)?;
         let unadmitted = tranche.unadmitted_usdc();
         let capacity = [
-            checked_sub_floor(
-                limits.max_automatically_admitted_usdc,
-                tranche.admitted_usdc,
-            ),
+            checked_sub_floor(tranche.admission_limit(limits), tranche.admitted_usdc),
             checked_sub_floor(limits.cumulative_admission_cap_usdc, admitted_total),
             checked_sub_floor(limits.yearly_admission_cap_usdc, admitted_year),
         ]
@@ -1769,6 +1782,9 @@ pub enum PacingError {
 fn validate_deposit(event: &DepositEvent) -> Result<(), PacingError> {
     if invalid_id(&event.event_id)
         || event.amount_usdc.is_zero()
+        || event.max_admitted_usdc.is_some_and(|limit| {
+            limit.is_zero() || limit > event.amount_usdc || event.admission_approved_at.is_none()
+        })
         || event
             .confirmed_at
             .is_some_and(|confirmed| confirmed < event.received_at)

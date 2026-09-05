@@ -344,6 +344,9 @@ impl RuntimeConfig {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DepositAdmissionApproval {
+    /// Optional operator-approved total admission ceiling, in integer USDC micros.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_admitted_usdc: Option<UsdcMicros>,
     pub event_id: String,
     pub confirmed_at: DateTime<Utc>,
     pub confirmation_count: u32,
@@ -382,6 +385,7 @@ impl AdmissionApprovals {
             if approval.event_id.trim() != approval.event_id
                 || approval.event_id.is_empty()
                 || approval.confirmation_count == 0
+                || approval.max_admitted_usdc.is_some_and(UsdcMicros::is_zero)
                 || approval.confirmed_at > approval.approved_at
             {
                 return Err(RuntimeError::InvalidAdmissionArtifact(
@@ -882,6 +886,10 @@ impl SignerFreeRuntime {
                     let approval = input.approvals.get(&movement.event_id);
                     let durable_tranche = self.state.pacing.deposits().get(&movement.event_id);
                     capital_events.push(CapitalEvent::Deposit(DepositEvent {
+                        max_admitted_usdc: approval.map_or_else(
+                            || durable_tranche.and_then(|tranche| tranche.max_admitted_usdc),
+                            |value| value.max_admitted_usdc,
+                        ),
                         event_id: movement.event_id.clone(),
                         amount_usdc: amount,
                         received_at: occurred_at,
@@ -1631,11 +1639,13 @@ fn capital_events_as_of(events: &[CapitalEvent], at: DateTime<Utc>) -> Vec<Capit
                     deposit.confirmed_at = None;
                     deposit.confirmation_count = 0;
                     deposit.admission_approved_at = None;
+                    deposit.max_admitted_usdc = None;
                 } else if deposit
                     .admission_approved_at
                     .is_some_and(|approved_at| approved_at > at)
                 {
                     deposit.admission_approved_at = None;
+                    deposit.max_admitted_usdc = None;
                 }
                 Some(CapitalEvent::Deposit(deposit))
             }
@@ -1702,6 +1712,8 @@ fn existing_deposit_events(
                         .confirmed_at
                         .is_some_and(|existing| existing != approval.confirmed_at)
                     || tranche.confirmation_count > approval.confirmation_count
+                    || (tranche.admission_approved_at.is_some()
+                        && tranche.max_admitted_usdc != approval.max_admitted_usdc)
                     || tranche
                         .admission_approved_at
                         .is_some_and(|existing| existing != approval.approved_at)
@@ -1712,6 +1724,8 @@ fn existing_deposit_events(
                 }
             }
             Ok(CapitalEvent::Deposit(DepositEvent {
+                max_admitted_usdc: approval
+                    .map_or(tranche.max_admitted_usdc, |value| value.max_admitted_usdc),
                 event_id: tranche.event_id.clone(),
                 amount_usdc: tranche.source_amount_usdc,
                 received_at: tranche.received_at,
