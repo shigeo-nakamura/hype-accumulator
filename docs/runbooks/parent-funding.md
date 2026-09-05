@@ -30,8 +30,9 @@ differ. The actual parent address and funding mode are bound into the effective
 live-policy digest, not just the environment variable name. This does not
 validate signer delegation or enable live trading.
 
-Both the signer-free runtime and supervised live-probe prepare command obtain the route through the typed config and binds it
-into authenticated runtime state on its first committed cycle. A subsequent
+Both the signer-free runtime and supervised live-probe prepare command obtain
+the route through the typed config and bind it into authenticated runtime state
+on its first committed cycle. A subsequent
 parent change, execution-account change, enablement, or disablement is rejected.
 Use a separately approved migration with a fresh state directory and protected
 anchor; preserve prior ledgers and reconcile existing admitted balances first.
