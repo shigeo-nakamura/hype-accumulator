@@ -14,8 +14,9 @@
 
 use rusoto_core::Region;
 use rusoto_s3::{PutObjectRequest, S3Client, S3};
-use std::env;
+use std::{env, time::Duration};
 use thiserror::Error;
+use tokio::time::timeout;
 
 // Bucket region hard-coded to `eu-central-1` in `put` below (via
 // `Region::EuCentral1`) to match the `debot-dashboard` bucket, which is
@@ -27,10 +28,16 @@ use thiserror::Error;
 // is already in the dependency graph via `debot-utils`' KMS decrypt path
 // and builds against it without issue.
 
+/// Upper bound on one mirror PUT. See the doc comment on `put` for why
+/// this exists even after the caller has released its own locks.
+const PUT_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Error)]
 pub enum StatusS3MirrorError {
     #[error("S3 put_object failed: {0}")]
     PutObject(String),
+    #[error("S3 put_object timed out after {0:?}")]
+    Timeout(Duration),
 }
 
 /// A configured mirror target, read once from the environment.
@@ -74,16 +81,23 @@ impl StatusS3Mirror {
     pub async fn put(&self, file_name: &str, body: String) -> Result<(), StatusS3MirrorError> {
         let client = S3Client::new(Region::EuCentral1);
         let key = format!("{}/{file_name}", self.key_prefix);
-        client
-            .put_object(PutObjectRequest {
-                bucket: self.bucket.clone(),
-                key,
-                cache_control: Some("max-age=2".to_owned()),
-                content_type: Some("application/json".to_owned()),
-                body: Some(body.into_bytes().into()),
-                ..Default::default()
-            })
+        // Bounded even though the caller already releases any exclusive
+        // lock before awaiting this: rusoto's default HTTP client has no
+        // guaranteed short timeout of its own, and every caller here is a
+        // one-shot CLI invocation that should fail fast on an unresponsive
+        // S3 endpoint rather than idle past its systemd unit's own
+        // TimeoutStartSec.
+        let request = client.put_object(PutObjectRequest {
+            bucket: self.bucket.clone(),
+            key,
+            cache_control: Some("max-age=2".to_owned()),
+            content_type: Some("application/json".to_owned()),
+            body: Some(body.into_bytes().into()),
+            ..Default::default()
+        });
+        timeout(PUT_TIMEOUT, request)
             .await
+            .map_err(|_| StatusS3MirrorError::Timeout(PUT_TIMEOUT))?
             .map_err(|error| StatusS3MirrorError::PutObject(error.to_string()))?;
         Ok(())
     }

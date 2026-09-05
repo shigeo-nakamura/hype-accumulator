@@ -290,6 +290,13 @@ async fn run_dry_run_cycle(
         manual_pause: config.manual_halt,
         api_errors,
     })?;
+    // Release the exclusive runtime/state-directory lock before the S3
+    // mirror's network call: `runtime` (and the `File` locks it owns) would
+    // otherwise stay held for the duration of that request, and an
+    // unresponsive S3 endpoint could then block the *next* scheduled cycle
+    // (every 5 minutes) from acquiring the same lock, halting decision
+    // progression even though mirroring is documented as best-effort.
+    drop(runtime);
     // `apply_cycle` already wrote `status_path` locally; read it back rather
     // than reconstructing the document here, so the mirrored copy is
     // byte-identical to what a durable-runtime consumer would see and this
