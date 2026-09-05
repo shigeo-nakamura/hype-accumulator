@@ -12,6 +12,7 @@ use hype_accumulator::{
         build_snapshot, core_health_label, plan_snapshot, publish_snapshot,
         HyperliquidCoreSignalSource, PublishOutcome,
     },
+    status_io::mirror_status_to_s3,
 };
 use std::{
     env, fs,
@@ -239,6 +240,7 @@ async fn run_dry_run_cycle(
     let runtime_config = RuntimeConfig::from_toml(&fs::read_to_string(runtime_config_path)?)?;
     let approvals_path = runtime_config.admission_approvals_path().to_path_buf();
     let signal_path = runtime_config.signal_snapshot_path().to_path_buf();
+    let status_path = runtime_config.status_path().to_path_buf();
     let mut runtime = SignerFreeRuntime::open(runtime_config, limits)?;
     let approvals = AdmissionApprovals::from_json(&fs::read_to_string(approvals_path)?)?;
     let signal = match fs::read_to_string(signal_path) {
@@ -288,6 +290,21 @@ async fn run_dry_run_cycle(
         manual_pause: config.manual_halt,
         api_errors,
     })?;
+    // Release the exclusive runtime/state-directory lock before the S3
+    // mirror's network call: `runtime` (and the `File` locks it owns) would
+    // otherwise stay held for the duration of that request, and an
+    // unresponsive S3 endpoint could then block the *next* scheduled cycle
+    // (every 5 minutes) from acquiring the same lock, halting decision
+    // progression even though mirroring is documented as best-effort.
+    drop(runtime);
+    // `apply_cycle` already wrote `status_path` locally; read it back rather
+    // than reconstructing the document here, so the mirrored copy is
+    // byte-identical to what a durable-runtime consumer would see and this
+    // otherwise-synchronous, crash-safe runtime module never has to import
+    // async S3 I/O itself.
+    if let Ok(body) = fs::read_to_string(&status_path) {
+        mirror_status_to_s3(&status_path, body).await;
+    }
     let disposition = if report.decision().is_none() {
         "not-due"
     } else if report.is_new_decision() {

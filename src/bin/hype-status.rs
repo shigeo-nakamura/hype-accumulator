@@ -3,7 +3,7 @@ use hype_accumulator::{
     config::{Config, ProcessEnvironment},
     monitor::{trade_cadence_label, HypeAttribution, HyperliquidObserver},
     status::DashboardStatus,
-    status_io::write_status_atomic,
+    status_io::{mirror_status_to_s3, write_status_atomic},
 };
 use std::{env, fs, path::PathBuf, process};
 
@@ -37,6 +37,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let updated_at = Utc::now();
     let status = DashboardStatus::new(updated_at, process_started_at, config.dry_run, accumulator);
     write_status_atomic(&output_path, &status)?;
+    mirror_status_to_s3(&output_path, status.to_json()?).await;
     println!("status observation written");
     Ok(())
 }

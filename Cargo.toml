@@ -20,13 +20,15 @@ dex-connector = { git = "https://github.com/shigeo-nakamura/dex-connector", tag 
 fs2 = "=0.4.3"
 libc = "=0.2.189"
 reqwest = { version = "=0.11.27", default-features = false, features = ["json", "rustls-tls"] }
+rusoto_core = "=0.48.0"
+rusoto_s3 = "=0.48.0"
 rust_decimal = "=1.42.1"
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.143"
 sha2 = "=0.10.9"
 tempfile = "=3.27.0"
 thiserror = "=2.0.12"
-tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "time"] }
 toml = "=0.8.23"
 
 [target.'cfg(windows)'.dependencies]
