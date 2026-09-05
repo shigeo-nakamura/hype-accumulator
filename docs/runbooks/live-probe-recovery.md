@@ -37,8 +37,8 @@ An `unknownOid` response is unresolved evidence, never permission to resubmit.
 `submit` now attempts this lookup after both a successful response and a
 submission error. If submission failed, it still exits unsuccessfully even when
 a subsequent lookup succeeds. If both calls fail, retain the journal and use
-`reconcile` once connectivity recovers. Approval and prepared-envelope expiry
-are rechecked using the current clock at submission, after key loading.
+`reconcile` once connectivity recovers. Prepared-envelope expiry is checked using the current clock at submission,
+after key loading.
 
 ## Required follow-up before scheduled live
 
