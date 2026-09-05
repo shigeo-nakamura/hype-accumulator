@@ -8,7 +8,6 @@ pub mod config;
 pub mod exchange;
 pub mod execution;
 pub(crate) mod fs_safety;
-#[cfg(feature = "live-probe")]
 pub mod hype_asset;
 pub mod ledger;
 #[cfg(feature = "live-probe")]

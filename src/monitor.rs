@@ -1,5 +1,6 @@
 use crate::{
     config::UtcSchedule,
+    hype_asset::HYPE_SPOT_MARKET,
     status::{AccumulatorStatus, StatusError},
 };
 use chrono::{DateTime, Utc};
@@ -13,8 +14,6 @@ use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
 use std::{path::PathBuf, str::FromStr, time::Duration};
 use thiserror::Error;
-
-const HYPE_SPOT_SYMBOL: &str = "HYPE/USDC";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BalanceObservation {
@@ -96,7 +95,7 @@ impl HyperliquidObserver {
             .map_err(|error| MonitorError::Http(error.to_string()))?;
         let connector = HyperliquidConnector::new(HyperliquidConnectorConfig {
             base_url: base_url.clone(),
-            tracked_symbols: vec![HYPE_SPOT_SYMBOL.to_owned()],
+            tracked_symbols: vec![HYPE_SPOT_MARKET.to_owned()],
         })
         .and_then(|connector| {
             connector.with_account(HyperliquidAccountConfig {
@@ -158,7 +157,7 @@ impl HyperliquidObserver {
         let balance_observed_at = Utc::now();
         let ticker = self
             .connector
-            .get_ticker(HYPE_SPOT_SYMBOL, None)
+            .get_ticker(HYPE_SPOT_MARKET, None)
             .await
             .map_err(|error| MonitorError::Connector(error.to_string()))?;
         let summary: DelegatorSummaryWire = self
