@@ -72,37 +72,63 @@ impl OperationalParams {
     }
 }
 
-/// Durably records exactly which venue endpoint and network `prepare`
-/// resolved its quantity/price/inventory from, at the same path every
-/// `submit` for this journal must independently re-derive and match.
+/// Durably records exactly which venue endpoint/network and vault-address
+/// routing decision `prepare` resolved its quantity/price/inventory/signed
+/// action shape from, at the same path every `submit` for this journal must
+/// independently re-derive and match.
 ///
-/// Nothing in `DecisionBinding`/`OrderEnvelopeBinding`/`InventoryBaseline`
-/// records network selection — `config.toml`'s `hyperliquid.endpoint` and
-/// `operational.toml`'s `is_mainnet` are read completely independently by
-/// each subcommand invocation. Without this check, an operator could
-/// `prepare` against testnet, then edit either file to point at mainnet
-/// before running `submit` for the *same already-fsynced journal*, and the
-/// mainnet-priced submission would silently use testnet-derived quantity,
-/// price, and inventory — never re-validated against the network it is
-/// actually about to hit.
+/// Nothing in `DecisionBinding`/`OrderEnvelopeBinding`/`InventoryBaseline`/
+/// `LiveProbeBinding` records either fact — `config.toml`'s
+/// `hyperliquid.endpoint` and `custody.execution_account_kind`, and
+/// `operational.toml`'s `is_mainnet`, are read completely independently by
+/// each subcommand invocation:
+///
+/// - Without the network half of this check, an operator could `prepare`
+///   against testnet, then edit either file to point at mainnet before
+///   running `submit` for the *same already-fsynced journal*, and the
+///   mainnet-priced submission would silently use testnet-derived quantity,
+///   price, and inventory — never re-validated against the network it is
+///   actually about to hit.
+/// - Without the routing half, `build_signed_connector` re-derives
+///   `vault_address` from `config.requires_vault_address_routing()` fresh at
+///   `submit` time. If `execution_account_kind` changes between `prepare`
+///   and `submit` (e.g. an operator edits it to fix an unrelated custody
+///   setting), the signed action's `vaultAddress` field silently follows the
+///   *new* setting while `LiveProbeBinding`'s hash — derived only from the
+///   unchanged account/signer addresses — cannot detect the change. The
+///   prepared IOC would then route to the wrong subaccount/vault/master
+///   account with every other binding check still passing.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct NetworkBinding {
+struct PrepareTimeBinding {
     endpoint: String,
     is_mainnet: bool,
+    requires_vault_address_routing: bool,
 }
 
-impl NetworkBinding {
+impl PrepareTimeBinding {
     fn path(journal_path: &str) -> PathBuf {
         let mut path = PathBuf::from(journal_path);
         path.set_extension("network-binding.json");
         path
     }
 
-    fn resolved(config: &Config, operational: &OperationalParams) -> Self {
+    fn new(endpoint: String, is_mainnet: bool, requires_vault_address_routing: bool) -> Self {
         Self {
-            endpoint: config.hyperliquid.endpoint.clone(),
-            is_mainnet: operational.is_mainnet,
+            endpoint,
+            is_mainnet,
+            requires_vault_address_routing,
         }
+    }
+
+    fn resolved(
+        config: &Config,
+        operational: &OperationalParams,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self::new(
+            config.hyperliquid.endpoint.clone(),
+            operational.is_mainnet,
+            config.requires_vault_address_routing()?,
+        ))
     }
 
     /// Durably writes this binding, refusing to silently overwrite a
@@ -115,9 +141,10 @@ impl NetworkBinding {
             let existing: Self = serde_json::from_str(&existing)?;
             if existing != *self {
                 return Err(format!(
-                    "network binding already recorded for this journal ({existing:?}) does not \
-                     match this prepare attempt ({self:?}); a journal's network selection is \
-                     fixed at first prepare and must never change"
+                    "prepare-time binding already recorded for this journal ({existing:?}) does \
+                     not match this prepare attempt ({self:?}); a journal's network selection \
+                     and vault-address routing mode are fixed at first prepare and must never \
+                     change"
                 )
                 .into());
             }
@@ -131,16 +158,16 @@ impl NetworkBinding {
         let path = Self::path(journal_path);
         let recorded: Self = serde_json::from_str(&fs::read_to_string(&path).map_err(|_| {
             format!(
-                "no network binding recorded at {}; run `prepare` first",
+                "no prepare-time binding recorded at {}; run `prepare` first",
                 path.display()
             )
         })?)?;
         if recorded != *current {
             return Err(format!(
                 "config.toml/operational.toml now resolve to {current:?}, but this journal was \
-                 prepared against {recorded:?}; refusing to submit a testnet-derived (or \
-                 otherwise different-network) order against a different network. Re-run \
-                 `prepare` with the network you intend to submit to."
+                 prepared against {recorded:?}; refusing to submit against a different network \
+                 or a changed vault-address routing mode. Re-run `prepare` with the network and \
+                 custody settings you intend to submit with."
             )
             .into());
         }
@@ -255,7 +282,7 @@ async fn prepare(
     // `config`/`operational` for a network-dependent value: refuses to
     // silently re-bind an already-prepared journal to a different network on
     // a later `prepare` retry.
-    NetworkBinding::resolved(&config, &operational).write_once(journal_path)?;
+    PrepareTimeBinding::resolved(&config, &operational)?.write_once(journal_path)?;
 
     // Decrypts the signer now, even though the signal-free
     // `SignerFreeRuntime::apply_cycle` below (inside
@@ -386,11 +413,12 @@ async fn submit(
     let effective = config.effective_live_order_policy(&ProcessEnvironment, now)?;
     let operational = OperationalParams::from_toml(&fs::read_to_string(operational_params_path)?)?;
     // Refuses to submit if `config.toml`/`operational.toml` now resolve to a
-    // different network than the one this journal was `prepare`d against —
-    // see `NetworkBinding`'s doc comment for the exact danger this closes.
-    NetworkBinding::verify(
+    // different network, or a changed vault-address routing mode, than what
+    // this journal was `prepare`d against — see `PrepareTimeBinding`'s doc
+    // comment for the exact danger this closes.
+    PrepareTimeBinding::verify(
         journal_path,
-        &NetworkBinding::resolved(&config, &operational),
+        &PrepareTimeBinding::resolved(&config, &operational)?,
     )?;
 
     let binding = DurableWorkflow::peek_committed_binding(journal_path)?
@@ -506,7 +534,7 @@ async fn build_signed_connector(
 
 #[cfg(test)]
 mod tests {
-    use super::{invocation, Invocation};
+    use super::{invocation, Invocation, PrepareTimeBinding};
 
     fn args(values: &[&str]) -> impl Iterator<Item = String> {
         values
@@ -574,6 +602,71 @@ mod tests {
             "0xabc123",
         ]))
         .is_err());
+    }
+
+    #[test]
+    fn prepare_time_binding_write_once_is_idempotent_for_the_same_binding() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let journal_path = directory.path().join("journal.jsonl");
+        let journal_path = journal_path.to_str().expect("utf8 path");
+        let binding = PrepareTimeBinding::new("https://api.hyperliquid.xyz".to_owned(), true, true);
+        binding.write_once(journal_path).expect("first write");
+        binding
+            .write_once(journal_path)
+            .expect("identical replay is a no-op");
+    }
+
+    #[test]
+    fn prepare_time_binding_write_once_rejects_a_changed_binding() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let journal_path = directory.path().join("journal.jsonl");
+        let journal_path = journal_path.to_str().expect("utf8 path");
+        PrepareTimeBinding::new("https://api.hyperliquid.xyz".to_owned(), true, true)
+            .write_once(journal_path)
+            .expect("first write");
+        // Same endpoint/network, but the routing mode this journal was
+        // prepared with (subaccount/vault) no longer matches — this is
+        // exactly the case a config edit between `prepare` and a re-run of
+        // `prepare` (or `submit`) must not silently pass through.
+        let changed =
+            PrepareTimeBinding::new("https://api.hyperliquid.xyz".to_owned(), true, false);
+        assert!(changed.write_once(journal_path).is_err());
+    }
+
+    #[test]
+    fn prepare_time_binding_verify_rejects_a_routing_mode_that_changed_since_prepare() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let journal_path = directory.path().join("journal.jsonl");
+        let journal_path = journal_path.to_str().expect("utf8 path");
+        let prepared_with_vault_routing =
+            PrepareTimeBinding::new("https://api.hyperliquid.xyz".to_owned(), true, true);
+        prepared_with_vault_routing
+            .write_once(journal_path)
+            .expect("prepare records vault routing");
+
+        // Same endpoint/network as `submit` would independently re-derive,
+        // but `execution_account_kind` was edited back to a dedicated
+        // master account before `submit` ran.
+        let now_resolves_to_master =
+            PrepareTimeBinding::new("https://api.hyperliquid.xyz".to_owned(), true, false);
+        assert!(
+            PrepareTimeBinding::verify(journal_path, &now_resolves_to_master).is_err(),
+            "submit must refuse when the vault-address routing mode no longer matches prepare"
+        );
+
+        // The unchanged binding still verifies.
+        PrepareTimeBinding::verify(journal_path, &prepared_with_vault_routing)
+            .expect("matching binding verifies");
+    }
+
+    #[test]
+    fn prepare_time_binding_verify_requires_a_prior_prepare() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let journal_path = directory.path().join("journal.jsonl");
+        let journal_path = journal_path.to_str().expect("utf8 path");
+        let current =
+            PrepareTimeBinding::new("https://api.hyperliquid.xyz".to_owned(), true, false);
+        assert!(PrepareTimeBinding::verify(journal_path, &current).is_err());
     }
 
     #[test]
