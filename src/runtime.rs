@@ -803,8 +803,7 @@ impl SignerFreeRuntime {
         let mut new_authoritative_deposit_ids = BTreeSet::new();
         let mut movement_ledger_events = Vec::new();
 
-        let mut ordered_movements = input.movements.iter().collect::<Vec<_>>();
-        ordered_movements.sort_by_key(|movement| (movement.timestamp_ms, &movement.event_id));
+        let ordered_movements = unique_ordered_movements(input.movements)?;
         for movement in ordered_movements {
             validate_movement_range(movement, &input)?;
             let occurred_at = timestamp_ms(movement.timestamp_ms)?;
@@ -1195,6 +1194,10 @@ impl SignerFreeRuntime {
             boundary_balance_available: decision_evidence.boundary_balance_available,
         };
         let pending = PendingRuntimeCycle::new(input.observed_at, next_state, ledger_events)?;
+        let replayed = self
+            .ledger
+            .validate_append_batch(&pending_cycle_ledger_events(&pending))?;
+        ensure_capital_totals_match(&pending.body.state.pacing, &replayed)?;
         self.ensure_runtime_lock_current()?;
         write_private_json_atomic(
             self.config.state_directory.join(PENDING_CYCLE_FILE_NAME),
@@ -1367,6 +1370,25 @@ fn recover_pending_cycle(
     Ok(())
 }
 
+fn pending_cycle_ledger_events(pending: &PendingRuntimeCycle) -> Vec<LedgerEvent> {
+    let mut events = vec![LedgerEvent {
+        event_id: format!("runtime-cycle:{}:prepared", pending.cycle_hash),
+        occurred_at: pending.body.observed_at,
+        kind: LedgerEventKind::RuntimeCyclePrepared {
+            cycle_hash: pending.cycle_hash.clone(),
+        },
+    }];
+    events.extend(pending.body.ledger_events.iter().cloned());
+    events.push(LedgerEvent {
+        event_id: format!("runtime-cycle:{}:committed", pending.cycle_hash),
+        occurred_at: pending.body.observed_at,
+        kind: LedgerEventKind::RuntimeCycleCommitted {
+            cycle_hash: pending.cycle_hash.clone(),
+        },
+    });
+    events
+}
+
 fn commit_pending_cycle(
     config: &RuntimeConfig,
     limits: &PacingLimits,
@@ -1387,23 +1409,9 @@ fn commit_pending_cycle(
     {
         return Err(RuntimeError::PendingCycleConflict);
     }
-    ledger.append(LedgerEvent {
-        event_id: format!("runtime-cycle:{}:prepared", pending.cycle_hash),
-        occurred_at: pending.body.observed_at,
-        kind: LedgerEventKind::RuntimeCyclePrepared {
-            cycle_hash: pending.cycle_hash.clone(),
-        },
-    })?;
-    for event in &pending.body.ledger_events {
-        ledger.append(event.clone())?;
+    for event in pending_cycle_ledger_events(pending) {
+        ledger.append(event)?;
     }
-    ledger.append(LedgerEvent {
-        event_id: format!("runtime-cycle:{}:committed", pending.cycle_hash),
-        occurred_at: pending.body.observed_at,
-        kind: LedgerEventKind::RuntimeCycleCommitted {
-            cycle_hash: pending.cycle_hash.clone(),
-        },
-    })?;
     if !ledger.state().runtime_cycle_committed(&pending.cycle_hash) {
         return Err(RuntimeError::CorruptPendingCycle);
     }
@@ -1637,6 +1645,30 @@ fn capital_events_as_of(events: &[CapitalEvent], at: DateTime<Utc>) -> Vec<Capit
             CapitalEvent::Deposit(_) | CapitalEvent::Withdrawal(_) => None,
         })
         .collect()
+}
+
+fn unique_ordered_movements(
+    movements: &[HyperliquidAccountMovement],
+) -> Result<Vec<&HyperliquidAccountMovement>, RuntimeError> {
+    let mut unique = BTreeMap::<&str, &HyperliquidAccountMovement>::new();
+    for movement in movements {
+        if let Some(previous) = unique.insert(&movement.event_id, movement) {
+            if previous.timestamp_ms != movement.timestamp_ms
+                || previous.kind != movement.kind
+                || previous.token != movement.token
+                || previous.amount != movement.amount
+                || previous.counterparty != movement.counterparty
+                || previous.transaction_hash != movement.transaction_hash
+            {
+                return Err(RuntimeError::InvalidCycle(
+                    "conflicting normalized movement ID".into(),
+                ));
+            }
+        }
+    }
+    let mut ordered = unique.into_values().collect::<Vec<_>>();
+    ordered.sort_by_key(|movement| (movement.timestamp_ms, &movement.event_id));
+    Ok(ordered)
 }
 
 fn validate_movement_range(

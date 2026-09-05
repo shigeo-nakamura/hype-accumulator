@@ -52,7 +52,10 @@ backfill is needed so previously ignored transfers are not lost behind a cursor.
   apply exactly as they do for other admitted tranches. No confirmations are
   fabricated from a balance change or a successful polling request.
 - Duplicate movement IDs, overlapping polls, and restarts cannot admit the same
-  funding twice. Conflicting event contents fail durable replay checks.
+  funding twice. Conflicting normalized movements within one scan are rejected
+  before persistence. The complete planned ledger batch is also checked against
+  durable history before any pending marker or event is written, so a corrected
+  scan can resume without a permanently uncommitted cycle.
 - Incoming USDC transfers from other accounts, unknown senders, zero/self
   transfers fail the history gate in this mode. They are not approved funding.
 - Negative USDC internal transfers with a valid distinct counterparty are

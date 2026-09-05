@@ -641,6 +641,34 @@ impl DurableLedger {
         self.records.len()
     }
 
+    /// Validates a complete planned runtime batch without writing any marker,
+    /// event, snapshot, or protected anchor. Conflicts with durable events and
+    /// conflicts within the batch are rejected before a cycle becomes pending.
+    pub(crate) fn validate_append_batch(
+        &self,
+        events: &[LedgerEvent],
+    ) -> Result<ReplayState, LedgerError> {
+        self.ensure_current()?;
+        let mut known = self.events_by_id.clone();
+        let mut planned = self
+            .records
+            .iter()
+            .map(|record| record.event.clone())
+            .collect::<Vec<_>>();
+        for event in events {
+            validate_event(event)?;
+            if let Some(previous) = known.get(&event.event_id) {
+                if previous != event {
+                    return Err(LedgerError::EventCollision(event.event_id.clone()));
+                }
+            } else {
+                known.insert(event.event_id.clone(), event.clone());
+                planned.push(event.clone());
+            }
+        }
+        replay(&planned)
+    }
+
     /// Appends one validated event and durably commits both its protected head
     /// and local journal before returning.
     ///

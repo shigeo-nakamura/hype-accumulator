@@ -2143,3 +2143,83 @@ fn parent_funding_mixed_return_preserves_only_admitted_withdrawal_debit() {
     .unwrap();
     assert_eq!(runtime.ledger.state().deployable_usdc(), usd(50));
 }
+
+#[test]
+fn parent_funding_conflicting_withdrawal_ids_leave_no_pending_cycle_and_can_recover() {
+    let directory = tempfile::tempdir().unwrap();
+    let start = at(2026, 7, 6, 8, 0);
+    let now = at(2026, 7, 6, 12, 0);
+    let cfg = config(directory.path(), ms(start)).with_parent_funding_route(Some(parent_route()));
+    let mut runtime = SignerFreeRuntime::open(cfg.clone(), limits()).unwrap();
+    let received = start + TimeDelta::hours(1);
+    let incoming = parent_transfer("initial", received, 1_000);
+    let admission = approvals("initial", received, received);
+    funding_cycle(
+        &mut runtime,
+        now,
+        std::slice::from_ref(&incoming),
+        &admission,
+        1_000.0,
+    )
+    .unwrap();
+    let count = runtime.ledger.record_count();
+    let before = runtime.state.clone();
+    let mut outgoing = parent_transfer("conflicting-return", now + TimeDelta::minutes(1), 100);
+    outgoing.amount = -outgoing.amount;
+    let mut conflict = outgoing.clone();
+    conflict.counterparty = Some("0x3333333333333333333333333333333333333333".to_owned());
+    assert!(funding_cycle(
+        &mut runtime,
+        now + TimeDelta::minutes(2),
+        &[incoming.clone(), outgoing.clone(), conflict.clone()],
+        &admission,
+        900.0
+    )
+    .is_err());
+    assert_eq!(runtime.ledger.record_count(), count);
+    assert_eq!(runtime.state, before);
+    assert!(!runtime
+        .config
+        .state_directory
+        .join(PENDING_CYCLE_FILE_NAME)
+        .exists());
+    drop(runtime);
+    let mut runtime = SignerFreeRuntime::open(cfg.clone(), limits()).unwrap();
+    funding_cycle(
+        &mut runtime,
+        now + TimeDelta::minutes(2),
+        &[incoming.clone(), outgoing.clone()],
+        &admission,
+        900.0,
+    )
+    .unwrap();
+    let count = runtime.ledger.record_count();
+    let before = runtime.state.clone();
+    // A later overlapping scan must not poison the journal either.
+    assert!(funding_cycle(
+        &mut runtime,
+        now + TimeDelta::minutes(3),
+        &[incoming.clone(), conflict],
+        &admission,
+        900.0
+    )
+    .is_err());
+    assert_eq!(runtime.ledger.record_count(), count);
+    assert_eq!(runtime.state, before);
+    assert!(!runtime
+        .config
+        .state_directory
+        .join(PENDING_CYCLE_FILE_NAME)
+        .exists());
+    drop(runtime);
+    let mut runtime = SignerFreeRuntime::open(cfg, limits()).unwrap();
+    funding_cycle(
+        &mut runtime,
+        now + TimeDelta::minutes(3),
+        &[incoming, outgoing],
+        &admission,
+        900.0,
+    )
+    .unwrap();
+    assert_eq!(runtime.ledger.state().deployable_usdc(), usd(900));
+}
