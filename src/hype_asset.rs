@@ -2,11 +2,12 @@
 //!
 //! Kept in one place so `order_envelope.rs` (envelope assembly),
 //! `live_decision.rs` (inventory/decision wiring), `live_probe.rs` (probe
-//! binding), and `monitor.rs` (read-only observer) agree on exactly the same
-//! market identity, atom scale, and metadata digest — a mismatch between
-//! them would make every `DecisionBinding`/`LiveProbeBinding` pairing
-//! silently fail its equality check downstream, or point the observer at a
-//! different market than the executor.
+//! binding), and `workflow.rs` (durable order evidence) agree on exactly the
+//! same market identity, atom scale, and metadata digest — a mismatch
+//! between them would make every `DecisionBinding`/`LiveProbeBinding`
+//! pairing silently fail its equality check downstream. `monitor.rs`
+//! (read-only observer) shares only the market identity, not the atom scale
+//! or metadata digest.
 //!
 //! The market identity and metadata digest are available in every build;
 //! the atom-scale conversion is only compiled with the `live-probe` feature
@@ -25,15 +26,20 @@ pub(crate) const HYPE_WEI_DECIMALS: u32 = 8;
 pub(crate) const HYPE_ATOMS_PER_HYPE: u64 = 100_000_000;
 const MARKET_METADATA_DOMAIN: &[u8] = b"hype-accumulator/hyperliquid-hype-usdc-spot-metadata/v1";
 
-/// Canonical digest binding [`crate::order_envelope::assemble_order_envelope_binding`]'s
+/// Canonical digest binding `order_envelope::assemble_order_envelope_binding`'s
 /// `OrderEnvelopeBinding::market_metadata_digest` and
-/// [`crate::live_probe::LiveProbeBinding`]'s `market_metadata_digest` to the
+/// `live_probe::LiveProbeBinding`'s `market_metadata_digest` to the
 /// same market identity. A caller constructing a `LiveProbeBinding`
 /// independently (e.g. the live-probe binary, at submit time) must pass
 /// this exact value, not any other digest (in particular, not
 /// `Config::effective_security_policy_digest`, which is a different,
 /// policy-fingerprint concept) — passing a different value here silently
 /// produces a `BindingMismatch` against the durably prepared action.
+///
+/// Written as plain code spans, not intra-doc links: `order_envelope` and
+/// `live_probe` are only compiled with the `live-probe` feature, and a
+/// default-build `cargo doc` cannot resolve a link into a module it did not
+/// compile.
 #[must_use]
 pub fn hype_usdc_market_metadata_digest() -> String {
     let mut hasher = Sha256::new();

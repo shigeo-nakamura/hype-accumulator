@@ -9,7 +9,10 @@
 //! new submission. A separately shared append-only owner store prevents one
 //! stable venue order identity from settling more than one decision workflow.
 
-use crate::pacing::{DailyDecision, DecisionReason, UsdcMicros};
+use crate::{
+    hype_asset::HYPE_SPOT_MARKET,
+    pacing::{DailyDecision, DecisionReason, UsdcMicros},
+};
 use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
@@ -1693,7 +1696,7 @@ impl WorkflowState {
             || evidence.l1_nonce != envelope.l1_nonce
             || evidence.signed_expiry_at != envelope.signed_expiry_at
             || evidence.effective_expiry_at != envelope.effective_expiry_at
-            || evidence.market != "HYPE/USDC"
+            || evidence.market != HYPE_SPOT_MARKET
             || evidence.side != "buy"
             || evidence.time_in_force != "IOC"
             || evidence.accepted_at < self.last_transition_at
@@ -3879,7 +3882,7 @@ fn canonical_order_envelope_hash(state: &WorkflowState) -> Result<String, Workfl
         venue_clock_evidence_digest: &state.binding.order_envelope.venue_clock_evidence_digest,
         max_venue_clock_lag_ms: state.binding.order_envelope.max_venue_clock_lag_ms,
         input_freshness: &state.binding.order_envelope.input_freshness,
-        market: "HYPE/USDC",
+        market: HYPE_SPOT_MARKET,
         side: "buy",
         time_in_force: "IOC",
     })

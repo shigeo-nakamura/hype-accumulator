@@ -458,7 +458,7 @@ mod tests {
 
     fn binding() -> LiveProbeBinding {
         LiveProbeBinding {
-            symbol: "HYPE/USDC".to_string(),
+            symbol: HYPE_SPOT_MARKET.to_string(),
             execution_identity_hash: "execution-a".to_string(),
             signer_identity_hash: "signer-a".to_string(),
             market_metadata_digest: "market-a".to_string(),
