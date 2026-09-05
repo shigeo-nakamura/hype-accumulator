@@ -217,10 +217,23 @@ pub struct DepositEvent {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WithdrawalEvent {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_unadmitted_funding: bool,
     pub event_id: String,
     pub amount_usdc: UsdcMicros,
     pub occurred_at: DateTime<Utc>,
     pub reconciled_at: DateTime<Utc>,
+}
+
+// Serde skip predicates receive references.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+// Serde skip predicates receive references.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_micros(value: &UsdcMicros) -> bool {
+    value.is_zero()
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -249,6 +262,8 @@ pub struct DepositTranche {
     pub invested_usdc: UsdcMicros,
     pub committed_usdc: UsdcMicros,
     pub withdrawn_usdc: UsdcMicros,
+    #[serde(default, skip_serializing_if = "is_zero_micros")]
+    pub returned_unadmitted_usdc: UsdcMicros,
 }
 
 impl DepositTranche {
@@ -268,7 +283,8 @@ impl DepositTranche {
         UsdcMicros(
             self.source_amount_usdc
                 .0
-                .saturating_sub(self.admitted_usdc.0),
+                .saturating_sub(self.admitted_usdc.0)
+                .saturating_sub(self.returned_unadmitted_usdc.0),
         )
     }
 }
@@ -284,6 +300,9 @@ pub struct WithdrawalRecord {
     pub event: WithdrawalEvent,
     pub applied: bool,
     pub allocations: Vec<CapitalAllocation>,
+    /// Frozen once applied, including an empty allocation list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unadmitted_allocations: Option<Vec<CapitalAllocation>>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -530,8 +549,10 @@ impl PacingState {
     ///
     /// Deposit admission requires confirmations, cooldown, explicit approval,
     /// and available automatic/yearly/cumulative capacity. A reconciled
-    /// withdrawal consumes only free tranche residual above the global fixed
-    /// reserve and never creates a HYPE sale intent.
+    /// withdrawal consumes free admitted residual above the global fixed reserve.
+    /// Explicit funding returns may first consume unadmitted source capital;
+    /// those allocations remain fixed and cannot later be admitted. Neither
+    /// path creates a HYPE sale intent.
     ///
     /// # Errors
     ///
@@ -948,7 +969,8 @@ impl PacingState {
                 || invalid_id(id)
                 || self.withdrawals.contains_key(id)
                 || tranche.source_amount_usdc.is_zero()
-                || tranche.admitted_usdc > tranche.source_amount_usdc
+                || checked_add(tranche.admitted_usdc, tranche.returned_unadmitted_usdc)?
+                    > tranche.source_amount_usdc
             {
                 return Err(PacingError::CorruptState);
             }
@@ -972,15 +994,47 @@ impl PacingState {
                 withdrawal
                     .allocations
                     .iter()
+                    .chain(withdrawal.unadmitted_allocations.iter().flatten())
                     .map(|allocation| allocation.amount_usdc),
             )?;
-            if (withdrawal.applied && allocated != withdrawal.event.amount_usdc)
+            if (!withdrawal.event.allow_unadmitted_funding
+                && withdrawal.unadmitted_allocations.is_some())
+                || (withdrawal.applied
+                    && withdrawal.event.allow_unadmitted_funding
+                    && withdrawal.unadmitted_allocations.is_none())
+                || (withdrawal.applied && allocated != withdrawal.event.amount_usdc)
                 || (!withdrawal.applied && !allocated.is_zero())
             {
                 return Err(PacingError::CorruptState);
             }
         }
         Ok(())
+    }
+
+    fn expected_unadmitted_returns(&self) -> Result<BTreeMap<&str, UsdcMicros>, PacingError> {
+        let mut expected_returned = BTreeMap::new();
+        for withdrawal in self.withdrawals.values().filter(|row| row.applied) {
+            for allocation in withdrawal.unadmitted_allocations.iter().flatten() {
+                let tranche = self
+                    .deposits
+                    .get(&allocation.tranche_id)
+                    .ok_or(PacingError::CorruptState)?;
+                if allocation.amount_usdc.is_zero()
+                    || tranche.received_at > withdrawal.event.occurred_at
+                {
+                    return Err(PacingError::CorruptState);
+                }
+                let current = expected_returned
+                    .get(allocation.tranche_id.as_str())
+                    .copied()
+                    .unwrap_or_default();
+                expected_returned.insert(
+                    allocation.tranche_id.as_str(),
+                    checked_add(current, allocation.amount_usdc)?,
+                );
+            }
+        }
+        Ok(expected_returned)
     }
 
     fn validate_decision_attribution(&self) -> Result<(), PacingError> {
@@ -1038,6 +1092,7 @@ impl PacingState {
             }
         }
         let mut expected_withdrawn = BTreeMap::<&str, UsdcMicros>::new();
+        let expected_returned = self.expected_unadmitted_returns()?;
         for withdrawal in self.withdrawals.values().filter(|row| row.applied) {
             for allocation in &withdrawal.allocations {
                 if !self.deposits.contains_key(&allocation.tranche_id) {
@@ -1054,11 +1109,16 @@ impl PacingState {
             }
         }
         for (id, tranche) in &self.deposits {
-            if tranche.committed_usdc
-                != expected_committed
+            if tranche.returned_unadmitted_usdc
+                != expected_returned
                     .get(id.as_str())
                     .copied()
                     .unwrap_or_default()
+                || tranche.committed_usdc
+                    != expected_committed
+                        .get(id.as_str())
+                        .copied()
+                        .unwrap_or_default()
                 || tranche.invested_usdc
                     != expected_invested
                         .get(id.as_str())
@@ -1118,6 +1178,7 @@ impl PacingState {
                 invested_usdc: UsdcMicros::default(),
                 committed_usdc: UsdcMicros::default(),
                 withdrawn_usdc: UsdcMicros::default(),
+                returned_unadmitted_usdc: UsdcMicros::default(),
             },
         );
         Ok(())
@@ -1138,6 +1199,7 @@ impl PacingState {
             event.event_id.clone(),
             WithdrawalRecord {
                 event: event.clone(),
+                unadmitted_allocations: None,
                 applied: false,
                 allocations: Vec::new(),
             },
@@ -1181,6 +1243,7 @@ impl PacingState {
             // admission around durable economic history.
             tranche.admitted_usdc = preserved_admission;
             tranche.withdrawn_usdc = UsdcMicros::default();
+            tranche.returned_unadmitted_usdc = UsdcMicros::default();
             tranche.status = status_before_admission(tranche, limits, at);
         }
         let reserved_total =
@@ -1289,13 +1352,59 @@ impl PacingState {
         id: &str,
         limits: &PacingLimits,
     ) -> Result<(), PacingError> {
-        let record = self.withdrawals.get(id).ok_or(PacingError::CorruptState)?;
+        let record = self
+            .withdrawals
+            .get(id)
+            .ok_or(PacingError::CorruptState)?
+            .clone();
+        let unadmitted_allocations = if record.event.allow_unadmitted_funding {
+            if let Some(frozen) = &record.unadmitted_allocations {
+                frozen.clone()
+            } else {
+                let mut remaining = record.event.amount_usdc.0;
+                let mut candidates = self
+                    .deposits
+                    .values()
+                    .filter(|tranche| tranche.received_at <= record.event.occurred_at)
+                    .collect::<Vec<_>>();
+                candidates.sort_by_key(|tranche| (tranche.received_at, &tranche.event_id));
+                let mut allocations = Vec::new();
+                for tranche in candidates {
+                    let amount = remaining.min(tranche.unadmitted_usdc().0);
+                    if amount > 0 {
+                        allocations.push(CapitalAllocation {
+                            tranche_id: tranche.event_id.clone(),
+                            amount_usdc: UsdcMicros(amount),
+                        });
+                        remaining -= amount;
+                    }
+                }
+                allocations
+            }
+        } else {
+            Vec::new()
+        };
+        let unadmitted_total =
+            checked_sum(unadmitted_allocations.iter().map(|row| row.amount_usdc))?;
+        let target = checked_sub(record.event.amount_usdc, unadmitted_total)?;
+        for allocation in &unadmitted_allocations {
+            let tranche = self
+                .deposits
+                .get_mut(&allocation.tranche_id)
+                .ok_or(PacingError::CorruptState)?;
+            if tranche.received_at > record.event.occurred_at
+                || allocation.amount_usdc > tranche.unadmitted_usdc()
+            {
+                return Err(PacingError::CorruptState);
+            }
+            tranche.returned_unadmitted_usdc =
+                checked_add(tranche.returned_unadmitted_usdc, allocation.amount_usdc)?;
+        }
         let free = checked_sum(self.deposits.values().map(DepositTranche::residual_usdc))?;
         let withdrawable = checked_sub_floor(free, limits.fixed_reserve_usdc);
-        if record.event.amount_usdc > withdrawable {
+        if target > withdrawable {
             return Err(PacingError::WithdrawalExceedsFreeCapital(id.to_owned()));
         }
-        let target = record.event.amount_usdc;
         let mut tranche_ids = self.deposits.keys().cloned().collect::<Vec<_>>();
         tranche_ids.sort_by_key(|tranche_id| {
             let tranche = &self.deposits[tranche_id];
@@ -1335,6 +1444,9 @@ impl PacingState {
             .ok_or(PacingError::CorruptState)?;
         record.applied = true;
         record.allocations = allocations;
+        if record.event.allow_unadmitted_funding {
+            record.unadmitted_allocations = Some(unadmitted_allocations);
+        }
         Ok(())
     }
 

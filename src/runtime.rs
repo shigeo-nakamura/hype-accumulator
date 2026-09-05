@@ -943,6 +943,7 @@ impl SignerFreeRuntime {
                                         )
                                     })?;
                             LedgerEventKind::AuthoritativeTransferWithdrawal {
+                                unadmitted_allocations: Vec::new(),
                                 amount_usdc: amount,
                                 execution_account: validated.execution_account,
                                 counterparty: validated.parent_account,
@@ -969,6 +970,7 @@ impl SignerFreeRuntime {
                             |record| record.event.reconciled_at,
                         );
                     capital_events.push(CapitalEvent::Withdrawal(WithdrawalEvent {
+                        allow_unadmitted_funding: transfer_withdrawal,
                         event_id: movement.event_id.clone(),
                         amount_usdc: amount,
                         occurred_at,
@@ -1024,6 +1026,7 @@ impl SignerFreeRuntime {
             ledger_events.extend(ordered_capital_ledger_events(
                 movement_ledger_events,
                 admission_events,
+                &next_state.pacing,
             ));
             Some(DecisionResult::Existing(decision))
         } else if boundary_replay_safe {
@@ -1048,6 +1051,7 @@ impl SignerFreeRuntime {
             ledger_events.extend(ordered_capital_ledger_events(
                 boundary_movements,
                 boundary_admission_events,
+                &next_state.pacing,
             ));
             let boundary_pacing = next_state.pacing.clone();
             let decision_input = DecisionInput {
@@ -1087,6 +1091,7 @@ impl SignerFreeRuntime {
             ledger_events.extend(ordered_capital_ledger_events(
                 later_movements,
                 later_admission_events,
+                &next_state.pacing,
             ));
             decision
         } else {
@@ -1104,6 +1109,7 @@ impl SignerFreeRuntime {
             ledger_events.extend(ordered_capital_ledger_events(
                 movement_ledger_events,
                 admission_events,
+                &next_state.pacing,
             ));
             None
         };
@@ -1777,7 +1783,21 @@ fn admission_delta_events_between(
 fn ordered_capital_ledger_events(
     mut movement_events: Vec<LedgerEvent>,
     admission_events: Vec<LedgerEvent>,
+    pacing: &PacingState,
 ) -> Vec<LedgerEvent> {
+    for event in &mut movement_events {
+        if let LedgerEventKind::AuthoritativeTransferWithdrawal {
+            unadmitted_allocations,
+            ..
+        } = &mut event.kind
+        {
+            if let Some(record) = pacing.withdrawals().get(&event.event_id) {
+                if let Some(frozen) = &record.unadmitted_allocations {
+                    unadmitted_allocations.clone_from(frozen);
+                }
+            }
+        }
+    }
     movement_events.extend(admission_events);
     movement_events.sort_by(|left, right| {
         left.occurred_at

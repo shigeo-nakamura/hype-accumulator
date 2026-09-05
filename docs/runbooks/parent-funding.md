@@ -30,7 +30,7 @@ differ. The actual parent address and funding mode are bound into the effective
 live-policy digest, not just the environment variable name. This does not
 validate signer delegation or enable live trading.
 
-The signer-free runtime obtains the route through the typed config and binds it
+Both the signer-free runtime and supervised live-probe prepare command obtain the route through the typed config and binds it
 into authenticated runtime state on its first committed cycle. A subsequent
 parent change, execution-account change, enablement, or disablement is rejected.
 Use a separately approved migration with a fresh state directory and protected
@@ -57,8 +57,12 @@ backfill is needed so previously ignored transfers are not lost behind a cursor.
   transfers fail the history gate in this mode. They are not approved funding.
 - Negative USDC internal transfers with a valid distinct counterparty are
   recorded separately as `AuthoritativeTransferWithdrawal`. They reduce
-  available capital and do not refund annual/lifetime admission room. Missing
-  or malformed counterparties fail closed.
+  available capital and do not refund annual/lifetime admission room. Returns
+  first consume available unadmitted funding in receipt-time/ID order, then free
+  admitted residual. The unadmitted allocations are frozen in durable state and
+  the ledger; later approval/cooldown expiry cannot admit returned capital.
+  Public unallocated funding excludes these returns. Missing or malformed
+  counterparties fail closed.
 - New funding after the daily decision cannot cause a second purchase that day.
   Current DRY_RUN still suppresses all signed actions.
 

@@ -1973,3 +1973,152 @@ fn parent_funding_malformed_withdrawal_is_rejected_before_any_pending_commit() {
         assert!(runtime.ledger.state().last_event_at().is_none());
     }
 }
+
+#[test]
+fn parent_funding_return_before_approval_cannot_be_admitted_later() {
+    for returned in [40, 100] {
+        let directory = tempfile::tempdir().unwrap();
+        let start = at(2026, 7, 6, 8, 0);
+        let now = at(2026, 7, 6, 12, 0);
+        let cfg =
+            config(directory.path(), ms(start)).with_parent_funding_route(Some(parent_route()));
+        let mut runtime = SignerFreeRuntime::open(cfg.clone(), limits()).unwrap();
+        let funding_at = start + TimeDelta::hours(1);
+        let incoming = parent_transfer("not-yet-approved", funding_at, 100);
+        let mut outgoing = parent_transfer(
+            "returned-before-approval",
+            funding_at + TimeDelta::minutes(30),
+            returned,
+        );
+        outgoing.amount = -outgoing.amount;
+        let balance = f64::from(u32::try_from(100 - returned).unwrap());
+        funding_cycle(
+            &mut runtime,
+            now,
+            &[incoming.clone(), outgoing.clone()],
+            &AdmissionApprovals::default(),
+            balance,
+        )
+        .unwrap();
+        assert_eq!(runtime.ledger.state().admitted_usdc(), usd(0));
+        assert_eq!(
+            runtime.ledger.state().authoritative_deposits_usdc(),
+            Some(usd(100 - returned))
+        );
+        assert_eq!(
+            runtime.state.pacing.deposits()["not-yet-approved"].returned_unadmitted_usdc,
+            usd(returned)
+        );
+        drop(runtime);
+        let mut runtime = SignerFreeRuntime::open(cfg, limits()).unwrap();
+        let later = now + TimeDelta::hours(1);
+        let admission = approvals("not-yet-approved", funding_at, later);
+        funding_cycle(
+            &mut runtime,
+            later,
+            &[incoming, outgoing],
+            &admission,
+            balance,
+        )
+        .unwrap();
+        assert_eq!(runtime.ledger.state().admitted_usdc(), usd(100 - returned));
+        assert_eq!(
+            runtime.ledger.state().deployable_usdc(),
+            usd(100 - returned)
+        );
+        assert_eq!(
+            runtime.state.pacing.deposits()["not-yet-approved"].returned_unadmitted_usdc,
+            usd(returned)
+        );
+    }
+}
+
+#[test]
+fn parent_funding_return_during_cooldown_stays_unavailable_after_cooldown() {
+    let directory = tempfile::tempdir().unwrap();
+    let start = at(2026, 7, 6, 8, 0);
+    let cfg = config(directory.path(), ms(start)).with_parent_funding_route(Some(parent_route()));
+    let mut cap = limits();
+    cap.deposit_cooldown_seconds = 4 * 3600;
+    let mut runtime = SignerFreeRuntime::open(cfg, cap).unwrap();
+    let received = start + TimeDelta::hours(1);
+    let incoming = parent_transfer("cooling", received, 100);
+    let mut outgoing = parent_transfer("return-cooling", received + TimeDelta::minutes(30), 100);
+    outgoing.amount = -outgoing.amount;
+    let admission = approvals("cooling", received, received);
+    let movements = [incoming, outgoing];
+    funding_cycle(
+        &mut runtime,
+        at(2026, 7, 6, 12, 0),
+        &movements,
+        &admission,
+        0.0,
+    )
+    .unwrap();
+    funding_cycle(
+        &mut runtime,
+        at(2026, 7, 6, 14, 0),
+        &movements,
+        &admission,
+        0.0,
+    )
+    .unwrap();
+    assert_eq!(runtime.ledger.state().admitted_usdc(), usd(0));
+    assert_eq!(
+        runtime.state.pacing.deposits()["cooling"].returned_unadmitted_usdc,
+        usd(100)
+    );
+}
+
+#[test]
+fn parent_funding_mixed_return_preserves_only_admitted_withdrawal_debit() {
+    let directory = tempfile::tempdir().unwrap();
+    let start = at(2026, 7, 6, 8, 0);
+    let now = at(2026, 7, 6, 12, 0);
+    let cfg = config(directory.path(), ms(start)).with_parent_funding_route(Some(parent_route()));
+    let mut cap = limits();
+    cap.max_automatically_admitted_usdc = usd(100);
+    let mut runtime = SignerFreeRuntime::open(cfg.clone(), cap.clone()).unwrap();
+    let received = start + TimeDelta::hours(1);
+    let incoming = parent_transfer("partly-admitted", received, 1_000);
+    let admission = approvals("partly-admitted", received, received);
+    funding_cycle(
+        &mut runtime,
+        now,
+        std::slice::from_ref(&incoming),
+        &admission,
+        1_000.0,
+    )
+    .unwrap();
+    let mut outgoing = parent_transfer("mixed-return", now + TimeDelta::minutes(1), 950);
+    outgoing.amount = -outgoing.amount;
+    let movements = [incoming, outgoing];
+    funding_cycle(
+        &mut runtime,
+        now + TimeDelta::minutes(2),
+        &movements,
+        &admission,
+        50.0,
+    )
+    .unwrap();
+    assert_eq!(runtime.ledger.state().admitted_usdc(), usd(100));
+    assert_eq!(runtime.ledger.state().deployable_usdc(), usd(50));
+    assert_eq!(
+        runtime.ledger.state().authoritative_deposits_usdc(),
+        Some(usd(100))
+    );
+    let tranche = &runtime.state.pacing.deposits()["partly-admitted"];
+    assert_eq!(tranche.returned_unadmitted_usdc, usd(900));
+    assert_eq!(tranche.withdrawn_usdc, usd(50));
+    drop(runtime);
+    let mut runtime = SignerFreeRuntime::open(cfg, cap).unwrap();
+    funding_cycle(
+        &mut runtime,
+        now + TimeDelta::minutes(5),
+        &movements,
+        &admission,
+        50.0,
+    )
+    .unwrap();
+    assert_eq!(runtime.ledger.state().deployable_usdc(), usd(50));
+}

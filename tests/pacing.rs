@@ -74,6 +74,7 @@ fn unapproved_deposit(
 
 fn withdrawal(id: impl Into<String>, amount: u64, occurred_at: DateTime<Utc>) -> CapitalEvent {
     CapitalEvent::Withdrawal(WithdrawalEvent {
+        allow_unadmitted_funding: false,
         event_id: id.into(),
         amount_usdc: usd(amount),
         occurred_at,
@@ -301,6 +302,7 @@ fn future_deposit_cannot_retroactively_fund_an_earlier_withdrawal() {
     let result = state.reconcile_capital(
         &[
             CapitalEvent::Withdrawal(WithdrawalEvent {
+                allow_unadmitted_funding: false,
                 event_id: "earlier-withdrawal".to_owned(),
                 amount_usdc: usd(10),
                 occurred_at: withdrawn_at,
@@ -337,6 +339,7 @@ fn late_reconciliation_replays_prior_admissions_before_allocating_withdrawal() {
 
     let result = state.reconcile_capital(
         &[CapitalEvent::Withdrawal(WithdrawalEvent {
+            allow_unadmitted_funding: false,
             event_id: "late-earlier-withdrawal".to_owned(),
             amount_usdc: usd(10),
             occurred_at: withdrawn_at,
@@ -372,6 +375,7 @@ fn retroactive_withdrawal_never_reuses_committed_or_invested_capital() {
 
     let late_withdrawal = |id: &str| {
         CapitalEvent::Withdrawal(WithdrawalEvent {
+            allow_unadmitted_funding: false,
             event_id: id.to_owned(),
             amount_usdc: usd(100),
             occurred_at: at(2026, 1, 1, 11),
@@ -467,6 +471,7 @@ fn stale_reconciliation_time_cannot_restore_applied_withdrawal_capital() {
             &[
                 deposit("deposit", 100, at(2026, 1, 1, 8)),
                 CapitalEvent::Withdrawal(WithdrawalEvent {
+                    allow_unadmitted_funding: false,
                     event_id: "withdrawal".to_owned(),
                     amount_usdc: usd(20),
                     occurred_at: at(2026, 1, 1, 9),
@@ -504,6 +509,7 @@ fn decision_replays_withdrawals_that_became_ready_after_last_reconciliation() {
             &[
                 deposit("deposit", 100, at(2026, 1, 1, 8)),
                 CapitalEvent::Withdrawal(WithdrawalEvent {
+                    allow_unadmitted_funding: false,
                     event_id: "future-ready".to_owned(),
                     amount_usdc: usd(20),
                     occurred_at: at(2026, 1, 1, 9),
@@ -842,6 +848,7 @@ fn unsettled_commitment_encumbers_fee_spread_reserve() {
 
     let before = state.clone();
     let blocked_withdrawal = CapitalEvent::Withdrawal(WithdrawalEvent {
+        allow_unadmitted_funding: false,
         event_id: "blocked-withdrawal".to_owned(),
         amount_usdc: usd(1),
         occurred_at: at(2026, 12, 31, 13),
@@ -1263,6 +1270,7 @@ proptest! {
             let withdraw_micros = requested.min(free_micros);
             if withdraw_micros != 0 {
                 let event = CapitalEvent::Withdrawal(WithdrawalEvent {
+                allow_unadmitted_funding: false,
                     event_id: format!("withdrawal-{index}"),
                     amount_usdc: UsdcMicros::from_micros(withdraw_micros),
                     occurred_at: day + TimeDelta::hours(22),

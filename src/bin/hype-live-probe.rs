@@ -364,7 +364,8 @@ async fn prepare(
     };
     let configured_residual_hype_atoms = HypeAtoms::from_atoms(effective.residual_hype_wei);
 
-    let runtime_config = RuntimeConfig::from_toml(&fs::read_to_string(runtime_config_path)?)?;
+    let runtime_config = RuntimeConfig::from_toml(&fs::read_to_string(runtime_config_path)?)?
+        .with_parent_funding_route(config.parent_funding_route(&ProcessEnvironment)?);
     let limits = PacingLimits::from_config(&config)?;
     let mut runtime = SignerFreeRuntime::open(runtime_config.clone(), limits)?;
 

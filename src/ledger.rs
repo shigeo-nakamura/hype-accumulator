@@ -5,7 +5,7 @@
 //! anything. Tamper and rollback resistance depends on the caller keeping its
 //! [`ProtectedAnchorStore`] outside the mutable ledger filesystem boundary.
 
-use crate::pacing::UsdcMicros;
+use crate::pacing::{CapitalAllocation, UsdcMicros};
 use chrono::{DateTime, NaiveDate, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -82,6 +82,7 @@ pub enum LedgerEventKind {
         execution_account: String,
     },
     AuthoritativeTransferWithdrawal {
+        unadmitted_allocations: Vec<CapitalAllocation>,
         amount_usdc: UsdcMicros,
         execution_account: String,
         counterparty: String,
@@ -181,6 +182,8 @@ struct DepositReplay {
     occurred_at: DateTime<Utc>,
     authoritative_usdc: UsdcMicros,
     admitted_usdc: UsdcMicros,
+    #[serde(default, skip_serializing_if = "is_zero_micros")]
+    returned_unadmitted_usdc: UsdcMicros,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -251,13 +254,26 @@ pub struct ReplayState {
     last_event_at: Option<DateTime<Utc>>,
 }
 
+// Serde skip predicates receive references.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_micros(value: &UsdcMicros) -> bool {
+    value.is_zero()
+}
+
 impl ReplayState {
+    /// Authoritative funding net of returns of capital that was never admitted.
+    /// The original gross amounts and return allocations remain in the journal.
     #[must_use]
     pub fn authoritative_deposits_usdc(&self) -> Option<UsdcMicros> {
         self.deposits
             .values()
             .try_fold(0_u64, |total, deposit| {
-                total.checked_add(deposit.authoritative_usdc.as_micros())
+                total.checked_add(
+                    deposit
+                        .authoritative_usdc
+                        .as_micros()
+                        .checked_sub(deposit.returned_unadmitted_usdc.as_micros())?,
+                )
             })
             .map(UsdcMicros::from_micros)
     }
@@ -1051,6 +1067,7 @@ fn apply_event(state: &mut ReplayState, event: &LedgerEvent) -> Result<(), Ledge
                 DepositReplay {
                     occurred_at: event.occurred_at,
                     authoritative_usdc: *amount_usdc,
+                    returned_unadmitted_usdc: UsdcMicros::default(),
                     admitted_usdc: UsdcMicros::default(),
                 },
             );
@@ -1059,8 +1076,46 @@ fn apply_event(state: &mut ReplayState, event: &LedgerEvent) -> Result<(), Ledge
             deposit_event_id,
             amount_usdc,
         } => record_deposit_admission(state, event.occurred_at, deposit_event_id, *amount_usdc)?,
-        LedgerEventKind::AuthoritativeWithdrawal { amount_usdc }
-        | LedgerEventKind::AuthoritativeTransferWithdrawal { amount_usdc, .. } => {
+        LedgerEventKind::AuthoritativeTransferWithdrawal {
+            amount_usdc,
+            unadmitted_allocations,
+            ..
+        } => {
+            let mut returned = UsdcMicros::default();
+            for allocation in unadmitted_allocations {
+                let deposit = state
+                    .deposits
+                    .get_mut(&allocation.tranche_id)
+                    .ok_or_else(|| LedgerError::UnknownDeposit(allocation.tranche_id.clone()))?;
+                let next_returned =
+                    checked_add(deposit.returned_unadmitted_usdc, allocation.amount_usdc)?;
+                if event.occurred_at < deposit.occurred_at
+                    || checked_add(next_returned, deposit.admitted_usdc)?
+                        > deposit.authoritative_usdc
+                {
+                    return Err(LedgerError::CorruptLedger(
+                        "return exceeds unadmitted funding".into(),
+                    ));
+                }
+                deposit.returned_unadmitted_usdc = next_returned;
+                returned = checked_add(returned, allocation.amount_usdc)?;
+            }
+            let admitted_withdrawal = amount_usdc
+                .as_micros()
+                .checked_sub(returned.as_micros())
+                .ok_or_else(|| {
+                    LedgerError::CorruptLedger("return allocation exceeds withdrawal".into())
+                })?;
+            let admitted_withdrawal = UsdcMicros::from_micros(admitted_withdrawal);
+            record_capital_timeline_entry(
+                state,
+                event.occurred_at,
+                UsdcMicros::default(),
+                admitted_withdrawal,
+            )?;
+            state.withdrawn_usdc = checked_add(state.withdrawn_usdc, admitted_withdrawal)?;
+        }
+        LedgerEventKind::AuthoritativeWithdrawal { amount_usdc } => {
             record_capital_timeline_entry(
                 state,
                 event.occurred_at,
@@ -1171,7 +1226,7 @@ fn record_deposit_admission(
         ));
     }
     let next_admitted = checked_add(deposit.admitted_usdc, amount_usdc)?;
-    if next_admitted > deposit.authoritative_usdc {
+    if checked_add(next_admitted, deposit.returned_unadmitted_usdc)? > deposit.authoritative_usdc {
         return Err(LedgerError::AdmissionExceedsDeposit(
             deposit_event_id.to_owned(),
         ));
@@ -1553,8 +1608,25 @@ fn validate_event(event: &LedgerEvent) -> Result<(), LedgerError> {
             amount_usdc,
             counterparty: parent_account,
             execution_account,
+            ..
         } => {
             require_nonzero(*amount_usdc)?;
+            if let LedgerEventKind::AuthoritativeTransferWithdrawal {
+                unadmitted_allocations,
+                ..
+            } = &event.kind
+            {
+                let mut ids = BTreeSet::new();
+                for allocation in unadmitted_allocations {
+                    validate_id("funding_event_id", &allocation.tranche_id)?;
+                    require_nonzero(allocation.amount_usdc)?;
+                    if !ids.insert(&allocation.tranche_id) {
+                        return Err(LedgerError::CorruptLedger(
+                            "duplicate return allocation".into(),
+                        ));
+                    }
+                }
+            }
             for account in [parent_account, execution_account] {
                 if account.len() != 42
                     || !account.starts_with("0x")
