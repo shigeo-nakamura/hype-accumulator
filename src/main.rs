@@ -7,10 +7,10 @@ use hype_accumulator::{
     monitor::{trade_cadence_label, HypeAttribution, HyperliquidObserver},
     pacing::PacingLimits,
     runtime::{AdmissionApprovals, RuntimeConfig, RuntimeCycleInput, SignerFreeRuntime},
-    signal::{CoreHealth, SignalSnapshot},
+    signal::SignalSnapshot,
     signal_source::{
-        build_snapshot, plan_snapshot, publish_snapshot, HyperliquidCoreSignalSource,
-        PublishOutcome,
+        build_snapshot, core_health_label, plan_snapshot, publish_snapshot,
+        HyperliquidCoreSignalSource, PublishOutcome,
     },
 };
 use std::{
@@ -317,17 +317,19 @@ async fn run_signal_snapshot(
     let source = HyperliquidCoreSignalSource::new(&config.hyperliquid.endpoint)?;
     let observation = source.observe_top_of_book().await?;
     let snapshot = build_snapshot(&plan, &observation)?;
-    let (core_health_label, core_age_seconds) = match snapshot.core_health() {
-        CoreHealth::Healthy { age_seconds } => ("healthy", *age_seconds),
-        CoreHealth::Missing | CoreHealth::Future { .. } | CoreHealth::Stale { .. } => {
-            return Err("produced snapshot is not purchase-eligible".into());
-        }
-    };
-    let (outcome, snapshot_hash) =
+    let (outcome, snapshot_hash, core_health) =
         match publish_snapshot(runtime_config.signal_snapshot_path(), &snapshot)? {
-            PublishOutcome::Written => ("written", snapshot.snapshot_hash().to_owned()),
-            PublishOutcome::Existing { snapshot_hash } => ("existing", snapshot_hash),
+            PublishOutcome::Written => (
+                "written",
+                snapshot.snapshot_hash().to_owned(),
+                snapshot.core_health().clone(),
+            ),
+            PublishOutcome::Existing {
+                snapshot_hash,
+                core_health,
+            } => ("existing", snapshot_hash, core_health),
         };
+    let (core_health_label, core_age_seconds) = core_health_label(&core_health)?;
     println!(
         "mode=signal-snapshot decision_at={} core_health={core_health_label} core_age_seconds={core_age_seconds} outcome={outcome} snapshot_hash={snapshot_hash} signed_action_created=false",
         plan.decision_at.to_rfc3339(),

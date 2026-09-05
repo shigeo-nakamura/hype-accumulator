@@ -27,7 +27,7 @@ use crate::{
     signal::{
         CoreHealth, CoreMarketData, FreshnessRequirement, LiveSignalNormalizer, PriceMicrounits,
         RevisionIdentity, RevisionQuery, RevisionTimestamps, SignalError, SignalRevision,
-        SignalSnapshot, SnapshotRequest,
+        SignalSnapshot, SnapshotRequest, SIGNAL_SCHEMA_VERSION,
     },
     status_io::{write_signal_snapshot_atomic, StatusIoError},
 };
@@ -59,7 +59,6 @@ pub const AUXILIARY_SIGNAL_SERIES: &str = "btc_etf_net_flow";
 /// adapter must choose its own value rather than inherit this one.
 const AUXILIARY_PLACEHOLDER_STALE_AFTER_SECONDS: u64 = 900;
 
-const SIGNAL_SCHEMA_VERSION: u8 = 1;
 const PRICE_MICROUNITS_PER_UNIT: u64 = 1_000_000;
 const TOP_OF_BOOK_DEPTH: usize = 1;
 
@@ -335,7 +334,13 @@ pub enum PublishOutcome {
     /// The snapshot was written atomically.
     Written,
     /// A valid snapshot for the same boundary already existed and was kept.
-    Existing { snapshot_hash: String },
+    /// Carries that snapshot's own (frozen, persisted-at-creation) core
+    /// health and hash — not the just-built candidate's — so a caller
+    /// reporting this outcome describes what is actually on disk.
+    Existing {
+        snapshot_hash: String,
+        core_health: CoreHealth,
+    },
 }
 
 /// Writes the snapshot unless a valid one for the same boundary already
@@ -366,6 +371,10 @@ pub fn publish_snapshot(
     // boundary" and both proceed to write, which would silently replace the
     // first published observation with a later one and break the "first
     // snapshot per UTC day is immutable" guarantee.
+    // `lock_exclusive` blocks the calling thread, which would stall a tokio
+    // worker if this ran inside a long-lived multi-task process; acceptable
+    // only because the producer is a one-shot CLI invocation with nothing
+    // else to schedule on this runtime.
     lock_file.lock_exclusive()?;
     match fs::read_to_string(path) {
         Ok(payload) => {
@@ -373,6 +382,7 @@ pub fn publish_snapshot(
                 if existing.decision_at() == snapshot.decision_at() {
                     return Ok(PublishOutcome::Existing {
                         snapshot_hash: existing.snapshot_hash().to_owned(),
+                        core_health: existing.core_health().clone(),
                     });
                 }
             }
@@ -382,6 +392,28 @@ pub fn publish_snapshot(
     }
     write_signal_snapshot_atomic(path, snapshot)?;
     Ok(PublishOutcome::Written)
+}
+
+/// Extracts the `(label, age_seconds)` pair for a snapshot's core health.
+///
+/// Every snapshot this producer ever persists is purchase-eligible:
+/// [`build_snapshot`] itself already returns [`SignalSourceError::NotEligible`]
+/// before returning one that is not. This helper exists only so a caller
+/// reporting either a freshly built or a previously persisted snapshot (see
+/// [`PublishOutcome::Existing`]) can format the same way; its `Missing`/
+/// `Future`/`Stale` arm is defensive and intentionally redundant with that
+/// earlier check, not an independent safety gate.
+///
+/// # Errors
+///
+/// Returns [`SignalSourceError::NotEligible`] if `health` is not `Healthy`.
+pub fn core_health_label(health: &CoreHealth) -> Result<(&'static str, u64), SignalSourceError> {
+    match health {
+        CoreHealth::Healthy { age_seconds } => Ok(("healthy", *age_seconds)),
+        CoreHealth::Missing | CoreHealth::Future { .. } | CoreHealth::Stale { .. } => {
+            Err(SignalSourceError::NotEligible(health.clone()))
+        }
+    }
 }
 
 fn signal_snapshot_lock_path(path: &Path) -> PathBuf {
@@ -645,6 +677,18 @@ mod tests {
     }
 
     #[test]
+    fn core_health_label_accepts_only_healthy() {
+        assert_eq!(
+            core_health_label(&CoreHealth::Healthy { age_seconds: 42 }).expect("healthy"),
+            ("healthy", 42)
+        );
+        assert!(matches!(
+            core_health_label(&CoreHealth::Missing),
+            Err(SignalSourceError::NotEligible(CoreHealth::Missing))
+        ));
+    }
+
+    #[test]
     fn publish_keeps_the_first_snapshot_per_boundary() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("inputs/signal-snapshot.json");
@@ -675,9 +719,14 @@ mod tests {
         assert_eq!(
             publish_snapshot(&path, &second).expect("kept"),
             PublishOutcome::Existing {
-                snapshot_hash: first.snapshot_hash().to_owned()
+                snapshot_hash: first.snapshot_hash().to_owned(),
+                core_health: first.core_health().clone(),
             }
         );
+        // The kept outcome must report the persisted (first) snapshot's own
+        // frozen health, not the just-built (second) candidate's — even
+        // though both are Healthy here, they carry different `age_seconds`.
+        assert_ne!(first.core_health(), second.core_health());
         assert_eq!(
             SignalSnapshot::from_json(&fs::read_to_string(&path).expect("payload"))
                 .expect("valid file"),
