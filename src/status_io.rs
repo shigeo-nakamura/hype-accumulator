@@ -2,6 +2,7 @@ use crate::{
     metrics::MetricsSnapshot,
     signal::{SignalError, SignalSnapshot},
     status::DashboardStatus,
+    status_s3_mirror::StatusS3Mirror,
 };
 use serde::Serialize;
 use std::{
@@ -22,6 +23,25 @@ pub enum StatusIoError {
     InvalidPath,
     #[error(transparent)]
     Signal(#[from] SignalError),
+}
+
+/// Best-effort mirrors an already-written local status document to S3.
+///
+/// A no-op when `STATUS_S3_BUCKET`/`STATUS_S3_KEY_PREFIX` are not
+/// configured. A mirror failure is logged to stderr and never surfaced as
+/// an error: the local write this always follows already succeeded and
+/// remains the source of truth (bot-strategy#343/#908).
+pub async fn mirror_status_to_s3(path: &Path, body: String) {
+    let Some(mirror) = StatusS3Mirror::from_env() else {
+        return;
+    };
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("status.json");
+    if let Err(error) = mirror.put(file_name, body).await {
+        eprintln!("[STATUS_S3] mirror failed file={file_name}: {error}");
+    }
 }
 
 /// Atomically rewrites a local dashboard status file in the target directory.

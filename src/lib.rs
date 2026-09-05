@@ -26,6 +26,7 @@ pub mod signal_source;
 pub mod signer;
 pub mod status;
 pub mod status_io;
+pub mod status_s3_mirror;
 pub mod workflow;
 
 use clock::{Clock, SystemClock};

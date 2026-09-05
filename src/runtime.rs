@@ -309,6 +309,15 @@ impl RuntimeConfig {
         self.signal_snapshot_stale_after_seconds
     }
 
+    /// Where the identifier-free public dashboard status document is
+    /// written each cycle. Used by the async CLI caller to best-effort
+    /// mirror the just-written file to S3 without threading async I/O
+    /// through this otherwise synchronous crash-safe runtime.
+    #[must_use]
+    pub fn status_path(&self) -> &Path {
+        &self.status_path
+    }
+
     fn configured_file_paths(&self) -> [&Path; 6] {
         [
             &self.protected_anchor_path,
