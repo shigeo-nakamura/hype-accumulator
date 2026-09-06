@@ -167,6 +167,12 @@ require_exactly_one(count, "admission_approvals_path")
 PY
 
 set -a; source /etc/hype-accumulator/observer.env; set +a  # public account identifiers only, no secret
+# The dry-run cycle also best-effort mirrors its local status write to S3
+# (src/status_io.rs::mirror_status_to_s3) whenever STATUS_S3_BUCKET and
+# STATUS_S3_KEY_PREFIX resolve from the environment — unconditionally unset
+# them so this disposable scratch run can never publish anywhere outside
+# $SCRATCH, regardless of what the shell or service environment sets.
+unset STATUS_S3_BUCKET STATUS_S3_KEY_PREFIX
 if /opt/hype-accumulator/current/hype-accumulator --dry-run-cycle \
      /etc/hype-accumulator/config.toml /etc/hype-accumulator/security-policy.toml \
      "$SCRATCH/runtime.toml"; then
@@ -180,10 +186,10 @@ fi
 A nonzero exit means the real parser rejected either the staged `admission-approvals.json` or the
 current config/policy pairing — do not install on a nonzero exit. `dry_run=true` in the real
 `config.toml` and the signer-free runtime's own design (no signing key is ever loaded by this path)
-mean nothing here can place, sign, or submit an order; the only state this touches is the disposable
-`$SCRATCH` directory, which is deleted immediately after. Treat a zero exit as "safe to proceed to
-the halted rollout," not as proof the *values* (amount, confirmation evidence) are correct — steps
-1–4 above are what establish that.
+mean nothing here can place, sign, or submit an order; with the S3 mirror explicitly disabled above,
+the only state this touches is the disposable `$SCRATCH` directory, which is deleted immediately
+after. Treat a zero exit as "safe to proceed to the halted rollout," not as proof the *values*
+(amount, confirmation evidence) are correct — steps 1–4 above are what establish that.
 
 Then install it the same way as any other production config change on this host: a halted rollout
 that pauses the HYPE timers, backs up the existing file, runs the config/policy `--install-preflight`
