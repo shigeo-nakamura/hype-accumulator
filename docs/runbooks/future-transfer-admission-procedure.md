@@ -120,66 +120,70 @@ Add one entry to `admission-approvals.json` (schema in `src/runtime.rs::DepositA
 independent human explorer check) — do not fill this in without step 3 having actually been done.
 
 `--install-preflight` (`docs/runbooks/release-install.md`) only validates `config.toml` and
-`security-policy.toml` — it does not parse or validate `admission-approvals.json`. There is no
-dedicated CLI subcommand that validates this artifact alone without opening the live runtime state
-(`--dry-run-cycle` does parse it via the real `AdmissionApprovals::from_json`, but it also opens
-`SignerFreeRuntime` against the configured, real `state_directory`, so it is not side-effect-free to
-run ad hoc before a backup exists). Before installing, run an offline check that reproduces the
-artifact's actual closed schema and typed-timestamp validation precisely — not a loose string
-comparison, which would wrongly accept unknown fields, non-integer numeric fields, or two identical
-non-date strings for `confirmed_at`/`approved_at`:
+`security-policy.toml` — it does not parse or validate `admission-approvals.json`. Hand-reproducing
+`AdmissionApprovals::from_json`'s exact closed schema and RFC 3339 grammar in another language is a
+moving target — Serde's typed `DateTime<Utc>` parser, `u32`/`u64` bounds, and `deny_unknown_fields`
+are implementation details that can drift out of sync with any reimplementation. Invoke the real
+parser instead, isolated from live state:
 
-```python
-import json
-from datetime import datetime, timezone
+`--dry-run-cycle config.toml security-policy.toml runtime.toml` parses the approvals artifact via
+the actual `AdmissionApprovals::from_json` and opens `SignerFreeRuntime` against whatever
+`state_directory`/`admission_approvals_path`/etc. the given `runtime.toml` names — it is exactly the
+code `hype-accumulator-dryrun.service` runs. Point it at a **scratch copy** of `runtime.toml` so it
+never touches production paths:
 
+```sh
+set -eu
+SCRATCH=$(mktemp -d)
+trap 'rm -rf "$SCRATCH"' EXIT
+# The host's system python3 is 3.9 (no stdlib tomllib), and runtime.toml here is
+# flat key = "value" / key = integer lines with no nested tables — a line-based
+# rewrite avoids needing a TOML parser at all.
+python3 - "$SCRATCH" <<'PY'
+import sys, re, pathlib
 
-def check(condition, message):
-    # Deliberately not `assert`: assertions are stripped entirely when Python
-    # runs with -O or PYTHONOPTIMIZE is set, which would silently disable
-    # every check below.
-    if not condition:
-        raise ValueError(message)
+# `if not count == 1: raise`, not `assert` — an assertion silently stripped
+# under -O/PYTHONOPTIMIZE would leave the substitution unapplied, and the
+# dry-run-cycle below would then read/write the REAL production paths
+# instead of the scratch directory. This check is what makes the isolation
+# a guarantee rather than a hope.
+def require_exactly_one(count, key):
+    if count != 1:
+        raise ValueError(f"expected exactly one {key} line, found {count}")
 
+scratch = pathlib.Path(sys.argv[1])
+text = pathlib.Path("/etc/hype-accumulator/runtime.toml").read_text()
+for key in ("state_directory", "protected_anchor_path", "signal_snapshot_path",
+            "status_path", "metrics_path", "cycle_report_path"):
+    pattern = re.compile(rf'^{key}\s*=\s*".*"\s*$', re.M)
+    replacement = f'{key} = "{scratch / key}"'
+    text, count = pattern.subn(replacement, text, count=1)
+    require_exactly_one(count, key)
+# Point this at the STAGED artifact under review, not the live one.
+pattern = re.compile(r'^admission_approvals_path\s*=\s*".*"\s*$', re.M)
+text, count = pattern.subn('admission_approvals_path = "staged-admission-approvals.json"', text, count=1)
+require_exactly_one(count, "admission_approvals_path")
+(scratch / "runtime.toml").write_text(text)
+PY
 
-def parse_rfc3339_utc(value):
-    check(isinstance(value, str), "timestamp must be a JSON string")
-    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    check(dt.tzinfo is not None, "timestamp must be timezone-aware")
-    return dt.astimezone(timezone.utc)
-
-
-data = json.load(open("staged-admission-approvals.json"))  # raises on malformed JSON
-check(set(data.keys()) == {"schema_version", "approvals"}, "unknown top-level field")
-check(data["schema_version"] == 1, "unsupported schema_version")
-seen = set()
-for a in data["approvals"]:
-    allowed = {"max_admitted_usdc", "event_id", "confirmed_at", "confirmation_count", "approved_at"}
-    check(set(a.keys()) <= allowed, "unknown field in approval entry")
-    check(isinstance(a["event_id"], str) and a["event_id"].strip() == a["event_id"] and a["event_id"],
-          "invalid event_id")
-    check(a["event_id"] not in seen, "duplicate event_id")
-    seen.add(a["event_id"])
-    check(isinstance(a["confirmation_count"], int) and not isinstance(a["confirmation_count"], bool),
-          "confirmation_count must be an integer")
-    check(0 < a["confirmation_count"] <= 0xFFFFFFFF, "confirmation_count must fit an unsigned 32-bit "
-          "integer (DepositAdmissionApproval.confirmation_count is a u32; the real parser rejects "
-          "negative or over-range values that a bare nonzero check would miss)")
-    if "max_admitted_usdc" in a and a["max_admitted_usdc"] is not None:
-        check(isinstance(a["max_admitted_usdc"], int) and not isinstance(a["max_admitted_usdc"], bool),
-              "max_admitted_usdc must be an integer")
-        check(0 < a["max_admitted_usdc"] <= 0xFFFFFFFFFFFFFFFF,
-              "max_admitted_usdc must fit an unsigned 64-bit integer (UsdcMicros wraps a u64)")
-    confirmed_at = parse_rfc3339_utc(a["confirmed_at"])
-    approved_at = parse_rfc3339_utc(a["approved_at"])
-    check(confirmed_at <= approved_at, "confirmed_at must not be after approved_at")
+set -a; source /etc/hype-accumulator/observer.env; set +a  # public account identifiers only, no secret
+if /opt/hype-accumulator/current/hype-accumulator --dry-run-cycle \
+     /etc/hype-accumulator/config.toml /etc/hype-accumulator/security-policy.toml \
+     "$SCRATCH/runtime.toml"; then
+  echo "staged admission-approvals.json accepted by the real parser"
+else
+  echo "REJECTED: do not install this artifact" >&2
+  exit 1
+fi
 ```
 
-Run this exactly as written (no `-O`/`PYTHONOPTIMIZE`, though the checks above do not rely on that
-flag being unset). This narrows, but does not eliminate, the gap with the real parser — it does not
-re-derive `UsdcMicros`' exact integer-overflow/bounds behavior, for instance. Treat a pass here as
-"safe to proceed to the halted rollout," not as a substitute for the runtime's own validation on
-first load.
+A nonzero exit means the real parser rejected either the staged `admission-approvals.json` or the
+current config/policy pairing — do not install on a nonzero exit. `dry_run=true` in the real
+`config.toml` and the signer-free runtime's own design (no signing key is ever loaded by this path)
+mean nothing here can place, sign, or submit an order; the only state this touches is the disposable
+`$SCRATCH` directory, which is deleted immediately after. Treat a zero exit as "safe to proceed to
+the halted rollout," not as proof the *values* (amount, confirmation evidence) are correct — steps
+1–4 above are what establish that.
 
 Then install it the same way as any other production config change on this host: a halted rollout
 that pauses the HYPE timers, backs up the existing file, runs the config/policy `--install-preflight`
