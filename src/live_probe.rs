@@ -448,6 +448,25 @@ async fn record_reconciliation(
         if observed_original_quantity != binding.order_envelope.original_quantity_hype {
             return Err(LiveProbeError::QuantityMismatch);
         }
+        // Side and time-in-force, read directly from the raw venue
+        // envelope (no market-metadata resolution needed for these two —
+        // unlike `coin`, which is venue-internal and not independently
+        // verified here; see the module-level note on that residual gap).
+        // Without this, `orderStatus` matching our CLOID and quantity but
+        // describing e.g. a sell or a resting GTC order would still be
+        // accepted as though it were the authorized HYPE IOC buy.
+        verify_observed_side_and_tif(&evidence.raw_order_status)?;
+        // Never trusted merely because *some* exchange order ID was
+        // already recorded: if a later lookup returns a *different* ID
+        // than the one already durably bound to this workflow, that must
+        // fail closed before anything below acts on it — including before
+        // this order's fills are merged into the durable accumulator,
+        // which would otherwise poison it with a different order's data.
+        if let Some(recorded) = workflow.state().exchange_order_id() {
+            if recorded != exchange_order_id {
+                return Err(LiveProbeError::BindingMismatch("exchange order ID"));
+            }
+        }
 
         // Hyperliquid's fill history is a bounded window shared across the
         // whole account, not scoped to this order: a fill can age out of
@@ -662,6 +681,42 @@ fn accepted_at_from_raw_order_status(raw: &str) -> Result<DateTime<Utc>, LivePro
         .ok_or(LiveProbeError::InvalidVenueTimestamp)?;
     let millis = i64::try_from(millis).map_err(|_| LiveProbeError::InvalidVenueTimestamp)?;
     DateTime::from_timestamp_millis(millis).ok_or(LiveProbeError::InvalidVenueTimestamp)
+}
+
+/// Verifies the raw venue envelope's own `side`/`tif` match the authorized
+/// buy IOC before any evidence built from it is trusted — confirmed real
+/// values (bot-strategy#901): `side: "B"` for buy, `tif: "Ioc"`.
+///
+/// Deliberately does **not** verify `coin` (the venue-internal asset index,
+/// e.g. `"@1035"` — not a human-readable symbol) against the authorized
+/// market: resolving it to confirm it names the HYPE/USDC spot market needs
+/// dex-connector market-metadata plumbing this binary does not have direct
+/// access to from a raw `orderStatus` body alone. This is a real residual
+/// gap, not a solved case — tracked as follow-up, not silently assumed
+/// covered.
+///
+/// # Errors
+///
+/// Returns an error for malformed JSON or a side/tif that doesn't match.
+fn verify_observed_side_and_tif(raw_order_status: &str) -> Result<(), LiveProbeError> {
+    let value: serde_json::Value = serde_json::from_str(raw_order_status)
+        .map_err(|_| LiveProbeError::BindingMismatch("orderStatus JSON"))?;
+    let order = value
+        .get("order")
+        .and_then(|envelope| envelope.get("order"));
+    let side = order
+        .and_then(|order| order.get("side"))
+        .and_then(|v| v.as_str());
+    let tif = order
+        .and_then(|order| order.get("tif"))
+        .and_then(|v| v.as_str());
+    if side != Some("B") {
+        return Err(LiveProbeError::BindingMismatch("order side"));
+    }
+    if tif != Some("Ioc") {
+        return Err(LiveProbeError::BindingMismatch("order time in force"));
+    }
+    Ok(())
 }
 
 const OBSERVED_FILLS_SCHEMA_VERSION: u8 = 1;
@@ -1438,7 +1493,7 @@ mod tests {
         let partially_filled = serde_json::json!({
             "status": "order",
             "order": {
-                "order": {"oid": 7, "origSz": "1", "sz": "0.5", "timestamp": accepted_at_ms},
+                "order": {"oid": 7, "origSz": "1", "sz": "0.5", "side": "B", "tif": "Ioc", "timestamp": accepted_at_ms},
                 "status": "open",
                 "statusTimestamp": accepted_at_ms
             }
@@ -1474,7 +1529,7 @@ mod tests {
         let fully_filled = serde_json::json!({
             "status": "order",
             "order": {
-                "order": {"oid": 7, "origSz": "1", "sz": "0", "timestamp": accepted_at_ms},
+                "order": {"oid": 7, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "timestamp": accepted_at_ms},
                 "status": "filled",
                 "statusTimestamp": fixture_at(21).timestamp_millis()
             }
@@ -1532,7 +1587,7 @@ mod tests {
         let canceled_unfilled = serde_json::json!({
             "status": "order",
             "order": {
-                "order": {"oid": 7, "origSz": "1", "sz": "1", "timestamp": accepted_at_ms},
+                "order": {"oid": 7, "origSz": "1", "sz": "1", "side": "B", "tif": "Ioc", "timestamp": accepted_at_ms},
                 "status": "canceled",
                 "statusTimestamp": accepted_at_ms
             }
@@ -1612,6 +1667,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_a_venue_reported_side_or_time_in_force_that_does_not_match_the_authorized_order(
+    ) {
+        // Regression test for a real Codex review finding: `orderStatus`
+        // matching our CLOID and quantity but describing e.g. a sell or a
+        // resting GTC order must not be accepted as though it were the
+        // authorized HYPE IOC buy.
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connector = unsigned_connector(format!("http://{}", listener.local_addr().unwrap()));
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let mut workflow = open_test_workflow(temp.path(), &binding);
+        workflow.prepare_order(fixture_at(2)).unwrap();
+
+        let accepted_at_ms = fixture_at(5).timestamp_millis();
+        let wrong_side = serde_json::json!({
+            "status": "order",
+            "order": {
+                "order": {"oid": 7, "origSz": "1", "sz": "1", "side": "A", "tif": "Ioc", "timestamp": accepted_at_ms},
+                "status": "open",
+                "statusTimestamp": accepted_at_ms
+            }
+        });
+        let no_fills = serde_json::json!([]);
+        let server = spawn_reconcile_responder(listener, wrong_side, no_fills, false);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reconcile_prepared_order(
+                &connector,
+                &mut workflow,
+                &test_journal_path(temp.path()),
+                fixture_at(20),
+            ),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(LiveProbeError::BindingMismatch("order side"))
+        ));
+        assert!(workflow.state().exchange_order_id().is_none());
+    }
+
+    #[tokio::test]
+    async fn rejects_an_exchange_order_id_change_before_touching_the_fill_accumulator() {
+        // Regression test for a real Codex review finding: the
+        // exchange-order-ID consistency check must run *before* merging
+        // this call's fills into the durable accumulator — otherwise a
+        // rejected, wrong-order response could still poison the
+        // accumulator with that other order's fill data before the
+        // mismatch is caught.
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connector = unsigned_connector(format!("http://{}", listener.local_addr().unwrap()));
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let mut workflow = open_test_workflow(temp.path(), &binding);
+        workflow.prepare_order(fixture_at(2)).unwrap();
+
+        let accepted_at_ms = fixture_at(5).timestamp_millis();
+        let first_order = serde_json::json!({
+            "status": "order",
+            "order": {
+                "order": {"oid": 7, "origSz": "1", "sz": "0.5", "side": "B", "tif": "Ioc", "timestamp": accepted_at_ms},
+                "status": "open",
+                "statusTimestamp": accepted_at_ms
+            }
+        });
+        let first_fill = serde_json::json!([{
+            "coin": "@1", "px": "25", "sz": "0.5", "side": "B", "time": 1_000,
+            "oid": 7, "tid": 1, "fee": "0.01", "feeToken": "USDC"
+        }]);
+        let server = spawn_reconcile_responder(listener, first_order, first_fill, true);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reconcile_prepared_order(
+                &connector,
+                &mut workflow,
+                &test_journal_path(temp.path()),
+                fixture_at(20),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(workflow.state().exchange_order_id(), Some("7"));
+
+        let accumulator_path = observed_fills_path(&test_journal_path(temp.path()));
+        let before = fs::read_to_string(&accumulator_path).unwrap();
+
+        // A later lookup returns a *different* exchange order ID (99, not
+        // 7), same authorized quantity and fully filled with its own fill.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connector = unsigned_connector(format!("http://{}", listener.local_addr().unwrap()));
+        let different_order = serde_json::json!({
+            "status": "order",
+            "order": {
+                "order": {"oid": 99, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "timestamp": accepted_at_ms},
+                "status": "filled",
+                "statusTimestamp": accepted_at_ms
+            }
+        });
+        let different_fill = serde_json::json!([{
+            "coin": "@1", "px": "25", "sz": "1", "side": "B", "time": 2_000,
+            "oid": 99, "tid": 2, "fee": "0.01", "feeToken": "USDC"
+        }]);
+        let server = spawn_reconcile_responder(listener, different_order, different_fill, false);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reconcile_prepared_order(
+                &connector,
+                &mut workflow,
+                &test_journal_path(temp.path()),
+                fixture_at(25),
+            ),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(LiveProbeError::BindingMismatch("exchange order ID"))
+        ));
+        // The workflow's recorded exchange order ID and the accumulator's
+        // contents must be untouched by the rejected, wrong-order response.
+        assert_eq!(workflow.state().exchange_order_id(), Some("7"));
+        let after = fs::read_to_string(&accumulator_path).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[tokio::test]
     async fn accepted_at_ahead_of_the_local_clock_does_not_block_recording() {
         // Regression test for a real Codex review finding: the venue clock
         // is permitted to run ahead of the local clock (up to the order
@@ -1633,7 +1827,7 @@ mod tests {
         let filled = serde_json::json!({
             "status": "order",
             "order": {
-                "order": {"oid": 7, "origSz": "1", "sz": "0", "timestamp": accepted_at_ms},
+                "order": {"oid": 7, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "timestamp": accepted_at_ms},
                 "status": "filled",
                 "statusTimestamp": accepted_at_ms
             }
