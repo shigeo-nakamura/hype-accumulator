@@ -39,21 +39,33 @@ not match exactly — do not admit a similar-looking or partial movement. Record
 (this becomes the ledger's `event_id`) and its `time` in milliseconds (this becomes `confirmed_at`,
 converted to UTC ISO 8601 — it is the on-chain time, not wall-clock poll time).
 
-## Step 2 — balance cross-check (second, structurally different check)
+## Step 2 — sender-side ledger lookup (second, genuinely independent check)
 
-Query a different endpoint over the same account to independently corroborate the balance change:
+A current balance is an aggregate figure: it cannot be attributed to one specific event, and
+`docs/runbooks/parent-funding.md` already forbids treating a balance change (or a repeated poll) as
+a confirmation. The second confirmation instead comes from checking the **other side of the same
+on-chain transaction** — query the same endpoint, but for the designated parent account:
 
 ```
 POST https://api.hyperliquid.xyz/info
-{"type":"spotClearinghouseState","user":"<execution_account>"}
+{"type":"userNonFundingLedgerUpdates","user":"<parent_account>","startTime":<ms>,"endTime":<ms>}
 ```
 
-Confirm the reported USDC `total` is consistent with the expected post-transfer balance, and that
-`hold == "0.0"` for the newly arrived funds (not already encumbered by an open order). A mismatch
-here — even if step 1 looked correct — means stop and investigate before proceeding.
+Find the entry with the exact same `hash` as step 1. Confirm its `delta.type == "send"`,
+`delta.user` equals the parent account itself, `delta.destination` equals the exact execution
+account, and `delta.amount`/`delta.usdcValue` match step 1 exactly. Reject and stop on any
+mismatch. This is a genuinely independent corroboration — the same committed transaction observed
+from both the source and destination ledgers — not a repeated poll of the same query or an
+unrelated aggregate metric.
 
-Two independent, structurally different reads that agree (transaction log + balance snapshot) is
-`confirmation_count = 2`, consistent with the current `min_deposit_confirmations = 2` policy value.
+Two independent, structurally matching reads of the same event (destination-side ledger lookup +
+source-side ledger lookup) is `confirmation_count = 2`, consistent with the current
+`min_deposit_confirmations = 2` policy value.
+
+As an additional sanity check (not counted toward `confirmation_count`), querying
+`{"type":"spotClearinghouseState","user":"<execution_account>"}` and confirming the current USDC
+`total`/`hold` are consistent with the expected post-transfer balance is still worth doing — it just
+does not by itself establish or add to confirmation evidence for this specific event.
 
 ## Step 3 — operator admission decision
 
@@ -87,9 +99,28 @@ Add one entry to `admission-approvals.json` (schema in `src/runtime.rs::DepositA
 }
 ```
 
-Install it the same way as any other production config change on this host: a halted rollout that
-pauses the HYPE timers, backs up the existing file, validates the new config offline (see
-`docs/runbooks/release-install.md`'s `--install-preflight` pattern), writes atomically, restarts the
+`--install-preflight` (`docs/runbooks/release-install.md`) only validates `config.toml` and
+`security-policy.toml` — it does not parse or validate `admission-approvals.json`. Before installing,
+run an explicit offline check that mirrors `AdmissionApprovals::from_json`'s own validation
+(`src/runtime.rs`), so a malformed artifact fails before anything is touched live rather than after
+the dry-run service restarts:
+
+```python
+import json
+data = json.load(open("staged-admission-approvals.json"))  # raises on malformed JSON
+assert data["schema_version"] == 1
+seen = set()
+for a in data["approvals"]:
+    assert a["event_id"].strip() == a["event_id"] and a["event_id"]
+    assert a["event_id"] not in seen; seen.add(a["event_id"])
+    assert a["confirmation_count"] != 0
+    assert a.get("max_admitted_usdc") is None or a["max_admitted_usdc"] > 0
+    assert a["confirmed_at"] <= a["approved_at"]  # ISO 8601 UTC strings compare correctly lexically
+```
+
+Then install it the same way as any other production config change on this host: a halted rollout
+that pauses the HYPE timers, backs up the existing file, runs the config/policy `--install-preflight`
+check above alongside the admission-artifact check above, writes atomically, restarts the
 observer/dry-run services once to confirm the expected `admitted_usdc` figure, and rolls back
 automatically on any mismatch. `dry_run`/`manual_halt`/`live_approved` are not touched by this step.
 
