@@ -461,9 +461,12 @@ async fn record_reconciliation(
         // coverage once enough other account activity evicts its rows,
         // even though it genuinely filled. See
         // docs/runbooks/live-probe-recovery.md.
+        let workflow_id = workflow.state().workflow_id().to_string();
         let accumulator_path = observed_fills_path(journal_path);
-        let mut accumulated_fills = load_observed_fills(&accumulator_path)?;
+        let mut accumulated_fills = load_observed_fills(&accumulator_path, &workflow_id)?;
         merge_observed_fills(&mut accumulated_fills.fills, &evidence.fills)?;
+        accumulated_fills.content_hash =
+            observed_fills_content_hash(&workflow_id, &accumulated_fills.fills);
         crate::status_io::write_private_json_atomic(&accumulator_path, &accumulated_fills)
             .map_err(|error| LiveProbeError::ObservedFillsAccumulator(error.to_string()))?;
         fills_complete =
@@ -556,7 +559,15 @@ async fn record_order_submission_if_new(
     hype_atoms_per_hype: u64,
     now: DateTime<Utc>,
 ) -> Result<DateTime<Utc>, LiveProbeError> {
-    if workflow.state().exchange_order_id().is_some() {
+    if let Some(recorded) = workflow.state().exchange_order_id() {
+        // Never silently treated as "already observed, nothing to do": a
+        // later lookup returning a *different* exchange order ID than the
+        // one already durably recorded would otherwise let the caller
+        // proceed to finalize using fills/status that belong to a
+        // different order entirely.
+        if recorded != exchange_order_id {
+            return Err(LiveProbeError::BindingMismatch("exchange order ID"));
+        }
         return Ok(now);
     }
     let account_scope_raw = connector.spot_state_raw().await?;
@@ -669,10 +680,23 @@ struct AccumulatedFill {
 /// Durable, append-only-in-spirit record of every fill row this journal's
 /// order has ever been observed to have, keyed by Hyperliquid's own trade
 /// ID. See [`observed_fills_path`] for why this exists.
+///
+/// `workflow_id` and `content_hash` bind this file to one specific workflow
+/// and detect naive tampering/corruption/staleness (a hand-edit, a bad
+/// backup restore, disk corruption, a bug elsewhere) — see
+/// [`load_observed_fills`]. This is not a substitute for the journal's own
+/// hash-chained protected-head mechanism (a determined tamperer with write
+/// access could recompute a matching hash after modifying `fills`); the
+/// journal's own `validate_cumulative_fill` regression check is the actual
+/// backstop against manufactured cumulative totals.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct ObservedFillsAccumulator {
     #[serde(default)]
     schema_version: u8,
+    #[serde(default)]
+    workflow_id: String,
+    #[serde(default)]
+    content_hash: String,
     #[serde(default)]
     fills: BTreeMap<String, AccumulatedFill>,
 }
@@ -692,13 +716,64 @@ fn observed_fills_path(journal_path: &Path) -> PathBuf {
     path
 }
 
-fn load_observed_fills(path: &Path) -> Result<ObservedFillsAccumulator, LiveProbeError> {
+/// Deterministic digest binding a workflow identity to its exact fill
+/// contents. `BTreeMap` iterates in sorted key order, so this is stable
+/// across process restarts regardless of insertion order.
+fn observed_fills_content_hash(
+    workflow_id: &str,
+    fills: &BTreeMap<String, AccumulatedFill>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(workflow_id.as_bytes());
+    for (trade_id, fill) in fills {
+        hasher.update([0]);
+        hasher.update(trade_id.as_bytes());
+        hasher.update([0]);
+        hasher.update(fill.size.as_bytes());
+        hasher.update([0]);
+        hasher.update(fill.notional.as_bytes());
+        hasher.update([0]);
+        hasher.update(fill.fee.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// Loads the durable fill accumulator for `workflow_id`, refusing a file
+/// that does not carry that exact workflow ID or whose stored content hash
+/// does not match its own fill contents.
+///
+/// # Errors
+///
+/// Returns [`LiveProbeError::ObservedFillsAccumulator`] for a read/parse
+/// failure, a workflow ID mismatch (this file belongs to a different
+/// order), or a content-hash mismatch (stale, corrupted, or hand-modified).
+fn load_observed_fills(
+    path: &Path,
+    workflow_id: &str,
+) -> Result<ObservedFillsAccumulator, LiveProbeError> {
     match fs::read_to_string(path) {
-        Ok(contents) => serde_json::from_str(&contents)
-            .map_err(|error| LiveProbeError::ObservedFillsAccumulator(error.to_string())),
+        Ok(contents) => {
+            let accumulator: ObservedFillsAccumulator = serde_json::from_str(&contents)
+                .map_err(|error| LiveProbeError::ObservedFillsAccumulator(error.to_string()))?;
+            if accumulator.workflow_id != workflow_id {
+                return Err(LiveProbeError::ObservedFillsAccumulator(
+                    "observed-fills record belongs to a different workflow".into(),
+                ));
+            }
+            if accumulator.content_hash
+                != observed_fills_content_hash(workflow_id, &accumulator.fills)
+            {
+                return Err(LiveProbeError::ObservedFillsAccumulator(
+                    "observed-fills record content hash does not match its own contents".into(),
+                ));
+            }
+            Ok(accumulator)
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Ok(ObservedFillsAccumulator {
                 schema_version: OBSERVED_FILLS_SCHEMA_VERSION,
+                workflow_id: workflow_id.to_string(),
+                content_hash: observed_fills_content_hash(workflow_id, &BTreeMap::new()),
                 fills: BTreeMap::new(),
             })
         }
@@ -1946,21 +2021,73 @@ mod tests {
         let journal = temp.path().join("journal.jsonl");
         let path = observed_fills_path(&journal);
         assert!(!path.exists());
-        assert!(load_observed_fills(&path).unwrap().fills.is_empty());
+        assert!(load_observed_fills(&path, "workflow-a")
+            .unwrap()
+            .fills
+            .is_empty());
 
-        let mut accumulator = load_observed_fills(&path).unwrap();
+        let mut accumulator = load_observed_fills(&path, "workflow-a").unwrap();
         merge_observed_fills(
             &mut accumulator.fills,
             &[raw_fill("1", "0.3", "10.692", "0.0075")],
         )
         .unwrap();
+        accumulator.content_hash = observed_fills_content_hash("workflow-a", &accumulator.fills);
         crate::status_io::write_private_json_atomic(&path, &accumulator).unwrap();
 
-        let reloaded = load_observed_fills(&path).unwrap();
+        let reloaded = load_observed_fills(&path, "workflow-a").unwrap();
         assert_eq!(reloaded.fills.len(), 1);
         assert_eq!(
             reloaded.fills.get("1").unwrap(),
             &accumulated("0.3", "10.692", "0.0075")
         );
+    }
+
+    #[test]
+    fn observed_fills_rejects_a_file_belonging_to_a_different_workflow() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = observed_fills_path(&temp.path().join("journal.jsonl"));
+        let mut accumulator = load_observed_fills(&path, "workflow-a").unwrap();
+        merge_observed_fills(
+            &mut accumulator.fills,
+            &[raw_fill("1", "0.3", "10.692", "0.0075")],
+        )
+        .unwrap();
+        accumulator.content_hash = observed_fills_content_hash("workflow-a", &accumulator.fills);
+        crate::status_io::write_private_json_atomic(&path, &accumulator).unwrap();
+
+        assert!(matches!(
+            load_observed_fills(&path, "workflow-b"),
+            Err(LiveProbeError::ObservedFillsAccumulator(_))
+        ));
+    }
+
+    #[test]
+    fn observed_fills_rejects_content_that_does_not_match_its_own_stored_hash() {
+        // Regression test for a real Codex review finding: this sidecar is
+        // not covered by the journal's own protected hash chain, so a
+        // stale or hand-modified copy must be detected rather than
+        // silently trusted for cumulative USDC totals.
+        let temp = tempfile::tempdir().unwrap();
+        let path = observed_fills_path(&temp.path().join("journal.jsonl"));
+        let mut accumulator = load_observed_fills(&path, "workflow-a").unwrap();
+        merge_observed_fills(
+            &mut accumulator.fills,
+            &[raw_fill("1", "0.3", "10.692", "0.0075")],
+        )
+        .unwrap();
+        accumulator.content_hash = observed_fills_content_hash("workflow-a", &accumulator.fills);
+        crate::status_io::write_private_json_atomic(&path, &accumulator).unwrap();
+
+        // Hand-tamper the notional without updating the stored hash.
+        let mut tampered: ObservedFillsAccumulator =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        tampered.fills.get_mut("1").unwrap().notional = "999".to_string();
+        crate::status_io::write_private_json_atomic(&path, &tampered).unwrap();
+
+        assert!(matches!(
+            load_observed_fills(&path, "workflow-a"),
+            Err(LiveProbeError::ObservedFillsAccumulator(_))
+        ));
     }
 }
