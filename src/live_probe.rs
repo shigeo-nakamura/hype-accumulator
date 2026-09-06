@@ -587,10 +587,34 @@ async fn record_order_submission_if_new(
         if recorded != exchange_order_id {
             return Err(LiveProbeError::BindingMismatch("exchange order ID"));
         }
-        return Ok(now);
+        // Stays monotonic with the workflow's own last transition, for the
+        // same reason as the first-observation path below: a fresh `now`
+        // that happens to be earlier than an earlier call's clock-lag-
+        // clamped transition time would otherwise regress and be rejected.
+        return Ok(now.max(workflow.state().last_transition_at()));
     }
     let account_scope_raw = connector.spot_state_raw().await?;
-    let accepted_at = accepted_at_from_raw_order_status(raw_order_status)?;
+    let raw_accepted_at = accepted_at_from_raw_order_status(raw_order_status)?;
+    // The venue clock may legitimately run up to the order envelope's own
+    // already-authorized `max_venue_clock_lag_ms` *behind* the local clock
+    // too (the `now.max(accepted_at)` below only handles it running
+    // ahead): `validate_order_submission_evidence` otherwise rejects
+    // `accepted_at` outright for predating the workflow's own last
+    // transition (`prepare_order`'s timestamp), which a lagging venue
+    // clock can trigger even though nothing is actually wrong. Normalized
+    // up to that floor only within the authorized tolerance — a raw
+    // timestamp further behind than that is a genuine anomaly, not
+    // ordinary skew, and must still fail closed.
+    let last_transition_at = workflow.state().last_transition_at();
+    let max_lag = chrono::TimeDelta::try_milliseconds(
+        i64::try_from(binding.order_envelope.max_venue_clock_lag_ms)
+            .map_err(|_| LiveProbeError::InvalidVenueTimestamp)?,
+    )
+    .ok_or(LiveProbeError::InvalidVenueTimestamp)?;
+    if raw_accepted_at < last_transition_at - max_lag {
+        return Err(LiveProbeError::InvalidVenueTimestamp);
+    }
+    let accepted_at = raw_accepted_at.max(last_transition_at);
     let now = now.max(accepted_at);
     let submission = AuthenticatedOrderSubmission {
         observation_id: content_hash(&[
@@ -1855,6 +1879,173 @@ mod tests {
 
         assert_eq!(observed.status, "filled");
         assert!(observed.durable_finality);
+    }
+
+    #[tokio::test]
+    async fn accepted_at_lagging_within_the_authorized_tolerance_does_not_block_recording() {
+        // Regression test for a real Codex review finding: the venue clock
+        // may also run *behind* the local clock, by up to the order
+        // envelope's own already-authorized max_venue_clock_lag_ms
+        // (59_999ms in decision_binding's fixture). A venue timestamp
+        // slightly before prepare_order's own transition time must not be
+        // rejected as "predates preparation".
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connector = unsigned_connector(format!("http://{}", listener.local_addr().unwrap()));
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let mut workflow = open_test_workflow(temp.path(), &binding);
+        workflow.prepare_order(fixture_at(2)).unwrap();
+
+        // 30s behind fixture_at(2) — well within the ~60s authorized lag.
+        let accepted_at_ms = (fixture_at(2) - chrono::TimeDelta::seconds(30)).timestamp_millis();
+        let filled = serde_json::json!({
+            "status": "order",
+            "order": {
+                "order": {"oid": 7, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "timestamp": accepted_at_ms},
+                "status": "filled",
+                "statusTimestamp": accepted_at_ms
+            }
+        });
+        let fills = serde_json::json!([{
+            "coin": "@1", "px": "25", "sz": "1", "side": "B", "time": 1_000,
+            "oid": 7, "tid": 1, "fee": "0.01", "feeToken": "USDC"
+        }]);
+        let server = spawn_reconcile_responder(listener, filled, fills, true);
+        let observed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reconcile_prepared_order(
+                &connector,
+                &mut workflow,
+                &test_journal_path(temp.path()),
+                fixture_at(20),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(observed.status, "filled");
+        assert!(observed.durable_finality);
+    }
+
+    #[tokio::test]
+    async fn accepted_at_lagging_beyond_the_authorized_tolerance_fails_closed() {
+        // A venue timestamp far enough behind prepare_order's transition
+        // time that it exceeds the authorized clock-lag tolerance is a
+        // genuine anomaly, not ordinary skew, and must still be rejected
+        // rather than silently normalized away.
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connector = unsigned_connector(format!("http://{}", listener.local_addr().unwrap()));
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let mut workflow = open_test_workflow(temp.path(), &binding);
+        workflow.prepare_order(fixture_at(2)).unwrap();
+
+        // 5 minutes behind fixture_at(2) — far beyond the ~60s authorized lag.
+        let accepted_at_ms = (fixture_at(2) - chrono::TimeDelta::minutes(5)).timestamp_millis();
+        let filled = serde_json::json!({
+            "status": "order",
+            "order": {
+                "order": {"oid": 7, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "timestamp": accepted_at_ms},
+                "status": "filled",
+                "statusTimestamp": accepted_at_ms
+            }
+        });
+        let fills = serde_json::json!([{
+            "coin": "@1", "px": "25", "sz": "1", "side": "B", "time": 1_000,
+            "oid": 7, "tid": 1, "fee": "0.01", "feeToken": "USDC"
+        }]);
+        let server = spawn_reconcile_responder(listener, filled, fills, true);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reconcile_prepared_order(
+                &connector,
+                &mut workflow,
+                &test_journal_path(temp.path()),
+                fixture_at(20),
+            ),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert!(matches!(result, Err(LiveProbeError::InvalidVenueTimestamp)));
+        assert!(workflow.state().exchange_order_id().is_none());
+    }
+
+    #[tokio::test]
+    async fn already_recorded_submission_returns_a_time_no_earlier_than_the_last_transition() {
+        // Regression test for a real Codex review finding: the early-
+        // return path (submission already recorded) must stay monotonic
+        // with the workflow's own last transition too, not just the
+        // first-observation path — otherwise a later call's fresh `now`
+        // regressing behind an earlier clock-lag-clamped transition time
+        // would make the caller's subsequent observe_order_fill/
+        // finalize_order calls reject it as regressing.
+        let temp = tempfile::tempdir().unwrap();
+        let connector = unsigned_connector("http://127.0.0.1:1".to_owned());
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let mut workflow = open_test_workflow(temp.path(), &binding);
+        workflow.prepare_order(fixture_at(2)).unwrap();
+
+        let submission = AuthenticatedOrderSubmission {
+            observation_id: "obs-a".to_string(),
+            account_scope_evidence_hash: "hash-a".to_string(),
+            order_envelope_evidence_hash: "hash-b".to_string(),
+            execution_identity_hash: binding.inventory_before.execution_identity_hash.clone(),
+            signer_identity_hash: binding.order_envelope.signer_identity_hash.clone(),
+            decision_id: binding.decision_id.clone(),
+            client_order_id: workflow.state().client_order_id(),
+            exchange_order_id: "7".to_string(),
+            canonical_order_envelope_hash: workflow
+                .state()
+                .canonical_order_envelope_hash()
+                .unwrap(),
+            planned_usdc: binding.planned_usdc,
+            max_debit_usdc: binding.committed_usdc,
+            original_quantity_hype: binding.order_envelope.original_quantity_hype,
+            hype_atoms_per_hype: binding.order_envelope.hype_atoms_per_hype,
+            market_metadata_digest: binding.order_envelope.market_metadata_digest.clone(),
+            limit_price_usdc_per_hype: binding.order_envelope.limit_price_usdc_per_hype,
+            l1_nonce: binding.order_envelope.l1_nonce,
+            signed_expiry_at: binding.order_envelope.signed_expiry_at,
+            effective_expiry_at: binding.order_envelope.effective_expiry_at,
+            market: HYPE_SPOT_MARKET.to_string(),
+            side: "buy".to_string(),
+            time_in_force: "IOC".to_string(),
+            accepted_at: fixture_at(20),
+        };
+        // Simulates an earlier call's positive clock-lag clamp having
+        // pushed the recorded transition time forward to fixture_at(20).
+        workflow
+            .observe_order_submission(&submission, fixture_at(20))
+            .unwrap();
+        assert_eq!(workflow.state().last_transition_at(), fixture_at(20));
+
+        // A later call's fresh wall-clock `now` regresses behind that.
+        let result = record_order_submission_if_new(
+            &connector,
+            &mut workflow,
+            &binding,
+            "7",
+            "{}",
+            binding.order_envelope.hype_atoms_per_hype,
+            fixture_at(15),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, fixture_at(20));
     }
 
     #[tokio::test]
