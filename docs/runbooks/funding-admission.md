@@ -45,7 +45,10 @@ contains time, hash and a movement delta, without a confirmation-count field.
 do not establish a second confirmation simply because an observer reads again.
 Verify an authoritative evidence source and its chain-specific interpretation
 before filling `confirmed_at` or `confirmation_count`; never copy fixture values
-into a production approval.
+into a production approval. See
+[the step-by-step operator procedure](future-transfer-admission-procedure.md)
+for the exact public-endpoint checks and install steps used for a designated-
+parent transfer.
 
 Keep the artifact outside runtime-writable state and public outputs. Review the
 exact movement, account route, independently obtained evidence, total amount and
