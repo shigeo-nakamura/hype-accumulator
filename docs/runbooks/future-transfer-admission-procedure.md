@@ -66,19 +66,31 @@ step 3 below is what actually earns the second confirmation.
 
 ## Step 3 — independent human verification (the genuine second source)
 
-A public, independently-operated block explorer not run by `api.hyperliquid.xyz`'s operator (for
-example `hypurrscan.io`) gives a different codebase, infrastructure, and organization reading the
-same underlying committed state — a real second failure domain, unlike another parameter on the same
-API. As of this writing its documented JSON API did not return usable per-address transfer data for
-a fresh address during this research (`/addressDetails/{address}` returned an empty object;
-`/transfers/{fromTimestamp}/{toTimestamp}` requires a JWT this procedure does not have), and it is a
-JavaScript application, so it cannot be checked by an unattended script fetch. This step is therefore
-manual: **a human operator opens such an explorer in a real browser**, searches for the transaction
-hash from step 1 (or the execution/parent account), and visually confirms the same hash, amount, and
-route appear. Record who performed this check and when. If no independent explorer can be reached or
-shows the transaction, do not record `confirmation_count = 2` — treat the transfer as
-single-source-confirmed only, which does not meet `min_deposit_confirmations = 2`, and escalate
-rather than proceeding.
+A different UI is not automatically a different failure domain: several public Hyperliquid
+"explorers" are themselves thin clients over `api.hyperliquid.xyz` and would reproduce, not
+corroborate, an error or compromise at that API. Per Hyperliquid's own architecture, "API servers
+listen to updates from a node" — the design explicitly allows multiple parties to run their own node
+and API server reading the L1 network directly, so a genuinely independent explorer is one that does
+this, not one that calls `api.hyperliquid.xyz` on the operator's behalf. This research did not
+establish which is true for any specific public explorer (for example `hypurrscan.io`'s documented
+JSON API returned no usable per-address data for a fresh address, and it is a JavaScript application
+that could not be inspected further here) — **do not assume a candidate explorer qualifies without
+checking.**
+
+Before relying on an explorer for this step:
+
+1. Confirm the explorer's own documentation, "about"/infrastructure page, or operator statement
+   describes it as running its own Hyperliquid node/validator connection, not proxying the official
+   API. If this cannot be established, it does not count as an independent source — pick a different
+   explorer or escalate; do not fall back to re-checking `api.hyperliquid.xyz` and calling it done.
+2. **A human operator opens the confirmed-independent explorer in a real browser**, searches for the
+   transaction hash from step 1 (or the execution/parent account), and visually confirms the same
+   hash, amount, and route appear. Record who performed this check, when, which explorer was used,
+   and the provenance basis from step 1 above.
+
+If no independent-with-confirmed-provenance explorer can be reached or shows the transaction, do not
+record `confirmation_count = 2` — treat the transfer as single-source-confirmed only, which does not
+meet `min_deposit_confirmations = 2`, and escalate rather than proceeding.
 
 This defends against a bug, cache, or compromise specific to the automated fetch path in steps 1–2;
 it does not defend against the underlying HyperCore consensus itself producing wrong committed state,
@@ -180,23 +192,34 @@ set -a; source /etc/hype-accumulator/observer.env; set +a  # public account iden
 # them so this disposable scratch run can never publish anywhere outside
 # $SCRATCH, regardless of what the shell or service environment sets.
 unset STATUS_S3_BUCKET STATUS_S3_KEY_PREFIX
-if /opt/hype-accumulator/current/hype-accumulator --dry-run-cycle \
-     /etc/hype-accumulator/config.toml /etc/hype-accumulator/security-policy.toml \
-     "$SCRATCH/runtime.toml"; then
-  echo "staged admission-approvals.json accepted by the real parser"
-else
-  echo "REJECTED: do not install this artifact" >&2
-  exit 1
-fi
+/opt/hype-accumulator/current/hype-accumulator --dry-run-cycle \
+  /etc/hype-accumulator/config.toml /etc/hype-accumulator/security-policy.toml \
+  "$SCRATCH/runtime.toml"
 ```
 
-A nonzero exit means the real parser rejected either the staged `admission-approvals.json` or the
-current config/policy pairing — do not install on a nonzero exit. `dry_run=true` in the real
-`config.toml` and the signer-free runtime's own design (no signing key is ever loaded by this path)
-mean nothing here can place, sign, or submit an order; with the S3 mirror explicitly disabled above,
-the only state this touches is the disposable `$SCRATCH` directory, which is deleted immediately
-after. Treat a zero exit as "safe to proceed to the halted rollout," not as proof the *values*
-(amount, confirmation evidence) are correct — steps 1–4 above are what establish that.
+A zero exit means the real parser accepted the staged `admission-approvals.json`. This is what makes
+`--dry-run-cycle` more than a pure offline artifact check: after parsing the approvals file, the same
+process also performs a **live, read-only Hyperliquid account observation** (`observer.observe(...)`
+in `src/main.rs`, the same call the real dry-run service makes every cycle) and exits nonzero if that
+call errors — which can happen from a transient venue or network issue that has nothing to do with
+the artifact's validity. Do not treat every nonzero exit as an artifact rejection:
+
+- The admission-approvals.json parse happens **before** that network call. A parse/schema rejection
+  therefore fails fast, and its stderr message names the artifact/parsing problem specifically (for
+  example mentioning "admission" or a JSON/schema error) rather than the network or the Hyperliquid
+  endpoint.
+- If stderr instead points at the account observation or the Hyperliquid endpoint (a timeout,
+  connection error, or similar), that is unrelated to the artifact — retry the whole check once
+  network access is confirmed healthy rather than concluding the artifact is invalid.
+- Only treat the artifact as rejected, and skip the install, when the failure is specifically
+  attributable to parsing/validating `admission-approvals.json`.
+
+`dry_run=true` in the real `config.toml` and the signer-free runtime's own design (no signing key is
+ever loaded by this path) mean nothing here can place, sign, or submit an order regardless of outcome.
+With the S3 mirror explicitly disabled above, the only local state this touches is the disposable
+`$SCRATCH` directory, which is deleted immediately after (network calls to Hyperliquid's public API
+are read-only). Treat a zero exit as "safe to proceed to the halted rollout," not as proof the
+*values* (amount, confirmation evidence) are correct — steps 1–4 above are what establish that.
 
 Then install it the same way as any other production config change on this host: a halted rollout
 that pauses the HYPE timers, backs up the existing file, runs the config/policy `--install-preflight`
