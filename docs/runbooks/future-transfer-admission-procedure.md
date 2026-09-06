@@ -38,8 +38,20 @@ Find the entry whose `delta.type == "send"`, `delta.user` equals the exact desig
 (case-insensitive), `delta.destination` equals the exact execution account, `delta.token == "USDC"`,
 and `delta.amount`/`delta.usdcValue` equal the expected amount. Reject and stop if any of these do
 not match exactly — do not admit a similar-looking or partial movement. Record the entry's `hash`
-(this becomes the ledger's `event_id`) and its `time` in milliseconds (this becomes `confirmed_at`,
-converted to UTC ISO 8601 — it is the on-chain time, not wall-clock poll time).
+(this becomes the ledger's `event_id`) and its `time` in milliseconds (this becomes `confirmed_at`)
+— it is the on-chain time, not wall-clock poll time.
+
+Convert `time` to UTC ISO 8601 **without losing its millisecond precision** — truncating to whole
+seconds can make `confirmed_at` appear earlier than the runtime's own millisecond-precise
+`received_at` for the same movement, which `validate_deposit` rejects outright:
+
+```python
+from datetime import datetime, timezone
+ms = 1788542589551  # replace with the entry's actual "time" value
+confirmed_at = datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") \
+    + f"{ms % 1000:03d}Z"
+# confirmed_at == "2026-09-04T17:23:09.551Z"
+```
 
 ## Step 2 — sender-side ledger lookup (consistency check, not an independent source)
 
@@ -240,14 +252,20 @@ After installing, verify with a command that is not part of the rollout script's
   `runtime.toml` (`config/runtime.example.toml` documents this field; do not assume a fixed path,
   it is a distinct directory per funding route on hosts that have migrated routes) — shows the
   deposit's `admitted_usdc`. The expected figure is `min(event_ceiling, remaining event capital
-  after any prior returns/withdrawals against this event, remaining yearly capacity, remaining
-  lifetime capacity)`, where `event_ceiling` is the approval's `max_admitted_usdc` **if the entry
-  set one** — if it was omitted (the schema explicitly permits this, falling back to the automatic
-  per-deposit ceiling), `event_ceiling` is instead `config.toml`'s
-  `capital.max_automatically_deployable_usdc` (`DepositTranche::admission_limit` in `src/pacing.rs`
-  makes the same substitution). Do not assume the un-capped transfer amount is the ceiling. A prior
-  partial return against this same event also legitimately reduces admissible capital even with
-  cooldown elapsed and caps otherwise unconstrained; check the event's recorded returns before
+  after any prior returns/withdrawals against this event, yearly capacity remaining to *other*
+  events, lifetime capacity remaining to *other* events)` — compute the yearly/lifetime remaining
+  capacity from admissions **excluding this event's own** (for example from the pre-install ledger
+  snapshot, or by summing every other tranche's `admitted_usdc`), not from the post-install ledger.
+  Checking post-install remaining capacity is self-referential: if this event's admission correctly
+  exhausts the last of a cap, the *post*-install remaining capacity is zero even though the
+  correctly admitted amount is positive, and comparing against zero would flag a correct rollout as
+  a failure. `event_ceiling` is the approval's `max_admitted_usdc` **if the entry set one** — if it
+  was omitted (the schema explicitly permits this, falling back to the automatic per-deposit
+  ceiling), `event_ceiling` is instead `config.toml`'s `capital.max_automatically_deployable_usdc`
+  (`DepositTranche::admission_limit` in `src/pacing.rs` makes the same substitution). Do not assume
+  the un-capped transfer amount is the ceiling. A prior partial return against this same event also
+  legitimately reduces admissible capital even with cooldown elapsed and caps otherwise
+  unconstrained; check the event's recorded returns before
   treating a shortfall as a failure.
   Separately, if the transfer's `received_at` is still within `pacing.deposit_cooldown_seconds` of
   the current time, `first_usable_at = received_at + deposit_cooldown_seconds` has not passed yet
