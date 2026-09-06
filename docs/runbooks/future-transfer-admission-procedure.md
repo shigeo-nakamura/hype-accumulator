@@ -20,7 +20,9 @@ commit — there is no PoW-style probabilistic finality that accrues with more e
 polls. The `min_deposit_confirmations` / `DepositAdmissionApproval.confirmation_count` fields should
 be read as **the number of independent verification checks that passed**, not blocks elapsed or
 repeated polls of the same source (`docs/runbooks/funding-admission.md` already forbids the latter).
-Step 1 and step 2 below are the two checks that count toward `confirmation_count`.
+Independence means a genuinely different failure domain, not just a different parameter to the same
+API — step 1 and step 3 below are the two checks that count toward `confirmation_count`; step 2 is a
+same-source consistency check only.
 
 ## Step 1 — transaction-history lookup (primary evidence)
 
@@ -39,12 +41,9 @@ not match exactly — do not admit a similar-looking or partial movement. Record
 (this becomes the ledger's `event_id`) and its `time` in milliseconds (this becomes `confirmed_at`,
 converted to UTC ISO 8601 — it is the on-chain time, not wall-clock poll time).
 
-## Step 2 — sender-side ledger lookup (second, genuinely independent check)
+## Step 2 — sender-side ledger lookup (consistency check, not an independent source)
 
-A current balance is an aggregate figure: it cannot be attributed to one specific event, and
-`docs/runbooks/parent-funding.md` already forbids treating a balance change (or a repeated poll) as
-a confirmation. The second confirmation instead comes from checking the **other side of the same
-on-chain transaction** — query the same endpoint, but for the designated parent account:
+Query the same endpoint again, but for the designated parent account:
 
 ```
 POST https://api.hyperliquid.xyz/info
@@ -53,21 +52,39 @@ POST https://api.hyperliquid.xyz/info
 
 Find the entry with the exact same `hash` as step 1. Confirm its `delta.type == "send"`,
 `delta.user` equals the parent account itself, `delta.destination` equals the exact execution
-account, and `delta.amount`/`delta.usdcValue` match step 1 exactly. Reject and stop on any
-mismatch. This is a genuinely independent corroboration — the same committed transaction observed
-from both the source and destination ledgers — not a repeated poll of the same query or an
-unrelated aggregate metric.
+account, and `delta.amount`/`delta.usdcValue` match step 1 exactly. Reject and stop on any mismatch
+— this catches a wrong sender/route/amount that a single-sided lookup could miss.
 
-Two independent, structurally matching reads of the same event (destination-side ledger lookup +
-source-side ledger lookup) is `confirmation_count = 2`, consistent with the current
-`min_deposit_confirmations = 2` policy value.
+**This does not, by itself, satisfy an independent second confirmation.** Both this lookup and
+step 1 hit the same `api.hyperliquid.xyz` operator: if that API returns an incorrect or compromised
+record, changing which account is queried does not create a different failure domain — it is one
+source asked twice. Neither this step nor a balance snapshot
+(`{"type":"spotClearinghouseState","user":"<execution_account>"}`, which `docs/runbooks/parent-funding.md`
+already forbids treating as a confirmation) may be counted toward `confirmation_count`. Both remain
+worth doing as consistency checks — they catch typos, wrong routes, and wrong amounts cheaply — but
+step 3 below is what actually earns the second confirmation.
 
-As an additional sanity check (not counted toward `confirmation_count`), querying
-`{"type":"spotClearinghouseState","user":"<execution_account>"}` and confirming the current USDC
-`total`/`hold` are consistent with the expected post-transfer balance is still worth doing — it just
-does not by itself establish or add to confirmation evidence for this specific event.
+## Step 3 — independent human verification (the genuine second source)
 
-## Step 3 — operator admission decision
+A public, independently-operated block explorer not run by `api.hyperliquid.xyz`'s operator (for
+example `hypurrscan.io`) gives a different codebase, infrastructure, and organization reading the
+same underlying committed state — a real second failure domain, unlike another parameter on the same
+API. As of this writing its documented JSON API did not return usable per-address transfer data for
+a fresh address during this research (`/addressDetails/{address}` returned an empty object;
+`/transfers/{fromTimestamp}/{toTimestamp}` requires a JWT this procedure does not have), and it is a
+JavaScript application, so it cannot be checked by an unattended script fetch. This step is therefore
+manual: **a human operator opens such an explorer in a real browser**, searches for the transaction
+hash from step 1 (or the execution/parent account), and visually confirms the same hash, amount, and
+route appear. Record who performed this check and when. If no independent explorer can be reached or
+shows the transaction, do not record `confirmation_count = 2` — treat the transfer as
+single-source-confirmed only, which does not meet `min_deposit_confirmations = 2`, and escalate
+rather than proceeding.
+
+This defends against a bug, cache, or compromise specific to the automated fetch path in steps 1–2;
+it does not defend against the underlying HyperCore consensus itself producing wrong committed state,
+which is a materially different and out-of-scope threat for this procedure.
+
+## Step 4 — operator admission decision
 
 Confirmation evidence only proves the transfer happened; it does not authorize admitting it. Get an
 explicit decision from the account owner on:
@@ -80,7 +97,7 @@ explicit decision from the account owner on:
 - Whether any prerequisite from `docs/runbooks/parent-funding.md`'s "Remaining live requirements"
   section has changed since the last transfer.
 
-## Step 4 — install the approval
+## Step 5 — install the approval
 
 Add one entry to `admission-approvals.json` (schema in `src/runtime.rs::DepositAdmissionApproval`):
 
@@ -99,6 +116,9 @@ Add one entry to `admission-approvals.json` (schema in `src/runtime.rs::DepositA
 }
 ```
 
+`confirmation_count = 2` here means steps 1 and 3 both passed (the destination-side lookup and the
+independent human explorer check) — do not fill this in without step 3 having actually been done.
+
 `--install-preflight` (`docs/runbooks/release-install.md`) only validates `config.toml` and
 `security-policy.toml` — it does not parse or validate `admission-approvals.json`. There is no
 dedicated CLI subcommand that validates this artifact alone without opening the live runtime state
@@ -113,46 +133,59 @@ non-date strings for `confirmed_at`/`approved_at`:
 import json
 from datetime import datetime, timezone
 
+
+def check(condition, message):
+    # Deliberately not `assert`: assertions are stripped entirely when Python
+    # runs with -O or PYTHONOPTIMIZE is set, which would silently disable
+    # every check below.
+    if not condition:
+        raise ValueError(message)
+
+
 def parse_rfc3339_utc(value):
-    if not isinstance(value, str):
-        raise ValueError("timestamp must be a JSON string")
+    check(isinstance(value, str), "timestamp must be a JSON string")
     dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if dt.tzinfo is None:
-        raise ValueError("timestamp must be timezone-aware")
+    check(dt.tzinfo is not None, "timestamp must be timezone-aware")
     return dt.astimezone(timezone.utc)
 
+
 data = json.load(open("staged-admission-approvals.json"))  # raises on malformed JSON
-assert set(data.keys()) == {"schema_version", "approvals"}, "unknown top-level field"
-assert data["schema_version"] == 1
+check(set(data.keys()) == {"schema_version", "approvals"}, "unknown top-level field")
+check(data["schema_version"] == 1, "unsupported schema_version")
 seen = set()
 for a in data["approvals"]:
     allowed = {"max_admitted_usdc", "event_id", "confirmed_at", "confirmation_count", "approved_at"}
-    assert set(a.keys()) <= allowed, "unknown field in approval entry"
-    assert isinstance(a["event_id"], str) and a["event_id"].strip() == a["event_id"] and a["event_id"]
-    assert a["event_id"] not in seen
+    check(set(a.keys()) <= allowed, "unknown field in approval entry")
+    check(isinstance(a["event_id"], str) and a["event_id"].strip() == a["event_id"] and a["event_id"],
+          "invalid event_id")
+    check(a["event_id"] not in seen, "duplicate event_id")
     seen.add(a["event_id"])
-    assert isinstance(a["confirmation_count"], int) and not isinstance(a["confirmation_count"], bool)
-    assert a["confirmation_count"] != 0
+    check(isinstance(a["confirmation_count"], int) and not isinstance(a["confirmation_count"], bool),
+          "confirmation_count must be an integer")
+    check(a["confirmation_count"] != 0, "confirmation_count must be nonzero")
     if "max_admitted_usdc" in a and a["max_admitted_usdc"] is not None:
-        assert isinstance(a["max_admitted_usdc"], int) and not isinstance(a["max_admitted_usdc"], bool)
-        assert a["max_admitted_usdc"] > 0
+        check(isinstance(a["max_admitted_usdc"], int) and not isinstance(a["max_admitted_usdc"], bool),
+              "max_admitted_usdc must be an integer")
+        check(a["max_admitted_usdc"] > 0, "max_admitted_usdc must be positive")
     confirmed_at = parse_rfc3339_utc(a["confirmed_at"])
     approved_at = parse_rfc3339_utc(a["approved_at"])
-    assert confirmed_at <= approved_at
+    check(confirmed_at <= approved_at, "confirmed_at must not be after approved_at")
 ```
 
-This narrows, but does not eliminate, the gap with the real parser (it does not re-derive
-`UsdcMicros`' exact integer-overflow/bounds behavior, for instance). Treat a pass here as "safe to
-proceed to the halted rollout," not as a substitute for the runtime's own validation on first load.
+Run this exactly as written (no `-O`/`PYTHONOPTIMIZE`, though the checks above do not rely on that
+flag being unset). This narrows, but does not eliminate, the gap with the real parser — it does not
+re-derive `UsdcMicros`' exact integer-overflow/bounds behavior, for instance. Treat a pass here as
+"safe to proceed to the halted rollout," not as a substitute for the runtime's own validation on
+first load.
 
 Then install it the same way as any other production config change on this host: a halted rollout
 that pauses the HYPE timers, backs up the existing file, runs the config/policy `--install-preflight`
 check above alongside the admission-artifact check above, writes atomically, restarts the
 observer/dry-run services once, and rolls back automatically if anything **other than** the expected
-cooldown-pending state is wrong (see step 5 for what "expected" means when the transfer is recent).
-`dry_run`/`manual_halt`/`live_approved` are not touched by this step.
+cooldown-or-returns-pending state is wrong (see step 6 for what "expected" means). `dry_run`,
+`manual_halt`, and `live_approved` are not touched by this step.
 
-## Step 5 — verify, independently
+## Step 6 — verify, independently
 
 After installing, verify with a command that is not part of the rollout script's own assertions
 (a second, independent read):
@@ -162,14 +195,16 @@ After installing, verify with a command that is not part of the rollout script's
 - The runtime ledger — `runtime-state.json` under the `state_directory` configured in the deployed
   `runtime.toml` (`config/runtime.example.toml` documents this field; do not assume a fixed path,
   it is a distinct directory per funding route on hosts that have migrated routes) — shows the
-  deposit's `admitted_usdc` matching the expected admitted amount, **unless** the transfer's
-  `received_at` is still within `pacing.deposit_cooldown_seconds` of the current time. Admission is
-  correctly gated on `first_usable_at = received_at + deposit_cooldown_seconds`, so a fresh transfer
-  checked soon after arrival will legitimately show `admitted_usdc = 0` (or a partial amount) on the
-  very first post-install cycle — this is expected, not a failure, and does not mean the approval or
-  caps are wrong. Re-check after the cooldown elapses. Only treat a mismatch as a real problem if it
-  persists once both the cooldown has elapsed and the yearly/lifetime caps have enough remaining
-  capacity for the expected amount.
+  deposit's `admitted_usdc`. The expected figure is `min(max_admitted_usdc, remaining event capital
+  after any prior returns/withdrawals against this event, remaining yearly capacity, remaining
+  lifetime capacity)`, not simply `max_admitted_usdc` — a prior partial return against this same
+  event legitimately reduces admissible capital even with cooldown elapsed and caps otherwise
+  unconstrained; check the event's recorded returns before treating a shortfall as a failure.
+  Separately, if the transfer's `received_at` is still within `pacing.deposit_cooldown_seconds` of
+  the current time, `first_usable_at = received_at + deposit_cooldown_seconds` has not passed yet
+  and `admitted_usdc = 0` on this first post-install cycle is expected, not a failure — re-check
+  after cooldown. Only treat a mismatch as a real problem once cooldown has elapsed and the computed
+  expected figure above is still not reached.
 - `dry_run` is still `true`, `signed_action_created` is `false`, and no unrelated systemd unit
   changed state.
 
