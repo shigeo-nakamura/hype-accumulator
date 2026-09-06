@@ -15,7 +15,7 @@ use crate::{
     pacing::UsdcMicros,
     workflow::{
         AuthenticatedOrderSubmission, DurableWorkflow, ExternalAction, HypeAtoms, OrderFinality,
-        WorkflowError,
+        WorkflowError, WorkflowState,
     },
 };
 use chrono::{DateTime, Utc};
@@ -110,11 +110,21 @@ pub struct ProbeReconciliation {
     pub status: String,
     pub filled_hype: HypeAtoms,
     pub remaining_hype: HypeAtoms,
+    /// Whether `fills` (the detailed rows this lookup returned) fully
+    /// accounts for `filled_hype` (the authoritative cumulative quantity
+    /// from `orderStatus`). `false` means Hyperliquid's bounded recent-fill
+    /// window has already dropped some of this order's rows — `filled_hype`/
+    /// `remaining_hype` above are still authoritative, but this call could
+    /// not durably record cumulative USDC (fill/finality recording is
+    /// skipped rather than persisting an understated total). See
+    /// docs/runbooks/live-probe-recovery.md.
+    pub fills_complete: bool,
     /// True exactly when this call recorded (or already durably held) a
     /// terminal [`crate::workflow::WorkflowTransition::OrderFinalized`] for
     /// this workflow — see [`finality_from_status`] for which statuses
-    /// count. `false` covers both "not yet terminal" and "order unknown to
-    /// the venue" (`exchange_order_id` is `None`).
+    /// count. `false` covers "not yet terminal", "order unknown to the
+    /// venue" (`exchange_order_id` is `None`), and `fills_complete == false`
+    /// blocking finalization.
     pub durable_finality: bool,
 }
 
@@ -282,24 +292,18 @@ impl HyperliquidLiveProbe {
         workflow: &mut DurableWorkflow,
         now: DateTime<Utc>,
     ) -> Result<ProbeReconciliation, LiveProbeError> {
-        let action = workflow.pending_prepared_order()?;
-        let ExternalAction::SubmitOrder {
-            client_order_id,
-            execution_identity_hash,
-            signer_identity_hash,
-            market_metadata_digest,
-            ..
-        } = action
-        else {
-            return Err(LiveProbeError::NotOrder);
-        };
+        // Derived from the durable binding, not `pending_prepared_order()`:
+        // that action is cleared once acceptance is observed, so a second
+        // reconcile call after the first successfully recorded submission
+        // (to catch up on fill/finality) must still work.
+        let binding = workflow.state().binding();
         validate_binding(
-            execution_identity_hash,
-            signer_identity_hash,
-            market_metadata_digest,
+            &binding.inventory_before.execution_identity_hash,
+            &binding.order_envelope.signer_identity_hash,
+            &binding.order_envelope.market_metadata_digest,
             &self.binding,
         )?;
-        let client_order_id = client_order_id.clone();
+        let client_order_id = workflow.state().client_order_id();
         let evidence = self
             .connector
             .reconcile_order_by_client_id(&client_order_id)
@@ -327,7 +331,7 @@ pub async fn reconcile_prepared_order(
     workflow: &mut DurableWorkflow,
     now: DateTime<Utc>,
 ) -> Result<ProbeReconciliation, LiveProbeError> {
-    let evidence = lookup_read_only(connector, workflow.pending_prepared_order()?).await?;
+    let evidence = lookup_read_only(connector, workflow.state()).await?;
     record_reconciliation(connector, workflow, evidence, now).await
 }
 
@@ -336,27 +340,29 @@ pub async fn reconcile_prepared_order(
 /// reconciliation evidence unmodified. Split out from
 /// [`reconcile_prepared_order`] so this half — the part that needs no
 /// [`DurableWorkflow`] — stays independently testable.
+///
+/// Reads the account/market/CLOID from the durable binding
+/// ([`WorkflowState::binding`]/[`WorkflowState::client_order_id`]), not
+/// [`DurableWorkflow::pending_prepared_order`]: that action is cleared once
+/// acceptance is observed, so recovery must keep working on a second call
+/// after the first already recorded submission, to catch up on fill/finality.
 async fn lookup_read_only(
     connector: &HyperliquidConnector,
-    action: &ExternalAction,
+    workflow_state: &WorkflowState,
 ) -> Result<HyperliquidOrderReconciliation, LiveProbeError> {
-    let ExternalAction::SubmitOrder {
-        execution_identity_hash,
-        market_metadata_digest,
-        client_order_id,
-        ..
-    } = action
-    else {
-        return Err(LiveProbeError::NotOrder);
-    };
+    let binding = workflow_state.binding();
     let account = connector.execution_account_address()?;
-    if *execution_identity_hash != identity_hash(EXECUTION_IDENTITY_DOMAIN, account) {
+    if binding.inventory_before.execution_identity_hash
+        != identity_hash(EXECUTION_IDENTITY_DOMAIN, account)
+    {
         return Err(LiveProbeError::BindingMismatch("execution identity"));
     }
-    if *market_metadata_digest != crate::hype_asset::hype_usdc_market_metadata_digest() {
+    if binding.order_envelope.market_metadata_digest
+        != crate::hype_asset::hype_usdc_market_metadata_digest()
+    {
         return Err(LiveProbeError::BindingMismatch("market metadata"));
     }
-    let client_order_id = client_order_id.clone();
+    let client_order_id = workflow_state.client_order_id();
     let evidence = connector
         .reconcile_order_by_client_id(&client_order_id)
         .await?;
@@ -397,8 +403,16 @@ async fn record_reconciliation(
     let hype_atoms_per_hype = binding.order_envelope.hype_atoms_per_hype;
     let cumulative_hype = decimal_to_atoms(evidence.filled_size, hype_atoms_per_hype)?;
     let remaining_hype = decimal_to_atoms(evidence.remaining_size, hype_atoms_per_hype)?;
-    let durable_finality =
-        evidence.order_id.is_some() && finality_from_status(&evidence.status).is_some();
+    // Hyperliquid's fill history is a bounded window shared across the whole
+    // account, not scoped to this order: a fill can age out of range while
+    // `orderStatus`'s origSz−sz still authoritatively reports the order as
+    // filled (dex-connector's `authoritative_filled_size`). Computing
+    // cumulative USDC from an incomplete `fills` list would silently
+    // understate it, so fill/finality recording is gated on the list
+    // actually summing to the authoritative filled quantity. See
+    // docs/runbooks/live-probe-recovery.md.
+    let fills_complete = fills_cover_authoritative_quantity(&evidence.fills, evidence.filled_size)?;
+    let mut durable_finality = false;
 
     if let Some(exchange_order_id) = evidence.order_id.clone() {
         if workflow.state().exchange_order_id().is_none() {
@@ -435,33 +449,36 @@ async fn record_reconciliation(
             workflow.observe_order_submission(&submission, now)?;
         }
 
-        let (cumulative_filled_usdc, cumulative_debited_usdc) =
-            cumulative_usdc_from_fills(&evidence.fills)?;
-        let fully_filled = cumulative_hype == binding.order_envelope.original_quantity_hype;
-        let fill_observation_id = content_hash(&[
-            "hype-accumulator/order-fill-observation/v1",
-            &exchange_order_id,
-            &cumulative_hype.as_atoms().to_string(),
-            &cumulative_filled_usdc.as_micros().to_string(),
-            &cumulative_debited_usdc.as_micros().to_string(),
-        ]);
-        workflow.observe_order_fill(
-            fill_observation_id,
-            cumulative_hype,
-            cumulative_filled_usdc,
-            cumulative_debited_usdc,
-            fully_filled,
-            now,
-        )?;
-
-        if let Some(finality) = finality_from_status(&evidence.status) {
-            workflow.finalize_order(
+        if fills_complete {
+            let (cumulative_filled_usdc, cumulative_debited_usdc) =
+                cumulative_usdc_from_fills(&evidence.fills)?;
+            let fully_filled = cumulative_hype == binding.order_envelope.original_quantity_hype;
+            let fill_observation_id = content_hash(&[
+                "hype-accumulator/order-fill-observation/v1",
+                &exchange_order_id,
+                &cumulative_hype.as_atoms().to_string(),
+                &cumulative_filled_usdc.as_micros().to_string(),
+                &cumulative_debited_usdc.as_micros().to_string(),
+            ]);
+            workflow.observe_order_fill(
+                fill_observation_id,
                 cumulative_hype,
                 cumulative_filled_usdc,
                 cumulative_debited_usdc,
-                finality,
+                fully_filled,
                 now,
             )?;
+
+            if let Some(finality) = finality_from_status(&evidence.status) {
+                workflow.finalize_order(
+                    cumulative_hype,
+                    cumulative_filled_usdc,
+                    cumulative_debited_usdc,
+                    finality,
+                    now,
+                )?;
+                durable_finality = true;
+            }
         }
     }
 
@@ -471,6 +488,7 @@ async fn record_reconciliation(
         status: evidence.status,
         filled_hype: cumulative_hype,
         remaining_hype,
+        fills_complete,
         durable_finality,
     })
 }
@@ -511,6 +529,34 @@ fn accepted_at_from_raw_order_status(raw: &str) -> Result<DateTime<Utc>, LivePro
         .ok_or(LiveProbeError::InvalidVenueTimestamp)?;
     let millis = i64::try_from(millis).map_err(|_| LiveProbeError::InvalidVenueTimestamp)?;
     DateTime::from_timestamp_millis(millis).ok_or(LiveProbeError::InvalidVenueTimestamp)
+}
+
+/// Whether `fills` (a rolling, account-wide-bounded window) fully accounts
+/// for `authoritative_filled_size` (from `orderStatus`'s own origSz−sz,
+/// which dex-connector's `authoritative_filled_size` treats as authoritative
+/// even when the fills list is truncated). A caller must never compute
+/// cumulative USDC totals from an incomplete fills list: a fill can age out
+/// of Hyperliquid's shared recent-fill window while `orderStatus` still
+/// correctly reports the order as filled, which would silently understate
+/// the total. See docs/runbooks/live-probe-recovery.md.
+///
+/// # Errors
+///
+/// Returns an error for a fill missing its size or on overflow summing it.
+fn fills_cover_authoritative_quantity(
+    fills: &[FilledOrder],
+    authoritative_filled_size: Decimal,
+) -> Result<bool, LiveProbeError> {
+    let mut total = Decimal::ZERO;
+    for fill in fills {
+        let size = fill
+            .filled_size
+            .ok_or(LiveProbeError::InvalidDecimal("fill size"))?;
+        total = total
+            .checked_add(size)
+            .ok_or(LiveProbeError::InvalidDecimal("cumulative fill size"))?;
+    }
+    Ok(total == authoritative_filled_size)
 }
 
 /// Sums each fill's notional and fee (both already quote-denominated by
@@ -701,9 +747,14 @@ fn decimal_to_atoms(value: Decimal, atoms_per_hype: u64) -> Result<HypeAtoms, Li
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workflow::{
+        AuthorizationInputFreshness, CapitalCommitment, DecisionBinding, EligibilityPolicyBinding,
+        ExchangeOrderOwnerStore, FileExchangeOrderOwnerStore, FileProtectedWorkflowHeadStore,
+        InventoryBaseline, OrderEnvelopeBinding, ProtectedWorkflowHeadStore,
+    };
     use chrono::TimeZone;
     use dex_connector::{HyperliquidAccountConfig, HyperliquidConnectorConfig};
-    use std::{path::Path, str::FromStr};
+    use std::{path::Path, str::FromStr, sync::Arc};
 
     const TEST_SIGNER_KEY: &str =
         "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -922,40 +973,255 @@ mod tests {
         .unwrap()
     }
 
-    fn read_only_action(connector: &HyperliquidConnector) -> ExternalAction {
-        let mut action = order();
-        if let ExternalAction::SubmitOrder {
-            execution_identity_hash,
-            market_metadata_digest,
-            ..
-        } = &mut action
-        {
-            *execution_identity_hash = identity_hash(
-                EXECUTION_IDENTITY_DOMAIN,
-                connector.execution_account_address().unwrap(),
-            );
-            *market_metadata_digest = crate::hype_asset::hype_usdc_market_metadata_digest();
+    fn fixture_at(minute: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 9, 6, 12, minute, 0)
+            .single()
+            .expect("valid UTC fixture")
+    }
+
+    /// A real, minimal, valid `DecisionBinding` — every field required by
+    /// [`DecisionBinding::validate`], not a stub. `execution_identity_hash`
+    /// is a parameter so it can be made to match a test connector's real
+    /// derived identity.
+    fn decision_binding(execution_identity_hash: String) -> DecisionBinding {
+        DecisionBinding {
+            decision_id: "decision-a".to_owned(),
+            decision_date: fixture_at(0).date_naive(),
+            decided_at: fixture_at(0),
+            capital_snapshot_hash: "capital-snapshot-a".to_owned(),
+            input_snapshot_hash: "input-snapshot-a".to_owned(),
+            planned_usdc: UsdcMicros::from_micros(25_000_000),
+            committed_usdc: UsdcMicros::from_micros(25_100_000),
+            capital_commitments: vec![CapitalCommitment {
+                event_id: "tranche-a".to_owned(),
+                planned_usdc: UsdcMicros::from_micros(25_000_000),
+                committed_usdc: UsdcMicros::from_micros(25_100_000),
+            }],
+            inventory_before: InventoryBaseline {
+                execution_identity_hash,
+                spot_hype_atoms: HypeAtoms::from_atoms(0),
+                staking_hype_atoms: HypeAtoms::from_atoms(0),
+                delegated_hype_atoms: HypeAtoms::from_atoms(0),
+                configured_residual_hype_atoms: HypeAtoms::from_atoms(0),
+                unconsumed_residual_spot_hype_atoms: HypeAtoms::from_atoms(0),
+            },
+            order_envelope: OrderEnvelopeBinding {
+                signer_identity_hash: "signer-identity-hash-a".to_owned(),
+                original_quantity_hype: HypeAtoms::from_atoms(100_000_000),
+                hype_atoms_per_hype: 100_000_000,
+                market_metadata_digest: crate::hype_asset::hype_usdc_market_metadata_digest(),
+                limit_price_usdc_per_hype: UsdcMicros::from_micros(25_000_000),
+                l1_nonce: 1,
+                signed_expiry_at: fixture_at(29),
+                effective_expiry_at: fixture_at(30),
+                venue_clock_evidence_at: fixture_at(0),
+                venue_clock_evidence_valid_through_at: fixture_at(31),
+                venue_clock_evidence_digest: "venue-clock-evidence-a".to_owned(),
+                max_venue_clock_lag_ms: 59_999,
+                input_freshness: AuthorizationInputFreshness {
+                    decision_valid_through_at: fixture_at(30),
+                    signal_evidence_valid_through_at: fixture_at(30),
+                    book_evidence_valid_through_at: fixture_at(30),
+                    account_evidence_valid_through_at: fixture_at(30),
+                    fee_schedule_valid_through_at: fixture_at(30),
+                    policy_acknowledgement_valid_through_at: fixture_at(30),
+                },
+            },
+            eligibility_policy: EligibilityPolicyBinding {
+                policy_version: "custody-policy-v1".to_owned(),
+                fill_registration_deadline_seconds: 60,
+                lot_eligibility_max_age_seconds: 3_600,
+            },
+            offline_staking_capability: None,
         }
-        action
+    }
+
+    fn open_test_workflow(dir: &Path, binding: &DecisionBinding) -> DurableWorkflow {
+        let head_store: Arc<dyn ProtectedWorkflowHeadStore> = Arc::new(
+            FileProtectedWorkflowHeadStore::new(dir.join("journal.protected-head.json")).unwrap(),
+        );
+        let owner_store: Arc<dyn ExchangeOrderOwnerStore> = Arc::new(
+            FileExchangeOrderOwnerStore::new(dir.join("exchange-order-owners.json")).unwrap(),
+        );
+        DurableWorkflow::open_or_create(dir.join("journal.jsonl"), binding, head_store, owner_store)
+            .expect("valid fixture binding opens a fresh workflow")
+    }
+
+    /// Answers exactly one `reconcile_prepared_order`/`HyperliquidLiveProbe::
+    /// reconcile` round: `userFillsByTime`, `orderStatus`, then (only when
+    /// the order is found) `spotClearinghouseState` for account-scope
+    /// evidence. One fake server accept-loop per round, since the client
+    /// sends `Connection: close` and reconnects for each `/info` call.
+    /// `expect_account_scope_lookup` must be `true` only when this round's
+    /// call is expected to durably record `AuthenticatedOrderSubmission` for
+    /// the first time (i.e. `WorkflowState::exchange_order_id()` is `None`
+    /// going in) — that's the only case `record_reconciliation` fetches
+    /// `spotClearinghouseState`. A later round reconciling an
+    /// already-recorded order does not repeat that lookup.
+    fn spawn_reconcile_responder(
+        listener: tokio::net::TcpListener,
+        order_status: serde_json::Value,
+        fills: serde_json::Value,
+        expect_account_scope_lookup: bool,
+    ) -> tokio::task::JoinHandle<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::spawn(async move {
+            let request_types = if expect_account_scope_lookup {
+                vec!["userFillsByTime", "orderStatus", "spotClearinghouseState"]
+            } else {
+                vec!["userFillsByTime", "orderStatus"]
+            };
+            for request_type in request_types {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut data = Vec::new();
+                let (header_end, length) = loop {
+                    let mut buffer = [0; 2048];
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    data.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = data.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&data[..end]);
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (key, value) = line.split_once(':')?;
+                                key.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse().unwrap())
+                            })
+                            .unwrap();
+                        break (end + 4, length);
+                    }
+                };
+                while data.len() < header_end + length {
+                    let mut buffer = [0; 2048];
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    data.extend_from_slice(&buffer[..count]);
+                }
+                let request: serde_json::Value =
+                    serde_json::from_slice(&data[header_end..header_end + length]).unwrap();
+                assert_eq!(request["type"], request_type);
+                let body = match request_type {
+                    "orderStatus" => order_status.to_string(),
+                    "userFillsByTime" => fills.to_string(),
+                    _ => serde_json::json!({"balances": []}).to_string(),
+                };
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn reconciliation_survives_being_called_again_after_acceptance_is_recorded() {
+        // Regression test for a real Codex review finding on this PR:
+        // `lookup_read_only`/`reconcile_prepared_order` must never depend on
+        // `DurableWorkflow::pending_prepared_order()` — that action is
+        // cleared once acceptance is durably observed, so a second
+        // reconcile call (to catch up on fill/finality, or after a crash)
+        // must keep working even though nothing is pending any more.
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connector = unsigned_connector(format!("http://{}", listener.local_addr().unwrap()));
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let mut workflow = open_test_workflow(temp.path(), &binding);
+        assert!(workflow.pending_prepared_order().is_err());
+        workflow.prepare_order(fixture_at(2)).unwrap();
+        // Staged and not yet observed: available now, but must not be
+        // required again once observed (that's the regression below).
+        assert!(workflow.pending_prepared_order().is_ok());
+
+        let accepted_at_ms = fixture_at(5).timestamp_millis();
+        let partially_filled = serde_json::json!({
+            "status": "order",
+            "order": {
+                "order": {"oid": 7, "origSz": "1", "sz": "0.5", "timestamp": accepted_at_ms},
+                "status": "open",
+                "statusTimestamp": accepted_at_ms
+            }
+        });
+        let one_fill = serde_json::json!([{
+            "coin": "@1", "px": "25", "sz": "0.5", "side": "B", "time": 1_000,
+            "oid": 7, "tid": 1, "fee": "0.01", "feeToken": "USDC"
+        }]);
+        let server = spawn_reconcile_responder(listener, partially_filled, one_fill, true);
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reconcile_prepared_order(&connector, &mut workflow, fixture_at(20)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(first.exchange_order_id.as_deref(), Some("7"));
+        assert!(first.fills_complete);
+        assert!(!first.durable_finality);
+        assert!(workflow.state().exchange_order_id().is_some());
+        // Now genuinely gone, confirming this path really did stop relying
+        // on it.
+        assert!(workflow.pending_prepared_order().is_err());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connector = unsigned_connector(format!("http://{}", listener.local_addr().unwrap()));
+        let fully_filled = serde_json::json!({
+            "status": "order",
+            "order": {
+                "order": {"oid": 7, "origSz": "1", "sz": "0", "timestamp": accepted_at_ms},
+                "status": "filled",
+                "statusTimestamp": fixture_at(21).timestamp_millis()
+            }
+        });
+        let both_fills = serde_json::json!([
+            {
+                "coin": "@1", "px": "25", "sz": "0.5", "side": "B", "time": 1_000,
+                "oid": 7, "tid": 1, "fee": "0.01", "feeToken": "USDC"
+            },
+            {
+                "coin": "@1", "px": "25", "sz": "0.5", "side": "B", "time": 1_500,
+                "oid": 7, "tid": 2, "fee": "0.01", "feeToken": "USDC"
+            }
+        ]);
+        let server = spawn_reconcile_responder(listener, fully_filled, both_fills, false);
+        // The regression itself: this must succeed even though acceptance
+        // was already recorded on the call above.
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reconcile_prepared_order(&connector, &mut workflow, fixture_at(25)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(second.status, "filled");
+        assert!(second.fills_complete);
+        assert!(second.durable_finality);
     }
 
     #[tokio::test]
     async fn unsigned_recovery_rejects_wrong_account_and_market_before_network() {
+        let temp = tempfile::tempdir().unwrap();
         let connector = unsigned_connector("http://127.0.0.1:1".to_owned());
+        let mismatched_account = decision_binding("some-other-account-identity".to_owned());
+        let workflow = open_test_workflow(temp.path(), &mismatched_account);
         assert!(matches!(
-            lookup_read_only(&connector, &order()).await,
+            lookup_read_only(&connector, workflow.state()).await,
             Err(LiveProbeError::BindingMismatch("execution identity"))
         ));
-        let mut wrong_market = read_only_action(&connector);
-        if let ExternalAction::SubmitOrder {
-            market_metadata_digest,
-            ..
-        } = &mut wrong_market
-        {
-            *market_metadata_digest = "other-market".to_owned();
-        }
+
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let mut wrong_market = decision_binding(execution_identity_hash);
+        wrong_market.order_envelope.market_metadata_digest = "other-market".to_owned();
+        let temp = tempfile::tempdir().unwrap();
+        let workflow = open_test_workflow(temp.path(), &wrong_market);
         assert!(matches!(
-            lookup_read_only(&connector, &wrong_market).await,
+            lookup_read_only(&connector, workflow.state()).await,
             Err(LiveProbeError::BindingMismatch("market metadata"))
         ));
     }
@@ -966,7 +1232,14 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let connector = unsigned_connector(format!("http://{}", listener.local_addr().unwrap()));
         assert!(connector.api_wallet_address().is_err());
-        let action = read_only_action(&connector);
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let temp = tempfile::tempdir().unwrap();
+        let workflow = open_test_workflow(temp.path(), &binding);
+        let expected_cloid = workflow.state().client_order_id();
         let server = tokio::spawn(async move {
             for request_type in ["userFillsByTime", "orderStatus"] {
                 let (mut socket, _) = listener.accept().await.unwrap();
@@ -1006,7 +1279,7 @@ mod tests {
                 assert!(request.get("signature").is_none());
                 assert!(request.get("action").is_none());
                 if request_type == "orderStatus" {
-                    assert_eq!(request["oid"], "0x00112233445566778899aabbccddeeff");
+                    assert_eq!(request["oid"], expected_cloid);
                 }
                 let body = if request_type == "orderStatus" {
                     status.to_string()
@@ -1019,7 +1292,7 @@ mod tests {
         });
         let observed = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            lookup_read_only(&connector, &action),
+            lookup_read_only(&connector, workflow.state()),
         )
         .await
         .unwrap()
@@ -1116,13 +1389,13 @@ mod tests {
         ));
     }
 
-    fn fill(value: &str, fee: &str) -> FilledOrder {
+    fn fill(size: &str, value: &str, fee: &str) -> FilledOrder {
         FilledOrder {
             order_id: "42".to_string(),
             is_rejected: false,
             trade_id: "1".to_string(),
             filled_side: None,
-            filled_size: None,
+            filled_size: Some(Decimal::from_str(size).unwrap()),
             filled_value: Some(Decimal::from_str(value).unwrap()),
             filled_fee: Some(Decimal::from_str(fee).unwrap()),
             filled_ts_ms: None,
@@ -1132,7 +1405,10 @@ mod tests {
 
     #[test]
     fn cumulative_usdc_sums_notional_and_fee_across_fills() {
-        let fills = [fill("10.692", "0.0075"), fill("5.0", "0.0035")];
+        let fills = [
+            fill("0.3", "10.692", "0.0075"),
+            fill("0.14", "5.0", "0.0035"),
+        ];
         let (filled, debited) = cumulative_usdc_from_fills(&fills).unwrap();
         assert_eq!(
             filled,
@@ -1153,11 +1429,43 @@ mod tests {
 
     #[test]
     fn cumulative_usdc_rejects_a_fill_missing_its_notional() {
-        let mut missing_value = fill("10", "0");
+        let mut missing_value = fill("0.3", "10", "0");
         missing_value.filled_value = None;
         assert!(matches!(
             cumulative_usdc_from_fills(&[missing_value]),
             Err(LiveProbeError::InvalidDecimal("fill notional"))
+        ));
+    }
+
+    #[test]
+    fn fills_covering_the_authoritative_quantity_are_complete() {
+        let fills = [
+            fill("0.3", "10.692", "0.0075"),
+            fill("0.14", "5.0", "0.0035"),
+        ];
+        assert!(
+            fills_cover_authoritative_quantity(&fills, Decimal::from_str("0.44").unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn fills_missing_from_the_rolling_window_are_detected_as_incomplete() {
+        // Only 0.3 of the authoritative 0.44 is present — the rest aged out
+        // of Hyperliquid's shared recent-fill window (bot-strategy#901).
+        let fills = [fill("0.3", "10.692", "0.0075")];
+        assert!(
+            !fills_cover_authoritative_quantity(&fills, Decimal::from_str("0.44").unwrap())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn fills_completeness_rejects_a_fill_missing_its_size() {
+        let mut missing_size = fill("0.3", "10.692", "0.0075");
+        missing_size.filled_size = None;
+        assert!(matches!(
+            fills_cover_authoritative_quantity(&[missing_size], Decimal::from_str("0.3").unwrap()),
+            Err(LiveProbeError::InvalidDecimal("fill size"))
         ));
     }
 }
