@@ -40,7 +40,13 @@ use hype_accumulator::{
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::{env, fs, path::PathBuf, process, str::FromStr, sync::Arc};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process,
+    str::FromStr,
+    sync::Arc,
+};
 
 #[tokio::main]
 async fn main() {
@@ -503,7 +509,9 @@ async fn submit(
     }
     // Even a transport error may follow venue acceptance. Recovery must run
     // after every attempt, without allowing a second economic request.
-    let reconciliation = probe.reconcile(&mut workflow, Utc::now()).await;
+    let reconciliation = probe
+        .reconcile(&mut workflow, Path::new(journal_path), Utc::now())
+        .await;
     match &reconciliation {
         Ok(observation) => print_observation(observation)?,
         Err(_) => eprintln!(
@@ -546,7 +554,13 @@ async fn reconcile(
     // Deliberately do not validate live approval or load/decrypt the signer.
     // An expired approval and a revoked key must not prevent read-only recovery.
     let connector = build_read_only_connector(&config, &operational, &ProcessEnvironment)?;
-    let observation = reconcile_prepared_order(&connector, &mut workflow, Utc::now()).await?;
+    let observation = reconcile_prepared_order(
+        &connector,
+        &mut workflow,
+        Path::new(journal_path),
+        Utc::now(),
+    )
+    .await?;
     print_observation(&observation)?;
     Ok(())
 }
