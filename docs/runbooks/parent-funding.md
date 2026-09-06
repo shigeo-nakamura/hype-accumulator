@@ -72,6 +72,10 @@ backfill is needed so previously ignored transfers are not lost behind a cursor.
 - New funding after the daily decision cannot cause a second purchase that day.
   Current DRY_RUN still suppresses all signed actions.
 
+See [the operator procedure for verifying and admitting a new transfer](future-transfer-admission-procedure.md)
+for the concrete steps to run each time a new transfer arrives from the
+designated parent.
+
 ## Remaining live requirements
 
 This adapter supplies funding recognition and uses existing admission evidence;
