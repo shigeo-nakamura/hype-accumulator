@@ -224,8 +224,9 @@ are read-only). Treat a zero exit as "safe to proceed to the halted rollout," no
 Then install it the same way as any other production config change on this host: a halted rollout
 that pauses the HYPE timers, backs up the existing file, runs the config/policy `--install-preflight`
 check above alongside the admission-artifact check above, writes atomically, restarts the
-observer/dry-run services once, and rolls back automatically if anything **other than** the expected
-cooldown-or-returns-pending state is wrong (see step 6 for what "expected" means). `dry_run`,
+observer/dry-run services once, and rolls back automatically if `admitted_usdc` differs from step 6's
+full expected-value formula — not merely from `max_admitted_usdc` — so a legitimate cooldown-pending,
+returns-reduced, or shared-cap-limited amount is never mistaken for a failure. `dry_run`,
 `manual_halt`, and `live_approved` are not touched by this step.
 
 ## Step 6 — verify, independently
