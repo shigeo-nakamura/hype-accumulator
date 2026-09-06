@@ -162,11 +162,14 @@ for a in data["approvals"]:
     seen.add(a["event_id"])
     check(isinstance(a["confirmation_count"], int) and not isinstance(a["confirmation_count"], bool),
           "confirmation_count must be an integer")
-    check(a["confirmation_count"] != 0, "confirmation_count must be nonzero")
+    check(0 < a["confirmation_count"] <= 0xFFFFFFFF, "confirmation_count must fit an unsigned 32-bit "
+          "integer (DepositAdmissionApproval.confirmation_count is a u32; the real parser rejects "
+          "negative or over-range values that a bare nonzero check would miss)")
     if "max_admitted_usdc" in a and a["max_admitted_usdc"] is not None:
         check(isinstance(a["max_admitted_usdc"], int) and not isinstance(a["max_admitted_usdc"], bool),
               "max_admitted_usdc must be an integer")
-        check(a["max_admitted_usdc"] > 0, "max_admitted_usdc must be positive")
+        check(0 < a["max_admitted_usdc"] <= 0xFFFFFFFFFFFFFFFF,
+              "max_admitted_usdc must fit an unsigned 64-bit integer (UsdcMicros wraps a u64)")
     confirmed_at = parse_rfc3339_utc(a["confirmed_at"])
     approved_at = parse_rfc3339_utc(a["approved_at"])
     check(confirmed_at <= approved_at, "confirmed_at must not be after approved_at")
@@ -195,11 +198,16 @@ After installing, verify with a command that is not part of the rollout script's
 - The runtime ledger — `runtime-state.json` under the `state_directory` configured in the deployed
   `runtime.toml` (`config/runtime.example.toml` documents this field; do not assume a fixed path,
   it is a distinct directory per funding route on hosts that have migrated routes) — shows the
-  deposit's `admitted_usdc`. The expected figure is `min(max_admitted_usdc, remaining event capital
+  deposit's `admitted_usdc`. The expected figure is `min(event_ceiling, remaining event capital
   after any prior returns/withdrawals against this event, remaining yearly capacity, remaining
-  lifetime capacity)`, not simply `max_admitted_usdc` — a prior partial return against this same
-  event legitimately reduces admissible capital even with cooldown elapsed and caps otherwise
-  unconstrained; check the event's recorded returns before treating a shortfall as a failure.
+  lifetime capacity)`, where `event_ceiling` is the approval's `max_admitted_usdc` **if the entry
+  set one** — if it was omitted (the schema explicitly permits this, falling back to the automatic
+  per-deposit ceiling), `event_ceiling` is instead `config.toml`'s
+  `capital.max_automatically_deployable_usdc` (`DepositTranche::admission_limit` in `src/pacing.rs`
+  makes the same substitution). Do not assume the un-capped transfer amount is the ceiling. A prior
+  partial return against this same event also legitimately reduces admissible capital even with
+  cooldown elapsed and caps otherwise unconstrained; check the event's recorded returns before
+  treating a shortfall as a failure.
   Separately, if the transfer's `received_at` is still within `pacing.deposit_cooldown_seconds` of
   the current time, `first_usable_at = received_at + deposit_cooldown_seconds` has not passed yet
   and `admitted_usdc = 0` on this first post-install cycle is expected, not a failure — re-check
