@@ -134,12 +134,15 @@ never touches production paths:
 
 ```sh
 set -eu
+# Absolute path to the staged artifact under review (the new
+# admission-approvals.json you are about to install, not the live one).
+STAGED_APPROVALS=/absolute/path/to/staged-admission-approvals.json
 SCRATCH=$(mktemp -d)
 trap 'rm -rf "$SCRATCH"' EXIT
 # The host's system python3 is 3.9 (no stdlib tomllib), and runtime.toml here is
 # flat key = "value" / key = integer lines with no nested tables — a line-based
 # rewrite avoids needing a TOML parser at all.
-python3 - "$SCRATCH" <<'PY'
+python3 - "$SCRATCH" "$STAGED_APPROVALS" <<'PY'
 import sys, re, pathlib
 
 # `if not count == 1: raise`, not `assert` — an assertion silently stripped
@@ -152,6 +155,9 @@ def require_exactly_one(count, key):
         raise ValueError(f"expected exactly one {key} line, found {count}")
 
 scratch = pathlib.Path(sys.argv[1])
+staged_approvals = pathlib.Path(sys.argv[2])
+if not staged_approvals.is_absolute():
+    raise ValueError("STAGED_APPROVALS must be an absolute path")
 text = pathlib.Path("/etc/hype-accumulator/runtime.toml").read_text()
 for key in ("state_directory", "protected_anchor_path", "signal_snapshot_path",
             "status_path", "metrics_path", "cycle_report_path"):
@@ -159,9 +165,10 @@ for key in ("state_directory", "protected_anchor_path", "signal_snapshot_path",
     replacement = f'{key} = "{scratch / key}"'
     text, count = pattern.subn(replacement, text, count=1)
     require_exactly_one(count, key)
-# Point this at the STAGED artifact under review, not the live one.
+# Point this at the STAGED artifact under review, not the live one — an
+# absolute path, so this does not depend on the invoking shell's cwd.
 pattern = re.compile(r'^admission_approvals_path\s*=\s*".*"\s*$', re.M)
-text, count = pattern.subn('admission_approvals_path = "staged-admission-approvals.json"', text, count=1)
+text, count = pattern.subn(f'admission_approvals_path = "{staged_approvals}"', text, count=1)
 require_exactly_one(count, "admission_approvals_path")
 (scratch / "runtime.toml").write_text(text)
 PY
