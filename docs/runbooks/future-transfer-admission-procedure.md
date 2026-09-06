@@ -100,29 +100,57 @@ Add one entry to `admission-approvals.json` (schema in `src/runtime.rs::DepositA
 ```
 
 `--install-preflight` (`docs/runbooks/release-install.md`) only validates `config.toml` and
-`security-policy.toml` — it does not parse or validate `admission-approvals.json`. Before installing,
-run an explicit offline check that mirrors `AdmissionApprovals::from_json`'s own validation
-(`src/runtime.rs`), so a malformed artifact fails before anything is touched live rather than after
-the dry-run service restarts:
+`security-policy.toml` — it does not parse or validate `admission-approvals.json`. There is no
+dedicated CLI subcommand that validates this artifact alone without opening the live runtime state
+(`--dry-run-cycle` does parse it via the real `AdmissionApprovals::from_json`, but it also opens
+`SignerFreeRuntime` against the configured, real `state_directory`, so it is not side-effect-free to
+run ad hoc before a backup exists). Before installing, run an offline check that reproduces the
+artifact's actual closed schema and typed-timestamp validation precisely — not a loose string
+comparison, which would wrongly accept unknown fields, non-integer numeric fields, or two identical
+non-date strings for `confirmed_at`/`approved_at`:
 
 ```python
 import json
+from datetime import datetime, timezone
+
+def parse_rfc3339_utc(value):
+    if not isinstance(value, str):
+        raise ValueError("timestamp must be a JSON string")
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        raise ValueError("timestamp must be timezone-aware")
+    return dt.astimezone(timezone.utc)
+
 data = json.load(open("staged-admission-approvals.json"))  # raises on malformed JSON
+assert set(data.keys()) == {"schema_version", "approvals"}, "unknown top-level field"
 assert data["schema_version"] == 1
 seen = set()
 for a in data["approvals"]:
-    assert a["event_id"].strip() == a["event_id"] and a["event_id"]
-    assert a["event_id"] not in seen; seen.add(a["event_id"])
+    allowed = {"max_admitted_usdc", "event_id", "confirmed_at", "confirmation_count", "approved_at"}
+    assert set(a.keys()) <= allowed, "unknown field in approval entry"
+    assert isinstance(a["event_id"], str) and a["event_id"].strip() == a["event_id"] and a["event_id"]
+    assert a["event_id"] not in seen
+    seen.add(a["event_id"])
+    assert isinstance(a["confirmation_count"], int) and not isinstance(a["confirmation_count"], bool)
     assert a["confirmation_count"] != 0
-    assert a.get("max_admitted_usdc") is None or a["max_admitted_usdc"] > 0
-    assert a["confirmed_at"] <= a["approved_at"]  # ISO 8601 UTC strings compare correctly lexically
+    if "max_admitted_usdc" in a and a["max_admitted_usdc"] is not None:
+        assert isinstance(a["max_admitted_usdc"], int) and not isinstance(a["max_admitted_usdc"], bool)
+        assert a["max_admitted_usdc"] > 0
+    confirmed_at = parse_rfc3339_utc(a["confirmed_at"])
+    approved_at = parse_rfc3339_utc(a["approved_at"])
+    assert confirmed_at <= approved_at
 ```
+
+This narrows, but does not eliminate, the gap with the real parser (it does not re-derive
+`UsdcMicros`' exact integer-overflow/bounds behavior, for instance). Treat a pass here as "safe to
+proceed to the halted rollout," not as a substitute for the runtime's own validation on first load.
 
 Then install it the same way as any other production config change on this host: a halted rollout
 that pauses the HYPE timers, backs up the existing file, runs the config/policy `--install-preflight`
 check above alongside the admission-artifact check above, writes atomically, restarts the
-observer/dry-run services once to confirm the expected `admitted_usdc` figure, and rolls back
-automatically on any mismatch. `dry_run`/`manual_halt`/`live_approved` are not touched by this step.
+observer/dry-run services once, and rolls back automatically if anything **other than** the expected
+cooldown-pending state is wrong (see step 5 for what "expected" means when the transfer is recent).
+`dry_run`/`manual_halt`/`live_approved` are not touched by this step.
 
 ## Step 5 — verify, independently
 
@@ -131,11 +159,17 @@ After installing, verify with a command that is not part of the rollout script's
 
 - `admission-approvals.json` has exactly the new entry, with the expected `event_id` and
   `max_admitted_usdc`.
-- The runtime ledger (`/var/lib/hype-accumulator/runtime/<current-route>/runtime-state.json`) shows
-  the deposit's `admitted_usdc` matching the expected admitted amount (capped by whatever the
-  current yearly/lifetime caps allow — it is normal for this to be less than the full transfer
-  amount if caps are the binding constraint; the remainder auto-admits on a later cycle once caps
-  allow, with no new approval needed).
+- The runtime ledger — `runtime-state.json` under the `state_directory` configured in the deployed
+  `runtime.toml` (`config/runtime.example.toml` documents this field; do not assume a fixed path,
+  it is a distinct directory per funding route on hosts that have migrated routes) — shows the
+  deposit's `admitted_usdc` matching the expected admitted amount, **unless** the transfer's
+  `received_at` is still within `pacing.deposit_cooldown_seconds` of the current time. Admission is
+  correctly gated on `first_usable_at = received_at + deposit_cooldown_seconds`, so a fresh transfer
+  checked soon after arrival will legitimately show `admitted_usdc = 0` (or a partial amount) on the
+  very first post-install cycle — this is expected, not a failure, and does not mean the approval or
+  caps are wrong. Re-check after the cooldown elapses. Only treat a mismatch as a real problem if it
+  persists once both the cooldown has elapsed and the yearly/lifetime caps have enough remaining
+  capacity for the expected amount.
 - `dry_run` is still `true`, `signed_action_created` is `false`, and no unrelated systemd unit
   changed state.
 
