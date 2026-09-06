@@ -399,6 +399,14 @@ async fn record_reconciliation(
     evidence: HyperliquidOrderReconciliation,
     now: DateTime<Utc>,
 ) -> Result<ProbeReconciliation, LiveProbeError> {
+    // Never rejected for being "before" the venue's own reported acceptance
+    // time: the venue clock is permitted to run ahead of the local clock by
+    // up to the order envelope's own `max_venue_clock_lag_ms` (already
+    // authorized), and `validate_order_submission_evidence` rejects
+    // `accepted_at > recorded_at` outright. Clamped once here so every
+    // subsequent call below (fill observation, finalization) uses a
+    // consistent, non-regressing timestamp too.
+    let mut now = now;
     let binding = workflow.state().binding().clone();
     let hype_atoms_per_hype = binding.order_envelope.hype_atoms_per_hype;
     let cumulative_hype = decimal_to_atoms(evidence.filled_size, hype_atoms_per_hype)?;
@@ -412,12 +420,12 @@ async fn record_reconciliation(
     // actually summing to the authoritative filled quantity. See
     // docs/runbooks/live-probe-recovery.md.
     let fills_complete = fills_cover_authoritative_quantity(&evidence.fills, evidence.filled_size)?;
-    let mut durable_finality = false;
 
     if let Some(exchange_order_id) = evidence.order_id.clone() {
         if workflow.state().exchange_order_id().is_none() {
             let account_scope_raw = connector.spot_state_raw().await?;
             let accepted_at = accepted_at_from_raw_order_status(&evidence.raw_order_status)?;
+            now = now.max(accepted_at);
             let submission = AuthenticatedOrderSubmission {
                 observation_id: content_hash(&[
                     "hype-accumulator/order-submission-observation/v1",
@@ -452,22 +460,31 @@ async fn record_reconciliation(
         if fills_complete {
             let (cumulative_filled_usdc, cumulative_debited_usdc) =
                 cumulative_usdc_from_fills(&evidence.fills)?;
-            let fully_filled = cumulative_hype == binding.order_envelope.original_quantity_hype;
-            let fill_observation_id = content_hash(&[
-                "hype-accumulator/order-fill-observation/v1",
-                &exchange_order_id,
-                &cumulative_hype.as_atoms().to_string(),
-                &cumulative_filled_usdc.as_micros().to_string(),
-                &cumulative_debited_usdc.as_micros().to_string(),
-            ]);
-            workflow.observe_order_fill(
-                fill_observation_id,
-                cumulative_hype,
-                cumulative_filled_usdc,
-                cumulative_debited_usdc,
-                fully_filled,
-                now,
-            )?;
+            // `observe_order_fill` never accepts a zero-HYPE observation
+            // (`validate_cumulative_fill` allows zero only for a Canceled/
+            // Expired *finalization*, not a bare fill observation) — a
+            // freshly accepted order still open with no fills yet, or an
+            // IOC canceled unfilled, must skip straight to finalization
+            // (when terminal) rather than recording a fill observation that
+            // would always be rejected.
+            if !cumulative_hype.is_zero() {
+                let fully_filled = cumulative_hype == binding.order_envelope.original_quantity_hype;
+                let fill_observation_id = content_hash(&[
+                    "hype-accumulator/order-fill-observation/v1",
+                    &exchange_order_id,
+                    &cumulative_hype.as_atoms().to_string(),
+                    &cumulative_filled_usdc.as_micros().to_string(),
+                    &cumulative_debited_usdc.as_micros().to_string(),
+                ]);
+                workflow.observe_order_fill(
+                    fill_observation_id,
+                    cumulative_hype,
+                    cumulative_filled_usdc,
+                    cumulative_debited_usdc,
+                    fully_filled,
+                    now,
+                )?;
+            }
 
             if let Some(finality) = finality_from_status(&evidence.status) {
                 workflow.finalize_order(
@@ -477,7 +494,6 @@ async fn record_reconciliation(
                     finality,
                     now,
                 )?;
-                durable_finality = true;
             }
         }
     }
@@ -489,8 +505,32 @@ async fn record_reconciliation(
         filled_hype: cumulative_hype,
         remaining_hype,
         fills_complete,
-        durable_finality,
+        // Reflects the workflow's actual durable state, not just whether
+        // *this* call reached `finalize_order` — an earlier call may already
+        // have finalized it, and this one's fills could be incomplete.
+        durable_finality: order_already_finalized(workflow.state().stage()),
     })
+}
+
+/// Whether the workflow has already durably recorded `OrderFinalized` (or
+/// progressed past it, e.g. into staking-eligibility bookkeeping), for
+/// [`ProbeReconciliation::durable_finality`] — computed from the workflow's
+/// actual stage rather than from whether the current call happened to
+/// (re)finalize it, so an earlier finalization is still reported correctly
+/// even when this call's own fills are incomplete or the order is not
+/// otherwise touched again.
+fn order_already_finalized(stage: crate::workflow::WorkflowStage) -> bool {
+    use crate::workflow::WorkflowStage;
+    matches!(
+        stage,
+        WorkflowStage::OrderFinalized
+            | WorkflowStage::StakingEligibilityRecorded
+            | WorkflowStage::StakingDepositSubmitted
+            | WorkflowStage::StakingBalanceConfirmed
+            | WorkflowStage::DelegationSubmitted
+            | WorkflowStage::DelegatedConfirmed
+            | WorkflowStage::Complete
+    )
 }
 
 /// Maps a raw Hyperliquid order status string to durable order finality.
@@ -1199,6 +1239,97 @@ mod tests {
         assert_eq!(second.status, "filled");
         assert!(second.fills_complete);
         assert!(second.durable_finality);
+    }
+
+    #[tokio::test]
+    async fn zero_fill_cancellation_finalizes_without_a_rejected_fill_observation() {
+        // Regression test for a real Codex review finding: `observe_order_
+        // fill` never accepts a zero-HYPE observation, so an IOC canceled
+        // with no fills at all must skip straight to finalization rather
+        // than attempt (and be rejected by) a zero-quantity fill
+        // observation first.
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connector = unsigned_connector(format!("http://{}", listener.local_addr().unwrap()));
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let mut workflow = open_test_workflow(temp.path(), &binding);
+        workflow.prepare_order(fixture_at(2)).unwrap();
+
+        let accepted_at_ms = fixture_at(5).timestamp_millis();
+        let canceled_unfilled = serde_json::json!({
+            "status": "order",
+            "order": {
+                "order": {"oid": 7, "origSz": "1", "sz": "1", "timestamp": accepted_at_ms},
+                "status": "canceled",
+                "statusTimestamp": accepted_at_ms
+            }
+        });
+        let no_fills = serde_json::json!([]);
+        let server = spawn_reconcile_responder(listener, canceled_unfilled, no_fills, true);
+        let observed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reconcile_prepared_order(&connector, &mut workflow, fixture_at(20)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(observed.status, "canceled");
+        assert!(observed.filled_hype.is_zero());
+        assert!(observed.fills_complete);
+        assert!(observed.durable_finality);
+    }
+
+    #[tokio::test]
+    async fn accepted_at_ahead_of_the_local_clock_does_not_block_recording() {
+        // Regression test for a real Codex review finding: the venue clock
+        // is permitted to run ahead of the local clock (up to the order
+        // envelope's own max_venue_clock_lag_ms, already authorized), so
+        // `accepted_at` (the venue's own order.timestamp) can legitimately
+        // be later than the `now` this call was invoked with.
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connector = unsigned_connector(format!("http://{}", listener.local_addr().unwrap()));
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let mut workflow = open_test_workflow(temp.path(), &binding);
+        workflow.prepare_order(fixture_at(2)).unwrap();
+
+        let accepted_at_ms = fixture_at(10).timestamp_millis();
+        let filled = serde_json::json!({
+            "status": "order",
+            "order": {
+                "order": {"oid": 7, "origSz": "1", "sz": "0", "timestamp": accepted_at_ms},
+                "status": "filled",
+                "statusTimestamp": accepted_at_ms
+            }
+        });
+        let fills = serde_json::json!([{
+            "coin": "@1", "px": "25", "sz": "1", "side": "B", "time": 1_000,
+            "oid": 7, "tid": 1, "fee": "0.01", "feeToken": "USDC"
+        }]);
+        let server = spawn_reconcile_responder(listener, filled, fills, true);
+        // Local `now` (fixture_at(5)) is BEFORE the venue's reported
+        // acceptance time (fixture_at(10)) — must still succeed.
+        let observed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reconcile_prepared_order(&connector, &mut workflow, fixture_at(5)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(observed.status, "filled");
+        assert!(observed.durable_finality);
     }
 
     #[tokio::test]
