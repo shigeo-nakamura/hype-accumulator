@@ -48,6 +48,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             config.validate_offline_install(&ProcessEnvironment)?;
             println!("mode=dry-run halted install-ready");
         }
+        Invocation::PrintExpectedAcknowledgement {
+            config_path,
+            security_policy_path,
+        } => {
+            let config = load_config(&config_path, Some(&security_policy_path))?;
+            let acknowledgement =
+                config.expected_live_acknowledgement(&ProcessEnvironment, Utc::now())?;
+            println!("{acknowledgement}");
+        }
         Invocation::DryRunCycle {
             config_path,
             security_policy_path,
@@ -121,6 +130,10 @@ enum Invocation {
         config_path: PathBuf,
         security_policy_path: PathBuf,
     },
+    PrintExpectedAcknowledgement {
+        config_path: PathBuf,
+        security_policy_path: PathBuf,
+    },
     DryRunCycle {
         config_path: PathBuf,
         security_policy_path: PathBuf,
@@ -175,6 +188,14 @@ where
                 security_policy_path: PathBuf::from(security_policy_path),
             })
         }
+        [command, config_path, security_policy_path]
+            if command == "--print-expected-acknowledgement" =>
+        {
+            Ok(Invocation::PrintExpectedAcknowledgement {
+                config_path: PathBuf::from(config_path),
+                security_policy_path: PathBuf::from(security_policy_path),
+            })
+        }
         [command, config_path, security_policy_path, runtime_config_path]
             if command == "--dry-run-cycle" =>
         {
@@ -224,7 +245,7 @@ where
             destination_anchor_path: PathBuf::from(destination_anchor_path),
         }),
         _ => Err(
-            "usage: hype-accumulator [config.toml] [security-policy.toml] | --install-preflight config.toml security-policy.toml | --dry-run-cycle config.toml security-policy.toml runtime.toml | --signal-snapshot config.toml security-policy.toml runtime.toml | --ledger-backup-create LEDGER_DIR SOURCE_ANCHOR BUNDLE_DIR ANCHOR_EXPORT | --ledger-backup-verify BUNDLE_DIR ANCHOR_EXPORT | --ledger-backup-restore BUNDLE_DIR ANCHOR_EXPORT DESTINATION_DIR DESTINATION_ANCHOR",
+            "usage: hype-accumulator [config.toml] [security-policy.toml] | --install-preflight config.toml security-policy.toml | --print-expected-acknowledgement config.toml security-policy.toml | --dry-run-cycle config.toml security-policy.toml runtime.toml | --signal-snapshot config.toml security-policy.toml runtime.toml | --ledger-backup-create LEDGER_DIR SOURCE_ANCHOR BUNDLE_DIR ANCHOR_EXPORT | --ledger-backup-verify BUNDLE_DIR ANCHOR_EXPORT | --ledger-backup-restore BUNDLE_DIR ANCHOR_EXPORT DESTINATION_DIR DESTINATION_ANCHOR",
         ),
     }
 }
@@ -393,6 +414,31 @@ mod tests {
         );
         assert!(invocation(
             ["--install-preflight", "runtime.toml"]
+                .into_iter()
+                .map(str::to_owned)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn print_expected_acknowledgement_requires_both_explicit_documents() {
+        assert_eq!(
+            invocation(
+                [
+                    "--print-expected-acknowledgement",
+                    "runtime.toml",
+                    "security-policy.toml",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+            ),
+            Ok(Invocation::PrintExpectedAcknowledgement {
+                config_path: PathBuf::from("runtime.toml"),
+                security_policy_path: PathBuf::from("security-policy.toml"),
+            })
+        );
+        assert!(invocation(
+            ["--print-expected-acknowledgement", "runtime.toml"]
                 .into_iter()
                 .map(str::to_owned)
         )

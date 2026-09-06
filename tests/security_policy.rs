@@ -145,7 +145,7 @@ fn config_with_policy(policy: &str) -> Config {
 
 fn acknowledged_policy(policy: &str, env: &HashMap<String, String>) -> String {
     let expected = config_with_policy(policy)
-        .expected_live_acknowledgement(env)
+        .expected_live_acknowledgement(env, at("2026-08-24T00:00:00Z"))
         .expect("complete effective policy");
     policy.replace(
         "live_acknowledgement = \"\"",
@@ -326,11 +326,12 @@ fn exact_acknowledgement_is_required_and_expires_at_the_boundary() {
 fn canonical_digest_excludes_acknowledgement_but_binds_policy_fields() {
     let env = live_environment();
     let policy = live_policy_template();
+    let now = at("2026-08-31T23:59:59Z");
     let expected = config_with_policy(&policy)
-        .expected_live_acknowledgement(&env)
+        .expected_live_acknowledgement(&env, now)
         .expect("expected acknowledgement");
     let digest = config_with_policy(&policy)
-        .effective_security_policy_digest(&env)
+        .effective_security_policy_digest(&env, now)
         .expect("effective digest");
     assert_eq!(expected, format!("v1:sha256:{digest}"));
     assert_eq!(digest.len(), 64);
@@ -338,14 +339,14 @@ fn canonical_digest_excludes_acknowledgement_but_binds_policy_fields() {
         HashMap::from([("HYPE_ACCOUNT_ID".to_owned(), EXECUTION_ACCOUNT.to_owned())]);
     assert_eq!(
         config_with_policy(&policy)
-            .expected_live_acknowledgement(&public_identities_only)
+            .expected_live_acknowledgement(&public_identities_only, now)
             .expect("digest does not read signing credentials"),
         expected
     );
     let acknowledged = acknowledged_policy(&policy, &env);
     assert_eq!(
         config_with_policy(&acknowledged)
-            .expected_live_acknowledgement(&env)
+            .expected_live_acknowledgement(&env, now)
             .expect("same effective policy"),
         expected
     );
@@ -385,7 +386,7 @@ fn acknowledged_caps_and_reserve_drive_effective_pacing() {
     let policy = live_policy_template();
     let expected = Config::from_toml_with_security_policy(&runtime, &policy)
         .expect("live documents")
-        .expected_live_acknowledgement(&env)
+        .expected_live_acknowledgement(&env, at("2026-08-24T00:00:00Z"))
         .expect("effective acknowledgement");
     let acknowledged = policy.replace(
         "live_acknowledgement = \"\"",
@@ -478,7 +479,7 @@ fn schedule_capacity_accounts_for_the_global_reserve_across_tranches() {
         .replace("reserve_microusd = 1000000", "reserve_microusd = 10000000");
     let expected = Config::from_toml_with_security_policy(&runtime, &multi_tranche_policy)
         .expect("live documents")
-        .expected_live_acknowledgement(&env)
+        .expected_live_acknowledgement(&env, at("2026-08-24T00:00:00Z"))
         .expect("effective acknowledgement");
     let acknowledged = multi_tranche_policy.replace(
         "live_acknowledgement = \"\"",
@@ -512,7 +513,7 @@ fn schedule_capacity_accounts_for_the_global_reserve_across_tranches() {
     let expected =
         Config::from_toml_with_security_policy(&one_tranche_runtime, &one_tranche_policy)
             .expect("single-tranche live documents")
-            .expected_live_acknowledgement(&env)
+            .expected_live_acknowledgement(&env, at("2026-08-24T00:00:00Z"))
             .expect("effective acknowledgement");
     let acknowledged = one_tranche_policy.replace(
         "live_acknowledgement = \"\"",
@@ -560,7 +561,7 @@ fn resolved_execution_identity_is_normalized_and_digest_bound() {
     let env = live_environment();
     let policy = live_policy_template();
     let lowercase = config_with_policy(&policy)
-        .expected_live_acknowledgement(&env)
+        .expected_live_acknowledgement(&env, at("2026-08-24T00:00:00Z"))
         .expect("lowercase identity");
     let mut mixed_case = env.clone();
     mixed_case.insert(
@@ -568,7 +569,7 @@ fn resolved_execution_identity_is_normalized_and_digest_bound() {
         "0x11111111111111111111111111111111111111AA".to_owned(),
     );
     let different = config_with_policy(&policy)
-        .expected_live_acknowledgement(&mixed_case)
+        .expected_live_acknowledgement(&mixed_case, at("2026-08-24T00:00:00Z"))
         .expect("mixed-case identity normalizes");
     assert_eq!(lowercase, different);
 
@@ -634,12 +635,12 @@ fn multiple_validators_are_normalized_as_a_digest_bound_set() {
     );
     let expected = Config::from_toml_with_security_policy(&runtime, &first)
         .expect("multi-validator documents")
-        .expected_live_acknowledgement(&env)
+        .expected_live_acknowledgement(&env, at("2026-08-24T00:00:00Z"))
         .expect("nonempty validator set is supported");
     assert_eq!(
         Config::from_toml_with_security_policy(&runtime, &reversed)
             .expect("reversed validator documents")
-            .expected_live_acknowledgement(&env)
+            .expected_live_acknowledgement(&env, at("2026-08-24T00:00:00Z"))
             .expect("validator order is normalized"),
         expected
     );
@@ -708,7 +709,8 @@ fn unsafe_custody_and_staking_modes_fail_before_live() {
         "execution_account_kind = \"unapproved\"",
     );
     assert!(matches!(
-        config_with_policy(&unapproved).expected_live_acknowledgement(&env),
+        config_with_policy(&unapproved)
+            .expected_live_acknowledgement(&env, at("2026-08-24T00:00:00Z")),
         Err(ConfigError::SecurityPolicy(SecurityPolicyError::Invalid(_)))
     ));
 
@@ -757,10 +759,10 @@ fn accepted_uncapped_authority_is_acknowledged_and_digest_bound() {
     // mode string, so the divergence below is guaranteed by several bound
     // fields at once rather than by the mode string alone.
     let bounded_ack = config_with_policy(&live_policy_template())
-        .expected_live_acknowledgement(&env)
+        .expected_live_acknowledgement(&env, at("2026-08-24T00:00:00Z"))
         .expect("bounded acknowledgement");
     let uncapped_ack = config_with_policy(&uncapped)
-        .expected_live_acknowledgement(&env)
+        .expected_live_acknowledgement(&env, at("2026-08-24T00:00:00Z"))
         .expect("uncapped acknowledgement");
     assert_ne!(bounded_ack, uncapped_ack);
     let cross_signed = uncapped.replace(
@@ -808,7 +810,8 @@ fn accepted_uncapped_authority_must_not_claim_bounded_evidence() {
         let policy = uncapped_policy_template().replace(from, to);
         assert!(
             matches!(
-                config_with_policy(&policy).expected_live_acknowledgement(&env),
+                config_with_policy(&policy)
+                    .expected_live_acknowledgement(&env, at("2026-08-24T00:00:00Z")),
                 Err(ConfigError::SecurityPolicy(SecurityPolicyError::Invalid(_)))
             ),
             "`{to}` must not be claimable under accepted uncapped authority"
@@ -824,7 +827,8 @@ fn accepted_uncapped_authority_requires_an_acceptance_record_and_alert_threshold
         "hot_balance_enforcement_change_ref = \"\"",
     );
     assert!(matches!(
-        config_with_policy(&no_record).expected_live_acknowledgement(&env),
+        config_with_policy(&no_record)
+            .expected_live_acknowledgement(&env, at("2026-08-24T00:00:00Z")),
         Err(ConfigError::SecurityPolicy(SecurityPolicyError::Invalid(_)))
     ));
     let no_threshold = uncapped_policy_template().replace(
@@ -832,9 +836,28 @@ fn accepted_uncapped_authority_requires_an_acceptance_record_and_alert_threshold
         "max_hot_trading_balance_microusd = 0",
     );
     assert!(matches!(
-        config_with_policy(&no_threshold).expected_live_acknowledgement(&env),
+        config_with_policy(&no_threshold)
+            .expected_live_acknowledgement(&env, at("2026-08-24T00:00:00Z")),
         Err(ConfigError::SecurityPolicy(SecurityPolicyError::Invalid(_)))
     ));
+}
+
+#[test]
+fn expected_live_acknowledgement_rejects_an_already_expired_policy() {
+    // Regression: a reported "expected" acknowledgement must never be one
+    // that normal startup would immediately reject as expired the moment an
+    // operator copies it into `live_acknowledgement`.
+    let env = live_environment();
+    let policy = live_policy_template();
+    assert!(matches!(
+        config_with_policy(&policy).expected_live_acknowledgement(&env, at(EXPIRY)),
+        Err(ConfigError::SecurityPolicy(
+            SecurityPolicyError::AcknowledgementExpired
+        ))
+    ));
+    config_with_policy(&policy)
+        .expected_live_acknowledgement(&env, at(EXPIRY) - chrono::TimeDelta::seconds(1))
+        .expect("still before expiry");
 }
 
 #[test]

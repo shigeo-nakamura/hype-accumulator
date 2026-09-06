@@ -344,7 +344,7 @@ async fn prepare(
     // unbounded KMS round trip baked into its staleness.
     let now = Utc::now();
     let effective = config.effective_live_order_policy(&ProcessEnvironment, now)?;
-    let policy_version = config.effective_security_policy_digest(&ProcessEnvironment)?;
+    let policy_version = config.effective_security_policy_digest(&ProcessEnvironment, now)?;
     let envelope_policy = OrderEnvelopeFreshnessPolicy {
         max_venue_clock_lag_ms: effective.max_venue_clock_lag_ms,
         venue_clock_evidence_stale_after_seconds: effective
