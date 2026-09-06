@@ -23,11 +23,13 @@ use dex_connector::{
     DexError, FilledOrder, HyperliquidConnector, HyperliquidL1ActionEnvelope,
     HyperliquidOrderReconciliation, OrderSide,
 };
+use fs2::FileExt;
 use rust_decimal::{prelude::ToPrimitive, Decimal};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    fs,
+    fs::{self, File, OpenOptions},
+    io,
     path::{Path, PathBuf},
 };
 use thiserror::Error;
@@ -482,12 +484,18 @@ async fn record_reconciliation(
         // docs/runbooks/live-probe-recovery.md.
         let workflow_id = workflow.state().workflow_id().to_string();
         let accumulator_path = observed_fills_path(journal_path);
+        // Held across the whole read-merge-write sequence, released as
+        // soon as it goes out of scope at the end of this block — nothing
+        // past this point needs exclusivity (observe_order_fill/
+        // finalize_order are already protected by the journal's own lock).
+        let accumulator_lock = acquire_observed_fills_lock(&accumulator_path)?;
         let mut accumulated_fills = load_observed_fills(&accumulator_path, &workflow_id)?;
         merge_observed_fills(&mut accumulated_fills.fills, &evidence.fills)?;
         accumulated_fills.content_hash =
             observed_fills_content_hash(&workflow_id, &accumulated_fills.fills);
         crate::status_io::write_private_json_atomic(&accumulator_path, &accumulated_fills)
             .map_err(|error| LiveProbeError::ObservedFillsAccumulator(error.to_string()))?;
+        drop(accumulator_lock);
         fills_complete =
             fills_cover_authoritative_quantity(&accumulated_fills.fills, evidence.filled_size)?;
 
@@ -593,29 +601,30 @@ async fn record_order_submission_if_new(
         // clamped transition time would otherwise regress and be rejected.
         return Ok(now.max(workflow.state().last_transition_at()));
     }
-    let account_scope_raw = connector.spot_state_raw().await?;
     let raw_accepted_at = accepted_at_from_raw_order_status(raw_order_status)?;
     // The venue clock may legitimately run up to the order envelope's own
-    // already-authorized `max_venue_clock_lag_ms` *behind* the local clock
-    // too (the `now.max(accepted_at)` below only handles it running
-    // ahead): `validate_order_submission_evidence` otherwise rejects
-    // `accepted_at` outright for predating the workflow's own last
-    // transition (`prepare_order`'s timestamp), which a lagging venue
-    // clock can trigger even though nothing is actually wrong. Normalized
-    // up to that floor only within the authorized tolerance — a raw
-    // timestamp further behind than that is a genuine anomaly, not
-    // ordinary skew, and must still fail closed.
+    // already-authorized `max_venue_clock_lag_ms` *behind or ahead* of the
+    // local clock: `validate_order_submission_evidence` otherwise rejects
+    // `accepted_at` outright for either predating the workflow's own last
+    // transition (`prepare_order`'s timestamp) or postdating `now`, which
+    // ordinary tolerated clock skew can trigger in either direction even
+    // though nothing is actually wrong. Normalized up to/bounded by that
+    // tolerance — checked (and any network call skipped) before the
+    // account-scope evidence lookup below, since a timestamp outside the
+    // authorized tolerance is a genuine anomaly that must fail closed
+    // regardless of what that lookup would return.
     let last_transition_at = workflow.state().last_transition_at();
     let max_lag = chrono::TimeDelta::try_milliseconds(
         i64::try_from(binding.order_envelope.max_venue_clock_lag_ms)
             .map_err(|_| LiveProbeError::InvalidVenueTimestamp)?,
     )
     .ok_or(LiveProbeError::InvalidVenueTimestamp)?;
-    if raw_accepted_at < last_transition_at - max_lag {
+    if raw_accepted_at < last_transition_at - max_lag || raw_accepted_at > now + max_lag {
         return Err(LiveProbeError::InvalidVenueTimestamp);
     }
     let accepted_at = raw_accepted_at.max(last_transition_at);
     let now = now.max(accepted_at);
+    let account_scope_raw = connector.spot_state_raw().await?;
     let submission = AuthenticatedOrderSubmission {
         observation_id: content_hash(&[
             "hype-accumulator/order-submission-observation/v1",
@@ -793,6 +802,47 @@ fn observed_fills_path(journal_path: &Path) -> PathBuf {
     let mut path = journal_path.to_path_buf();
     path.set_extension("observed-fills.json");
     path
+}
+
+/// Serializes the accumulator's read-merge-write sequence against another
+/// process doing the same for the same journal (`submit` and the
+/// signer-free `reconcile` recovery command can run concurrently). Atomic
+/// rename alone only prevents a torn/partial file; it does not prevent one
+/// process's merge from silently overwriting another's, which could drop a
+/// fill row that has since aged out of Hyperliquid's recent-fill window and
+/// can never be recovered from the venue again. Fails fast (does not
+/// block) on contention, mirroring `workflow.rs`'s own journal append
+/// lock.
+///
+/// # Errors
+///
+/// Returns [`LiveProbeError::ObservedFillsAccumulator`] if the lock file
+/// cannot be opened, or if another process already holds the lock.
+fn acquire_observed_fills_lock(accumulator_path: &Path) -> Result<File, LiveProbeError> {
+    let parent = accumulator_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .map_err(|error| LiveProbeError::ObservedFillsAccumulator(error.to_string()))?;
+    let mut lock_path = accumulator_path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(|error| LiveProbeError::ObservedFillsAccumulator(error.to_string()))?;
+    match lock.try_lock_exclusive() {
+        Ok(()) => Ok(lock),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(LiveProbeError::ObservedFillsAccumulator(
+                "observed-fills record is locked by a concurrent reconciliation".into(),
+            ))
+        }
+        Err(error) => Err(LiveProbeError::ObservedFillsAccumulator(error.to_string())),
+    }
 }
 
 /// Deterministic digest binding a workflow identity to its exact fill
@@ -1847,7 +1897,9 @@ mod tests {
         let mut workflow = open_test_workflow(temp.path(), &binding);
         workflow.prepare_order(fixture_at(2)).unwrap();
 
-        let accepted_at_ms = fixture_at(10).timestamp_millis();
+        // 30s ahead of the local `now` below — well within the ~60s
+        // authorized lag (decision_binding's max_venue_clock_lag_ms).
+        let accepted_at_ms = (fixture_at(5) + chrono::TimeDelta::seconds(30)).timestamp_millis();
         let filled = serde_json::json!({
             "status": "order",
             "order": {
@@ -1862,7 +1914,7 @@ mod tests {
         }]);
         let server = spawn_reconcile_responder(listener, filled, fills, true);
         // Local `now` (fixture_at(5)) is BEFORE the venue's reported
-        // acceptance time (fixture_at(10)) — must still succeed.
+        // acceptance time — must still succeed.
         let observed = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             reconcile_prepared_order(
@@ -1879,6 +1931,57 @@ mod tests {
 
         assert_eq!(observed.status, "filled");
         assert!(observed.durable_finality);
+    }
+
+    #[tokio::test]
+    async fn accepted_at_too_far_ahead_of_the_local_clock_fails_closed() {
+        // Regression test for a real Codex review finding: forward clock
+        // skew is only authorized up to max_venue_clock_lag_ms too (not
+        // just the lagging direction) — an accepted_at far enough ahead of
+        // `now` that it exceeds that tolerance is a genuine anomaly and
+        // must be rejected, not unconditionally clamped through as valid
+        // evidence.
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connector = unsigned_connector(format!("http://{}", listener.local_addr().unwrap()));
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let mut workflow = open_test_workflow(temp.path(), &binding);
+        workflow.prepare_order(fixture_at(2)).unwrap();
+
+        // 5 minutes ahead of `now` below — far beyond the ~60s authorized lag.
+        let accepted_at_ms = (fixture_at(5) + chrono::TimeDelta::minutes(5)).timestamp_millis();
+        let filled = serde_json::json!({
+            "status": "order",
+            "order": {
+                "order": {"oid": 7, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "timestamp": accepted_at_ms},
+                "status": "filled",
+                "statusTimestamp": accepted_at_ms
+            }
+        });
+        let fills = serde_json::json!([{
+            "coin": "@1", "px": "25", "sz": "1", "side": "B", "time": 1_000,
+            "oid": 7, "tid": 1, "fee": "0.01", "feeToken": "USDC"
+        }]);
+        // Rejected before the account-scope lookup, so only 2 requests.
+        let server = spawn_reconcile_responder(listener, filled, fills, false);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reconcile_prepared_order(
+                &connector,
+                &mut workflow,
+                &test_journal_path(temp.path()),
+                fixture_at(5),
+            ),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert!(matches!(result, Err(LiveProbeError::InvalidVenueTimestamp)));
+        assert!(workflow.state().exchange_order_id().is_none());
     }
 
     #[tokio::test]
@@ -1963,7 +2066,8 @@ mod tests {
             "coin": "@1", "px": "25", "sz": "1", "side": "B", "time": 1_000,
             "oid": 7, "tid": 1, "fee": "0.01", "feeToken": "USDC"
         }]);
-        let server = spawn_reconcile_responder(listener, filled, fills, true);
+        // Rejected before the account-scope lookup, so only 2 requests.
+        let server = spawn_reconcile_responder(listener, filled, fills, false);
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             reconcile_prepared_order(
@@ -2474,5 +2578,25 @@ mod tests {
             load_observed_fills(&path, "workflow-a"),
             Err(LiveProbeError::ObservedFillsAccumulator(_))
         ));
+    }
+
+    #[test]
+    fn observed_fills_lock_rejects_concurrent_access_instead_of_blocking() {
+        // Regression test for a real Codex review finding: `submit` and the
+        // signer-free `reconcile` recovery command can run concurrently
+        // against the same journal. Without a lock, one process's
+        // read-merge-write could silently overwrite fills the other just
+        // recorded — this must fail fast (not block or corrupt) on
+        // contention instead.
+        let temp = tempfile::tempdir().unwrap();
+        let path = observed_fills_path(&temp.path().join("journal.jsonl"));
+        let held = acquire_observed_fills_lock(&path).unwrap();
+        assert!(matches!(
+            acquire_observed_fills_lock(&path),
+            Err(LiveProbeError::ObservedFillsAccumulator(_))
+        ));
+        drop(held);
+        // Released: a fresh acquisition now succeeds.
+        acquire_observed_fills_lock(&path).unwrap();
     }
 }
