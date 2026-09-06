@@ -461,19 +461,25 @@ impl Config {
     ///
     /// This never reads the signing-key environment value. It resolves only
     /// public account identities that form part of the approval boundary.
+    /// Takes `now` explicitly (matching [`Self::effective_live_order_policy`])
+    /// and rejects an already-expired `live_acknowledgement_expires_at` the
+    /// same way [`Self::validate`] would, so a reported value can never be
+    /// one that normal startup would immediately reject as expired.
     ///
     /// # Errors
     ///
-    /// Returns an error when no policy is attached or an identity/policy field
-    /// cannot be normalized safely.
+    /// Returns an error when no policy is attached, an identity/policy field
+    /// cannot be normalized safely, or the configured expiry is not after
+    /// `now`.
     pub fn expected_live_acknowledgement<E: Environment>(
         &self,
         env: &E,
+        now: DateTime<Utc>,
     ) -> Result<String, ConfigError> {
         self.security_policy
             .as_ref()
             .ok_or(ConfigError::MissingSecurityPolicy)?
-            .expected_acknowledgement(self, env)
+            .expected_acknowledgement(self, env, now)
             .map_err(ConfigError::from)
     }
 
@@ -543,13 +549,15 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Returns an error when no policy is attached or the effective policy
-    /// cannot be normalized safely.
+    /// Returns an error when no policy is attached, the effective policy
+    /// cannot be normalized safely, or the configured expiry is not after
+    /// `now`.
     pub fn effective_security_policy_digest<E: Environment>(
         &self,
         env: &E,
+        now: DateTime<Utc>,
     ) -> Result<String, ConfigError> {
-        let acknowledgement = self.expected_live_acknowledgement(env)?;
+        let acknowledgement = self.expected_live_acknowledgement(env, now)?;
         acknowledgement
             .strip_prefix(LIVE_ACKNOWLEDGEMENT_PREFIX)
             .map(str::to_owned)
@@ -1146,8 +1154,12 @@ impl SecurityPolicy {
         &self,
         config: &Config,
         env: &E,
+        now: DateTime<Utc>,
     ) -> Result<String, SecurityPolicyError> {
         let context = self.live_context(config, env)?;
+        if now >= context.acknowledgement_expiry {
+            return Err(SecurityPolicyError::AcknowledgementExpired);
+        }
         self.acknowledgement_for_context(config, &context)
     }
 

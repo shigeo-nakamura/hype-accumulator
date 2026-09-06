@@ -53,7 +53,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             security_policy_path,
         } => {
             let config = load_config(&config_path, Some(&security_policy_path))?;
-            let acknowledgement = config.expected_live_acknowledgement(&ProcessEnvironment)?;
+            let acknowledgement =
+                config.expected_live_acknowledgement(&ProcessEnvironment, Utc::now())?;
             println!("{acknowledgement}");
         }
         Invocation::DryRunCycle {
