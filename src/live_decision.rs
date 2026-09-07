@@ -32,7 +32,8 @@ use crate::{
     runtime::{RuntimeCycleInput, RuntimeError, SignerFreeRuntime},
     workflow::{
         DecisionBinding, DurableWorkflow, EligibilityPolicyBinding, ExchangeOrderOwnerStore,
-        HypeAtoms, InventoryBaseline, ProtectedWorkflowHeadStore, WorkflowError,
+        HypeAtoms, InventoryBaseline, ProtectedHeadStoreFactory, ProtectedWorkflowHeadStore,
+        WorkflowError,
     },
 };
 use chrono::{DateTime, Utc};
@@ -102,6 +103,7 @@ pub async fn prepare_first_live_order_workflow(
     configured_residual_hype_atoms: HypeAtoms,
     journal_path: &Path,
     journal_directory: &Path,
+    historical_protected_head_store_for: &ProtectedHeadStoreFactory<'_>,
     protected_head_store: Arc<dyn ProtectedWorkflowHeadStore>,
     exchange_order_owner_store: Arc<dyn ExchangeOrderOwnerStore>,
     now: DateTime<Utc>,
@@ -142,6 +144,8 @@ pub async fn prepare_first_live_order_workflow(
                 journal_directory,
                 Some(journal_path),
                 spot_hype_atoms,
+                &probe_binding.execution_identity_hash,
+                historical_protected_head_store_for,
             )?;
 
         let inventory_before = InventoryBaseline {

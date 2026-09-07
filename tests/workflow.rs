@@ -15,7 +15,6 @@ use hype_accumulator::{
         InventoryBaseline, JournalCommitStatus, OrderBoundEligibilityEvidence,
         OrderEnvelopeBinding, OrderFinality, OwnershipCommitOutcome, PrepareOutcome,
         ProtectedWorkflowHead, ProtectedWorkflowHeadStore, WorkflowError, WorkflowStage,
-        WorkflowState,
     },
 };
 use std::{
@@ -316,6 +315,19 @@ fn exchange_order_owner_store(path: &Path) -> Arc<MemoryExchangeOrderOwnerStore>
         .entry(path.to_path_buf())
         .or_insert_with(|| Arc::new(MemoryExchangeOrderOwnerStore::default()))
         .clone()
+}
+
+// Reuses the same path-keyed in-memory registry `reopen` itself writes to
+// (via `protected_head_store`), so `aggregate_terminal_residual_hype`'s
+// verification reads back exactly what each test's own `reopen` calls
+// wrote for that journal path. The `Result` return is required to match
+// `ProtectedHeadStoreFactory`, not because this particular in-memory
+// lookup can fail.
+#[allow(clippy::unnecessary_wraps)]
+fn memory_protected_head_store_for(
+    path: &Path,
+) -> Result<Arc<dyn ProtectedWorkflowHeadStore>, WorkflowError> {
+    Ok(protected_head_store(path) as Arc<dyn ProtectedWorkflowHeadStore>)
 }
 
 fn at(minute: u32) -> DateTime<Utc> {
@@ -4539,8 +4551,21 @@ fn peek_committed_binding_lets_a_retry_reuse_the_first_attempts_binding() {
     ));
 }
 
+// `workflow_id` is derived only from `decision_id` (see `workflow_id_for`),
+// so two journals built from unmodified `binding()` fixtures collide even
+// with different residual amounts; give each journal its own decision_id.
+fn distinct_decision_id(path: &Path) -> String {
+    format!(
+        "decision-{}",
+        path.file_stem()
+            .and_then(|stem| stem.to_str())
+            .expect("utf8 journal file stem")
+    )
+}
+
 fn complete_workflow_with_residual(path: &Path, residual_atoms: u64) -> DecisionBinding {
     let mut binding = binding();
+    binding.decision_id = distinct_decision_id(path);
     binding.inventory_before.spot_hype_atoms = hype(residual_atoms);
     binding.inventory_before.unconsumed_residual_spot_hype_atoms = hype(0);
     binding.inventory_before.configured_residual_hype_atoms = hype(residual_atoms);
@@ -4599,6 +4624,7 @@ fn complete_workflow_with_residual_and_eligible(
 ) -> DecisionBinding {
     let purchased_atoms = residual_atoms + eligible_atoms;
     let mut binding = binding();
+    binding.decision_id = distinct_decision_id(path);
     binding.inventory_before.spot_hype_atoms = hype(purchased_atoms);
     binding.inventory_before.unconsumed_residual_spot_hype_atoms = hype(0);
     binding.inventory_before.configured_residual_hype_atoms = hype(residual_atoms);
@@ -4649,8 +4675,13 @@ fn aggregate_terminal_residual_hype_reconciles_against_residual_plus_unstaked_el
     // only the residual portion must fail closed, not silently
     // under-reconcile and let an external sale of the "eligible" HYPE go
     // undetected.
-    let insufficient =
-        DurableWorkflow::aggregate_terminal_residual_hype(temp.path(), None, hype(50));
+    let insufficient = DurableWorkflow::aggregate_terminal_residual_hype(
+        temp.path(),
+        None,
+        hype(50),
+        "signer-identity-hash-a",
+        &memory_protected_head_store_for,
+    );
     assert!(matches!(
         insufficient,
         Err(WorkflowError::ResidualReconciliationGap(_))
@@ -4658,9 +4689,14 @@ fn aggregate_terminal_residual_hype_reconciles_against_residual_plus_unstaked_el
 
     // Once the live balance covers the full residual+eligible total, the
     // call succeeds and still returns only the residual portion.
-    let aggregated =
-        DurableWorkflow::aggregate_terminal_residual_hype(temp.path(), None, hype(110))
-            .expect("live balance covers residual plus unstaked eligible HYPE");
+    let aggregated = DurableWorkflow::aggregate_terminal_residual_hype(
+        temp.path(),
+        None,
+        hype(110),
+        "signer-identity-hash-a",
+        &memory_protected_head_store_for,
+    )
+    .expect("live balance covers residual plus unstaked eligible HYPE");
     assert_eq!(aggregated, hype(10));
 }
 
@@ -4673,11 +4709,160 @@ fn aggregate_terminal_residual_hype_fails_closed_on_an_empty_historical_journal(
     // genuinely unknown; it must be an error, not silently skipped.
     fs::write(temp.path().join("day-2.jsonl"), b"").expect("write empty journal");
 
-    let result = DurableWorkflow::aggregate_terminal_residual_hype(temp.path(), None, hype(100));
+    let result = DurableWorkflow::aggregate_terminal_residual_hype(
+        temp.path(),
+        None,
+        hype(100),
+        "signer-identity-hash-a",
+        &memory_protected_head_store_for,
+    );
     assert!(matches!(
         result,
         Err(WorkflowError::NonTerminalHistoricalJournal(_))
     ));
+}
+
+#[test]
+fn aggregate_terminal_residual_hype_rejects_a_journal_rolled_back_since_its_protected_head() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("rolled-back.jsonl");
+    let mut binding = binding();
+    binding.decision_id = distinct_decision_id(&path);
+    binding.inventory_before.spot_hype_atoms = hype(5);
+    binding.inventory_before.unconsumed_residual_spot_hype_atoms = hype(0);
+    binding.inventory_before.configured_residual_hype_atoms = hype(5);
+
+    let mut workflow = reopen(&path, &binding);
+    let decision_only = fs::read(&path).expect("decision record read");
+    let decision_head = fs::read(checkpoint_path(&path)).expect("decision head read");
+
+    // Advance the same journal all the way to Complete — this durably
+    // updates both the local checkpoint and the independent protected
+    // head store to reflect the final state.
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
+    workflow
+        .observe_order_fill(
+            "fill",
+            hype(5),
+            usdc(1_000_000),
+            usdc(1_010_000),
+            false,
+            at(3),
+        )
+        .expect("fill observed");
+    workflow
+        .finalize_order(
+            hype(5),
+            usdc(1_000_000),
+            usdc(1_010_000),
+            OrderFinality::Canceled,
+            at(4),
+        )
+        .expect("order finalized");
+    let evidence = bound_evidence(&workflow, &[("fill", 5, 3)], at(5));
+    workflow
+        .record_staking_eligibility(Some(evidence), at(5))
+        .expect("eligibility recorded");
+    workflow.complete(at(6)).expect("workflow completed");
+    drop(workflow);
+
+    // Roll the on-disk journal and its own local checkpoint back to an
+    // earlier, internally self-consistent prefix (as a bad backup restore,
+    // or tampering, might do) — the independent protected head store
+    // still holds the later, true state.
+    fs::write(&path, decision_only).expect("journal rolled back to a valid earlier prefix");
+    fs::write(checkpoint_path(&path), decision_head)
+        .expect("adjacent head rolled back to the same valid prefix");
+
+    let result = DurableWorkflow::aggregate_terminal_residual_hype(
+        temp.path(),
+        None,
+        hype(100),
+        "signer-identity-hash-a",
+        &memory_protected_head_store_for,
+    );
+    assert!(matches!(result, Err(WorkflowError::RollbackDetected(_))));
+}
+
+#[test]
+fn aggregate_terminal_residual_hype_rejects_a_duplicate_workflow_id_across_two_files() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let original_path = temp.path().join("day-1.jsonl");
+    complete_workflow_with_residual(&original_path, 4);
+
+    // A copy (or hard link, plus its protected-head sidecar) of the same
+    // journal under another name replays to the identical workflow_id and
+    // must not be double-counted.
+    let copied_bytes = fs::read(&original_path).expect("read original journal");
+    let copy_path = temp.path().join("day-1-copy.jsonl");
+    fs::write(&copy_path, copied_bytes).expect("write copied journal");
+    if let Some(head) = protected_head_store(&original_path)
+        .load()
+        .expect("read original protected head")
+    {
+        protected_head_store(&copy_path)
+            .compare_and_swap(None, &head)
+            .expect("seed the copy's protected head to match");
+    }
+
+    let result = DurableWorkflow::aggregate_terminal_residual_hype(
+        temp.path(),
+        None,
+        hype(100),
+        "signer-identity-hash-a",
+        &memory_protected_head_store_for,
+    );
+    assert!(matches!(result, Err(WorkflowError::CorruptJournal(_))));
+}
+
+#[test]
+fn aggregate_terminal_residual_hype_rejects_a_journal_from_a_different_execution_identity() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("foreign.jsonl");
+    let mut binding = binding();
+    binding.decision_id = distinct_decision_id(&path);
+    binding.inventory_before.execution_identity_hash = "signer-identity-hash-other".to_owned();
+    binding.inventory_before.spot_hype_atoms = hype(5);
+    binding.inventory_before.unconsumed_residual_spot_hype_atoms = hype(0);
+    binding.inventory_before.configured_residual_hype_atoms = hype(5);
+    let mut workflow = reopen(&path, &binding);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
+    workflow
+        .observe_order_fill(
+            "fill",
+            hype(5),
+            usdc(1_000_000),
+            usdc(1_010_000),
+            false,
+            at(3),
+        )
+        .expect("fill observed");
+    workflow
+        .finalize_order(
+            hype(5),
+            usdc(1_000_000),
+            usdc(1_010_000),
+            OrderFinality::Canceled,
+            at(4),
+        )
+        .expect("order finalized");
+    let evidence = bound_evidence(&workflow, &[("fill", 5, 3)], at(5));
+    workflow
+        .record_staking_eligibility(Some(evidence), at(5))
+        .expect("eligibility recorded");
+    workflow.complete(at(6)).expect("workflow completed");
+    drop(workflow);
+
+    let result = DurableWorkflow::aggregate_terminal_residual_hype(
+        temp.path(),
+        None,
+        hype(100),
+        "signer-identity-hash-a",
+        &memory_protected_head_store_for,
+    );
+    assert!(matches!(result, Err(WorkflowError::CorruptJournal(_))));
 }
 
 #[cfg(feature = "offline-staking-simulation")]
@@ -4707,8 +4892,14 @@ fn aggregate_terminal_residual_hype_excludes_hype_already_delegated_to_staking()
     // All 250 HYPE was eligible and all 250 was actually delegated out of
     // spot — a live spot balance far below 250 must still reconcile,
     // because none of that eligible HYPE is expected in spot any more.
-    let aggregated = DurableWorkflow::aggregate_terminal_residual_hype(temp.path(), None, hype(0))
-        .expect("delegated eligible HYPE is excluded from the spot reconciliation");
+    let aggregated = DurableWorkflow::aggregate_terminal_residual_hype(
+        temp.path(),
+        None,
+        hype(0),
+        "signer-identity-hash-a",
+        &memory_protected_head_store_for,
+    )
+    .expect("delegated eligible HYPE is excluded from the spot reconciliation");
     assert_eq!(aggregated, hype(0));
 }
 
@@ -4762,29 +4953,17 @@ fn terminal_staking_eligibility_is_none_before_complete_and_some_after() {
 }
 
 #[test]
-fn peek_state_returns_none_for_a_missing_or_empty_journal() {
-    let temp = tempfile::tempdir().expect("temp directory");
-    let missing = temp.path().join("missing.jsonl");
-    assert!(DurableWorkflow::peek_state(&missing)
-        .expect("missing journal is not an error")
-        .is_none());
-
-    let empty = temp.path().join("empty.jsonl");
-    fs::write(&empty, b"").expect("write empty journal");
-    assert!(DurableWorkflow::peek_state(&empty)
-        .expect("empty journal is not an error")
-        .is_none());
-}
-
-#[test]
-fn peek_state_replays_a_terminal_journal_without_a_lock() {
+fn aggregate_terminal_residual_hype_reads_a_terminal_journal_without_the_append_lock() {
     let temp = tempfile::tempdir().expect("temp directory");
     let path = temp.path().join("peek.jsonl");
     complete_workflow_with_residual(&path, 3);
 
     // No lock is held after `complete_workflow_with_residual` returns and
-    // drops its `DurableWorkflow`, but `peek_state` must not need one even
-    // while the append lock is externally held.
+    // drops its `DurableWorkflow`, but this read-only aggregation must not
+    // need one even while the append lock is externally held (e.g. by a
+    // concurrent `submit`/`reconcile` against that same historical
+    // journal, which should never be possible once it's `Complete`, but
+    // the read path itself must not assume it).
     let lock_path = {
         let mut lock = path.as_os_str().to_os_string();
         lock.push(".append.lock");
@@ -4800,23 +4979,29 @@ fn peek_state_replays_a_terminal_journal_without_a_lock() {
         .lock_exclusive()
         .expect("hold the append lock externally");
 
-    let state: WorkflowState = DurableWorkflow::peek_state(&path)
-        .expect("peek succeeds while the append lock is held")
-        .expect("journal is non-empty");
-    assert_eq!(state.stage(), WorkflowStage::Complete);
-    let eligibility = state
-        .terminal_staking_eligibility()
-        .expect("complete workflow has terminal eligibility");
-    assert_eq!(eligibility.residual_hype, hype(3));
+    let aggregated = DurableWorkflow::aggregate_terminal_residual_hype(
+        temp.path(),
+        None,
+        hype(3),
+        "signer-identity-hash-a",
+        &memory_protected_head_store_for,
+    )
+    .expect("aggregation succeeds while the append lock is held");
+    assert_eq!(aggregated, hype(3));
 }
 
 #[test]
 fn aggregate_terminal_residual_hype_returns_zero_for_a_directory_that_does_not_exist_yet() {
     let temp = tempfile::tempdir().expect("temp directory");
     let missing_directory = temp.path().join("journals");
-    let aggregated =
-        DurableWorkflow::aggregate_terminal_residual_hype(&missing_directory, None, hype(0))
-            .expect("a directory that does not exist yet has no historical journals");
+    let aggregated = DurableWorkflow::aggregate_terminal_residual_hype(
+        &missing_directory,
+        None,
+        hype(0),
+        "signer-identity-hash-a",
+        &memory_protected_head_store_for,
+    )
+    .expect("a directory that does not exist yet has no historical journals");
     assert_eq!(aggregated, hype(0));
 }
 
@@ -4832,9 +5017,14 @@ fn aggregate_terminal_residual_hype_sums_across_the_directory_and_excludes_the_c
     let today_binding = binding();
     reopen(&today_path, &today_binding);
 
-    let aggregated =
-        DurableWorkflow::aggregate_terminal_residual_hype(temp.path(), Some(&today_path), hype(20))
-            .expect("two terminal journals reconcile against the live balance");
+    let aggregated = DurableWorkflow::aggregate_terminal_residual_hype(
+        temp.path(),
+        Some(&today_path),
+        hype(20),
+        "signer-identity-hash-a",
+        &memory_protected_head_store_for,
+    )
+    .expect("two terminal journals reconcile against the live balance");
     assert_eq!(aggregated, hype(12));
 }
 
@@ -4864,8 +5054,14 @@ fn aggregate_terminal_residual_hype_ignores_non_journal_sidecar_files() {
     )
     .expect("write sidecar");
 
-    let aggregated = DurableWorkflow::aggregate_terminal_residual_hype(temp.path(), None, hype(3))
-        .expect("sidecar files are never mistaken for journals");
+    let aggregated = DurableWorkflow::aggregate_terminal_residual_hype(
+        temp.path(),
+        None,
+        hype(3),
+        "signer-identity-hash-a",
+        &memory_protected_head_store_for,
+    )
+    .expect("sidecar files are never mistaken for journals");
     assert_eq!(aggregated, hype(3));
 }
 
@@ -4882,7 +5078,13 @@ fn aggregate_terminal_residual_hype_rejects_a_symlinked_journal_instead_of_skipp
     let symlink_path = temp.path().join("linked.jsonl");
     std::os::unix::fs::symlink(&real_path, &symlink_path).expect("create symlink");
 
-    let result = DurableWorkflow::aggregate_terminal_residual_hype(temp.path(), None, hype(100));
+    let result = DurableWorkflow::aggregate_terminal_residual_hype(
+        temp.path(),
+        None,
+        hype(100),
+        "signer-identity-hash-a",
+        &memory_protected_head_store_for,
+    );
     assert!(matches!(result, Err(WorkflowError::Io(_))));
 }
 
@@ -4902,7 +5104,13 @@ fn aggregate_terminal_residual_hype_fails_closed_on_a_non_terminal_historical_jo
     observe_submission(&mut stuck_workflow, "exchange-order-1", at(2))
         .expect("submission observed");
 
-    let result = DurableWorkflow::aggregate_terminal_residual_hype(temp.path(), None, hype(100));
+    let result = DurableWorkflow::aggregate_terminal_residual_hype(
+        temp.path(),
+        None,
+        hype(100),
+        "signer-identity-hash-a",
+        &memory_protected_head_store_for,
+    );
     assert!(matches!(
         result,
         Err(WorkflowError::NonTerminalHistoricalJournal(_))
@@ -4914,7 +5122,13 @@ fn aggregate_terminal_residual_hype_fails_closed_on_a_reconciliation_gap() {
     let temp = tempfile::tempdir().expect("temp directory");
     complete_workflow_with_residual(&temp.path().join("day-1.jsonl"), 10);
 
-    let result = DurableWorkflow::aggregate_terminal_residual_hype(temp.path(), None, hype(9));
+    let result = DurableWorkflow::aggregate_terminal_residual_hype(
+        temp.path(),
+        None,
+        hype(9),
+        "signer-identity-hash-a",
+        &memory_protected_head_store_for,
+    );
     assert!(matches!(
         result,
         Err(WorkflowError::ResidualReconciliationGap(_))

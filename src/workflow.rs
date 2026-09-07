@@ -1995,6 +1995,14 @@ pub trait ProtectedWorkflowHeadStore: Send + Sync {
     ) -> Result<bool, String>;
 }
 
+/// Constructs one journal path's independent protected-head store, for
+/// [`DurableWorkflow::aggregate_terminal_residual_hype`] to verify each
+/// historical journal it scans (they each need their own store instance,
+/// unlike [`DurableWorkflow::open_or_create`]'s single caller-supplied one
+/// for the current journal).
+pub type ProtectedHeadStoreFactory<'a> =
+    dyn Fn(&Path) -> Result<Arc<dyn ProtectedWorkflowHeadStore>, WorkflowError> + 'a;
+
 /// File-backed [`ProtectedWorkflowHeadStore`], one instance per stable
 /// decision identity (construct with a path derived from that identity, e.g.
 /// `<state_dir>/workflow-heads/<decision_id>.json`; never share one instance
@@ -2576,39 +2584,53 @@ impl DurableWorkflow {
         Ok(Some(state.binding))
     }
 
-    /// Reads and replays one workflow journal's full state, without a lock
-    /// or protected-head verification.
+    /// Reads, replays, and verifies one workflow journal's full state
+    /// against its own independently protected head, without acquiring the
+    /// append lock.
     ///
     /// This is a read-only historical peek, not a live open: it never
-    /// acquires the append lock, never checks the independently protected
-    /// head anchor, and never reconciles exchange order/fill ownership — it
-    /// is only safe to use for aggregating already-durable, immutable
-    /// history (see [`Self::aggregate_terminal_residual_hype`]), never as a
-    /// substitute for [`Self::open_or_create`] before appending to a
-    /// journal.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for a truncated or hash-invalid journal. Returns
-    /// `Ok(None)` when the journal does not yet exist or is empty.
-    pub fn peek_state(path: impl AsRef<Path>) -> Result<Option<WorkflowState>, WorkflowError> {
-        let records = load_records(path.as_ref())?;
-        if records.is_empty() {
+    /// acquires the append lock and never reconciles exchange order/fill
+    /// ownership. It does perform the same protected-head check
+    /// [`Self::open_or_create`] performs before ever trusting a non-empty
+    /// journal, so a journal replaced or rolled back on mutable storage
+    /// since its own head was last durably confirmed is rejected, not
+    /// silently trusted — only safe to use for aggregating already-durable,
+    /// immutable history (see [`Self::aggregate_terminal_residual_hype`]),
+    /// never as a substitute for [`Self::open_or_create`] before appending
+    /// to a journal.
+    fn peek_verified_terminal_state(
+        path: &Path,
+        protected_head_store: &dyn ProtectedWorkflowHeadStore,
+    ) -> Result<Option<WorkflowState>, WorkflowError> {
+        let records = load_records(path)?;
+        let Some(last) = records.last() else {
             return Ok(None);
-        }
+        };
         let events = records
             .iter()
             .map(|record| record.event.clone())
             .collect::<Vec<_>>();
-        Ok(Some(WorkflowState::replay(&events)?))
+        let state = WorkflowState::replay(&events)?;
+        let file_len = fs::metadata(path).map_err(WorkflowError::io)?.len();
+        let expected_protected_head = protected_head_for(last, &state.workflow_id, file_len);
+        let protected_head = protected_head_store
+            .load()
+            .map_err(WorkflowError::ProtectedHead)?;
+        if protected_head.as_ref() != Some(&expected_protected_head) {
+            return Err(WorkflowError::RollbackDetected(format!(
+                "{}: historical journal does not match its independently protected head",
+                path.display()
+            )));
+        }
+        Ok(Some(state))
     }
 
     /// Sums the terminal residual HYPE left behind by every completed
-    /// workflow journal in `journal_directory`, then reconciles that sum
-    /// — plus every still-unstaked terminal eligible HYPE, which is
-    /// physically in spot alongside residual until it is actually
-    /// delegated — against a live spot balance read. Only the residual
-    /// portion is returned.
+    /// workflow journal in `journal_directory` that belongs to
+    /// `execution_identity_hash`, then reconciles that sum — plus every
+    /// still-unstaked terminal eligible HYPE, which is physically in spot
+    /// alongside residual until it is actually delegated — against a live
+    /// spot balance read. Only the residual portion is returned.
     ///
     /// Every regular file directly in `journal_directory` whose name ends
     /// in `.jsonl` is treated as a workflow journal (this codebase's own
@@ -2619,12 +2641,19 @@ impl DurableWorkflow {
     /// skipped — skipping it could hide real residual HYPE instead of
     /// failing closed on it. `exclude_path`, when given, is skipped by
     /// file name and should be the caller's own in-flight journal for
-    /// today's decision, which is never "past".
+    /// today's decision, which is never "past". `protected_head_store_for`
+    /// constructs the independent protected-head store for one journal
+    /// path (see [`Self::protected_head_path_for`] for the conventional
+    /// per-journal path).
     ///
     /// Fails closed rather than guessing: a journal found in the directory
-    /// that is empty or not yet `Complete` is an error, not a skip (its
-    /// terminal state, or its residual/eligible split, is not known) and a
-    /// total that exceeds the live spot balance is also an error — this
+    /// that is empty, not yet `Complete`, does not match its own protected
+    /// head, belongs to a different execution identity (journals for
+    /// multiple accounts must never share a directory, but this is checked
+    /// rather than merely documented), or duplicates a `workflow_id`
+    /// already aggregated from another file (a copy or hard link would
+    /// otherwise double-count the same workflow) is an error, not a skip.
+    /// A total that exceeds the live spot balance is also an error — this
     /// account's own history expects more HYPE in spot than is actually
     /// there, which this function cannot explain (a sale or external
     /// transfer of residual or still-unstaked eligible HYPE, tracked
@@ -2635,13 +2664,15 @@ impl DurableWorkflow {
     /// # Errors
     ///
     /// Returns an error if `journal_directory` cannot be read, if any
-    /// journal in it is empty, corrupt, missing its terminal residual/eligible
-    /// split, or overflows on summation, or if the aggregated total exceeds
-    /// `live_spot_hype_atoms`.
+    /// journal in it is empty, corrupt, rolled back, foreign, duplicated,
+    /// missing its terminal residual/eligible split, or overflows on
+    /// summation, or if the aggregated total exceeds `live_spot_hype_atoms`.
     pub fn aggregate_terminal_residual_hype(
         journal_directory: &Path,
         exclude_path: Option<&Path>,
         live_spot_hype_atoms: HypeAtoms,
+        execution_identity_hash: &str,
+        protected_head_store_for: &ProtectedHeadStoreFactory<'_>,
     ) -> Result<HypeAtoms, WorkflowError> {
         let exclude_name = exclude_path.and_then(Path::file_name);
         let mut journal_paths = Vec::new();
@@ -2701,14 +2732,34 @@ impl DurableWorkflow {
         // would still cover the (too-small) residual-only total even
         // though real HYPE this account's own history expects is missing.
         let mut aggregated_still_in_spot = HypeAtoms::from_atoms(0);
+        let mut seen_workflow_ids: BTreeSet<String> = BTreeSet::new();
         for path in &journal_paths {
-            let Some(state) = Self::peek_state(path)? else {
+            let protected_head_store = protected_head_store_for(path)?;
+            let Some(state) =
+                Self::peek_verified_terminal_state(path, protected_head_store.as_ref())?
+            else {
                 return Err(WorkflowError::NonTerminalHistoricalJournal(format!(
                     "{}: journal is empty (a crash before its first durable append, or \
                      truncation) and its terminal state is unknown",
                     path.display()
                 )));
             };
+            if state.binding().inventory_before.execution_identity_hash != execution_identity_hash {
+                return Err(WorkflowError::CorruptJournal(format!(
+                    "{}: journal belongs to a different execution identity than the account \
+                     being aggregated for — journals for multiple accounts must never share a \
+                     directory",
+                    path.display()
+                )));
+            }
+            if !seen_workflow_ids.insert(state.workflow_id().to_owned()) {
+                return Err(WorkflowError::CorruptJournal(format!(
+                    "{}: workflow {} was already aggregated from another journal in this \
+                     directory (a copy or hard link would double-count it)",
+                    path.display(),
+                    state.workflow_id()
+                )));
+            }
             let Some(eligibility) = state.terminal_staking_eligibility() else {
                 return Err(WorkflowError::NonTerminalHistoricalJournal(format!(
                     "{}: workflow {} has not reached a terminal stage (stage={:?})",
@@ -2744,6 +2795,18 @@ impl DurableWorkflow {
         }
 
         Ok(aggregated_residual)
+    }
+
+    /// The conventional independent protected-head-store path for a
+    /// journal, so a caller building a `protected_head_store_for` factory
+    /// for [`Self::aggregate_terminal_residual_hype`] uses the same
+    /// per-journal naming convention its own [`Self::open_or_create`]
+    /// caller already uses for the current journal.
+    #[must_use]
+    pub fn protected_head_path_for(journal_path: &Path) -> PathBuf {
+        let mut path = journal_path.to_path_buf();
+        path.set_extension("protected-head.json");
+        path
     }
 
     /// Opens or creates one append-only workflow journal.

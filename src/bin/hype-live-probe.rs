@@ -35,7 +35,7 @@ use hype_accumulator::{
     workflow::{
         DurableWorkflow, EligibilityPolicyBinding, ExchangeOrderOwnerStore,
         FileExchangeOrderOwnerStore, FileProtectedWorkflowHeadStore, HypeAtoms,
-        ProtectedWorkflowHeadStore,
+        ProtectedWorkflowHeadStore, WorkflowError,
     },
 };
 use rust_decimal::Decimal;
@@ -413,10 +413,7 @@ async fn prepare(
 
     let (protected_head_store, owner_store) = build_stores(journal_path)?;
     let journal = PathBuf::from(journal_path);
-    let journal_directory = journal
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let journal_directory = journal_directory_for(&journal);
 
     // `signal_evidence_valid_through_at` is not `policy_acknowledgement_valid_through_at`
     // (an unrelated quantity that happens to also be a `DateTime<Utc>`) — no
@@ -437,6 +434,7 @@ async fn prepare(
         configured_residual_hype_atoms,
         &journal,
         &journal_directory,
+        &historical_protected_head_store_for,
         protected_head_store,
         owner_store,
         now,
@@ -609,8 +607,7 @@ type WorkflowStores = (
 );
 
 fn build_stores(journal_path: &str) -> Result<WorkflowStores, Box<dyn std::error::Error>> {
-    let mut head_path = PathBuf::from(journal_path);
-    head_path.set_extension("protected-head.json");
+    let head_path = DurableWorkflow::protected_head_path_for(Path::new(journal_path));
     let protected_head_store: Arc<dyn ProtectedWorkflowHeadStore> =
         Arc::new(FileProtectedWorkflowHeadStore::new(head_path)?);
     // Deliberately outside the per-journal path: this store must be shared
@@ -624,6 +621,22 @@ fn build_stores(journal_path: &str) -> Result<WorkflowStores, Box<dyn std::error
     let owner_store: Arc<dyn ExchangeOrderOwnerStore> =
         Arc::new(FileExchangeOrderOwnerStore::new(owner_store_path)?);
     Ok((protected_head_store, owner_store))
+}
+
+fn journal_directory_for(journal_path: &Path) -> PathBuf {
+    journal_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+}
+
+fn historical_protected_head_store_for(
+    path: &Path,
+) -> Result<Arc<dyn ProtectedWorkflowHeadStore>, WorkflowError> {
+    let head_path = DurableWorkflow::protected_head_path_for(path);
+    FileProtectedWorkflowHeadStore::new(head_path)
+        .map(|store| Arc::new(store) as Arc<dyn ProtectedWorkflowHeadStore>)
+        .map_err(WorkflowError::ProtectedHead)
 }
 
 fn box_error<E: std::error::Error + 'static>(error: E) -> Box<dyn std::error::Error> {
