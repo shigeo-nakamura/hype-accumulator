@@ -40,7 +40,13 @@ use hype_accumulator::{
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::{env, fs, path::PathBuf, process, str::FromStr, sync::Arc};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process,
+    str::FromStr,
+    sync::Arc,
+};
 
 #[tokio::main]
 async fn main() {
@@ -466,7 +472,7 @@ async fn submit(
     let binding = DurableWorkflow::peek_committed_binding(journal_path)?
         .ok_or("no prepared order found at this journal path; run `prepare` first")?;
     let (protected_head_store, owner_store) = build_stores(journal_path)?;
-    let workflow =
+    let mut workflow =
         DurableWorkflow::open_or_create(journal_path, &binding, protected_head_store, owner_store)?;
     let action = workflow.pending_prepared_order()?;
     let client_order_id = workflow.state().client_order_id();
@@ -503,7 +509,9 @@ async fn submit(
     }
     // Even a transport error may follow venue acceptance. Recovery must run
     // after every attempt, without allowing a second economic request.
-    let reconciliation = probe.reconcile(&workflow).await;
+    let reconciliation = probe
+        .reconcile(&mut workflow, Path::new(journal_path), Utc::now())
+        .await;
     match &reconciliation {
         Ok(observation) => print_observation(observation)?,
         Err(_) => eprintln!(
@@ -518,7 +526,10 @@ async fn submit(
 fn print_observation(
     observation: &hype_accumulator::live_probe::ProbeReconciliation,
 ) -> Result<(), serde_json::Error> {
-    println!("mode=reconciled durable_finality=false retry_authorized=false");
+    println!(
+        "mode=reconciled durable_finality={} retry_authorized=false",
+        observation.durable_finality
+    );
     println!("{}", serde_json::to_string(observation)?);
     Ok(())
 }
@@ -538,12 +549,18 @@ async fn reconcile(
     let binding = DurableWorkflow::peek_committed_binding(journal_path)?
         .ok_or("no committed workflow; reconciliation never prepares a new order")?;
     let (protected_head_store, owner_store) = build_stores(journal_path)?;
-    let workflow =
+    let mut workflow =
         DurableWorkflow::open_or_create(journal_path, &binding, protected_head_store, owner_store)?;
     // Deliberately do not validate live approval or load/decrypt the signer.
     // An expired approval and a revoked key must not prevent read-only recovery.
     let connector = build_read_only_connector(&config, &operational, &ProcessEnvironment)?;
-    let observation = reconcile_prepared_order(&connector, &workflow).await?;
+    let observation = reconcile_prepared_order(
+        &connector,
+        &mut workflow,
+        Path::new(journal_path),
+        Utc::now(),
+    )
+    .await?;
     print_observation(&observation)?;
     Ok(())
 }
