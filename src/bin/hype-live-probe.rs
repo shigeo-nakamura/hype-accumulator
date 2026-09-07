@@ -698,6 +698,18 @@ fn historical_protected_head_store_for(
 /// sidecar against `current`, so a foreign-network or foreign-routing
 /// journal sharing this directory is rejected by
 /// `aggregate_terminal_residual_hype` rather than silently aggregated.
+///
+/// Known residual risk, deliberately out of scope here: this reads the
+/// sidecar `.network-binding.json` written by plain `fs::write`, not a
+/// journal's own hash-chained, protected-head-anchored content — an
+/// attacker with write access to just this file (not the journal itself)
+/// could still relabel a testnet journal's residual as mainnet-admissible
+/// without invalidating the journal's own protected head. Closing this
+/// fully means either folding network/routing identity into
+/// `live_probe.rs`'s already-merged `execution_identity_hash` computation,
+/// or building an independent protection mechanism for this sidecar —
+/// both out of scope for this aggregator-foundation PR. Tracked in
+/// bot-strategy#942.
 fn network_routing_admissible_for(
     current: &PrepareTimeBinding,
 ) -> impl Fn(&Path) -> Result<(), WorkflowError> + '_ {
