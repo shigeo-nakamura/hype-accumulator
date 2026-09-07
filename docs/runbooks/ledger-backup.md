@@ -78,9 +78,30 @@ must not have delete access to both boundaries. A single bucket with different
 prefixes is rejected because it does not prove an independent protected-anchor
 boundary.
 
-After separately approving the AWS target and action, resolve and record the
-verifier exactly once (see "Every path argument" below for why), then upload
-with:
+**Resolve the verifier once.** Every path argument to the transfer tool is
+rejected if it contains a symlink component, the verifier included. A
+deployment that publishes its current release through a symlink must
+therefore pass the resolved release path, not the symlink -- but resolving it
+pins the executable only for that invocation; nothing else records which
+release it was, and shell history keeps the unexpanded `$(readlink -f ...)`
+text rather than what it resolved to. `current` can also be re-activated or
+rolled back between separate commands, so resolving it twice -- once to pass
+`--verifier`, again later to record evidence -- risks attributing the
+recorded digest to a different release than the one that actually ran.
+Before either command below, resolve it exactly once into a variable and
+record its path and digest as private operator evidence next to the backup
+ID, so the evidence and every invocation are guaranteed to name the exact
+same file:
+
+```text
+VERIFIER="$(readlink -f <install-root>/current/hype-accumulator)"
+printf '%s\n' "$VERIFIER"; sha256sum "$VERIFIER"
+```
+
+Passing the symlink itself instead of `"$VERIFIER"` fails with `verifier
+binary must not contain aliases or symlink components`.
+
+After separately approving the AWS target and action, upload with:
 
 ```text
 python3 scripts/ledger_backup_transfer.py \
@@ -118,32 +139,9 @@ system temporary filesystem. It must not be the source bundle or a directory
 inside that bundle. Both the full capture and bounded multipart scratch files
 remain under the per-run capture root, which is removed after the operation.
 AWS CLI and verifier binaries must also be beneath root- or operator-owned
-ancestor directories that are not group/world writable.
-
-Every path argument is rejected if it contains a symlink component, the
-verifier included. A deployment that publishes its current release through a
-symlink must therefore pass the resolved release path, not the symlink.
-Resolving the symlink pins the executable for that invocation, but nothing
-persists which release it was: the receipt records the backup ID and the S3
-object details, not the verifier, and shell history keeps the unexpanded
-`$(readlink -f ...)` text rather than what it resolved to. `current` can also
-be re-activated or rolled back between separate commands, so resolving it
-twice -- once to pass `--verifier`, again later to record evidence -- risks
-attributing the recorded digest to a different release than the one that
-actually ran. Resolve it exactly once into a variable, and use that same
-variable for both the transfer command and the evidence:
-
-```text
-VERIFIER="$(readlink -f <install-root>/current/hype-accumulator)"
-printf '%s\n' "$VERIFIER"; sha256sum "$VERIFIER"
-```
-
-Passing the symlink itself instead of `"$VERIFIER"` fails with `verifier
-binary must not contain aliases or symlink components`. Record the resolved
-path and its digest in the private operator evidence next to the backup ID,
-then pass `--verifier "$VERIFIER"` (not a fresh `$(readlink -f ...)`) to the
-upload command below, so the evidence and the invocation are guaranteed to
-name the exact same file.
+ancestor directories that are not group/world writable ("Resolve the
+verifier once" above covers why `--verifier` takes `$VERIFIER`, a variable
+resolved ahead of the command, rather than a literal path).
 
 Full replay and S3 `put-object`/`get-object` transfers have no wall-clock
 timeout by default, so backup size or recovery-host bandwidth alone cannot
@@ -165,9 +163,9 @@ closed; an interrupted upload must be inspected/aborted before retry.
 ## Clean-directory restore drill
 
 Download every exact version from the private receipt into a new local root.
-Resolve and record `$VERIFIER` again for this run (see "Every path argument"
-above) -- the release verifying a restore is not necessarily the one that
-verified the original backup -- then:
+Resolve and record `$VERIFIER` again for this run (see "Resolve the verifier
+once" above) -- the release verifying a restore is not necessarily the one
+that verified the original backup -- then:
 
 ```text
 python3 scripts/ledger_backup_transfer.py \
