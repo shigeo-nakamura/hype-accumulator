@@ -460,16 +460,20 @@ async fn record_reconciliation(
         if observed_original_quantity != binding.order_envelope.original_quantity_hype {
             return Err(LiveProbeError::QuantityMismatch);
         }
-        // Side, time-in-force, and limit price, read directly from the raw
-        // venue envelope (no market-metadata resolution needed for these —
-        // unlike `coin`, which is venue-internal and not independently
-        // verified here; see the module-level note on that residual gap).
-        // Without this, `orderStatus` matching our CLOID and quantity but
-        // describing e.g. a sell, a resting GTC order, or a different
-        // limit price would still be accepted as though it were the
-        // authorized HYPE IOC buy.
+        // CLOID, side, time-in-force, and limit price, read directly from
+        // the raw venue envelope (no market-metadata resolution needed for
+        // these — unlike `coin`, which is venue-internal and not
+        // independently verified here; see the module-level note on that
+        // residual gap). Without this, `orderStatus` matching the
+        // requested quantity but describing e.g. a different order
+        // entirely, a sell, a resting GTC order, or a different limit
+        // price would still be accepted as though it were the authorized
+        // HYPE IOC buy — evidence.client_order_id alone cannot catch this,
+        // since dex-connector currently echoes the requested CLOID back
+        // rather than parsing it from the response.
         verify_observed_order_envelope(
             &evidence.raw_order_status,
+            &workflow.state().client_order_id(),
             binding
                 .order_envelope
                 .limit_price_usdc_per_hype
@@ -744,6 +748,7 @@ fn accepted_at_from_raw_order_status(raw: &str) -> Result<DateTime<Utc>, LivePro
 /// doesn't match.
 fn verify_observed_order_envelope(
     raw_order_status: &str,
+    expected_client_order_id: &str,
     expected_limit_price_usdc_per_hype: Decimal,
 ) -> Result<(), LiveProbeError> {
     let value: serde_json::Value = serde_json::from_str(raw_order_status)
@@ -751,6 +756,16 @@ fn verify_observed_order_envelope(
     let order = value
         .get("order")
         .and_then(|envelope| envelope.get("order"));
+    // dex-connector's `reconcile_order_by_client_id` currently populates
+    // `HyperliquidOrderReconciliation.client_order_id` by echoing the
+    // requested (normalized) CLOID rather than parsing it from the venue
+    // response, so comparing against that field alone can never actually
+    // catch a wrong response — it would always match by construction. The
+    // raw envelope's own `cloid` is the only field that genuinely reflects
+    // what the venue returned.
+    let cloid = order
+        .and_then(|order| order.get("cloid"))
+        .and_then(|v| v.as_str());
     let side = order
         .and_then(|order| order.get("side"))
         .and_then(|v| v.as_str());
@@ -761,6 +776,9 @@ fn verify_observed_order_envelope(
         .and_then(|order| order.get("limitPx"))
         .and_then(|v| v.as_str())
         .and_then(|v| v.parse::<Decimal>().ok());
+    if cloid != Some(expected_client_order_id) {
+        return Err(LiveProbeError::BindingMismatch("order client id"));
+    }
     if side != Some("B") {
         return Err(LiveProbeError::BindingMismatch("order side"));
     }
@@ -1647,7 +1665,7 @@ mod tests {
         let partially_filled = serde_json::json!({
             "status": "order",
             "order": {
-                "order": {"oid": 7, "origSz": "1", "sz": "0.5", "side": "B", "tif": "Ioc", "limitPx": "25.0", "timestamp": accepted_at_ms},
+                "order": {"oid": 7, "origSz": "1", "sz": "0.5", "side": "B", "tif": "Ioc", "cloid": workflow.state().client_order_id(), "limitPx": "25.0", "timestamp": accepted_at_ms},
                 "status": "open",
                 "statusTimestamp": accepted_at_ms
             }
@@ -1683,7 +1701,7 @@ mod tests {
         let fully_filled = serde_json::json!({
             "status": "order",
             "order": {
-                "order": {"oid": 7, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "limitPx": "25.0", "timestamp": accepted_at_ms},
+                "order": {"oid": 7, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "cloid": workflow.state().client_order_id(), "limitPx": "25.0", "timestamp": accepted_at_ms},
                 "status": "filled",
                 "statusTimestamp": fixture_at(21).timestamp_millis()
             }
@@ -1741,7 +1759,7 @@ mod tests {
         let canceled_unfilled = serde_json::json!({
             "status": "order",
             "order": {
-                "order": {"oid": 7, "origSz": "1", "sz": "1", "side": "B", "tif": "Ioc", "limitPx": "25.0", "timestamp": accepted_at_ms},
+                "order": {"oid": 7, "origSz": "1", "sz": "1", "side": "B", "tif": "Ioc", "cloid": workflow.state().client_order_id(), "limitPx": "25.0", "timestamp": accepted_at_ms},
                 "status": "canceled",
                 "statusTimestamp": accepted_at_ms
             }
@@ -1821,6 +1839,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_a_venue_reported_cloid_that_does_not_match_the_requested_one() {
+        // Regression test for a real Codex review finding: dex-connector's
+        // reconcile_order_by_client_id currently echoes the requested
+        // (normalized) CLOID back as HyperliquidOrderReconciliation::
+        // client_order_id rather than parsing it from the venue response,
+        // so that field alone can never catch a wrong response. The raw
+        // envelope's own `cloid` is the only field that genuinely reflects
+        // what the venue returned, and must be independently verified.
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connector = unsigned_connector(format!("http://{}", listener.local_addr().unwrap()));
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let mut workflow = open_test_workflow(temp.path(), &binding);
+        workflow.prepare_order(fixture_at(2)).unwrap();
+
+        let accepted_at_ms = fixture_at(5).timestamp_millis();
+        let wrong_cloid = serde_json::json!({
+            "status": "order",
+            "order": {
+                "order": {
+                    "oid": 7, "origSz": "1", "sz": "1", "side": "B", "tif": "Ioc",
+                    "limitPx": "25.0", "timestamp": accepted_at_ms,
+                    "cloid": "0xdeadbeefdeadbeefdeadbeefdeadbeef"
+                },
+                "status": "open",
+                "statusTimestamp": accepted_at_ms
+            }
+        });
+        let no_fills = serde_json::json!([]);
+        let server = spawn_reconcile_responder(listener, wrong_cloid, no_fills, false);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reconcile_prepared_order(
+                &connector,
+                &mut workflow,
+                &test_journal_path(temp.path()),
+                fixture_at(20),
+            ),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(LiveProbeError::BindingMismatch("order client id"))
+        ));
+        assert!(workflow.state().exchange_order_id().is_none());
+    }
+
+    #[tokio::test]
     async fn rejects_a_venue_reported_side_or_time_in_force_that_does_not_match_the_authorized_order(
     ) {
         // Regression test for a real Codex review finding: `orderStatus`
@@ -1842,7 +1914,7 @@ mod tests {
         let wrong_side = serde_json::json!({
             "status": "order",
             "order": {
-                "order": {"oid": 7, "origSz": "1", "sz": "1", "side": "A", "tif": "Ioc", "timestamp": accepted_at_ms},
+                "order": {"oid": 7, "origSz": "1", "sz": "1", "side": "A", "tif": "Ioc", "cloid": workflow.state().client_order_id(), "timestamp": accepted_at_ms},
                 "status": "open",
                 "statusTimestamp": accepted_at_ms
             }
@@ -1893,7 +1965,7 @@ mod tests {
         let wrong_price = serde_json::json!({
             "status": "order",
             "order": {
-                "order": {"oid": 7, "origSz": "1", "sz": "1", "side": "B", "tif": "Ioc", "limitPx": "30.0", "timestamp": accepted_at_ms},
+                "order": {"oid": 7, "origSz": "1", "sz": "1", "side": "B", "tif": "Ioc", "cloid": workflow.state().client_order_id(), "limitPx": "30.0", "timestamp": accepted_at_ms},
                 "status": "open",
                 "statusTimestamp": accepted_at_ms
             }
@@ -1942,7 +2014,7 @@ mod tests {
         let first_order = serde_json::json!({
             "status": "order",
             "order": {
-                "order": {"oid": 7, "origSz": "1", "sz": "0.5", "side": "B", "tif": "Ioc", "limitPx": "25.0", "timestamp": accepted_at_ms},
+                "order": {"oid": 7, "origSz": "1", "sz": "0.5", "side": "B", "tif": "Ioc", "cloid": workflow.state().client_order_id(), "limitPx": "25.0", "timestamp": accepted_at_ms},
                 "status": "open",
                 "statusTimestamp": accepted_at_ms
             }
@@ -1977,7 +2049,7 @@ mod tests {
         let different_order = serde_json::json!({
             "status": "order",
             "order": {
-                "order": {"oid": 99, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "limitPx": "25.0", "timestamp": accepted_at_ms},
+                "order": {"oid": 99, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "cloid": workflow.state().client_order_id(), "limitPx": "25.0", "timestamp": accepted_at_ms},
                 "status": "filled",
                 "statusTimestamp": accepted_at_ms
             }
@@ -2066,7 +2138,7 @@ mod tests {
         let different_order = serde_json::json!({
             "status": "order",
             "order": {
-                "order": {"oid": 99, "origSz": "1", "sz": "0.5", "side": "B", "tif": "Ioc", "limitPx": "25.0", "timestamp": accepted_at_ms},
+                "order": {"oid": 99, "origSz": "1", "sz": "0.5", "side": "B", "tif": "Ioc", "cloid": workflow.state().client_order_id(), "limitPx": "25.0", "timestamp": accepted_at_ms},
                 "status": "open",
                 "statusTimestamp": accepted_at_ms
             }
@@ -2120,7 +2192,7 @@ mod tests {
         let filled = serde_json::json!({
             "status": "order",
             "order": {
-                "order": {"oid": 7, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "limitPx": "25.0", "timestamp": accepted_at_ms},
+                "order": {"oid": 7, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "cloid": workflow.state().client_order_id(), "limitPx": "25.0", "timestamp": accepted_at_ms},
                 "status": "filled",
                 "statusTimestamp": accepted_at_ms
             }
@@ -2174,7 +2246,7 @@ mod tests {
         let filled = serde_json::json!({
             "status": "order",
             "order": {
-                "order": {"oid": 7, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "limitPx": "25.0", "timestamp": accepted_at_ms},
+                "order": {"oid": 7, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "cloid": workflow.state().client_order_id(), "limitPx": "25.0", "timestamp": accepted_at_ms},
                 "status": "filled",
                 "statusTimestamp": accepted_at_ms
             }
@@ -2225,7 +2297,7 @@ mod tests {
         let filled = serde_json::json!({
             "status": "order",
             "order": {
-                "order": {"oid": 7, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "limitPx": "25.0", "timestamp": accepted_at_ms},
+                "order": {"oid": 7, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "cloid": workflow.state().client_order_id(), "limitPx": "25.0", "timestamp": accepted_at_ms},
                 "status": "filled",
                 "statusTimestamp": accepted_at_ms
             }
@@ -2274,7 +2346,7 @@ mod tests {
         let filled = serde_json::json!({
             "status": "order",
             "order": {
-                "order": {"oid": 7, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "limitPx": "25.0", "timestamp": accepted_at_ms},
+                "order": {"oid": 7, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "cloid": workflow.state().client_order_id(), "limitPx": "25.0", "timestamp": accepted_at_ms},
                 "status": "filled",
                 "statusTimestamp": accepted_at_ms
             }
