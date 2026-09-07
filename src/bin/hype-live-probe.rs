@@ -782,6 +782,22 @@ fn build_prepare_policies(
 /// allocation vanish from aggregation without a trace, since the
 /// live-balance check only ever rejects a total that's too large, never
 /// one that's suspiciously small.
+///
+/// Residual gap, deliberately deferred (bot-strategy#944, same class of gap
+/// as bot-strategy#943): this is an `is_dir()` check, not a content check.
+/// An unmounted journal filesystem can leave an ordinary, empty mount-point
+/// directory behind, and a directory deleted then recreated empty passes
+/// this check exactly the same way a genuinely-preserved one would —
+/// `aggregate_terminal_residual_hype` then returns zero from a directory
+/// that "exists" but no longer holds any journals. Closing this needs a
+/// durable, account-specific manifest or journal-count high-water mark
+/// recorded in `HistoryDirectoryBinding` (which lives outside
+/// `journal_directory` and so survives its loss) and checked against what
+/// the directory currently holds — new persisted state, out of scope for
+/// this aggregator-foundation PR (hype-accumulator#47), which the operator
+/// explicitly scoped narrowly (same reasoning as bot-strategy#943).
+/// hype-accumulator has no live capital today (DRY_RUN only, no order ever
+/// signed), so the practical exposure is low until live use begins.
 fn ensure_history_directory_available(
     history_initialization: HistoryInitialization,
     journal_directory: &Path,
