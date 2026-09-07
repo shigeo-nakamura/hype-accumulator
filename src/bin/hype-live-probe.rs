@@ -242,6 +242,15 @@ struct HistoryDirectoryBinding {
 }
 
 impl HistoryDirectoryBinding {
+    /// Keyed by `operational_params_path` itself, not by the execution
+    /// account it protects — the cleaner key, `execution_identity_hash`,
+    /// isn't available until after the KMS-decrypted connector is built,
+    /// several steps later in `prepare()`. This means copying or renaming
+    /// the operational file gives the same account a fresh, empty binding
+    /// namespace, undetected. Deliberately deferred (bot-strategy#943,
+    /// same class of gap as bot-strategy#942): `operational_params_path` is
+    /// operator-controlled infrastructure (systemd unit / cron job), not
+    /// attacker-reachable, and hype-accumulator has no live capital today.
     fn path(operational_params_path: &str) -> PathBuf {
         let mut path = PathBuf::from(operational_params_path);
         path.set_extension("history-directory-binding.json");
@@ -263,20 +272,36 @@ impl HistoryDirectoryBinding {
         let current = Self {
             history_directory: history_directory.to_owned(),
         };
-        if let Ok(existing) = fs::read_to_string(&path) {
-            let existing: Self = serde_json::from_str(&existing)?;
-            if existing != current {
+        // A read failure other than "no binding yet" (permission denied, a
+        // truncated or non-UTF-8 file after a crash) must not be treated as
+        // a first-ever prepare: `fs::write` below would then silently
+        // replace whatever evidence the file held, exactly the undetected
+        // history_directory reset this binding exists to prevent.
+        match fs::read_to_string(&path) {
+            Ok(existing) => {
+                let existing: Self = serde_json::from_str(&existing)?;
+                if existing != current {
+                    return Err(format!(
+                        "operational.toml's history_directory is now {:?}, but the first prepare \
+                         for this operational_params_path recorded {:?}; history_directory must \
+                         never change once an account has any completed journals. Restore the \
+                         original value, or start a genuinely new account with a fresh \
+                         operational_params_path.",
+                        current.history_directory, existing.history_directory
+                    )
+                    .into());
+                }
+                return Ok(HistoryInitialization::AlreadyInitialized);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
                 return Err(format!(
-                    "operational.toml's history_directory is now {:?}, but the first prepare for \
-                     this operational_params_path recorded {:?}; history_directory must never \
-                     change once an account has any completed journals. Restore the original \
-                     value, or start a genuinely new account with a fresh \
-                     operational_params_path.",
-                    current.history_directory, existing.history_directory
+                    "failed to read history-directory binding at {}: {err}; refusing to treat an \
+                     unreadable or corrupt binding as a first-ever prepare.",
+                    path.display()
                 )
                 .into());
             }
-            return Ok(HistoryInitialization::AlreadyInitialized);
         }
         fs::write(&path, serde_json::to_string_pretty(&current)?)?;
         Ok(HistoryInitialization::FirstEver)
@@ -430,6 +455,13 @@ async fn prepare(
     )?;
     let journal_directory = PathBuf::from(&operational.history_directory);
     ensure_history_directory_available(history_initialization, &journal_directory)?;
+    // Reached only when the directory already exists (the `AlreadyInitialized`
+    // case above fails closed otherwise) or this is a genuinely first-ever
+    // prepare, so creating it here is a no-op in the former case and turns
+    // the latter's "missing is normal" into "present before anything below
+    // — the journal write, `PrepareTimeBinding`'s sidecar, protected-head
+    // store — tries to write into it.
+    fs::create_dir_all(&journal_directory)?;
     validate_journal_path(journal_path, &journal_directory)?;
     // Fixes the network this journal is bound to before anything else reads
     // `config`/`operational` for a network-dependent value: refuses to
@@ -957,6 +989,32 @@ mod tests {
             "/opt/hype-accumulator/journals",
         )
         .expect("original value still verifies");
+    }
+
+    #[test]
+    fn history_directory_binding_fails_closed_on_an_unreadable_binding() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let operational_params_path = directory.path().join("operational.toml");
+        let operational_params_path = operational_params_path.to_str().expect("utf8 path");
+
+        // A binding file that exists but isn't valid JSON (truncated write,
+        // corruption after a crash) must never be treated as "no binding
+        // yet" — that would silently let a changed history_directory
+        // through as though this were a first-ever prepare.
+        let binding_path = HistoryDirectoryBinding::path(operational_params_path);
+        std::fs::write(&binding_path, b"not valid json").expect("write corrupt binding");
+
+        assert!(HistoryDirectoryBinding::write_once_and_verify(
+            operational_params_path,
+            "/opt/hype-accumulator/journals",
+        )
+        .is_err());
+
+        // The corrupt file must be left alone, not silently overwritten.
+        assert_eq!(
+            std::fs::read_to_string(&binding_path).expect("binding still present"),
+            "not valid json"
+        );
     }
 
     #[test]
