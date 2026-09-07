@@ -4953,17 +4953,16 @@ fn terminal_staking_eligibility_is_none_before_complete_and_some_after() {
 }
 
 #[test]
-fn aggregate_terminal_residual_hype_reads_a_terminal_journal_without_the_append_lock() {
+fn aggregate_terminal_residual_hype_fails_closed_when_a_journal_is_concurrently_locked() {
     let temp = tempfile::tempdir().expect("temp directory");
     let path = temp.path().join("peek.jsonl");
     complete_workflow_with_residual(&path, 3);
 
-    // No lock is held after `complete_workflow_with_residual` returns and
-    // drops its `DurableWorkflow`, but this read-only aggregation must not
-    // need one even while the append lock is externally held (e.g. by a
-    // concurrent `submit`/`reconcile` against that same historical
-    // journal, which should never be possible once it's `Complete`, but
-    // the read path itself must not assume it).
+    // Simulates a concurrent submit/reconcile against this same historical
+    // journal (unusual once Complete, but not structurally prevented — see
+    // `fresh_late_order_evidence_durably_invalidates_terminal_results`):
+    // reading it while its append lock is held elsewhere must fail closed
+    // with `ConcurrentModification`, not race a live write.
     let lock_path = {
         let mut lock = path.as_os_str().to_os_string();
         lock.push(".append.lock");
@@ -4979,15 +4978,14 @@ fn aggregate_terminal_residual_hype_reads_a_terminal_journal_without_the_append_
         .lock_exclusive()
         .expect("hold the append lock externally");
 
-    let aggregated = DurableWorkflow::aggregate_terminal_residual_hype(
+    let result = DurableWorkflow::aggregate_terminal_residual_hype(
         temp.path(),
         None,
         hype(3),
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
-    )
-    .expect("aggregation succeeds while the append lock is held");
-    assert_eq!(aggregated, hype(3));
+    );
+    assert!(matches!(result, Err(WorkflowError::ConcurrentModification)));
 }
 
 #[test]
@@ -5062,6 +5060,56 @@ fn aggregate_terminal_residual_hype_ignores_non_journal_sidecar_files() {
         &memory_protected_head_store_for,
     )
     .expect("sidecar files are never mistaken for journals");
+    assert_eq!(aggregated, hype(3));
+}
+
+#[test]
+fn aggregate_terminal_residual_hype_rejects_an_orphaned_protected_head_file() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    complete_workflow_with_residual(&temp.path().join("day-1.jsonl"), 3);
+
+    // Simulates a journal deleted or renamed after completion while its
+    // protected-head sidecar was left behind.
+    fs::write(
+        temp.path().join("orphan.protected-head.json"),
+        b"stale head",
+    )
+    .expect("write orphaned protected-head file");
+
+    let result = DurableWorkflow::aggregate_terminal_residual_hype(
+        temp.path(),
+        None,
+        hype(100),
+        "signer-identity-hash-a",
+        &memory_protected_head_store_for,
+    );
+    assert!(matches!(result, Err(WorkflowError::CorruptJournal(_))));
+}
+
+#[test]
+fn aggregate_terminal_residual_hype_does_not_flag_the_excluded_journals_own_protected_head() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    complete_workflow_with_residual(&temp.path().join("day-1.jsonl"), 3);
+
+    let today_path = temp.path().join("day-2.jsonl");
+    // The in-flight journal's own protected-head sidecar can already exist
+    // (created by `open_or_create`'s live path) even though this
+    // simplified fixture never creates `day-2.jsonl` itself; it must be
+    // excluded by stem, not mistaken for an orphan.
+    fs::write(
+        temp.path().join("day-2.protected-head.json"),
+        b"in-flight head",
+    )
+    .expect("write in-flight protected-head file");
+
+    let aggregated = DurableWorkflow::aggregate_terminal_residual_hype(
+        temp.path(),
+        Some(&today_path),
+        hype(3),
+        "signer-identity-hash-a",
+        &memory_protected_head_store_for,
+    )
+    .expect("the excluded journal's own protected-head file is not orphaned");
     assert_eq!(aggregated, hype(3));
 }
 

@@ -38,6 +38,7 @@ const EXCHANGE_ORDER_OWNER_CONFLICT_REASON: &str =
     "exchange order ID is already owned by another workflow";
 const EXCHANGE_FILL_OWNER_CONFLICT_REASON: &str =
     "exchange fill ID is already owned by another workflow";
+const PROTECTED_HEAD_SUFFIX: &str = ".protected-head.json";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -2602,6 +2603,21 @@ impl DurableWorkflow {
         path: &Path,
         protected_head_store: &dyn ProtectedWorkflowHeadStore,
     ) -> Result<Option<WorkflowState>, WorkflowError> {
+        // Held only for this read: a concurrent submit/reconcile against
+        // this same journal — unusual once Complete, but not structurally
+        // prevented; reconcile remains callable afterward and can still
+        // durably move a terminal-adjacent journal to ManualReview on late
+        // contradictory evidence (see
+        // `fresh_late_order_evidence_durably_invalidates_terminal_results`)
+        // — fails this read closed with `ConcurrentModification` instead of
+        // racing a live write. This does not by itself stop that journal's
+        // state from changing again the moment after this lock is released
+        // and before the caller's own new workflow commits; closing that
+        // ordering window needs a lock spanning the whole daily decision,
+        // which belongs with the still-separate daily-scheduler /
+        // duplicate-process-protection work (bot-strategy#929's remaining
+        // scope), not this read primitive.
+        let _append_lock = acquire_journal_append_lock(path)?;
         let records = load_records(path)?;
         let Some(last) = records.last() else {
             return Ok(None);
@@ -2623,6 +2639,87 @@ impl DurableWorkflow {
             )));
         }
         Ok(Some(state))
+    }
+
+    /// Lists every `.jsonl` journal directly in `journal_directory` (sorted,
+    /// symlinks rejected, `exclude_path` skipped by file name), and fails
+    /// closed on an orphaned `<stem>.protected-head.json` sidecar with no
+    /// corresponding `.jsonl` (its journal deleted or renamed after
+    /// completion) — see [`Self::aggregate_terminal_residual_hype`]'s doc
+    /// for why. Returns `Ok(None)` when `journal_directory` does not exist
+    /// yet (no historical journals yet, not a corrupt or unreadable state).
+    fn scan_journal_paths(
+        journal_directory: &Path,
+        exclude_path: Option<&Path>,
+    ) -> Result<Option<Vec<PathBuf>>, WorkflowError> {
+        let exclude_name = exclude_path.and_then(Path::file_name);
+        let mut journal_paths = Vec::new();
+        let mut protected_head_stems: BTreeSet<String> = BTreeSet::new();
+        let entries = match fs::read_dir(journal_directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(WorkflowError::io(error)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(WorkflowError::io)?;
+            let path = entry.path();
+            let file_name_str = entry.file_name();
+            let file_name_str = file_name_str.to_str();
+            if let Some(stem) =
+                file_name_str.and_then(|name| name.strip_suffix(PROTECTED_HEAD_SUFFIX))
+            {
+                protected_head_stems.insert(stem.to_owned());
+                continue;
+            }
+            if path.extension().and_then(std::ffi::OsStr::to_str) != Some("jsonl") {
+                continue;
+            }
+            if exclude_name.is_some() && path.file_name() == exclude_name {
+                continue;
+            }
+            // `DirEntry::file_type` does not follow symlinks; a symlinked
+            // journal would otherwise silently fail `is_file()` below and
+            // be skipped rather than aggregated, hiding real residual HYPE
+            // instead of failing closed on it. Matches this crate's
+            // existing symlink posture for every other security-relevant
+            // file open (`FileProtectedWorkflowHeadStore`,
+            // `FileExchangeOrderOwnerStore`).
+            reject_linked_file(&path).map_err(WorkflowError::io)?;
+            let file_type = entry.file_type().map_err(WorkflowError::io)?;
+            if !file_type.is_file() {
+                return Err(WorkflowError::CorruptJournal(format!(
+                    "{}: expected a regular file journal",
+                    path.display()
+                )));
+            }
+            journal_paths.push(path);
+        }
+        journal_paths.sort();
+
+        for path in &journal_paths {
+            if let Some(stem) = path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .and_then(|name| name.strip_suffix(".jsonl"))
+            {
+                protected_head_stems.remove(stem);
+            }
+        }
+        if let Some(excluded_stem) = exclude_name
+            .and_then(std::ffi::OsStr::to_str)
+            .and_then(|name| name.strip_suffix(".jsonl"))
+        {
+            protected_head_stems.remove(excluded_stem);
+        }
+        if let Some(orphan_stem) = protected_head_stems.into_iter().next() {
+            return Err(WorkflowError::CorruptJournal(format!(
+                "{orphan_stem}{PROTECTED_HEAD_SUFFIX}: orphaned protected-head file has no \
+                 corresponding .jsonl journal in {}",
+                journal_directory.display()
+            )));
+        }
+
+        Ok(Some(journal_paths))
     }
 
     /// Sums the terminal residual HYPE left behind by every completed
@@ -2650,23 +2747,25 @@ impl DurableWorkflow {
     /// that is empty, not yet `Complete`, does not match its own protected
     /// head, belongs to a different execution identity (journals for
     /// multiple accounts must never share a directory, but this is checked
-    /// rather than merely documented), or duplicates a `workflow_id`
-    /// already aggregated from another file (a copy or hard link would
-    /// otherwise double-count the same workflow) is an error, not a skip.
-    /// A total that exceeds the live spot balance is also an error — this
-    /// account's own history expects more HYPE in spot than is actually
-    /// there, which this function cannot explain (a sale or external
-    /// transfer of residual or still-unstaked eligible HYPE, tracked
-    /// nowhere yet — seeing it through is the still-open external-transfer
-    /// ledger work) and refuses to guess at rather than silently
-    /// misclassify the next decision's inventory.
+    /// rather than merely documented), duplicates a `workflow_id` already
+    /// aggregated from another file (a copy or hard link would otherwise
+    /// double-count the same workflow), or is concurrently locked by
+    /// another process is an error, not a skip. A total that exceeds the
+    /// live spot balance is also an error — this account's own history
+    /// expects more HYPE in spot than is actually there, which this
+    /// function cannot explain (a sale or external transfer of residual or
+    /// still-unstaked eligible HYPE, tracked nowhere yet — seeing it
+    /// through is the still-open external-transfer ledger work) and
+    /// refuses to guess at rather than silently misclassify the next
+    /// decision's inventory.
     ///
     /// # Errors
     ///
     /// Returns an error if `journal_directory` cannot be read, if any
     /// journal in it is empty, corrupt, rolled back, foreign, duplicated,
-    /// missing its terminal residual/eligible split, or overflows on
-    /// summation, or if the aggregated total exceeds `live_spot_hype_atoms`.
+    /// concurrently locked, missing its terminal residual/eligible split,
+    /// or overflows on summation, or if the aggregated total exceeds
+    /// `live_spot_hype_atoms`.
     pub fn aggregate_terminal_residual_hype(
         journal_directory: &Path,
         exclude_path: Option<&Path>,
@@ -2674,45 +2773,12 @@ impl DurableWorkflow {
         execution_identity_hash: &str,
         protected_head_store_for: &ProtectedHeadStoreFactory<'_>,
     ) -> Result<HypeAtoms, WorkflowError> {
-        let exclude_name = exclude_path.and_then(Path::file_name);
-        let mut journal_paths = Vec::new();
-        let entries = match fs::read_dir(journal_directory) {
-            Ok(entries) => entries,
+        let Some(journal_paths) = Self::scan_journal_paths(journal_directory, exclude_path)? else {
             // No directory yet means no historical journals yet — this is
             // the normal state before this execution account's very first
             // workflow, not a corrupt or unreadable one.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(HypeAtoms::from_atoms(0));
-            }
-            Err(error) => return Err(WorkflowError::io(error)),
+            return Ok(HypeAtoms::from_atoms(0));
         };
-        for entry in entries {
-            let entry = entry.map_err(WorkflowError::io)?;
-            let path = entry.path();
-            if path.extension().and_then(std::ffi::OsStr::to_str) != Some("jsonl") {
-                continue;
-            }
-            if exclude_name.is_some() && path.file_name() == exclude_name {
-                continue;
-            }
-            // `DirEntry::file_type` does not follow symlinks; a symlinked
-            // journal would otherwise silently fail `is_file()` below and
-            // be skipped rather than aggregated, hiding real residual HYPE
-            // instead of failing closed on it. Matches this crate's
-            // existing symlink posture for every other security-relevant
-            // file open (`FileProtectedWorkflowHeadStore`,
-            // `FileExchangeOrderOwnerStore`).
-            reject_linked_file(&path).map_err(WorkflowError::io)?;
-            let file_type = entry.file_type().map_err(WorkflowError::io)?;
-            if !file_type.is_file() {
-                return Err(WorkflowError::CorruptJournal(format!(
-                    "{}: expected a regular file journal",
-                    path.display()
-                )));
-            }
-            journal_paths.push(path);
-        }
-        journal_paths.sort();
 
         let overflowed = |what: &str| {
             WorkflowError::CorruptJournal(format!(
@@ -2805,7 +2871,10 @@ impl DurableWorkflow {
     #[must_use]
     pub fn protected_head_path_for(journal_path: &Path) -> PathBuf {
         let mut path = journal_path.to_path_buf();
-        path.set_extension("protected-head.json");
+        // Must stay byte-consistent with `PROTECTED_HEAD_SUFFIX`, which
+        // `aggregate_terminal_residual_hype` strips to detect an orphaned
+        // protected-head file whose `.jsonl` journal has vanished.
+        path.set_extension(PROTECTED_HEAD_SUFFIX.trim_start_matches('.'));
         path
     }
 
