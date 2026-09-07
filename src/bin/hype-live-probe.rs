@@ -78,7 +78,16 @@ struct OperationalParams {
     // scheduler) could vary without ever meaning to change where history is
     // aggregated from. Fixed here, in a file the operator reviews and edits
     // deliberately, not inferred.
-    history_directory: String,
+    //
+    // Optional, not required, even though only `prepare` ever reads it:
+    // `submit`/`reconcile` parse this same shared struct out of an
+    // operational.toml that may predate this field, to recover an in-flight
+    // order after an upgrade. A hard-required field here would make those
+    // two commands fail to even parse a still-otherwise-valid legacy file,
+    // forcing an operator to edit unrelated configuration before recovery —
+    // see `prepare`'s explicit `ok_or` below for where this is actually
+    // enforced.
+    history_directory: Option<String>,
 }
 
 impl OperationalParams {
@@ -539,14 +548,22 @@ async fn prepare(
     let config = load_config(config_path, security_policy_path)?;
     config.validate_at(&ProcessEnvironment, now)?;
     let operational = OperationalParams::from_toml(&fs::read_to_string(operational_params_path)?)?;
+    // The only place `history_directory` is required: `submit`/`reconcile`
+    // never read it (see the field's doc comment), so a legacy
+    // operational.toml that predates this field parses fine for them, but
+    // `prepare` cannot proceed without a directory to bind history to.
+    let history_directory = operational
+        .history_directory
+        .as_deref()
+        .ok_or("operational.toml is missing history_directory, required by `prepare`")?;
     // Durably binds history_directory to the first value ever read for this
     // operational_params_path, before trusting it for anything: an
     // operator later editing operational.toml's history_directory would
     // otherwise go undetected, and the next prepare would silently
     // aggregate from an empty new location instead of failing closed.
     let history_initialization =
-        HistoryDirectoryBinding::check(operational_params_path, &operational.history_directory)?;
-    let journal_directory = PathBuf::from(&operational.history_directory);
+        HistoryDirectoryBinding::check(operational_params_path, history_directory)?;
+    let journal_directory = PathBuf::from(history_directory);
     // Validated before anything below acts on `journal_directory`, in
     // particular before `persist_first_ever` durably (and irreversibly)
     // commits history_directory below: on a genuinely first-ever prepare
@@ -570,10 +587,7 @@ async fn prepare(
     // observe `AlreadyInitialized` against a directory that was never
     // actually created (see `HistoryDirectoryBinding::check`'s doc).
     if history_initialization == HistoryInitialization::FirstEver {
-        HistoryDirectoryBinding::persist_first_ever(
-            operational_params_path,
-            &operational.history_directory,
-        )?;
+        HistoryDirectoryBinding::persist_first_ever(operational_params_path, history_directory)?;
     }
     // Fixes the network this journal is bound to before anything else reads
     // `config`/`operational` for a network-dependent value: refuses to
@@ -1354,6 +1368,26 @@ mod tests {
             connector.execution_account_address().unwrap(),
             "0x1111111111111111111111111111111111111111"
         );
+    }
+
+    #[test]
+    fn operational_params_without_history_directory_still_parses_for_submit_and_reconcile() {
+        // A legacy operational.toml written before `history_directory`
+        // existed must still deserialize: `submit`/`reconcile` never read
+        // that field (only `prepare` does, and enforces its presence
+        // itself), so requiring it here would block recovering an
+        // already-prepared or already-submitted order after an upgrade.
+        let legacy_toml = r#"
+            is_mainnet = false
+            max_taker_notional_usdc = "25.0"
+            max_taker_slippage_bps = 20
+            max_taker_book_age_ms = 5000
+            order_timeout_seconds = 10
+            order_book_depth = 5
+        "#;
+        let operational = super::OperationalParams::from_toml(legacy_toml)
+            .expect("legacy operational.toml without history_directory must still parse");
+        assert!(operational.history_directory.is_none());
     }
 
     #[test]
