@@ -605,14 +605,32 @@ async fn prepare(
     // scope (it would mean revisiting `live_decision.rs`, already merged).
     let connector = build_signed_connector(&config, &operational, journal_path).await?;
 
-    // Re-reads the clock here, after the KMS-backed signer decrypt above
-    // (a network round trip whose latency is outside this binary's control)
-    // rather than reusing the `now` captured before it. Every freshness/
-    // expiry computation below — policy acknowledgement validity, the
-    // movement-scan window, signal evidence, and the order envelope's
-    // `signed_expiry_at` — should be judged against a clock read as close as
-    // practical to the decision it gates, not one that already has an
-    // unbounded KMS round trip baked into its staleness.
+    // Observes the account *before* the cycle clock is read below, in the
+    // same order as `main.rs`'s `--dry-run-cycle`: `validate_cycle_range`
+    // rejects a cycle whose `accumulator.balance_observed_at()` is later
+    // than its `observed_at` ("account observation is after the runtime
+    // cycle"). Reading `now` first and observing afterwards fails that
+    // check deterministically — found on the first real mainnet `prepare`
+    // (bot-strategy#845, 2026-09-07), a path no offline fixture exercises.
+    let account = config.observation_account(&ProcessEnvironment)?;
+    let observer = HyperliquidObserver::new(&config.hyperliquid.endpoint, &account)?;
+    let accumulator = observer
+        .observe(
+            &HypeAttribution::Unavailable,
+            trade_cadence_label(&config.schedule),
+        )
+        .await?;
+
+    // Re-reads the clock here, after the KMS-backed signer decrypt and the
+    // account observation above (network round trips whose latency is
+    // outside this binary's control) rather than reusing the `now` captured
+    // before them. Every freshness/expiry computation below — policy
+    // acknowledgement validity, the movement-scan window, signal evidence,
+    // and the order envelope's `signed_expiry_at` — should be judged against
+    // a clock read as close as practical to the decision it gates, not one
+    // that already has an unbounded KMS round trip baked into its staleness.
+    // This is also what keeps `observed_at >= balance_observed_at` and
+    // `scan_end_ms == observed_at` for `validate_cycle_range`.
     let now = Utc::now();
     let effective = config.effective_live_order_policy(&ProcessEnvironment, now)?;
     let policy_version = config.effective_security_policy_digest(&ProcessEnvironment, now)?;
@@ -633,14 +651,6 @@ async fn prepare(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    let account = config.observation_account(&ProcessEnvironment)?;
-    let observer = HyperliquidObserver::new(&config.hyperliquid.endpoint, &account)?;
-    let accumulator = observer
-        .observe(
-            &HypeAttribution::Unavailable,
-            trade_cadence_label(&config.schedule),
-        )
-        .await?;
     let scan_end_ms = u64::try_from(now.timestamp_millis())?;
     let scan_start_ms = runtime.next_scan_start_ms();
     let (movements, capital_history_complete, api_errors) =
