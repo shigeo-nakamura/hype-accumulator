@@ -4749,6 +4749,23 @@ fn aggregate_terminal_residual_hype_ignores_non_journal_sidecar_files() {
     assert_eq!(aggregated, hype(3));
 }
 
+#[cfg(unix)]
+#[test]
+fn aggregate_terminal_residual_hype_rejects_a_symlinked_journal_instead_of_skipping_it() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let real_path = temp.path().join("real.jsonl");
+    complete_workflow_with_residual(&real_path, 4);
+
+    // A `.jsonl`-named symlink must be rejected, not silently skipped: a
+    // silent skip would under-count real residual HYPE rather than fail
+    // closed on it.
+    let symlink_path = temp.path().join("linked.jsonl");
+    std::os::unix::fs::symlink(&real_path, &symlink_path).expect("create symlink");
+
+    let result = DurableWorkflow::aggregate_terminal_residual_hype(temp.path(), None, hype(100));
+    assert!(matches!(result, Err(WorkflowError::Io(_))));
+}
+
 #[test]
 fn aggregate_terminal_residual_hype_fails_closed_on_a_non_terminal_historical_journal() {
     let temp = tempfile::tempdir().expect("temp directory");

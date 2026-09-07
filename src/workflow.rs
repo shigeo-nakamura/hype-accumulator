@@ -2611,9 +2611,12 @@ impl DurableWorkflow {
     /// in `.jsonl` is treated as a workflow journal (this codebase's own
     /// sidecar files — checkpoints, locks, pending-append markers, the
     /// observed-fills accumulator, the owner store — never use that
-    /// extension, so this cannot mistake one for a journal). `exclude_path`,
-    /// when given, is skipped by file name and should be the caller's own
-    /// in-flight journal for today's decision, which is never "past".
+    /// extension, so this cannot mistake one for a journal). A `.jsonl`-
+    /// named symlink or non-regular entry is rejected, not silently
+    /// skipped — skipping it could hide real residual HYPE instead of
+    /// failing closed on it. `exclude_path`, when given, is skipped by
+    /// file name and should be the caller's own in-flight journal for
+    /// today's decision, which is never "past".
     ///
     /// Fails closed rather than guessing: a journal found in the directory
     /// that is not yet `Complete` is an error, not a skip (its split has
@@ -2647,15 +2650,26 @@ impl DurableWorkflow {
         for entry in entries {
             let entry = entry.map_err(WorkflowError::io)?;
             let path = entry.path();
-            let file_type = entry.file_type().map_err(WorkflowError::io)?;
-            if !file_type.is_file() {
-                continue;
-            }
             if path.extension().and_then(std::ffi::OsStr::to_str) != Some("jsonl") {
                 continue;
             }
             if exclude_name.is_some() && path.file_name() == exclude_name {
                 continue;
+            }
+            // `DirEntry::file_type` does not follow symlinks; a symlinked
+            // journal would otherwise silently fail `is_file()` below and
+            // be skipped rather than aggregated, hiding real residual HYPE
+            // instead of failing closed on it. Matches this crate's
+            // existing symlink posture for every other security-relevant
+            // file open (`FileProtectedWorkflowHeadStore`,
+            // `FileExchangeOrderOwnerStore`).
+            reject_linked_file(&path).map_err(WorkflowError::io)?;
+            let file_type = entry.file_type().map_err(WorkflowError::io)?;
+            if !file_type.is_file() {
+                return Err(WorkflowError::CorruptJournal(format!(
+                    "{}: expected a regular file journal",
+                    path.display()
+                )));
             }
             journal_paths.push(path);
         }
