@@ -30,6 +30,40 @@ use tokio::time::timeout;
 
 /// Upper bound on one mirror PUT. See the doc comment on `put` for why
 /// this exists even after the caller has released its own locks.
+///
+/// **Ordering** (bot-strategy#920) does not come from this bound. The
+/// pre-PUT phase of a cycle — observation, movement history, persistence —
+/// has no bound of its own, so the interval between two PUT *starts* is
+/// not the interval between two timer ticks. It comes from the deployment
+/// shape:
+///
+/// - Only one unit mirrors, so a key has a single writer rather than two
+///   racing ones: `hype-accumulator-dryrun.service` carries the
+///   `STATUS_S3_*` environment and the observer unit does not.
+/// - A timer that elapses while the unit it triggers is still active
+///   leaves that unit running rather than starting a second instance
+///   (systemd.timer(5)). Cycle N+1 therefore cannot begin until cycle N's
+///   process has exited, which is after N's PUT completed or was
+///   abandoned. Two of this writer's PUTs are never in flight together,
+///   however long N's pre-PUT phase took.
+///
+/// **What this bound does buy** is a limit on how far a stalled mirror
+/// propagates. Because systemd skips rather than queues, a cycle still
+/// running at a tick costs that tick outright — releasing the
+/// state-directory lock before the PUT protects other lock takers, not
+/// this unit's own next tick. Keeping one attempt far below the schedule
+/// means a stall can only ever cost the single tick it overlaps: the unit
+/// exits within `PUT_TIMEOUT` of its pre-PUT work finishing, so it is
+/// always inactive again well before the following tick.
+/// `mirror_stall_cannot_cost_more_than_one_cycle` pins that inequality.
+///
+/// Neither half of the ordering argument is observable from inside this
+/// process, so both are written down in
+/// `docs/runbooks/signer-free-runtime.md`. Giving a second unit the
+/// `STATUS_S3_*` environment, mirroring from a long-lived process that can
+/// overlap its own writes, or adding retries that outlive a cycle each
+/// reopen the race and need an actual ordering mechanism — a mirror-scoped
+/// lock, or a conditional write — not a different constant here.
 const PUT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Error)]
@@ -108,6 +142,15 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    /// The shortest scheduling interval any deployment may run a status
+    /// writer at. Matches the deployed `OnCalendar=*-*-* *:0/5:00` timer.
+    const MIN_SUPPORTED_CYCLE_INTERVAL: Duration = Duration::from_secs(300);
+
+    /// How much shorter than a cycle one PUT attempt must stay. A PUT
+    /// consuming a meaningful fraction of the interval would eat into the
+    /// budget the next cycle needs.
+    const MIN_CYCLE_INTERVAL_SAFETY_FACTOR: u64 = 10;
+
     // Env var access must serialize: `from_env` reads process env vars,
     // and parallel test execution can otherwise see each other's
     // mutations. Recover from poisoning so a panic in one test does not
@@ -119,6 +162,36 @@ mod tests {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+
+    /// A mirror stall must not be able to cost more than the single cycle
+    /// it overlaps. systemd skips a tick whose unit is still active rather
+    /// than queueing it, so a cycle that is still awaiting its PUT when a
+    /// tick arrives loses that tick outright; keeping one attempt far
+    /// below the schedule means the unit is always inactive again before
+    /// the *following* tick, bounding the loss at one. Raising
+    /// `PUT_TIMEOUT` past a whole interval, or adding retries whose total
+    /// budget does, would let one unresponsive endpoint swallow several
+    /// consecutive cycles.
+    ///
+    /// This does not claim a stall causes no delay — it can still cost the
+    /// tick it overlaps — and it is not part of the write-ordering
+    /// argument; see `PUT_TIMEOUT`'s own comment for that.
+    ///
+    /// A `const _: () = assert!(..)` in the module body would be stronger,
+    /// but the dead-code lint does not count a use inside one, so both
+    /// constants would then need an `#[allow(dead_code)]` that would also
+    /// hide genuinely unused constants later.
+    #[test]
+    fn mirror_stall_cannot_cost_more_than_one_cycle() {
+        assert!(
+            PUT_TIMEOUT.as_secs() * MIN_CYCLE_INTERVAL_SAFETY_FACTOR
+                <= MIN_SUPPORTED_CYCLE_INTERVAL.as_secs(),
+            "one PUT attempt ({PUT_TIMEOUT:?}) must stay at least \
+             {MIN_CYCLE_INTERVAL_SAFETY_FACTOR}x shorter than the shortest supported cycle \
+             interval ({MIN_SUPPORTED_CYCLE_INTERVAL:?}), so a stalled mirror can only ever \
+             cost the single tick it overlaps"
+        );
     }
 
     #[test]

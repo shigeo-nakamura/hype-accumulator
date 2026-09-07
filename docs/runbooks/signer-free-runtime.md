@@ -168,6 +168,60 @@ request itself fails, the command exits non-zero before the cycle commit; the
 previously published status remains stale for the external service monitor to
 alert on.
 
+## S3 status mirror write ordering
+
+The cycle releases its exclusive state-directory lock before awaiting the
+optional S3 mirror PUT, so an unresponsive endpoint cannot hold that lock while
+the request is outstanding. Nothing then mutually excludes two cycles' PUTs at
+the application level, so write ordering rests on the deployment shape
+(bot-strategy#920):
+
+- **One writer per key.** `hype-accumulator-dryrun.service` carries the
+  `STATUS_S3_BUCKET`/`STATUS_S3_KEY_PREFIX` environment; the observer unit does
+  not, so `StatusS3Mirror::from_env()` returns `None` there. Both units fire on
+  the same five-minute marks, so this is what keeps them from being concurrent
+  writers.
+- **A timer whose unit is already active leaves it running** rather than
+  starting a second instance (systemd.timer(5)). That writer's cycle N+1
+  therefore cannot begin until cycle N's process has exited, which is after N's
+  PUT completed or was abandoned. Two of its PUTs are never in flight together.
+
+The second point is what the ordering depends on, and it does not depend on how
+long a cycle's pre-PUT work takes. A cycle's observation, movement-history and
+persistence phases have no bound of their own, so the interval between two timer
+ticks is *not* the interval between two PUT starts — an argument built on the
+five-minute cadence alone would be wrong.
+
+### What a stalled mirror still costs
+
+systemd **skips** a tick whose unit is still active; it does not queue it. So a
+cycle still awaiting its PUT when a tick arrives loses that tick outright, and
+releasing the state-directory lock first does not prevent that — the lock
+release protects *other* lock takers, not this unit's own next tick.
+
+One PUT attempt is abandoned after ten seconds (`PUT_TIMEOUT`), far below the
+shortest supported writer schedule (`MIN_SUPPORTED_CYCLE_INTERVAL`, five
+minutes). That bounds the damage rather than removing it: the unit is always
+inactive again well before the *following* tick, so a stall can only ever cost
+the single tick it overlaps. `cargo test` enforces the two constants'
+relationship. Raising `PUT_TIMEOUT` past a whole interval, or adding retries
+whose total budget does, would let one unresponsive endpoint swallow several
+consecutive cycles.
+
+**Accepted residual**: a PUT that S3 commits after its client-side timeout is
+not detected, and could in principle land after a newer object. The local
+`status.json` remains the source of truth, the mirror self-corrects on the next
+cycle, and no economic or trading path reads the mirrored object. A stalled
+mirror can also cost one decision cycle, which for a once-per-UTC-day decision
+means a five-minute retry, not a missed day.
+
+Each of these invalidates the argument and requires a real ordering mechanism —
+a mirror-scoped lock, or a conditional write — rather than a different
+constant: giving a second unit the `STATUS_S3_*` environment; mirroring from a
+long-lived process that can overlap its own writes; adding retries whose total
+budget outlives a cycle; scheduling a status writer more often than
+`MIN_SUPPORTED_CYCLE_INTERVAL`.
+
 Artifact installation, timer/unit creation, host start/restart, secret
 installation, funding, signing, submission, and live enablement remain
 separate explicit approval gates.
