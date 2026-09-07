@@ -27,10 +27,10 @@
       "master_commit": "623dad52febd076b28244443ab2cfb4ce07ac08d",
       "release_candidate": {
         "version": "4.7.21",
-        "version_pr_head_commit": "74ac00bf0d4a537e979fcb245995f9df1b4e8383",
-        "version_merge_commit": "74ac00bf0d4a537e979fcb245995f9df1b4e8383",
+        "version_pr_head_commit": "623dad52febd076b28244443ab2cfb4ce07ac08d",
+        "version_merge_commit": "623dad52febd076b28244443ab2cfb4ce07ac08d",
         "tag_present": true,
-        "tag_commit": "74ac00bf0d4a537e979fcb245995f9df1b4e8383"
+        "tag_commit": "623dad52febd076b28244443ab2cfb4ce07ac08d"
       }
     },
     "pairtrade": {
@@ -64,10 +64,10 @@
     },
     {
       "repository": "shigeo-nakamura/dex-connector",
-      "commit": "74ac00bf0d4a537e979fcb245995f9df1b4e8383",
-      "command": "git -C dex-connector rev-parse v4.7.21",
+      "commit": "623dad52febd076b28244443ab2cfb4ce07ac08d",
+      "command": "git -C dex-connector rev-parse v4.7.21^{commit}",
       "status": "PASS",
-      "result": "The v4.7.21 tag hype-accumulator's Cargo.toml pins resolves to a commit reachable from dex-connector's origin/master (git merge-base --is-ancestor v4.7.21 origin/master)"
+      "result": "The v4.7.21 annotated tag peels to 623dad52febd076b28244443ab2cfb4ce07ac08d, the exact revision Cargo.lock pins and hype-accumulator compiles against (git rev-parse v4.7.21 alone returns the tag object 74ac00bf..., not the commit)"
     }
   ],
   "required_gates": [
@@ -257,8 +257,8 @@
         },
         {
           "kind": "verification_run",
-          "command": "git -C dex-connector rev-parse v4.7.21",
-          "result": "Tag resolves to 74ac00bf0d4a537e979fcb245995f9df1b4e8383, an ancestor of dex-connector origin/master"
+          "command": "git -C dex-connector rev-parse v4.7.21^{commit}",
+          "result": "Tag peels to 623dad52febd076b28244443ab2cfb4ce07ac08d (not the tag object 74ac00bf...), an ancestor of dex-connector origin/master and the exact revision Cargo.lock pins"
         }
       ]
     },
