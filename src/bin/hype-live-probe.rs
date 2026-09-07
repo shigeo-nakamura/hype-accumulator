@@ -23,7 +23,7 @@
 use chrono::Utc;
 use dex_connector::{HyperliquidAccountConfig, HyperliquidConnector, HyperliquidConnectorConfig};
 use hype_accumulator::{
-    config::{Config, ProcessEnvironment},
+    config::{Config, EffectiveLiveOrderPolicy, ProcessEnvironment},
     live_decision::prepare_first_live_order_workflow,
     live_probe::{reconcile_prepared_order, HyperliquidLiveProbe, LiveProbeBinding},
     monitor::{trade_cadence_label, HypeAttribution, HyperliquidObserver},
@@ -330,7 +330,8 @@ async fn prepare(
     // `config`/`operational` for a network-dependent value: refuses to
     // silently re-bind an already-prepared journal to a different network on
     // a later `prepare` retry.
-    PrepareTimeBinding::resolved(&config, &operational)?.write_once(journal_path)?;
+    let prepare_time_binding = PrepareTimeBinding::resolved(&config, &operational)?;
+    prepare_time_binding.write_once(journal_path)?;
 
     // Decrypts the signer now, even though the signal-free
     // `SignerFreeRuntime::apply_cycle` below (inside
@@ -352,23 +353,8 @@ async fn prepare(
     let now = Utc::now();
     let effective = config.effective_live_order_policy(&ProcessEnvironment, now)?;
     let policy_version = config.effective_security_policy_digest(&ProcessEnvironment, now)?;
-    let envelope_policy = OrderEnvelopeFreshnessPolicy {
-        max_venue_clock_lag_ms: effective.max_venue_clock_lag_ms,
-        venue_clock_evidence_stale_after_seconds: effective
-            .venue_clock_evidence_stale_after_seconds,
-        book_stale_after_seconds: effective.book_stale_after_seconds,
-        account_history_stale_after_seconds: effective.account_history_stale_after_seconds,
-        fee_schedule_stale_after_seconds: effective.fee_schedule_stale_after_seconds,
-        signal_stale_after_seconds: effective.signal_stale_after_seconds,
-        order_timeout_seconds: operational.order_timeout_seconds,
-        max_slippage_bps: effective.max_slippage_bps,
-        order_book_depth: operational.order_book_depth,
-    };
-    let eligibility_policy = EligibilityPolicyBinding {
-        policy_version,
-        fill_registration_deadline_seconds: effective.fill_registration_deadline_seconds,
-        lot_eligibility_max_age_seconds: effective.lot_eligibility_max_age_seconds,
-    };
+    let (envelope_policy, eligibility_policy) =
+        build_prepare_policies(&effective, &operational, policy_version);
     let configured_residual_hype_atoms = HypeAtoms::from_atoms(effective.residual_hype_wei);
 
     let runtime_config = RuntimeConfig::from_toml(&fs::read_to_string(runtime_config_path)?)?
@@ -424,6 +410,7 @@ async fn prepare(
     // `now` and bound it by the same `signal_stale_after_seconds` window.
     let signal_evidence_valid_through_at =
         now + chrono::TimeDelta::seconds(i64::try_from(effective.signal_stale_after_seconds)?);
+    let network_routing_admissible = network_routing_admissible_for(&prepare_time_binding);
     let workflow = prepare_first_live_order_workflow(
         &connector,
         &mut runtime,
@@ -436,6 +423,7 @@ async fn prepare(
         &journal,
         &journal_directory,
         &historical_protected_head_store_for,
+        &network_routing_admissible,
         protected_head_store,
         owner_store,
         now,
@@ -624,6 +612,31 @@ fn build_stores(journal_path: &str) -> Result<WorkflowStores, Box<dyn std::error
     Ok((protected_head_store, owner_store))
 }
 
+fn build_prepare_policies(
+    effective: &EffectiveLiveOrderPolicy,
+    operational: &OperationalParams,
+    policy_version: String,
+) -> (OrderEnvelopeFreshnessPolicy, EligibilityPolicyBinding) {
+    let envelope_policy = OrderEnvelopeFreshnessPolicy {
+        max_venue_clock_lag_ms: effective.max_venue_clock_lag_ms,
+        venue_clock_evidence_stale_after_seconds: effective
+            .venue_clock_evidence_stale_after_seconds,
+        book_stale_after_seconds: effective.book_stale_after_seconds,
+        account_history_stale_after_seconds: effective.account_history_stale_after_seconds,
+        fee_schedule_stale_after_seconds: effective.fee_schedule_stale_after_seconds,
+        signal_stale_after_seconds: effective.signal_stale_after_seconds,
+        order_timeout_seconds: operational.order_timeout_seconds,
+        max_slippage_bps: effective.max_slippage_bps,
+        order_book_depth: operational.order_book_depth,
+    };
+    let eligibility_policy = EligibilityPolicyBinding {
+        policy_version,
+        fill_registration_deadline_seconds: effective.fill_registration_deadline_seconds,
+        lot_eligibility_max_age_seconds: effective.lot_eligibility_max_age_seconds,
+    };
+    (envelope_policy, eligibility_policy)
+}
+
 fn journal_directory_for(journal_path: &Path) -> PathBuf {
     journal_path
         .parent()
@@ -660,6 +673,27 @@ fn historical_protected_head_store_for(
     FileProtectedWorkflowHeadStore::new(head_path)
         .map(|store| Arc::new(store) as Arc<dyn ProtectedWorkflowHeadStore>)
         .map_err(WorkflowError::ProtectedHead)
+}
+
+/// `execution_identity_hash` alone does not distinguish testnet from
+/// mainnet, or one vault-address routing mode from another, for the same
+/// address — this checks each historical journal's own `PrepareTimeBinding`
+/// sidecar against `current`, so a foreign-network or foreign-routing
+/// journal sharing this directory is rejected by
+/// `aggregate_terminal_residual_hype` rather than silently aggregated.
+fn network_routing_admissible_for(
+    current: &PrepareTimeBinding,
+) -> impl Fn(&Path) -> Result<(), WorkflowError> + '_ {
+    move |path: &Path| {
+        let path_str = path.to_str().ok_or_else(|| {
+            WorkflowError::CorruptJournal(format!(
+                "{}: journal path is not valid UTF-8",
+                path.display()
+            ))
+        })?;
+        PrepareTimeBinding::verify(path_str, current)
+            .map_err(|error| WorkflowError::CorruptJournal(error.to_string()))
+    }
 }
 
 fn box_error<E: std::error::Error + 'static>(error: E) -> Box<dyn std::error::Error> {
@@ -707,7 +741,10 @@ async fn build_signed_connector(
 
 #[cfg(test)]
 mod tests {
-    use super::{invocation, validate_journal_path_extension, Invocation, PrepareTimeBinding};
+    use super::{
+        invocation, network_routing_admissible_for, validate_journal_path_extension, Invocation,
+        PrepareTimeBinding,
+    };
 
     #[test]
     fn journal_path_extension_must_be_exactly_lowercase_jsonl() {
@@ -894,6 +931,39 @@ mod tests {
         // The unchanged binding still verifies.
         PrepareTimeBinding::verify(journal_path, &prepared_with_vault_routing)
             .expect("matching binding verifies");
+    }
+
+    #[test]
+    fn network_routing_admissible_for_matches_prepare_time_binding_verify() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mainnet_path = directory.path().join("mainnet.jsonl");
+        let mainnet_path_str = mainnet_path.to_str().expect("utf8 path");
+        let mainnet =
+            PrepareTimeBinding::new("https://api.hyperliquid.xyz".to_owned(), true, false);
+        mainnet
+            .write_once(mainnet_path_str)
+            .expect("mainnet journal prepared");
+
+        let testnet_path = directory.path().join("testnet.jsonl");
+        let testnet_path_str = testnet_path.to_str().expect("utf8 path");
+        let testnet = PrepareTimeBinding::new(
+            "https://api.hyperliquid-testnet.xyz".to_owned(),
+            false,
+            false,
+        );
+        testnet
+            .write_once(testnet_path_str)
+            .expect("testnet journal prepared");
+
+        let admissible_for_mainnet = network_routing_admissible_for(&mainnet);
+        assert!(
+            admissible_for_mainnet(&mainnet_path).is_ok(),
+            "a journal prepared under the same binding is admissible"
+        );
+        assert!(
+            admissible_for_mainnet(&testnet_path).is_err(),
+            "a testnet journal must not be aggregated into a mainnet run"
+        );
     }
 
     #[test]

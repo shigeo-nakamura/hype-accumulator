@@ -330,6 +330,15 @@ fn memory_protected_head_store_for(
     Ok(protected_head_store(path) as Arc<dyn ProtectedWorkflowHeadStore>)
 }
 
+// No test in this file exercises journal_admissible rejecting anything
+// (network/routing scoping is `hype-live-probe`'s own concern, tested
+// there against `PrepareTimeBinding`) — every fixture here belongs to one
+// implied context, so this always admits.
+#[allow(clippy::unnecessary_wraps)]
+fn always_admissible(_path: &Path) -> Result<(), WorkflowError> {
+    Ok(())
+}
+
 fn at(minute: u32) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 8, 24, 12, minute, 0)
         .single()
@@ -4736,6 +4745,7 @@ fn aggregate_terminal_residual_hype_reconciles_against_residual_plus_unstaked_el
         hype(50),
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
+        &always_admissible,
     );
     assert!(matches!(
         insufficient,
@@ -4750,6 +4760,7 @@ fn aggregate_terminal_residual_hype_reconciles_against_residual_plus_unstaked_el
         hype(110),
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
+        &always_admissible,
     )
     .expect("live balance covers residual plus unstaked eligible HYPE");
     assert_eq!(aggregated, hype(10));
@@ -4770,6 +4781,7 @@ fn aggregate_terminal_residual_hype_fails_closed_on_an_empty_historical_journal(
         hype(100),
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
+        &always_admissible,
     );
     assert!(matches!(
         result,
@@ -4836,6 +4848,7 @@ fn aggregate_terminal_residual_hype_rejects_a_journal_rolled_back_since_its_prot
         hype(100),
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
+        &always_admissible,
     );
     assert!(matches!(result, Err(WorkflowError::RollbackDetected(_))));
 }
@@ -4867,6 +4880,7 @@ fn aggregate_terminal_residual_hype_rejects_a_duplicate_workflow_id_across_two_f
         hype(100),
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
+        &always_admissible,
     );
     assert!(matches!(result, Err(WorkflowError::CorruptJournal(_))));
 }
@@ -4916,6 +4930,32 @@ fn aggregate_terminal_residual_hype_rejects_a_journal_from_a_different_execution
         hype(100),
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
+        &always_admissible,
+    );
+    assert!(matches!(result, Err(WorkflowError::CorruptJournal(_))));
+}
+
+#[test]
+fn aggregate_terminal_residual_hype_rejects_a_journal_the_caller_marks_inadmissible() {
+    // Simulates `hype-live-probe`'s network/routing scoping: a caller can
+    // reject a journal for a reason `workflow.rs` itself has no notion of
+    // (e.g. a testnet journal found while aggregating for mainnet).
+    let temp = tempfile::tempdir().expect("temp directory");
+    complete_workflow_with_residual(&temp.path().join("day-1.jsonl"), 3);
+
+    let reject_everything = |_path: &Path| -> Result<(), WorkflowError> {
+        Err(WorkflowError::CorruptJournal(
+            "journal belongs to a different network".into(),
+        ))
+    };
+
+    let result = DurableWorkflow::aggregate_terminal_residual_hype(
+        temp.path(),
+        None,
+        hype(100),
+        "signer-identity-hash-a",
+        &memory_protected_head_store_for,
+        &reject_everything,
     );
     assert!(matches!(result, Err(WorkflowError::CorruptJournal(_))));
 }
@@ -4953,6 +4993,7 @@ fn aggregate_terminal_residual_hype_excludes_hype_already_delegated_to_staking()
         hype(0),
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
+        &always_admissible,
     )
     .expect("delegated eligible HYPE is excluded from the spot reconciliation");
     assert_eq!(aggregated, hype(0));
@@ -5064,6 +5105,7 @@ fn aggregate_terminal_residual_hype_reconciles_using_movement_adjusted_residual(
         hype(6),
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
+        &always_admissible,
     )
     .expect("aggregation uses the movement-adjusted residual, not the raw split");
     assert_eq!(aggregated, hype(6));
@@ -5150,6 +5192,7 @@ fn aggregate_terminal_residual_hype_fails_closed_when_a_journal_is_concurrently_
         hype(3),
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
+        &always_admissible,
     );
     assert!(matches!(result, Err(WorkflowError::ConcurrentModification)));
 }
@@ -5164,6 +5207,7 @@ fn aggregate_terminal_residual_hype_returns_zero_for_a_directory_that_does_not_e
         hype(0),
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
+        &always_admissible,
     )
     .expect("a directory that does not exist yet has no historical journals");
     assert_eq!(aggregated, hype(0));
@@ -5187,6 +5231,7 @@ fn aggregate_terminal_residual_hype_sums_across_the_directory_and_excludes_the_c
         hype(20),
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
+        &always_admissible,
     )
     .expect("two terminal journals reconcile against the live balance");
     assert_eq!(aggregated, hype(12));
@@ -5224,6 +5269,7 @@ fn aggregate_terminal_residual_hype_ignores_non_journal_sidecar_files() {
         hype(3),
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
+        &always_admissible,
     )
     .expect("sidecar files are never mistaken for journals");
     assert_eq!(aggregated, hype(3));
@@ -5248,6 +5294,7 @@ fn aggregate_terminal_residual_hype_rejects_an_orphaned_protected_head_file() {
         hype(100),
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
+        &always_admissible,
     );
     assert!(matches!(result, Err(WorkflowError::CorruptJournal(_))));
 }
@@ -5274,6 +5321,7 @@ fn aggregate_terminal_residual_hype_does_not_flag_the_excluded_journals_own_prot
         hype(3),
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
+        &always_admissible,
     )
     .expect("the excluded journal's own protected-head file is not orphaned");
     assert_eq!(aggregated, hype(3));
@@ -5298,6 +5346,7 @@ fn aggregate_terminal_residual_hype_rejects_a_symlinked_journal_instead_of_skipp
         hype(100),
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
+        &always_admissible,
     );
     assert!(matches!(result, Err(WorkflowError::Io(_))));
 }
@@ -5324,6 +5373,7 @@ fn aggregate_terminal_residual_hype_fails_closed_on_a_non_terminal_historical_jo
         hype(100),
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
+        &always_admissible,
     );
     assert!(matches!(
         result,
@@ -5342,6 +5392,7 @@ fn aggregate_terminal_residual_hype_fails_closed_on_a_reconciliation_gap() {
         hype(9),
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
+        &always_admissible,
     );
     assert!(matches!(
         result,

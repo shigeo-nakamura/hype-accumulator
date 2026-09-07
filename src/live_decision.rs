@@ -32,8 +32,8 @@ use crate::{
     runtime::{RuntimeCycleInput, RuntimeError, SignerFreeRuntime},
     workflow::{
         DecisionBinding, DurableWorkflow, EligibilityPolicyBinding, ExchangeOrderOwnerStore,
-        HypeAtoms, InventoryBaseline, ProtectedHeadStoreFactory, ProtectedWorkflowHeadStore,
-        WorkflowError,
+        HypeAtoms, InventoryBaseline, JournalAdmissibilityCheck, ProtectedHeadStoreFactory,
+        ProtectedWorkflowHeadStore, WorkflowError,
     },
 };
 use chrono::{DateTime, Utc};
@@ -78,9 +78,12 @@ pub enum LiveDecisionError {
 /// `signal_evidence_valid_through_at` and
 /// `policy_acknowledgement_valid_through_at` likewise come from state this
 /// module does not own. `journal_directory` must be a directory dedicated to
-/// this execution account's own workflow journals (see
+/// this execution account's own workflow journals under the exact same
+/// network and vault-address routing mode as this call — `historical_
+/// journal_admissible` is where the caller enforces that, since this
+/// module has no notion of either (see
 /// [`crate::workflow::DurableWorkflow::aggregate_terminal_residual_hype`])
-/// and should ordinarily be `journal_path`'s parent directory.
+/// — and should ordinarily be `journal_path`'s parent directory.
 ///
 /// # Errors
 ///
@@ -104,6 +107,7 @@ pub async fn prepare_first_live_order_workflow(
     journal_path: &Path,
     journal_directory: &Path,
     historical_protected_head_store_for: &ProtectedHeadStoreFactory<'_>,
+    historical_journal_admissible: &JournalAdmissibilityCheck<'_>,
     protected_head_store: Arc<dyn ProtectedWorkflowHeadStore>,
     exchange_order_owner_store: Arc<dyn ExchangeOrderOwnerStore>,
     now: DateTime<Utc>,
@@ -156,6 +160,7 @@ pub async fn prepare_first_live_order_workflow(
                 spot_hype_atoms,
                 &probe_binding.execution_identity_hash,
                 historical_protected_head_store_for,
+                historical_journal_admissible,
             )?;
 
         let inventory_before = InventoryBaseline {

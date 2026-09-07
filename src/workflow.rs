@@ -2039,6 +2039,16 @@ pub trait ProtectedWorkflowHeadStore: Send + Sync {
 pub type ProtectedHeadStoreFactory<'a> =
     dyn Fn(&Path) -> Result<Arc<dyn ProtectedWorkflowHeadStore>, WorkflowError> + 'a;
 
+/// Checks one historical journal path against whatever execution context
+/// `workflow.rs` itself has no notion of — network selection, vault-address
+/// routing mode, or any other caller-defined admissibility criterion for
+/// [`DurableWorkflow::aggregate_terminal_residual_hype`] — returning an
+/// error to exclude it from aggregation as a whole (matching that
+/// function's `execution_identity_hash` mismatch precedent: journals for a
+/// different context sharing this directory is a configuration error, not
+/// silently worked around).
+pub type JournalAdmissibilityCheck<'a> = dyn Fn(&Path) -> Result<(), WorkflowError> + 'a;
+
 /// File-backed [`ProtectedWorkflowHeadStore`], one instance per stable
 /// decision identity (construct with a path derived from that identity, e.g.
 /// `<state_dir>/workflow-heads/<decision_id>.json`; never share one instance
@@ -2776,12 +2786,18 @@ impl DurableWorkflow {
     /// today's decision, which is never "past". `protected_head_store_for`
     /// constructs the independent protected-head store for one journal
     /// path (see [`Self::protected_head_path_for`] for the conventional
-    /// per-journal path).
+    /// per-journal path). `journal_admissible` lets the caller reject a
+    /// journal on criteria this module has no notion of — network
+    /// selection, vault-address routing mode, or anything else scoping
+    /// what "the same account" means beyond `execution_identity_hash`
+    /// alone (a testnet and a mainnet journal for the same address must
+    /// never be aggregated together, for one).
     ///
     /// Fails closed rather than guessing: a journal found in the directory
     /// that is empty, not yet `Complete`, does not match its own protected
-    /// head, belongs to a different execution identity (journals for
-    /// multiple accounts must never share a directory, but this is checked
+    /// head, belongs to a different execution identity or fails
+    /// `journal_admissible` (journals for multiple accounts, networks, or
+    /// routing modes must never share a directory, but this is checked
     /// rather than merely documented), duplicates a `workflow_id` already
     /// aggregated from another file (a copy or hard link would otherwise
     /// double-count the same workflow), or is concurrently locked by
@@ -2807,6 +2823,7 @@ impl DurableWorkflow {
         live_spot_hype_atoms: HypeAtoms,
         execution_identity_hash: &str,
         protected_head_store_for: &ProtectedHeadStoreFactory<'_>,
+        journal_admissible: &JournalAdmissibilityCheck<'_>,
     ) -> Result<HypeAtoms, WorkflowError> {
         let Some(journal_paths) = Self::scan_journal_paths(journal_directory, exclude_path)? else {
             // No directory yet means no historical journals yet — this is
@@ -2835,6 +2852,7 @@ impl DurableWorkflow {
         let mut aggregated_still_in_spot = HypeAtoms::from_atoms(0);
         let mut seen_workflow_ids: BTreeSet<String> = BTreeSet::new();
         for path in &journal_paths {
+            journal_admissible(path)?;
             let protected_head_store = protected_head_store_for(path)?;
             let Some(state) =
                 Self::peek_verified_terminal_state(path, protected_head_store.as_ref())?
