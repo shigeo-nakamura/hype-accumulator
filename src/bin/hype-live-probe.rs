@@ -168,14 +168,20 @@ impl PrepareTimeBinding {
         Ok(())
     }
 
-    fn verify(journal_path: &str, current: &Self) -> Result<(), Box<dyn std::error::Error>> {
+    fn read(journal_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let path = Self::path(journal_path);
-        let recorded: Self = serde_json::from_str(&fs::read_to_string(&path).map_err(|_| {
-            format!(
-                "no prepare-time binding recorded at {}; run `prepare` first",
-                path.display()
-            )
-        })?)?;
+        Ok(serde_json::from_str(&fs::read_to_string(&path).map_err(
+            |_| {
+                format!(
+                    "no prepare-time binding recorded at {}; run `prepare` first",
+                    path.display()
+                )
+            },
+        )?)?)
+    }
+
+    fn verify(journal_path: &str, current: &Self) -> Result<(), Box<dyn std::error::Error>> {
+        let recorded = Self::read(journal_path)?;
         if recorded != *current {
             return Err(format!(
                 "config.toml/operational.toml now resolve to {current:?}, but this journal was \
@@ -186,6 +192,17 @@ impl PrepareTimeBinding {
             .into());
         }
         Ok(())
+    }
+
+    /// Unlike [`Self::verify`] (exact equality, used before ever submitting
+    /// a signed action against a specific endpoint), historical-journal
+    /// aggregation only cares about the stable network/routing identity: a
+    /// benign endpoint change (URL migration, failover) must not
+    /// permanently exclude every already-completed journal's residual just
+    /// because their immutable, write-once bindings recorded the old URL.
+    const fn same_network_and_routing_as(&self, other: &Self) -> bool {
+        self.is_mainnet == other.is_mainnet
+            && self.requires_vault_address_routing == other.requires_vault_address_routing
     }
 }
 
@@ -691,8 +708,16 @@ fn network_routing_admissible_for(
                 path.display()
             ))
         })?;
-        PrepareTimeBinding::verify(path_str, current)
-            .map_err(|error| WorkflowError::CorruptJournal(error.to_string()))
+        let recorded = PrepareTimeBinding::read(path_str)
+            .map_err(|error| WorkflowError::CorruptJournal(error.to_string()))?;
+        if !recorded.same_network_and_routing_as(current) {
+            return Err(WorkflowError::CorruptJournal(format!(
+                "{path_str}: journal was prepared under a different network or vault-address \
+                 routing mode ({recorded:?}) than the account currently being aggregated for \
+                 ({current:?})"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -934,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn network_routing_admissible_for_matches_prepare_time_binding_verify() {
+    fn network_routing_admissible_for_rejects_a_different_network_or_routing_mode() {
         let directory = tempfile::tempdir().expect("temp dir");
         let mainnet_path = directory.path().join("mainnet.jsonl");
         let mainnet_path_str = mainnet_path.to_str().expect("utf8 path");
@@ -955,14 +980,49 @@ mod tests {
             .write_once(testnet_path_str)
             .expect("testnet journal prepared");
 
+        let vault_routed_path = directory.path().join("vault.jsonl");
+        let vault_routed_path_str = vault_routed_path.to_str().expect("utf8 path");
+        let vault_routed =
+            PrepareTimeBinding::new("https://api.hyperliquid.xyz".to_owned(), true, true);
+        vault_routed
+            .write_once(vault_routed_path_str)
+            .expect("vault-routed journal prepared");
+
         let admissible_for_mainnet = network_routing_admissible_for(&mainnet);
         assert!(
             admissible_for_mainnet(&mainnet_path).is_ok(),
-            "a journal prepared under the same binding is admissible"
+            "a journal prepared under the same network and routing mode is admissible"
         );
         assert!(
             admissible_for_mainnet(&testnet_path).is_err(),
             "a testnet journal must not be aggregated into a mainnet run"
+        );
+        assert!(
+            admissible_for_mainnet(&vault_routed_path).is_err(),
+            "a different vault-address routing mode must not be aggregated together"
+        );
+    }
+
+    #[test]
+    fn network_routing_admissible_for_tolerates_a_benign_endpoint_change() {
+        // A completed journal's write-once binding can never be updated;
+        // an endpoint URL migration or failover on the same network must
+        // not permanently exclude every already-completed journal, unlike
+        // `PrepareTimeBinding::verify`'s exact-equality check (correct for
+        // its own submit-safety purpose, wrong for aggregation).
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("day-1.jsonl");
+        let path_str = path.to_str().expect("utf8 path");
+        PrepareTimeBinding::new("https://api.hyperliquid.xyz".to_owned(), true, false)
+            .write_once(path_str)
+            .expect("journal prepared against the old endpoint");
+
+        let current_after_endpoint_migration =
+            PrepareTimeBinding::new("https://api2.hyperliquid.xyz".to_owned(), true, false);
+        let admissible = network_routing_admissible_for(&current_after_endpoint_migration);
+        assert!(
+            admissible(&path).is_ok(),
+            "a same-network, same-routing journal remains admissible across an endpoint change"
         );
     }
 
