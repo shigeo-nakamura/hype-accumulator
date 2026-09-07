@@ -168,6 +168,37 @@ request itself fails, the command exits non-zero before the cycle commit; the
 previously published status remains stale for the external service monitor to
 alert on.
 
+## S3 status mirror write ordering
+
+The cycle releases its exclusive state-directory lock before awaiting the
+optional S3 mirror PUT, so an unresponsive S3 endpoint cannot hold that lock
+long enough to make the next scheduled cycle skip. Nothing then mutually
+excludes two cycles' PUTs, so ordering rests on an inequality rather than a
+lock (bot-strategy#920):
+
+- One PUT attempt is abandoned after ten seconds (`PUT_TIMEOUT`).
+- The shortest supported writer schedule is five minutes
+  (`MIN_SUPPORTED_CYCLE_INTERVAL`), matching the deployed
+  `OnCalendar=*-*-* *:0/5:00`.
+- Only one unit mirrors. `hype-accumulator-dryrun.service` carries the
+  `STATUS_S3_BUCKET`/`STATUS_S3_KEY_PREFIX` environment; the observer unit does
+  not, so a key has a single writer rather than two racing ones.
+
+An older cycle can therefore only overwrite a newer object if S3 commits a
+request the client abandoned more than ~290 seconds earlier. `cargo test`
+enforces the constants' relationship, but the deployment side is not
+machine-checked here — nothing in the process can observe its own timer.
+
+**Accepted residual**: a PUT that S3 commits after its client-side timeout is
+not detected. The local `status.json` remains the source of truth, the mirror
+self-corrects on the next cycle, and no economic or trading path reads the
+mirrored object.
+
+Raising `PUT_TIMEOUT`, adding retries around the PUT, scheduling a status
+writer more often than five minutes, or giving a second unit the `STATUS_S3_*`
+environment all invalidate this argument and require a real ordering mechanism
+— a mirror-scoped lock, or a conditional write — not a larger constant.
+
 Artifact installation, timer/unit creation, host start/restart, secret
 installation, funding, signing, submission, and live enablement remain
 separate explicit approval gates.

@@ -30,6 +30,30 @@ use tokio::time::timeout;
 
 /// Upper bound on one mirror PUT. See the doc comment on `put` for why
 /// this exists even after the caller has released its own locks.
+///
+/// This bound is also what keeps the mirror's write ordering safe
+/// (bot-strategy#920). The runtime deliberately releases its exclusive
+/// state-directory lock before awaiting this PUT, so two consecutive
+/// cycles' PUTs are not mutually excluded and a slow cycle N could in
+/// principle overwrite the newer object cycle N+1 already wrote. That
+/// interleaving needs cycle N's request to still be in flight when cycle
+/// N+1's completes, which cannot happen while this timeout stays far
+/// below the interval between cycles: the client abandons cycle N's
+/// request after this timeout, and cycle N+1 does not start until its
+/// schedule comes round — five minutes on the deployed
+/// `OnCalendar=*-*-* *:0/5:00` timer. Only one unit mirrors, so a key has
+/// a single writer rather than two racing ones:
+/// `hype-accumulator-dryrun.service` carries the `STATUS_S3_*`
+/// environment and the observer unit does not.
+///
+/// The deployment half of that argument cannot be checked here — nothing
+/// in this process can observe its own systemd timer — so it is pinned as
+/// an assertion in `put_timeout_cannot_outlive_a_cycle` and written down
+/// in `docs/runbooks/signer-free-runtime.md`. Raising this timeout, adding
+/// retries around the PUT, scheduling a status writer more often than five
+/// minutes, or giving a second unit the `STATUS_S3_*` environment all
+/// reopen the race and need an actual ordering mechanism — a mirror-scoped
+/// lock, or a conditional write — rather than a bigger constant here.
 const PUT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Error)]
@@ -108,6 +132,16 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    /// The shortest scheduling interval any deployment may run a status
+    /// writer at; the other half of `PUT_TIMEOUT`'s ordering argument.
+    /// Matches the deployed `OnCalendar=*-*-* *:0/5:00` timer.
+    const MIN_SUPPORTED_CYCLE_INTERVAL: Duration = Duration::from_secs(300);
+
+    /// How much shorter than a cycle one PUT attempt must stay. A PUT that
+    /// consumed a meaningful fraction of the interval would leave the
+    /// argument resting on timer accuracy alone.
+    const MIN_CYCLE_INTERVAL_SAFETY_FACTOR: u64 = 10;
+
     // Env var access must serialize: `from_env` reads process env vars,
     // and parallel test execution can otherwise see each other's
     // mutations. Recover from poisoning so a panic in one test does not
@@ -119,6 +153,27 @@ mod tests {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+
+    /// bot-strategy#920: the mirror's write ordering rests on an inequality
+    /// between these two constants rather than on a lock. Raising
+    /// `PUT_TIMEOUT`, or adding retries whose total budget exceeds it,
+    /// silently reopens the stale-write race unless a real ordering
+    /// mechanism comes with it — fail here rather than in production.
+    ///
+    /// A `const _: () = assert!(..)` in the module body would be stronger,
+    /// but the dead-code lint does not count a use inside one, so both
+    /// constants would then need an `#[allow(dead_code)]` that would also
+    /// hide genuinely unused constants later.
+    #[test]
+    fn put_timeout_cannot_outlive_a_cycle() {
+        assert!(
+            PUT_TIMEOUT.as_secs() * MIN_CYCLE_INTERVAL_SAFETY_FACTOR
+                <= MIN_SUPPORTED_CYCLE_INTERVAL.as_secs(),
+            "one PUT attempt ({PUT_TIMEOUT:?}) must stay at least \
+             {MIN_CYCLE_INTERVAL_SAFETY_FACTOR}x shorter than the shortest supported cycle \
+             interval ({MIN_SUPPORTED_CYCLE_INTERVAL:?}); see this module's ordering argument"
+        );
     }
 
     #[test]
