@@ -1505,8 +1505,27 @@ impl SecurityPolicy {
         Ok(())
     }
 
+    /// Validates live execution controls, including the capital invariant that
+    /// makes a purchase settleable at all: pacing must reserve at least as many
+    /// basis points as the worst-case purchase fee this policy authorizes.
+    ///
+    /// A decision commits `planned / (1 - reserve)` USDC, while the live probe
+    /// refuses to submit unless `limit_notional * (1 + fee_ceiling)` fits inside
+    /// that commitment (`PreparedIocOrder::from_action`), and `settle_decision`
+    /// rejects a `DebitExceedsCommitment` afterwards. With a reserve below the
+    /// fee ceiling both checks fail for every order size, so the mismatch is a
+    /// config error to surface at live-readiness time rather than a submission
+    /// that is rejected on the day. Requiring `reserve >= fee ceiling` is
+    /// slightly stricter than the exact `fee / (1 + fee)` threshold, which is
+    /// deliberate: it keeps the rule auditable by eye against the two values an
+    /// operator actually sets.
     fn validate_live_execution(&self, config: &Config) -> Result<(), SecurityPolicyError> {
         let execution = &self.wire.execution;
+        if execution.max_purchase_fee_bps > config.pacing.fee_spread_reserve_bps {
+            return invalid_policy(
+                "pacing.fee_spread_reserve_bps must be at least execution.max_purchase_fee_bps",
+            );
+        }
         if execution.max_slippage_bps != config.execution.max_slippage_bps
             || execution.max_purchase_fee_bps >= 10_000
             || execution.authorized_order_tif != AuthorizedOrderTif::Ioc

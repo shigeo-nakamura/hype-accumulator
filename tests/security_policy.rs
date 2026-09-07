@@ -1006,3 +1006,32 @@ fn designated_parent_funding_binds_the_source_and_rejects_inheritance_claims() {
     );
     assert!(cfg.parent_funding_route(&env).is_err());
 }
+
+#[test]
+fn purchase_fee_ceiling_above_the_pacing_reserve_fails_before_live() {
+    // Regression for bot-strategy#844: a decision commits
+    // `planned / (1 - fee_spread_reserve_bps)`, while the live probe refuses
+    // to submit unless `limit_notional * (1 + max_purchase_fee_bps)` fits
+    // inside that commitment. A fee ceiling above the reserve therefore makes
+    // every order unsubmittable and every settlement a
+    // `DebitExceedsCommitment`; that has to surface as a policy error at
+    // live-readiness time, not as a rejected submission on the launch day.
+    // The fixture pacing reserve is 25 bps.
+    let env = live_environment();
+    let over_reserved =
+        live_policy_template().replace("max_purchase_fee_bps = 5", "max_purchase_fee_bps = 26");
+    assert!(matches!(
+        config_with_policy(&over_reserved)
+            .expected_live_acknowledgement(&env, at("2026-08-24T00:00:00Z")),
+        Err(ConfigError::SecurityPolicy(SecurityPolicyError::Invalid(_)))
+    ));
+
+    // Equality is the boundary that must still be accepted: reserving exactly
+    // the authorized fee ceiling covers the worst case, because grossing up by
+    // `1 / (1 - r)` always exceeds a `1 + r` markup.
+    let exactly_reserved =
+        live_policy_template().replace("max_purchase_fee_bps = 5", "max_purchase_fee_bps = 25");
+    config_with_policy(&exactly_reserved)
+        .expected_live_acknowledgement(&env, at("2026-08-24T00:00:00Z"))
+        .expect("a fee ceiling equal to the pacing reserve is settleable");
+}
