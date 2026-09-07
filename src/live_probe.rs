@@ -450,14 +450,21 @@ async fn record_reconciliation(
         if observed_original_quantity != binding.order_envelope.original_quantity_hype {
             return Err(LiveProbeError::QuantityMismatch);
         }
-        // Side and time-in-force, read directly from the raw venue
-        // envelope (no market-metadata resolution needed for these two —
+        // Side, time-in-force, and limit price, read directly from the raw
+        // venue envelope (no market-metadata resolution needed for these —
         // unlike `coin`, which is venue-internal and not independently
         // verified here; see the module-level note on that residual gap).
         // Without this, `orderStatus` matching our CLOID and quantity but
-        // describing e.g. a sell or a resting GTC order would still be
-        // accepted as though it were the authorized HYPE IOC buy.
-        verify_observed_side_and_tif(&evidence.raw_order_status)?;
+        // describing e.g. a sell, a resting GTC order, or a different
+        // limit price would still be accepted as though it were the
+        // authorized HYPE IOC buy.
+        verify_observed_order_envelope(
+            &evidence.raw_order_status,
+            binding
+                .order_envelope
+                .limit_price_usdc_per_hype
+                .as_decimal(),
+        )?;
         // Never trusted merely because *some* exchange order ID was
         // already recorded: if a later lookup returns a *different* ID
         // than the one already durably bound to this workflow, that must
@@ -482,20 +489,12 @@ async fn record_reconciliation(
         // coverage once enough other account activity evicts its rows,
         // even though it genuinely filled. See
         // docs/runbooks/live-probe-recovery.md.
-        let workflow_id = workflow.state().workflow_id().to_string();
-        let accumulator_path = observed_fills_path(journal_path);
-        // Held across the whole read-merge-write sequence, released as
-        // soon as it goes out of scope at the end of this block — nothing
-        // past this point needs exclusivity (observe_order_fill/
-        // finalize_order are already protected by the journal's own lock).
-        let accumulator_lock = acquire_observed_fills_lock(&accumulator_path)?;
-        let mut accumulated_fills = load_observed_fills(&accumulator_path, &workflow_id)?;
-        merge_observed_fills(&mut accumulated_fills.fills, &evidence.fills)?;
-        accumulated_fills.content_hash =
-            observed_fills_content_hash(&workflow_id, &accumulated_fills.fills);
-        crate::status_io::write_private_json_atomic(&accumulator_path, &accumulated_fills)
-            .map_err(|error| LiveProbeError::ObservedFillsAccumulator(error.to_string()))?;
-        drop(accumulator_lock);
+        let accumulated_fills = merge_and_persist_observed_fills(
+            journal_path,
+            workflow.state().workflow_id(),
+            &exchange_order_id,
+            &evidence.fills,
+        )?;
         fills_complete =
             fills_cover_authoritative_quantity(&accumulated_fills.fills, evidence.filled_size)?;
 
@@ -716,9 +715,10 @@ fn accepted_at_from_raw_order_status(raw: &str) -> Result<DateTime<Utc>, LivePro
     DateTime::from_timestamp_millis(millis).ok_or(LiveProbeError::InvalidVenueTimestamp)
 }
 
-/// Verifies the raw venue envelope's own `side`/`tif` match the authorized
-/// buy IOC before any evidence built from it is trusted — confirmed real
-/// values (bot-strategy#901): `side: "B"` for buy, `tif: "Ioc"`.
+/// Verifies the raw venue envelope's own `side`/`tif`/`limitPx` match the
+/// authorized buy IOC at the authorized limit price before any evidence
+/// built from it is trusted — confirmed real values (bot-strategy#901):
+/// `side: "B"` for buy, `tif: "Ioc"`, `limitPx` as a plain decimal string.
 ///
 /// Deliberately does **not** verify `coin` (the venue-internal asset index,
 /// e.g. `"@1035"` — not a human-readable symbol) against the authorized
@@ -730,8 +730,12 @@ fn accepted_at_from_raw_order_status(raw: &str) -> Result<DateTime<Utc>, LivePro
 ///
 /// # Errors
 ///
-/// Returns an error for malformed JSON or a side/tif that doesn't match.
-fn verify_observed_side_and_tif(raw_order_status: &str) -> Result<(), LiveProbeError> {
+/// Returns an error for malformed JSON, or a side/tif/limit price that
+/// doesn't match.
+fn verify_observed_order_envelope(
+    raw_order_status: &str,
+    expected_limit_price_usdc_per_hype: Decimal,
+) -> Result<(), LiveProbeError> {
     let value: serde_json::Value = serde_json::from_str(raw_order_status)
         .map_err(|_| LiveProbeError::BindingMismatch("orderStatus JSON"))?;
     let order = value
@@ -743,11 +747,18 @@ fn verify_observed_side_and_tif(raw_order_status: &str) -> Result<(), LiveProbeE
     let tif = order
         .and_then(|order| order.get("tif"))
         .and_then(|v| v.as_str());
+    let limit_price = order
+        .and_then(|order| order.get("limitPx"))
+        .and_then(|v| v.as_str())
+        .and_then(|v| v.parse::<Decimal>().ok());
     if side != Some("B") {
         return Err(LiveProbeError::BindingMismatch("order side"));
     }
     if tif != Some("Ioc") {
         return Err(LiveProbeError::BindingMismatch("order time in force"));
+    }
+    if limit_price != Some(expected_limit_price_usdc_per_hype) {
+        return Err(LiveProbeError::BindingMismatch("order limit price"));
     }
     Ok(())
 }
@@ -783,6 +794,14 @@ struct ObservedFillsAccumulator {
     schema_version: u8,
     #[serde(default)]
     workflow_id: String,
+    /// Empty until the first successful merge binds it. Rejects a later
+    /// merge for a *different* exchange order ID even when the workflow
+    /// itself has no recorded `exchange_order_id` yet (e.g. a first
+    /// attempt wrote fills here but failed before
+    /// `observe_order_submission` persisted anything) — see
+    /// [`record_reconciliation`]'s ordering.
+    #[serde(default)]
+    exchange_order_id: String,
     #[serde(default)]
     content_hash: String,
     #[serde(default)]
@@ -845,15 +864,61 @@ fn acquire_observed_fills_lock(accumulator_path: &Path) -> Result<File, LiveProb
     }
 }
 
+/// Loads, binds/verifies, merges, and durably persists this call's fill
+/// rows into the observed-fills accumulator for `journal_path`, under an
+/// exclusive lock held for the whole sequence.
+///
+/// # Errors
+///
+/// Propagates lock, I/O, and merge errors, and rejects a `fills` batch for
+/// an `exchange_order_id` different from the one this accumulator was
+/// first bound to — independently of whether the *workflow* has recorded
+/// an exchange order ID yet, since a first attempt can write fills here
+/// and then fail before `observe_order_submission` ever persists anything.
+fn merge_and_persist_observed_fills(
+    journal_path: &Path,
+    workflow_id: &str,
+    exchange_order_id: &str,
+    fills: &[FilledOrder],
+) -> Result<ObservedFillsAccumulator, LiveProbeError> {
+    let accumulator_path = observed_fills_path(journal_path);
+    // Held across the whole read-merge-write sequence, released as soon as
+    // this function returns — nothing past that point needs exclusivity
+    // (observe_order_fill/finalize_order are already protected by the
+    // journal's own lock).
+    let lock = acquire_observed_fills_lock(&accumulator_path)?;
+    let mut accumulated = load_observed_fills(&accumulator_path, workflow_id)?;
+    if accumulated.exchange_order_id.is_empty() {
+        accumulated.exchange_order_id = exchange_order_id.to_string();
+    } else if accumulated.exchange_order_id != exchange_order_id {
+        return Err(LiveProbeError::BindingMismatch(
+            "exchange order ID (accumulator)",
+        ));
+    }
+    merge_observed_fills(&mut accumulated.fills, fills)?;
+    accumulated.content_hash = observed_fills_content_hash(
+        workflow_id,
+        &accumulated.exchange_order_id,
+        &accumulated.fills,
+    );
+    crate::status_io::write_private_json_atomic(&accumulator_path, &accumulated)
+        .map_err(|error| LiveProbeError::ObservedFillsAccumulator(error.to_string()))?;
+    drop(lock);
+    Ok(accumulated)
+}
+
 /// Deterministic digest binding a workflow identity to its exact fill
 /// contents. `BTreeMap` iterates in sorted key order, so this is stable
 /// across process restarts regardless of insertion order.
 fn observed_fills_content_hash(
     workflow_id: &str,
+    exchange_order_id: &str,
     fills: &BTreeMap<String, AccumulatedFill>,
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(workflow_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(exchange_order_id.as_bytes());
     for (trade_id, fill) in fills {
         hasher.update([0]);
         hasher.update(trade_id.as_bytes());
@@ -890,7 +955,11 @@ fn load_observed_fills(
                 ));
             }
             if accumulator.content_hash
-                != observed_fills_content_hash(workflow_id, &accumulator.fills)
+                != observed_fills_content_hash(
+                    workflow_id,
+                    &accumulator.exchange_order_id,
+                    &accumulator.fills,
+                )
             {
                 return Err(LiveProbeError::ObservedFillsAccumulator(
                     "observed-fills record content hash does not match its own contents".into(),
@@ -902,7 +971,8 @@ fn load_observed_fills(
             Ok(ObservedFillsAccumulator {
                 schema_version: OBSERVED_FILLS_SCHEMA_VERSION,
                 workflow_id: workflow_id.to_string(),
-                content_hash: observed_fills_content_hash(workflow_id, &BTreeMap::new()),
+                exchange_order_id: String::new(),
+                content_hash: observed_fills_content_hash(workflow_id, "", &BTreeMap::new()),
                 fills: BTreeMap::new(),
             })
         }
@@ -1567,7 +1637,7 @@ mod tests {
         let partially_filled = serde_json::json!({
             "status": "order",
             "order": {
-                "order": {"oid": 7, "origSz": "1", "sz": "0.5", "side": "B", "tif": "Ioc", "timestamp": accepted_at_ms},
+                "order": {"oid": 7, "origSz": "1", "sz": "0.5", "side": "B", "tif": "Ioc", "limitPx": "25.0", "timestamp": accepted_at_ms},
                 "status": "open",
                 "statusTimestamp": accepted_at_ms
             }
@@ -1603,7 +1673,7 @@ mod tests {
         let fully_filled = serde_json::json!({
             "status": "order",
             "order": {
-                "order": {"oid": 7, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "timestamp": accepted_at_ms},
+                "order": {"oid": 7, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "limitPx": "25.0", "timestamp": accepted_at_ms},
                 "status": "filled",
                 "statusTimestamp": fixture_at(21).timestamp_millis()
             }
@@ -1661,7 +1731,7 @@ mod tests {
         let canceled_unfilled = serde_json::json!({
             "status": "order",
             "order": {
-                "order": {"oid": 7, "origSz": "1", "sz": "1", "side": "B", "tif": "Ioc", "timestamp": accepted_at_ms},
+                "order": {"oid": 7, "origSz": "1", "sz": "1", "side": "B", "tif": "Ioc", "limitPx": "25.0", "timestamp": accepted_at_ms},
                 "status": "canceled",
                 "statusTimestamp": accepted_at_ms
             }
@@ -1789,6 +1859,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_a_venue_reported_limit_price_that_does_not_match_the_authorized_order() {
+        // Regression test for a real Codex review finding:
+        // `AuthenticatedOrderSubmission.limit_price_usdc_per_hype` was
+        // copied from the authorized binding rather than compared with the
+        // venue response, so a mismatched limit price would still be
+        // recorded (and could even finalize) as though it were the
+        // authorized order.
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connector = unsigned_connector(format!("http://{}", listener.local_addr().unwrap()));
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let mut workflow = open_test_workflow(temp.path(), &binding);
+        workflow.prepare_order(fixture_at(2)).unwrap();
+
+        // Authorized limit price is 25.0 (decision_binding's
+        // limit_price_usdc_per_hype); this venue response reports 30.0.
+        let accepted_at_ms = fixture_at(5).timestamp_millis();
+        let wrong_price = serde_json::json!({
+            "status": "order",
+            "order": {
+                "order": {"oid": 7, "origSz": "1", "sz": "1", "side": "B", "tif": "Ioc", "limitPx": "30.0", "timestamp": accepted_at_ms},
+                "status": "open",
+                "statusTimestamp": accepted_at_ms
+            }
+        });
+        let no_fills = serde_json::json!([]);
+        let server = spawn_reconcile_responder(listener, wrong_price, no_fills, false);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reconcile_prepared_order(
+                &connector,
+                &mut workflow,
+                &test_journal_path(temp.path()),
+                fixture_at(20),
+            ),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(LiveProbeError::BindingMismatch("order limit price"))
+        ));
+        assert!(workflow.state().exchange_order_id().is_none());
+    }
+
+    #[tokio::test]
     async fn rejects_an_exchange_order_id_change_before_touching_the_fill_accumulator() {
         // Regression test for a real Codex review finding: the
         // exchange-order-ID consistency check must run *before* merging
@@ -1811,7 +1932,7 @@ mod tests {
         let first_order = serde_json::json!({
             "status": "order",
             "order": {
-                "order": {"oid": 7, "origSz": "1", "sz": "0.5", "side": "B", "tif": "Ioc", "timestamp": accepted_at_ms},
+                "order": {"oid": 7, "origSz": "1", "sz": "0.5", "side": "B", "tif": "Ioc", "limitPx": "25.0", "timestamp": accepted_at_ms},
                 "status": "open",
                 "statusTimestamp": accepted_at_ms
             }
@@ -1846,7 +1967,7 @@ mod tests {
         let different_order = serde_json::json!({
             "status": "order",
             "order": {
-                "order": {"oid": 99, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "timestamp": accepted_at_ms},
+                "order": {"oid": 99, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "limitPx": "25.0", "timestamp": accepted_at_ms},
                 "status": "filled",
                 "statusTimestamp": accepted_at_ms
             }
@@ -1880,6 +2001,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accumulator_rejects_a_different_order_even_when_the_workflow_has_not_recorded_one_yet()
+    {
+        // Regression test for a real Codex review finding: a first attempt
+        // can merge fills into the accumulator and then fail *before*
+        // observe_order_submission ever persists an exchange_order_id on
+        // the workflow — leaving workflow.state().exchange_order_id() at
+        // None. Without binding the accumulator itself to the exchange
+        // order ID it was first written for, a retry resolving to a
+        // *different* order would sail past the workflow-level check
+        // (nothing recorded yet to compare against) and merge a different
+        // order's fills into the same accumulator.
+        let temp = tempfile::tempdir().unwrap();
+        let connector = unsigned_connector("http://127.0.0.1:1".to_owned());
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let workflow = open_test_workflow(temp.path(), &binding);
+        // Simulates a first attempt that merged order 7's fills into the
+        // accumulator but never reached observe_order_submission.
+        let accumulator_path = observed_fills_path(&test_journal_path(temp.path()));
+        let workflow_id = workflow.state().workflow_id().to_string();
+        let mut accumulator = load_observed_fills(&accumulator_path, &workflow_id).unwrap();
+        accumulator.exchange_order_id = "7".to_string();
+        merge_observed_fills(
+            &mut accumulator.fills,
+            &[raw_fill("1", "0.5", "12.5", "0.01")],
+        )
+        .unwrap();
+        accumulator.content_hash = observed_fills_content_hash(
+            &workflow_id,
+            &accumulator.exchange_order_id,
+            &accumulator.fills,
+        );
+        crate::status_io::write_private_json_atomic(&accumulator_path, &accumulator).unwrap();
+        assert!(workflow.state().exchange_order_id().is_none());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connector = unsigned_connector(format!("http://{}", listener.local_addr().unwrap()));
+        // Re-derive the binding against the new connector's identity, and
+        // re-open the same journal so the workflow_id (and thus the
+        // accumulator path) stays identical.
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let mut workflow = open_test_workflow(temp.path(), &binding);
+        workflow.prepare_order(fixture_at(2)).unwrap();
+
+        let accepted_at_ms = fixture_at(5).timestamp_millis();
+        let different_order = serde_json::json!({
+            "status": "order",
+            "order": {
+                "order": {"oid": 99, "origSz": "1", "sz": "0.5", "side": "B", "tif": "Ioc", "limitPx": "25.0", "timestamp": accepted_at_ms},
+                "status": "open",
+                "statusTimestamp": accepted_at_ms
+            }
+        });
+        let different_fill = serde_json::json!([{
+            "coin": "@1", "px": "25", "sz": "0.5", "side": "B", "time": 2_000,
+            "oid": 99, "tid": 2, "fee": "0.01", "feeToken": "USDC"
+        }]);
+        let server = spawn_reconcile_responder(listener, different_order, different_fill, false);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reconcile_prepared_order(
+                &connector,
+                &mut workflow,
+                &test_journal_path(temp.path()),
+                fixture_at(20),
+            ),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(LiveProbeError::BindingMismatch(
+                "exchange order ID (accumulator)"
+            ))
+        ));
+    }
+
+    #[tokio::test]
     async fn accepted_at_ahead_of_the_local_clock_does_not_block_recording() {
         // Regression test for a real Codex review finding: the venue clock
         // is permitted to run ahead of the local clock (up to the order
@@ -1903,7 +2110,7 @@ mod tests {
         let filled = serde_json::json!({
             "status": "order",
             "order": {
-                "order": {"oid": 7, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "timestamp": accepted_at_ms},
+                "order": {"oid": 7, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "limitPx": "25.0", "timestamp": accepted_at_ms},
                 "status": "filled",
                 "statusTimestamp": accepted_at_ms
             }
@@ -1957,7 +2164,7 @@ mod tests {
         let filled = serde_json::json!({
             "status": "order",
             "order": {
-                "order": {"oid": 7, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "timestamp": accepted_at_ms},
+                "order": {"oid": 7, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "limitPx": "25.0", "timestamp": accepted_at_ms},
                 "status": "filled",
                 "statusTimestamp": accepted_at_ms
             }
@@ -2008,7 +2215,7 @@ mod tests {
         let filled = serde_json::json!({
             "status": "order",
             "order": {
-                "order": {"oid": 7, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "timestamp": accepted_at_ms},
+                "order": {"oid": 7, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "limitPx": "25.0", "timestamp": accepted_at_ms},
                 "status": "filled",
                 "statusTimestamp": accepted_at_ms
             }
@@ -2057,7 +2264,7 @@ mod tests {
         let filled = serde_json::json!({
             "status": "order",
             "order": {
-                "order": {"oid": 7, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "timestamp": accepted_at_ms},
+                "order": {"oid": 7, "origSz": "1", "sz": "0", "side": "B", "tif": "Ioc", "limitPx": "25.0", "timestamp": accepted_at_ms},
                 "status": "filled",
                 "statusTimestamp": accepted_at_ms
             }
@@ -2521,7 +2728,8 @@ mod tests {
             &[raw_fill("1", "0.3", "10.692", "0.0075")],
         )
         .unwrap();
-        accumulator.content_hash = observed_fills_content_hash("workflow-a", &accumulator.fills);
+        accumulator.content_hash =
+            observed_fills_content_hash("workflow-a", "", &accumulator.fills);
         crate::status_io::write_private_json_atomic(&path, &accumulator).unwrap();
 
         let reloaded = load_observed_fills(&path, "workflow-a").unwrap();
@@ -2542,7 +2750,8 @@ mod tests {
             &[raw_fill("1", "0.3", "10.692", "0.0075")],
         )
         .unwrap();
-        accumulator.content_hash = observed_fills_content_hash("workflow-a", &accumulator.fills);
+        accumulator.content_hash =
+            observed_fills_content_hash("workflow-a", "", &accumulator.fills);
         crate::status_io::write_private_json_atomic(&path, &accumulator).unwrap();
 
         assert!(matches!(
@@ -2565,7 +2774,8 @@ mod tests {
             &[raw_fill("1", "0.3", "10.692", "0.0075")],
         )
         .unwrap();
-        accumulator.content_hash = observed_fills_content_hash("workflow-a", &accumulator.fills);
+        accumulator.content_hash =
+            observed_fills_content_hash("workflow-a", "", &accumulator.fills);
         crate::status_io::write_private_json_atomic(&path, &accumulator).unwrap();
 
         // Hand-tamper the notional without updating the stored hash.
