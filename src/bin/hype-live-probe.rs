@@ -230,6 +230,12 @@ impl PrepareTimeBinding {
 /// `aggregate_terminal_residual_hype` then silently scans only the new,
 /// likely-empty directory — the live-balance upper bound cannot detect
 /// this undercount, since it only ever rejects a total that's too large.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryInitialization {
+    FirstEver,
+    AlreadyInitialized,
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct HistoryDirectoryBinding {
     history_directory: String,
@@ -244,10 +250,15 @@ impl HistoryDirectoryBinding {
 
     /// Durably writes the binding on first use, or verifies an existing one
     /// still matches.
+    /// Returns whether history for this `operational_params_path` was
+    /// already initialized before this call, so the caller can tell a
+    /// genuinely first-ever `prepare` (no directory yet is normal) apart
+    /// from one that already succeeded before (no directory now means it
+    /// was lost, not that it never existed).
     fn write_once_and_verify(
         operational_params_path: &str,
         history_directory: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<HistoryInitialization, Box<dyn std::error::Error>> {
         let path = Self::path(operational_params_path);
         let current = Self {
             history_directory: history_directory.to_owned(),
@@ -265,10 +276,10 @@ impl HistoryDirectoryBinding {
                 )
                 .into());
             }
-            return Ok(());
+            return Ok(HistoryInitialization::AlreadyInitialized);
         }
         fs::write(&path, serde_json::to_string_pretty(&current)?)?;
-        Ok(())
+        Ok(HistoryInitialization::FirstEver)
     }
 }
 
@@ -413,11 +424,12 @@ async fn prepare(
     // operator later editing operational.toml's history_directory would
     // otherwise go undetected, and the next prepare would silently
     // aggregate from an empty new location instead of failing closed.
-    HistoryDirectoryBinding::write_once_and_verify(
+    let history_initialization = HistoryDirectoryBinding::write_once_and_verify(
         operational_params_path,
         &operational.history_directory,
     )?;
     let journal_directory = PathBuf::from(&operational.history_directory);
+    ensure_history_directory_available(history_initialization, &journal_directory)?;
     validate_journal_path(journal_path, &journal_directory)?;
     // Fixes the network this journal is bound to before anything else reads
     // `config`/`operational` for a network-dependent value: refuses to
@@ -729,6 +741,33 @@ fn build_prepare_policies(
     (envelope_policy, eligibility_policy)
 }
 
+/// A missing `journal_directory` is only ever the normal state before this
+/// account's genuinely first-ever `prepare` (aggregation then correctly
+/// treats it as zero historical journals). Once history has been
+/// initialized before, its disappearance — deleted, unmounted, unavailable
+/// storage — must fail closed: silently proceeding would let
+/// `open_or_create` recreate an empty directory and every prior residual
+/// allocation vanish from aggregation without a trace, since the
+/// live-balance check only ever rejects a total that's too large, never
+/// one that's suspiciously small.
+fn ensure_history_directory_available(
+    history_initialization: HistoryInitialization,
+    journal_directory: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if history_initialization == HistoryInitialization::AlreadyInitialized
+        && !journal_directory.is_dir()
+    {
+        return Err(format!(
+            "history_directory {} was already initialized for this account but does not exist \
+             (deleted, unmounted, or unavailable?); refusing to silently start aggregating from \
+             an empty directory. Restore it before running prepare again.",
+            journal_directory.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// `DurableWorkflow::aggregate_terminal_residual_hype` only ever
 /// rediscovers a `.jsonl` journal directly inside one stable directory. A
 /// journal with any other extension would complete normally today but
@@ -868,25 +907,28 @@ async fn build_signed_connector(
 mod tests {
     use super::{
         invocation, network_routing_admissible_for, validate_journal_path, HistoryDirectoryBinding,
-        Invocation, PrepareTimeBinding,
+        HistoryInitialization, Invocation, PrepareTimeBinding,
     };
     use std::path::Path;
 
     #[test]
-    fn history_directory_binding_write_once_is_idempotent_for_the_same_value() {
+    fn history_directory_binding_distinguishes_first_ever_from_already_initialized() {
         let directory = tempfile::tempdir().expect("temp dir");
         let operational_params_path = directory.path().join("operational.toml");
         let operational_params_path = operational_params_path.to_str().expect("utf8 path");
-        HistoryDirectoryBinding::write_once_and_verify(
+        let first = HistoryDirectoryBinding::write_once_and_verify(
             operational_params_path,
             "/opt/hype-accumulator/journals",
         )
         .expect("first write");
-        HistoryDirectoryBinding::write_once_and_verify(
+        assert_eq!(first, HistoryInitialization::FirstEver);
+
+        let second = HistoryDirectoryBinding::write_once_and_verify(
             operational_params_path,
             "/opt/hype-accumulator/journals",
         )
         .expect("matching re-verify");
+        assert_eq!(second, HistoryInitialization::AlreadyInitialized);
     }
 
     #[test]
@@ -915,6 +957,35 @@ mod tests {
             "/opt/hype-accumulator/journals",
         )
         .expect("original value still verifies");
+    }
+
+    #[test]
+    fn ensure_history_directory_available_only_requires_the_directory_when_already_initialized() {
+        use super::ensure_history_directory_available;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let missing = temp.path().join("does-not-exist");
+
+        // A genuinely first-ever prepare finding no directory yet is normal.
+        assert!(
+            ensure_history_directory_available(HistoryInitialization::FirstEver, &missing).is_ok()
+        );
+
+        // Once history was already initialized before, the same missing
+        // directory must fail closed rather than silently restart empty.
+        assert!(ensure_history_directory_available(
+            HistoryInitialization::AlreadyInitialized,
+            &missing,
+        )
+        .is_err());
+
+        // An existing directory always passes, regardless of
+        // initialization state.
+        assert!(ensure_history_directory_available(
+            HistoryInitialization::AlreadyInitialized,
+            temp.path(),
+        )
+        .is_ok());
     }
 
     #[test]
