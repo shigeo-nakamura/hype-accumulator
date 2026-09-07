@@ -78,7 +78,9 @@ must not have delete access to both boundaries. A single bucket with different
 prefixes is rejected because it does not prove an independent protected-anchor
 boundary.
 
-After separately approving the AWS target and action, upload with:
+After separately approving the AWS target and action, resolve and record the
+verifier exactly once (see "Every path argument" below for why), then upload
+with:
 
 ```text
 python3 scripts/ledger_backup_transfer.py \
@@ -88,7 +90,7 @@ python3 scripts/ledger_backup_transfer.py \
   --bundle <absolute-new-bundle-directory> \
   --anchor <absolute-new-anchor-export> \
   --receipt <absolute-new-private-receipt.json> \
-  --verifier <absolute-resolved-hype-accumulator-binary> \
+  --verifier "$VERIFIER" \
   --payload-bucket <versioned-payload-bucket> \
   --payload-owner <12-digit-account-id> \
   --payload-kms-key <full-payload-kms-key-arn> \
@@ -120,26 +122,28 @@ ancestor directories that are not group/world writable.
 
 Every path argument is rejected if it contains a symlink component, the
 verifier included. A deployment that publishes its current release through a
-symlink must therefore pass the resolved release path, not the symlink:
-
-```text
---verifier "$(readlink -f <install-root>/current/hype-accumulator)"
-```
-
-Passing the symlink fails with `verifier binary must not contain aliases or
-symlink components`.
-
+symlink must therefore pass the resolved release path, not the symlink.
 Resolving the symlink pins the executable for that invocation, but nothing
 persists which release it was: the receipt records the backup ID and the S3
 object details, not the verifier, and shell history keeps the unexpanded
-`$(readlink -f ...)` text rather than what it resolved to. To be able to audit
-which build verified a backup, record the resolved path and its digest in the
-private operator evidence next to the backup ID:
+`$(readlink -f ...)` text rather than what it resolved to. `current` can also
+be re-activated or rolled back between separate commands, so resolving it
+twice -- once to pass `--verifier`, again later to record evidence -- risks
+attributing the recorded digest to a different release than the one that
+actually ran. Resolve it exactly once into a variable, and use that same
+variable for both the transfer command and the evidence:
 
 ```text
 VERIFIER="$(readlink -f <install-root>/current/hype-accumulator)"
 printf '%s\n' "$VERIFIER"; sha256sum "$VERIFIER"
 ```
+
+Passing the symlink itself instead of `"$VERIFIER"` fails with `verifier
+binary must not contain aliases or symlink components`. Record the resolved
+path and its digest in the private operator evidence next to the backup ID,
+then pass `--verifier "$VERIFIER"` (not a fresh `$(readlink -f ...)`) to the
+upload command below, so the evidence and the invocation are guaranteed to
+name the exact same file.
 
 Full replay and S3 `put-object`/`get-object` transfers have no wall-clock
 timeout by default, so backup size or recovery-host bandwidth alone cannot
@@ -160,7 +164,10 @@ closed; an interrupted upload must be inspected/aborted before retry.
 
 ## Clean-directory restore drill
 
-Download every exact version from the private receipt into a new local root:
+Download every exact version from the private receipt into a new local root.
+Resolve and record `$VERIFIER` again for this run (see "Every path argument"
+above) -- the release verifying a restore is not necessarily the one that
+verified the original backup -- then:
 
 ```text
 python3 scripts/ledger_backup_transfer.py \
@@ -169,7 +176,7 @@ python3 scripts/ledger_backup_transfer.py \
   download \
   --receipt <absolute-private-receipt.json> \
   --destination-root <absolute-new-download-root> \
-  --verifier <absolute-resolved-hype-accumulator-binary>
+  --verifier "$VERIFIER"
 ```
 
 The destination parent and its ancestor chain must be root/operator controlled
