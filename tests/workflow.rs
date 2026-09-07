@@ -4904,6 +4904,117 @@ fn aggregate_terminal_residual_hype_excludes_hype_already_delegated_to_staking()
 }
 
 #[test]
+fn terminal_staking_eligibility_subtracts_residual_consumed_by_recorded_movements() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("movement.jsonl");
+    let mut binding = binding();
+    binding.decision_id = distinct_decision_id(&path);
+    binding.inventory_before.spot_hype_atoms = hype(10);
+    binding.inventory_before.unconsumed_residual_spot_hype_atoms = hype(0);
+    binding.inventory_before.configured_residual_hype_atoms = hype(10);
+    let mut workflow = reopen(&path, &binding);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
+    workflow
+        .observe_order_fill(
+            "fill",
+            hype(10),
+            usdc(2_000_000),
+            usdc(2_010_000),
+            false,
+            at(3),
+        )
+        .expect("fill observed");
+    workflow
+        .finalize_order(
+            hype(10),
+            usdc(2_000_000),
+            usdc(2_010_000),
+            OrderFinality::Canceled,
+            at(4),
+        )
+        .expect("order finalized");
+    let mut evidence = bound_evidence(&workflow, &[("fill", 10, 3)], at(5));
+    evidence.movements.push(BoundMovementEvidence {
+        movement_id: "movement-a".to_owned(),
+        consumed_hype: hype(4),
+        occurred_at: at(4),
+    });
+    let eligibility = workflow
+        .record_staking_eligibility(Some(evidence), at(5))
+        .expect("eligibility recorded despite the recorded residual-consuming movement");
+    // The raw split conserves purchased HYPE, unaffected by the movement...
+    assert_eq!(eligibility.residual_hype, hype(10));
+    assert_eq!(eligibility.eligible_hype, hype(0));
+    workflow.complete(at(6)).expect("workflow completed");
+
+    // ...but the terminal, aggregation-safe view nets out what the
+    // movement already consumed.
+    let terminal = workflow
+        .state()
+        .terminal_staking_eligibility()
+        .expect("complete workflow has terminal eligibility");
+    assert_eq!(terminal.residual_hype, hype(6));
+    assert_eq!(terminal.eligible_hype, hype(0));
+}
+
+#[test]
+fn aggregate_terminal_residual_hype_reconciles_using_movement_adjusted_residual() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("day-1.jsonl");
+    let mut binding = binding();
+    binding.decision_id = distinct_decision_id(&path);
+    binding.inventory_before.spot_hype_atoms = hype(10);
+    binding.inventory_before.unconsumed_residual_spot_hype_atoms = hype(0);
+    binding.inventory_before.configured_residual_hype_atoms = hype(10);
+    let mut workflow = reopen(&path, &binding);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
+    workflow
+        .observe_order_fill(
+            "fill",
+            hype(10),
+            usdc(2_000_000),
+            usdc(2_010_000),
+            false,
+            at(3),
+        )
+        .expect("fill observed");
+    workflow
+        .finalize_order(
+            hype(10),
+            usdc(2_000_000),
+            usdc(2_010_000),
+            OrderFinality::Canceled,
+            at(4),
+        )
+        .expect("order finalized");
+    let mut evidence = bound_evidence(&workflow, &[("fill", 10, 3)], at(5));
+    evidence.movements.push(BoundMovementEvidence {
+        movement_id: "movement-a".to_owned(),
+        consumed_hype: hype(4),
+        occurred_at: at(4),
+    });
+    workflow
+        .record_staking_eligibility(Some(evidence), at(5))
+        .expect("eligibility recorded");
+    workflow.complete(at(6)).expect("workflow completed");
+    drop(workflow);
+
+    // A live balance of 6 — exactly the movement-adjusted residual, not
+    // the raw 10 — must reconcile.
+    let aggregated = DurableWorkflow::aggregate_terminal_residual_hype(
+        temp.path(),
+        None,
+        hype(6),
+        "signer-identity-hash-a",
+        &memory_protected_head_store_for,
+    )
+    .expect("aggregation uses the movement-adjusted residual, not the raw split");
+    assert_eq!(aggregated, hype(6));
+}
+
+#[test]
 fn terminal_staking_eligibility_is_none_before_complete_and_some_after() {
     let temp = tempfile::tempdir().expect("temp directory");
     let path = temp.path().join("terminal-eligibility.jsonl");

@@ -730,6 +730,8 @@ pub struct WorkflowState {
     debited_usdc: UsdcMicros,
     residual_hype: HypeAtoms,
     staking_eligible_hype: HypeAtoms,
+    #[serde(default)]
+    residual_consumed_by_movements_hype: HypeAtoms,
     eligibility_workflow_id: Option<String>,
     staking_target_hype: HypeAtoms,
     #[serde(default)]
@@ -828,8 +830,10 @@ impl WorkflowState {
         }
     }
 
-    /// Returns this workflow's residual/eligible HYPE split only once it is
-    /// durably terminal (`stage() == WorkflowStage::Complete`).
+    /// Returns this workflow's residual/eligible HYPE split, net of any
+    /// residual HYPE a bound movement already recorded as consumed (e.g. a
+    /// sale) before eligibility was recorded, only once it is durably
+    /// terminal (`stage() == WorkflowStage::Complete`).
     ///
     /// `residual_hype`/`staking_eligible_hype` are set once, at
     /// `StakingEligibilityRecorded`, and never change again — but a
@@ -837,13 +841,20 @@ impl WorkflowState {
     /// not yet had its split reconciled to conclusion and must not be
     /// counted as HYPE left behind by a finished day. Returns `None`
     /// otherwise; callers aggregating across historical journals must treat
-    /// that as fail-closed, not as zero.
+    /// that as fail-closed, not as zero. Use [`Self::staking_eligibility`]
+    /// instead for the raw, pre-movement split.
     #[must_use]
-    pub const fn terminal_staking_eligibility(&self) -> Option<StakingEligibility> {
+    pub fn terminal_staking_eligibility(&self) -> Option<StakingEligibility> {
         if !matches!(self.stage, WorkflowStage::Complete) {
             return None;
         }
-        Some(self.staking_eligibility())
+        Some(StakingEligibility {
+            residual_hype: self
+                .residual_hype
+                .checked_sub(self.residual_consumed_by_movements_hype)
+                .unwrap_or_default(),
+            eligible_hype: self.staking_eligible_hype,
+        })
     }
 
     #[must_use]
@@ -913,6 +924,7 @@ impl WorkflowState {
             debited_usdc: UsdcMicros::from_micros(0),
             residual_hype: HypeAtoms::default(),
             staking_eligible_hype: HypeAtoms::default(),
+            residual_consumed_by_movements_hype: HypeAtoms::default(),
             eligibility_workflow_id: None,
             staking_target_hype: HypeAtoms::default(),
             staking_confirmed_hype: HypeAtoms::default(),
@@ -1134,8 +1146,24 @@ impl WorkflowState {
                         "eligibility workflow identity does not match its complete evidence".into(),
                     ));
                 }
+                // Validated above (`validate_eligibility_evidence` ->
+                // `validate_bound_movements`) to never exceed
+                // `residual_hype`, but recomputed independently here rather
+                // than trusted from that pass, matching this transition's
+                // own re-derive-everything style.
+                let consumed_by_movements = match evidence.as_deref() {
+                    None => Some(0_u64),
+                    Some(evidence) => evidence.movements.iter().try_fold(0_u64, |sum, movement| {
+                        sum.checked_add(movement.consumed_hype.as_atoms())
+                    }),
+                }
+                .map(HypeAtoms::from_atoms)
+                .ok_or_else(|| {
+                    WorkflowError::CorruptJournal("residual movement consumption overflowed".into())
+                })?;
                 self.residual_hype = *residual_hype;
                 self.staking_eligible_hype = *eligible_hype;
+                self.residual_consumed_by_movements_hype = consumed_by_movements;
                 self.eligibility_workflow_id = Some(eligibility_workflow_id.clone());
                 self.stage = WorkflowStage::StakingEligibilityRecorded;
             }
