@@ -62,6 +62,10 @@ impl HypeAtoms {
     fn checked_sub(self, other: Self) -> Option<Self> {
         self.0.checked_sub(other.0).map(Self)
     }
+
+    fn checked_add(self, other: Self) -> Option<Self> {
+        self.0.checked_add(other.0).map(Self)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -821,6 +825,24 @@ impl WorkflowState {
             residual_hype: self.residual_hype,
             eligible_hype: self.staking_eligible_hype,
         }
+    }
+
+    /// Returns this workflow's residual/eligible HYPE split only once it is
+    /// durably terminal (`stage() == WorkflowStage::Complete`).
+    ///
+    /// `residual_hype`/`staking_eligible_hype` are set once, at
+    /// `StakingEligibilityRecorded`, and never change again — but a
+    /// non-terminal workflow (mid-flight, or stuck in `ManualReview`) has
+    /// not yet had its split reconciled to conclusion and must not be
+    /// counted as HYPE left behind by a finished day. Returns `None`
+    /// otherwise; callers aggregating across historical journals must treat
+    /// that as fail-closed, not as zero.
+    #[must_use]
+    pub const fn terminal_staking_eligibility(&self) -> Option<StakingEligibility> {
+        if !matches!(self.stage, WorkflowStage::Complete) {
+            return None;
+        }
+        Some(self.staking_eligibility())
     }
 
     #[must_use]
@@ -2552,6 +2574,126 @@ impl DurableWorkflow {
             .collect::<Vec<_>>();
         let state = WorkflowState::replay(&events)?;
         Ok(Some(state.binding))
+    }
+
+    /// Reads and replays one workflow journal's full state, without a lock
+    /// or protected-head verification.
+    ///
+    /// This is a read-only historical peek, not a live open: it never
+    /// acquires the append lock, never checks the independently protected
+    /// head anchor, and never reconciles exchange order/fill ownership — it
+    /// is only safe to use for aggregating already-durable, immutable
+    /// history (see [`Self::aggregate_terminal_residual_hype`]), never as a
+    /// substitute for [`Self::open_or_create`] before appending to a
+    /// journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a truncated or hash-invalid journal. Returns
+    /// `Ok(None)` when the journal does not yet exist or is empty.
+    pub fn peek_state(path: impl AsRef<Path>) -> Result<Option<WorkflowState>, WorkflowError> {
+        let records = load_records(path.as_ref())?;
+        if records.is_empty() {
+            return Ok(None);
+        }
+        let events = records
+            .iter()
+            .map(|record| record.event.clone())
+            .collect::<Vec<_>>();
+        Ok(Some(WorkflowState::replay(&events)?))
+    }
+
+    /// Sums the terminal residual HYPE left behind by every completed
+    /// workflow journal in `journal_directory`, then reconciles that sum
+    /// against a live spot balance read.
+    ///
+    /// Every regular file directly in `journal_directory` whose name ends
+    /// in `.jsonl` is treated as a workflow journal (this codebase's own
+    /// sidecar files — checkpoints, locks, pending-append markers, the
+    /// observed-fills accumulator, the owner store — never use that
+    /// extension, so this cannot mistake one for a journal). `exclude_path`,
+    /// when given, is skipped by file name and should be the caller's own
+    /// in-flight journal for today's decision, which is never "past".
+    ///
+    /// Fails closed rather than guessing: a journal found in the directory
+    /// that is not yet `Complete` is an error, not a skip (its split has
+    /// not been reconciled to conclusion) and an aggregated sum that
+    /// exceeds the live spot balance is also an error (evidence the sum, the
+    /// balance read, or a journal's own history is wrong).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `journal_directory` cannot be read, if any
+    /// journal in it is corrupt, missing its terminal residual/eligible
+    /// split, or overflows on summation, or if the aggregated total exceeds
+    /// `live_spot_hype_atoms`.
+    pub fn aggregate_terminal_residual_hype(
+        journal_directory: &Path,
+        exclude_path: Option<&Path>,
+        live_spot_hype_atoms: HypeAtoms,
+    ) -> Result<HypeAtoms, WorkflowError> {
+        let exclude_name = exclude_path.and_then(Path::file_name);
+        let mut journal_paths = Vec::new();
+        let entries = match fs::read_dir(journal_directory) {
+            Ok(entries) => entries,
+            // No directory yet means no historical journals yet — this is
+            // the normal state before this execution account's very first
+            // workflow, not a corrupt or unreadable one.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(HypeAtoms::from_atoms(0));
+            }
+            Err(error) => return Err(WorkflowError::io(error)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(WorkflowError::io)?;
+            let path = entry.path();
+            let file_type = entry.file_type().map_err(WorkflowError::io)?;
+            if !file_type.is_file() {
+                continue;
+            }
+            if path.extension().and_then(std::ffi::OsStr::to_str) != Some("jsonl") {
+                continue;
+            }
+            if exclude_name.is_some() && path.file_name() == exclude_name {
+                continue;
+            }
+            journal_paths.push(path);
+        }
+        journal_paths.sort();
+
+        let mut aggregated = HypeAtoms::from_atoms(0);
+        for path in &journal_paths {
+            let Some(state) = Self::peek_state(path)? else {
+                continue;
+            };
+            let Some(eligibility) = state.terminal_staking_eligibility() else {
+                return Err(WorkflowError::NonTerminalHistoricalJournal(format!(
+                    "{}: workflow {} has not reached a terminal stage (stage={:?})",
+                    path.display(),
+                    state.workflow_id(),
+                    state.stage()
+                )));
+            };
+            aggregated = aggregated
+                .checked_add(eligibility.residual_hype)
+                .ok_or_else(|| {
+                    WorkflowError::CorruptJournal(
+                        "aggregated residual HYPE across historical journals overflowed".into(),
+                    )
+                })?;
+        }
+
+        if aggregated > live_spot_hype_atoms {
+            return Err(WorkflowError::ResidualReconciliationGap(format!(
+                "aggregated residual {} HYPE atoms across {} historical journal(s) exceeds live \
+                 spot balance {} HYPE atoms",
+                aggregated.as_atoms(),
+                journal_paths.len(),
+                live_spot_hype_atoms.as_atoms()
+            )));
+        }
+
+        Ok(aggregated)
     }
 
     /// Opens or creates one append-only workflow journal.
@@ -4518,6 +4660,10 @@ pub enum WorkflowError {
     Io(String),
     #[error("journal serialization failed: {0}")]
     Json(String),
+    #[error("historical workflow journal is not terminal: {0}")]
+    NonTerminalHistoricalJournal(String),
+    #[error("aggregated residual HYPE does not reconcile against the live spot balance: {0}")]
+    ResidualReconciliationGap(String),
 }
 
 fn append_result_commit_status(

@@ -15,6 +15,7 @@ use hype_accumulator::{
         InventoryBaseline, JournalCommitStatus, OrderBoundEligibilityEvidence,
         OrderEnvelopeBinding, OrderFinality, OwnershipCommitOutcome, PrepareOutcome,
         ProtectedWorkflowHead, ProtectedWorkflowHeadStore, WorkflowError, WorkflowStage,
+        WorkflowState,
     },
 };
 use std::{
@@ -4535,5 +4536,250 @@ fn peek_committed_binding_lets_a_retry_reuse_the_first_attempts_binding() {
     assert!(matches!(
         workflow.prepare_order(at(1)),
         Ok(PrepareOutcome::Ready(_))
+    ));
+}
+
+fn complete_workflow_with_residual(path: &Path, residual_atoms: u64) -> DecisionBinding {
+    let mut binding = binding();
+    binding.inventory_before.spot_hype_atoms = hype(residual_atoms);
+    binding.inventory_before.unconsumed_residual_spot_hype_atoms = hype(0);
+    binding.inventory_before.configured_residual_hype_atoms = hype(residual_atoms);
+    let mut workflow = reopen(path, &binding);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
+    // Filled notional must stay within `original_quantity_hype *
+    // limit_price_usdc_per_hype`'s per-atom cap (200_000 micros-USDC/HYPE
+    // at this fixture's `hype_atoms_per_hype: 1`), so it must scale with
+    // `residual_atoms` rather than reuse one fixed amount.
+    let filled_usdc_micros = residual_atoms
+        .checked_mul(200_000)
+        .expect("fixture notional fits");
+    let debited_usdc_micros = filled_usdc_micros + 10_000;
+    let fills: Vec<(&str, u64, u32)> = if residual_atoms > 0 {
+        workflow
+            .observe_order_fill(
+                "residual-fill",
+                hype(residual_atoms),
+                usdc(filled_usdc_micros),
+                usdc(debited_usdc_micros),
+                false,
+                at(3),
+            )
+            .expect("residual fill observed");
+        vec![("residual-fill", residual_atoms, 3)]
+    } else {
+        Vec::new()
+    };
+    let (filled_usdc, debited_usdc) = if residual_atoms > 0 {
+        (usdc(filled_usdc_micros), usdc(debited_usdc_micros))
+    } else {
+        (usdc(0), usdc(0))
+    };
+    workflow
+        .finalize_order(
+            hype(residual_atoms),
+            filled_usdc,
+            debited_usdc,
+            OrderFinality::Canceled,
+            at(4),
+        )
+        .expect("order finalized");
+    let evidence = bound_evidence(&workflow, &fills, at(5));
+    workflow
+        .record_staking_eligibility(Some(evidence), at(5))
+        .expect("eligibility recorded");
+    workflow.complete(at(6)).expect("workflow completed");
+    binding
+}
+
+#[test]
+fn terminal_staking_eligibility_is_none_before_complete_and_some_after() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("terminal-eligibility.jsonl");
+    let mut binding = binding();
+    binding.inventory_before.spot_hype_atoms = hype(5);
+    binding.inventory_before.unconsumed_residual_spot_hype_atoms = hype(5);
+    let mut workflow = reopen(&path, &binding);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
+    workflow
+        .observe_order_fill(
+            "residual-fill",
+            hype(5),
+            usdc(1_000_000),
+            usdc(1_010_000),
+            false,
+            at(3),
+        )
+        .expect("residual fill observed");
+    workflow
+        .finalize_order(
+            hype(5),
+            usdc(1_000_000),
+            usdc(1_010_000),
+            OrderFinality::Canceled,
+            at(4),
+        )
+        .expect("order finalized");
+    assert!(workflow.state().terminal_staking_eligibility().is_none());
+
+    let evidence = bound_evidence(&workflow, &[("residual-fill", 5, 3)], at(5));
+    workflow
+        .record_staking_eligibility(Some(evidence), at(5))
+        .expect("eligibility recorded");
+    assert!(
+        workflow.state().terminal_staking_eligibility().is_none(),
+        "StakingEligibilityRecorded is not yet terminal"
+    );
+
+    workflow.complete(at(6)).expect("workflow completed");
+    let eligibility = workflow
+        .state()
+        .terminal_staking_eligibility()
+        .expect("complete workflow has terminal eligibility");
+    assert_eq!(eligibility.residual_hype, hype(5));
+    assert_eq!(eligibility.eligible_hype, hype(0));
+}
+
+#[test]
+fn peek_state_returns_none_for_a_missing_or_empty_journal() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let missing = temp.path().join("missing.jsonl");
+    assert!(DurableWorkflow::peek_state(&missing)
+        .expect("missing journal is not an error")
+        .is_none());
+
+    let empty = temp.path().join("empty.jsonl");
+    fs::write(&empty, b"").expect("write empty journal");
+    assert!(DurableWorkflow::peek_state(&empty)
+        .expect("empty journal is not an error")
+        .is_none());
+}
+
+#[test]
+fn peek_state_replays_a_terminal_journal_without_a_lock() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("peek.jsonl");
+    complete_workflow_with_residual(&path, 3);
+
+    // No lock is held after `complete_workflow_with_residual` returns and
+    // drops its `DurableWorkflow`, but `peek_state` must not need one even
+    // while the append lock is externally held.
+    let lock_path = {
+        let mut lock = path.as_os_str().to_os_string();
+        lock.push(".append.lock");
+        PathBuf::from(lock)
+    };
+    let held_lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .expect("open lock file");
+    held_lock
+        .lock_exclusive()
+        .expect("hold the append lock externally");
+
+    let state: WorkflowState = DurableWorkflow::peek_state(&path)
+        .expect("peek succeeds while the append lock is held")
+        .expect("journal is non-empty");
+    assert_eq!(state.stage(), WorkflowStage::Complete);
+    let eligibility = state
+        .terminal_staking_eligibility()
+        .expect("complete workflow has terminal eligibility");
+    assert_eq!(eligibility.residual_hype, hype(3));
+}
+
+#[test]
+fn aggregate_terminal_residual_hype_returns_zero_for_a_directory_that_does_not_exist_yet() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let missing_directory = temp.path().join("journals");
+    let aggregated =
+        DurableWorkflow::aggregate_terminal_residual_hype(&missing_directory, None, hype(0))
+            .expect("a directory that does not exist yet has no historical journals");
+    assert_eq!(aggregated, hype(0));
+}
+
+#[test]
+fn aggregate_terminal_residual_hype_sums_across_the_directory_and_excludes_the_current_journal() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    complete_workflow_with_residual(&temp.path().join("day-1.jsonl"), 5);
+    complete_workflow_with_residual(&temp.path().join("day-2.jsonl"), 7);
+
+    // The caller's own in-flight journal for today's decision is not yet
+    // terminal and must be excluded, not treated as a fail-closed error.
+    let today_path = temp.path().join("day-3.jsonl");
+    let today_binding = binding();
+    reopen(&today_path, &today_binding);
+
+    let aggregated =
+        DurableWorkflow::aggregate_terminal_residual_hype(temp.path(), Some(&today_path), hype(20))
+            .expect("two terminal journals reconcile against the live balance");
+    assert_eq!(aggregated, hype(12));
+}
+
+#[test]
+fn aggregate_terminal_residual_hype_ignores_non_journal_sidecar_files() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("day-1.jsonl");
+    complete_workflow_with_residual(&path, 3);
+
+    // Every sidecar file this codebase creates alongside a journal uses a
+    // different extension than `.jsonl` and must never be misread as one.
+    fs::write(temp.path().join("day-1.jsonl.head"), b"not a journal").expect("write sidecar");
+    fs::write(temp.path().join("day-1.jsonl.append.lock"), b"").expect("write sidecar");
+    fs::write(
+        temp.path().join("day-1.jsonl.pending-append.json"),
+        b"not a journal",
+    )
+    .expect("write sidecar");
+    fs::write(
+        temp.path().join("day-1.protected-head.json"),
+        b"not a journal",
+    )
+    .expect("write sidecar");
+    fs::write(
+        temp.path().join("exchange-order-owners.json"),
+        b"not a journal",
+    )
+    .expect("write sidecar");
+
+    let aggregated = DurableWorkflow::aggregate_terminal_residual_hype(temp.path(), None, hype(3))
+        .expect("sidecar files are never mistaken for journals");
+    assert_eq!(aggregated, hype(3));
+}
+
+#[test]
+fn aggregate_terminal_residual_hype_fails_closed_on_a_non_terminal_historical_journal() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    complete_workflow_with_residual(&temp.path().join("day-1.jsonl"), 2);
+
+    let stuck_path = temp.path().join("day-2.jsonl");
+    let mut stuck_binding = binding();
+    stuck_binding.inventory_before.spot_hype_atoms = hype(1);
+    stuck_binding
+        .inventory_before
+        .unconsumed_residual_spot_hype_atoms = hype(1);
+    let mut stuck_workflow = reopen(&stuck_path, &stuck_binding);
+    ready(stuck_workflow.prepare_order(at(1)).expect("order prepared"));
+    observe_submission(&mut stuck_workflow, "exchange-order-1", at(2))
+        .expect("submission observed");
+
+    let result = DurableWorkflow::aggregate_terminal_residual_hype(temp.path(), None, hype(100));
+    assert!(matches!(
+        result,
+        Err(WorkflowError::NonTerminalHistoricalJournal(_))
+    ));
+}
+
+#[test]
+fn aggregate_terminal_residual_hype_fails_closed_on_a_reconciliation_gap() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    complete_workflow_with_residual(&temp.path().join("day-1.jsonl"), 10);
+
+    let result = DurableWorkflow::aggregate_terminal_residual_hype(temp.path(), None, hype(9));
+    assert!(matches!(
+        result,
+        Err(WorkflowError::ResidualReconciliationGap(_))
     ));
 }

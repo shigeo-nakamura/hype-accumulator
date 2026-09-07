@@ -413,6 +413,10 @@ async fn prepare(
 
     let (protected_head_store, owner_store) = build_stores(journal_path)?;
     let journal = PathBuf::from(journal_path);
+    let journal_directory = journal
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
 
     // `signal_evidence_valid_through_at` is not `policy_acknowledgement_valid_through_at`
     // (an unrelated quantity that happens to also be a `DateTime<Utc>`) — no
@@ -432,6 +436,7 @@ async fn prepare(
         eligibility_policy,
         configured_residual_hype_atoms,
         &journal,
+        &journal_directory,
         protected_head_store,
         owner_store,
         now,
