@@ -4592,6 +4592,126 @@ fn complete_workflow_with_residual(path: &Path, residual_atoms: u64) -> Decision
     binding
 }
 
+fn complete_workflow_with_residual_and_eligible(
+    path: &Path,
+    residual_atoms: u64,
+    eligible_atoms: u64,
+) -> DecisionBinding {
+    let purchased_atoms = residual_atoms + eligible_atoms;
+    let mut binding = binding();
+    binding.inventory_before.spot_hype_atoms = hype(purchased_atoms);
+    binding.inventory_before.unconsumed_residual_spot_hype_atoms = hype(0);
+    binding.inventory_before.configured_residual_hype_atoms = hype(residual_atoms);
+    let mut workflow = reopen(path, &binding);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
+    let filled_usdc_micros = purchased_atoms
+        .checked_mul(200_000)
+        .expect("fixture notional fits");
+    let debited_usdc_micros = filled_usdc_micros + 10_000;
+    workflow
+        .observe_order_fill(
+            "fill",
+            hype(purchased_atoms),
+            usdc(filled_usdc_micros),
+            usdc(debited_usdc_micros),
+            false,
+            at(3),
+        )
+        .expect("fill observed");
+    workflow
+        .finalize_order(
+            hype(purchased_atoms),
+            usdc(filled_usdc_micros),
+            usdc(debited_usdc_micros),
+            OrderFinality::Canceled,
+            at(4),
+        )
+        .expect("order finalized");
+    let evidence = bound_evidence(&workflow, &[("fill", purchased_atoms, 3)], at(5));
+    let eligibility = workflow
+        .record_staking_eligibility(Some(evidence), at(5))
+        .expect("eligibility recorded");
+    assert_eq!(eligibility.residual_hype, hype(residual_atoms));
+    assert_eq!(eligibility.eligible_hype, hype(eligible_atoms));
+    workflow.complete(at(6)).expect("workflow completed");
+    binding
+}
+
+#[test]
+fn aggregate_terminal_residual_hype_reconciles_against_residual_plus_unstaked_eligible_hype() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    complete_workflow_with_residual_and_eligible(&temp.path().join("day-1.jsonl"), 10, 100);
+
+    // Both residual (10) and still-unstaked eligible (100) HYPE remain
+    // physically in spot — staking is hard-disabled by policy, so eligible
+    // HYPE is never actually moved anywhere. A live balance that covers
+    // only the residual portion must fail closed, not silently
+    // under-reconcile and let an external sale of the "eligible" HYPE go
+    // undetected.
+    let insufficient =
+        DurableWorkflow::aggregate_terminal_residual_hype(temp.path(), None, hype(50));
+    assert!(matches!(
+        insufficient,
+        Err(WorkflowError::ResidualReconciliationGap(_))
+    ));
+
+    // Once the live balance covers the full residual+eligible total, the
+    // call succeeds and still returns only the residual portion.
+    let aggregated =
+        DurableWorkflow::aggregate_terminal_residual_hype(temp.path(), None, hype(110))
+            .expect("live balance covers residual plus unstaked eligible HYPE");
+    assert_eq!(aggregated, hype(10));
+}
+
+#[test]
+fn aggregate_terminal_residual_hype_fails_closed_on_an_empty_historical_journal() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    complete_workflow_with_residual(&temp.path().join("day-1.jsonl"), 2);
+    // A crash between creating the journal file and its first durable
+    // append leaves a 0-byte `.jsonl` file whose terminal state is
+    // genuinely unknown; it must be an error, not silently skipped.
+    fs::write(temp.path().join("day-2.jsonl"), b"").expect("write empty journal");
+
+    let result = DurableWorkflow::aggregate_terminal_residual_hype(temp.path(), None, hype(100));
+    assert!(matches!(
+        result,
+        Err(WorkflowError::NonTerminalHistoricalJournal(_))
+    ));
+}
+
+#[cfg(feature = "offline-staking-simulation")]
+#[test]
+fn aggregate_terminal_residual_hype_excludes_hype_already_delegated_to_staking() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("delegated.jsonl");
+    let binding = offline_staking_binding();
+    let (mut workflow, delegation_confirmation, _validator) =
+        offline_delegation_submitted_with_receipt(&path, &binding, ExternalReceipt::Ambiguous);
+    workflow
+        .confirm_delegated_balance(delegation_confirmation, at(11))
+        .expect("delegation authoritatively confirmed");
+    assert_eq!(workflow.state().stage(), WorkflowStage::DelegatedConfirmed);
+    workflow.complete(at(12)).expect("workflow completed");
+    assert_eq!(
+        workflow.state().staking_eligibility().residual_hype,
+        hype(0)
+    );
+    assert_eq!(
+        workflow.state().staking_eligibility().eligible_hype,
+        hype(250)
+    );
+    assert_eq!(workflow.state().delegated_hype(), hype(250));
+    drop(workflow);
+
+    // All 250 HYPE was eligible and all 250 was actually delegated out of
+    // spot — a live spot balance far below 250 must still reconcile,
+    // because none of that eligible HYPE is expected in spot any more.
+    let aggregated = DurableWorkflow::aggregate_terminal_residual_hype(temp.path(), None, hype(0))
+        .expect("delegated eligible HYPE is excluded from the spot reconciliation");
+    assert_eq!(aggregated, hype(0));
+}
+
 #[test]
 fn terminal_staking_eligibility_is_none_before_complete_and_some_after() {
     let temp = tempfile::tempdir().expect("temp directory");

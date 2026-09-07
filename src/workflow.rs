@@ -2605,7 +2605,10 @@ impl DurableWorkflow {
 
     /// Sums the terminal residual HYPE left behind by every completed
     /// workflow journal in `journal_directory`, then reconciles that sum
-    /// against a live spot balance read.
+    /// — plus every still-unstaked terminal eligible HYPE, which is
+    /// physically in spot alongside residual until it is actually
+    /// delegated — against a live spot balance read. Only the residual
+    /// portion is returned.
     ///
     /// Every regular file directly in `journal_directory` whose name ends
     /// in `.jsonl` is treated as a workflow journal (this codebase's own
@@ -2619,15 +2622,20 @@ impl DurableWorkflow {
     /// today's decision, which is never "past".
     ///
     /// Fails closed rather than guessing: a journal found in the directory
-    /// that is not yet `Complete` is an error, not a skip (its split has
-    /// not been reconciled to conclusion) and an aggregated sum that
-    /// exceeds the live spot balance is also an error (evidence the sum, the
-    /// balance read, or a journal's own history is wrong).
+    /// that is empty or not yet `Complete` is an error, not a skip (its
+    /// terminal state, or its residual/eligible split, is not known) and a
+    /// total that exceeds the live spot balance is also an error — this
+    /// account's own history expects more HYPE in spot than is actually
+    /// there, which this function cannot explain (a sale or external
+    /// transfer of residual or still-unstaked eligible HYPE, tracked
+    /// nowhere yet — seeing it through is the still-open external-transfer
+    /// ledger work) and refuses to guess at rather than silently
+    /// misclassify the next decision's inventory.
     ///
     /// # Errors
     ///
     /// Returns an error if `journal_directory` cannot be read, if any
-    /// journal in it is corrupt, missing its terminal residual/eligible
+    /// journal in it is empty, corrupt, missing its terminal residual/eligible
     /// split, or overflows on summation, or if the aggregated total exceeds
     /// `live_spot_hype_atoms`.
     pub fn aggregate_terminal_residual_hype(
@@ -2675,10 +2683,31 @@ impl DurableWorkflow {
         }
         journal_paths.sort();
 
-        let mut aggregated = HypeAtoms::from_atoms(0);
+        let overflowed = |what: &str| {
+            WorkflowError::CorruptJournal(format!(
+                "aggregated {what} HYPE across historical journals overflowed"
+            ))
+        };
+
+        let mut aggregated_residual = HypeAtoms::from_atoms(0);
+        // Reconciled against more than just residual HYPE: eligible HYPE
+        // is only actually moved out of spot once it is durably delegated
+        // (`delegated_hype() >= eligible_hype`; today's hard-disabled
+        // staking policy means this is never reachable in production, but
+        // the offline-staking-simulation feature does exercise it). Until
+        // then it is still physically sitting in spot alongside residual,
+        // and omitting it from this reconciliation would let an external
+        // sale or transfer of that HYPE go undetected — the live balance
+        // would still cover the (too-small) residual-only total even
+        // though real HYPE this account's own history expects is missing.
+        let mut aggregated_still_in_spot = HypeAtoms::from_atoms(0);
         for path in &journal_paths {
             let Some(state) = Self::peek_state(path)? else {
-                continue;
+                return Err(WorkflowError::NonTerminalHistoricalJournal(format!(
+                    "{}: journal is empty (a crash before its first durable append, or \
+                     truncation) and its terminal state is unknown",
+                    path.display()
+                )));
             };
             let Some(eligibility) = state.terminal_staking_eligibility() else {
                 return Err(WorkflowError::NonTerminalHistoricalJournal(format!(
@@ -2688,26 +2717,33 @@ impl DurableWorkflow {
                     state.stage()
                 )));
             };
-            aggregated = aggregated
+            let still_in_spot = if state.delegated_hype() >= eligibility.eligible_hype {
+                eligibility.residual_hype
+            } else {
+                eligibility
+                    .residual_hype
+                    .checked_add(eligibility.eligible_hype)
+                    .ok_or_else(|| overflowed("still-in-spot"))?
+            };
+            aggregated_residual = aggregated_residual
                 .checked_add(eligibility.residual_hype)
-                .ok_or_else(|| {
-                    WorkflowError::CorruptJournal(
-                        "aggregated residual HYPE across historical journals overflowed".into(),
-                    )
-                })?;
+                .ok_or_else(|| overflowed("residual"))?;
+            aggregated_still_in_spot = aggregated_still_in_spot
+                .checked_add(still_in_spot)
+                .ok_or_else(|| overflowed("still-in-spot"))?;
         }
 
-        if aggregated > live_spot_hype_atoms {
+        if aggregated_still_in_spot > live_spot_hype_atoms {
             return Err(WorkflowError::ResidualReconciliationGap(format!(
-                "aggregated residual {} HYPE atoms across {} historical journal(s) exceeds live \
-                 spot balance {} HYPE atoms",
-                aggregated.as_atoms(),
+                "aggregated {} HYPE atoms still expected in spot across {} historical \
+                 journal(s) exceeds live spot balance {} HYPE atoms",
+                aggregated_still_in_spot.as_atoms(),
                 journal_paths.len(),
                 live_spot_hype_atoms.as_atoms()
             )));
         }
 
-        Ok(aggregated)
+        Ok(aggregated_residual)
     }
 
     /// Opens or creates one append-only workflow journal.
