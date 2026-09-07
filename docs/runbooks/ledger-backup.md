@@ -127,8 +127,19 @@ symlink must therefore pass the resolved release path, not the symlink:
 ```
 
 Passing the symlink fails with `verifier binary must not contain aliases or
-symlink components`. Resolving it also records which exact release verified the
-backup, rather than whichever release the symlink happens to point at later.
+symlink components`.
+
+Resolving the symlink pins the executable for that invocation, but nothing
+persists which release it was: the receipt records the backup ID and the S3
+object details, not the verifier, and shell history keeps the unexpanded
+`$(readlink -f ...)` text rather than what it resolved to. To be able to audit
+which build verified a backup, record the resolved path and its digest in the
+private operator evidence next to the backup ID:
+
+```text
+VERIFIER="$(readlink -f <install-root>/current/hype-accumulator)"
+printf '%s\n' "$VERIFIER"; sha256sum "$VERIFIER"
+```
 
 Full replay and S3 `put-object`/`get-object` transfers have no wall-clock
 timeout by default, so backup size or recovery-host bandwidth alone cannot
