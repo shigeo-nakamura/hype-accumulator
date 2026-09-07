@@ -322,6 +322,16 @@ impl HyperliquidLiveProbe {
             .connector
             .reconcile_order_by_client_id(&client_order_id)
             .await?;
+        // Matches the same check `lookup_read_only` already performs for
+        // the unsigned recovery path: without it, evidence for a CLOID the
+        // connector returned but that doesn't match what was actually
+        // requested could still be recorded and finalized as though it
+        // were the authorized order (client_order_id in the constructed
+        // AuthenticatedOrderSubmission comes from workflow state, not from
+        // this evidence, so nothing else would catch the mismatch).
+        if evidence.client_order_id != client_order_id {
+            return Err(LiveProbeError::BindingMismatch("client order ID"));
+        }
         record_reconciliation(&self.connector, workflow, journal_path, evidence, now).await
     }
 }
