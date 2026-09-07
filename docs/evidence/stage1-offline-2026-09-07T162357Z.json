@@ -1,0 +1,299 @@
+{
+  "schema_version": "hype-stage1-offline-evidence/v1",
+  "captured_at": "2026-09-07T16:23:57Z",
+  "scope": {
+    "kind": "offline_and_replay_only",
+    "overall_status": "PARTIAL",
+    "stage1_accepted": false,
+    "statement": "This append-only snapshot records the merged state at the commit intended for the 2026-09-11 stage-4 small-notional launch probe (bot-strategy#849/#845). PASS applies only to the named offline gate and is not authorization for deployment, signing, funding, staking, or live operation.",
+    "excluded_operations": [
+      "network or exchange API probes",
+      "testnet or mainnet funding",
+      "action signing or submission",
+      "deployment or service restart",
+      "secret or signer installation",
+      "live enablement"
+    ]
+  },
+  "source_state": {
+    "hype_accumulator": {
+      "repository": "shigeo-nakamura/hype-accumulator",
+      "ref": "master",
+      "commit": "7ec4b96f81a2cea12064e4a766d0f6aa8ae113fd",
+      "dex_connector_ref": "v4.7.21"
+    },
+    "dex_connector": {
+      "repository": "shigeo-nakamura/dex-connector",
+      "master_commit": "623dad52febd076b28244443ab2cfb4ce07ac08d",
+      "release_candidate": {
+        "version": "4.7.21",
+        "version_pr_head_commit": "74ac00bf0d4a537e979fcb245995f9df1b4e8383",
+        "version_merge_commit": "74ac00bf0d4a537e979fcb245995f9df1b4e8383",
+        "tag_present": true,
+        "tag_commit": "74ac00bf0d4a537e979fcb245995f9df1b4e8383"
+      }
+    },
+    "pairtrade": {
+      "repository": "shigeo-nakamura/pairtrade",
+      "ref": "master",
+      "commit": "0d6b003dc6983c182d9ccd0b8c61be58dbfbc977",
+      "dex_connector_ref": "path-dependency (local checkout, not tag-pinned); pairtrade production was sunset 2026-09-06 (bot-strategy pairtrade sunset), so it is no longer an active caller of the staking release this gate originally tracked"
+    }
+  },
+  "verification_runs": [
+    {
+      "repository": "shigeo-nakamura/hype-accumulator",
+      "commit": "7ec4b96f81a2cea12064e4a766d0f6aa8ae113fd",
+      "command": "gh run view 34140777270 --repo shigeo-nakamura/hype-accumulator --json status,conclusion,jobs",
+      "status": "PASS",
+      "result": "Master CI (quality, locked AL2023 ARM64 release artifact, locked AL2023 ARM64 live-probe artifact) completed successfully at this commit"
+    },
+    {
+      "repository": "shigeo-nakamura/hype-accumulator",
+      "commit": "7ec4b96f81a2cea12064e4a766d0f6aa8ae113fd",
+      "command": "cargo test --offline --features live-probe --quiet",
+      "status": "PASS",
+      "result": "193 tests across default and live-probe feature configurations passed locally in a clean worktree (0 failed, 0 ignored)"
+    },
+    {
+      "repository": "shigeo-nakamura/hype-accumulator",
+      "commit": "7ec4b96f81a2cea12064e4a766d0f6aa8ae113fd",
+      "command": "cargo clippy --offline --all-targets --features live-probe -- -D warnings",
+      "status": "PASS",
+      "result": "No warnings"
+    },
+    {
+      "repository": "shigeo-nakamura/dex-connector",
+      "commit": "74ac00bf0d4a537e979fcb245995f9df1b4e8383",
+      "command": "git -C dex-connector rev-parse v4.7.21",
+      "status": "PASS",
+      "result": "The v4.7.21 tag hype-accumulator's Cargo.toml pins resolves to a commit reachable from dex-connector's origin/master (git merge-base --is-ancestor v4.7.21 origin/master)"
+    }
+  ],
+  "required_gates": [
+    {
+      "id": "deterministic_strategy_and_pacing",
+      "status": "PASS",
+      "summary": "Point-in-time fixture mechanics, arbitrary capital paths, one durable UTC decision per day, capital conservation, execution caps, and DRY_RUN signal attribution remain deterministic; this does not establish economic edge. Unchanged in substance since the previous snapshot; PR #47's new aggregation function and PR #48's fee-reserve cross-check are additional deterministic, offline-testable invariants layered on the same design.",
+      "evidence": [
+        {
+          "kind": "github_pr",
+          "repository": "shigeo-nakamura/hype-accumulator",
+          "number": 47,
+          "head_commit": "7c2d19e88d4f6034b973884a2103f6b07fc2e434",
+          "merge_commit": "466544fa3a7b8fbc0f7ef8e2dc72867b7b6ea204",
+          "url": "https://github.com/shigeo-nakamura/hype-accumulator/pull/47"
+        },
+        {
+          "kind": "github_pr",
+          "repository": "shigeo-nakamura/hype-accumulator",
+          "number": 48,
+          "head_commit": "1d4682aecfc53d5ff8d7c7a8c4126862b2f7478a",
+          "merge_commit": "ecb3e3f45250a7966cda214716d96f2c52953c53",
+          "url": "https://github.com/shigeo-nakamura/hype-accumulator/pull/48"
+        },
+        {
+          "kind": "verification_run",
+          "command": "cargo test --offline --features live-probe --quiet",
+          "result": "193 tests passed"
+        }
+      ]
+    },
+    {
+      "id": "full_workflow_fault_injection",
+      "status": "FAIL",
+      "summary": "The signer-free workflow now also persists authenticated order-submission evidence, fills, and terminal finality durably (PR #46), and aggregates terminal residual HYPE across past journals (PR #47), but it still cannot prove venue-enforced acceptance deadline behavior or signer capability, and the durable order-finality flow is still not connected to the capital ledger's exactly-once debit (bot-strategy#901 item 5, confirmed by code inspection: `pacing::settle_decision` is called only from the zero-value DRY_RUN cycle, never from the live-probe order-finality path). Offline simulation therefore cannot change this gate to PASS.",
+      "evidence": [
+        {
+          "kind": "github_pr",
+          "repository": "shigeo-nakamura/hype-accumulator",
+          "number": 46,
+          "head_commit": "7dbed7efc255a8a6c8b4eafa4e0860a6009fd393",
+          "merge_commit": "4ef02e44ce8a8e6eb6c61de8ab00e9f83aba1d45",
+          "url": "https://github.com/shigeo-nakamura/hype-accumulator/pull/46"
+        },
+        {
+          "kind": "github_pr",
+          "repository": "shigeo-nakamura/hype-accumulator",
+          "number": 47,
+          "head_commit": "7c2d19e88d4f6034b973884a2103f6b07fc2e434",
+          "merge_commit": "466544fa3a7b8fbc0f7ef8e2dc72867b7b6ea204",
+          "url": "https://github.com/shigeo-nakamura/hype-accumulator/pull/47"
+        },
+        {
+          "kind": "repository_document",
+          "path": "docs/security/custody-threat-model.md",
+          "result": "Automatic staking remains disabled pending venue-enforced acceptance deadlines, revised custody review, and explicit approval; unchanged since the previous snapshot"
+        }
+      ]
+    },
+    {
+      "id": "spot_execution_vectors_and_reconciliation",
+      "status": "PASS",
+      "summary": "The pinned connector lineage contains deterministic HYPE spot vectors, authoritative account-movement normalization, and ambiguity-safe order reconciliation. dex-connector v4.7.21 additionally exposes the raw per-fill tx hash and raw orderStatus/spotClearinghouseState response bodies that hype-accumulator's PR #46 now independently re-derives evidence from, rather than trusting echoed fields.",
+      "evidence": [
+        {
+          "kind": "github_pr",
+          "repository": "shigeo-nakamura/dex-connector",
+          "number": 87,
+          "head_commit": "b8bb5c8fbed496a9f3c6212b6862d740ba255160",
+          "merge_commit": "5d104b4e1cf3616a289f361dbf4bcd38ae776805",
+          "url": "https://github.com/shigeo-nakamura/dex-connector/pull/87"
+        },
+        {
+          "kind": "github_pr",
+          "repository": "shigeo-nakamura/hype-accumulator",
+          "number": 46,
+          "head_commit": "7dbed7efc255a8a6c8b4eafa4e0860a6009fd393",
+          "merge_commit": "4ef02e44ce8a8e6eb6c61de8ab00e9f83aba1d45",
+          "url": "https://github.com/shigeo-nakamura/hype-accumulator/pull/46"
+        }
+      ]
+    },
+    {
+      "id": "staking_vectors_validator_and_reconciliation",
+      "status": "PASS",
+      "summary": "Account-bound staking reads, deterministic cDeposit/tokenDelegate vectors, fail-closed validator policy, guarded submission primitives, and ambiguity reconciliation pass offline tests without proving signer capability. Unchanged in substance since the previous snapshot; automatic staking remains hard-disabled and out of scope for the 2026-09-11 probe entirely (staking deferred post-launch per bot-strategy#849).",
+      "evidence": [
+        {
+          "kind": "github_pr",
+          "repository": "shigeo-nakamura/dex-connector",
+          "number": 70,
+          "head_commit": "2268b8e000136d2d0eb5a40fcf9a413ed45a7682",
+          "merge_commit": "6956d9e259356e08ffff3bf903df6cc37675321e",
+          "url": "https://github.com/shigeo-nakamura/dex-connector/pull/70"
+        }
+      ]
+    },
+    {
+      "id": "protected_ledger_restore",
+      "status": "PASS",
+      "summary": "Protected ledger replay detects tampering, rollback, and divergent restore candidates while preserving crash-safe recovery semantics, per the original offline PR. A separate, non-stage-1 production off-host restore drill (real AWS S3 boundaries, real ledger, real tamper-detection) has since been completed against the actual deployment host under bot-strategy#839 on 2026-09-07 and is recorded there, not here, because it is network/deployment evidence excluded from this offline scope by design.",
+      "evidence": [
+        {
+          "kind": "github_pr",
+          "repository": "shigeo-nakamura/hype-accumulator",
+          "number": 10,
+          "head_commit": "959ad430ccab3d9df2b3d15cd65a99515a80e8d3",
+          "merge_commit": "aa6b364536a7b7d3891b78d07de34ece31626e2b",
+          "url": "https://github.com/shigeo-nakamura/hype-accumulator/pull/10"
+        },
+        {
+          "kind": "github_pr",
+          "repository": "shigeo-nakamura/hype-accumulator",
+          "number": 50,
+          "head_commit": "401e2e7b5d15d308bc6125e770094422fb32229b",
+          "merge_commit": "7ec4b96f81a2cea12064e4a766d0f6aa8ae113fd",
+          "url": "https://github.com/shigeo-nakamura/hype-accumulator/pull/50"
+        }
+      ]
+    },
+    {
+      "id": "fail_closed_configuration",
+      "status": "PASS",
+      "summary": "Unknown fields and unsafe live configuration fail closed; DRY_RUN and manual halt remain the defaults and live execution remains unavailable. PR #48 adds a new live-readiness cross-check (fee_spread_reserve_bps >= max_purchase_fee_bps) that fails --install-preflight closed on an otherwise-unsubmittable combination that would previously only have surfaced as a live order rejection.",
+      "evidence": [
+        {
+          "kind": "github_pr",
+          "repository": "shigeo-nakamura/hype-accumulator",
+          "number": 12,
+          "head_commit": "a69c4370f155c9f6cc7cc944fed845b46b6162d1",
+          "merge_commit": "f90d5212986c27d5dd7b4ea729639abed9c6a15b",
+          "url": "https://github.com/shigeo-nakamura/hype-accumulator/pull/12"
+        },
+        {
+          "kind": "github_pr",
+          "repository": "shigeo-nakamura/hype-accumulator",
+          "number": 48,
+          "head_commit": "1d4682aecfc53d5ff8d7c7a8c4126862b2f7478a",
+          "merge_commit": "ecb3e3f45250a7966cda214716d96f2c52953c53",
+          "url": "https://github.com/shigeo-nakamura/hype-accumulator/pull/48"
+        }
+      ]
+    },
+    {
+      "id": "observability_and_durable_suppression",
+      "status": "PASS",
+      "summary": "Offline tests cover durable decision status, skip reasons, stale inputs, reconciliation state, suppression, workflow age, and privacy-safe metrics; deployed alert routing remains separate. PR #49 pins and documents the S3 status-mirror's write-ordering invariant (put_timeout_cannot_outlive_a_cycle, mutation-checked) that a prior review flagged (bot-strategy#920, now closed) as an unstated dependency between a source constant and an external systemd timer.",
+      "evidence": [
+        {
+          "kind": "github_pr",
+          "repository": "shigeo-nakamura/hype-accumulator",
+          "number": 14,
+          "head_commit": "d7aa501c4402987f2a6a5c5f0e561d9f74cffce1",
+          "merge_commit": "cdca3158fc73a40e7415f5e5578b85e38edff0c1",
+          "url": "https://github.com/shigeo-nakamura/hype-accumulator/pull/14"
+        },
+        {
+          "kind": "github_pr",
+          "repository": "shigeo-nakamura/hype-accumulator",
+          "number": 49,
+          "head_commit": "f53c5931eca7bc5995c5d2217958050d99b81a62",
+          "merge_commit": "bdd5c1bf50ccec2168371f6f68782036f21087f8",
+          "url": "https://github.com/shigeo-nakamura/hype-accumulator/pull/49"
+        }
+      ]
+    },
+    {
+      "id": "staking_release_and_active_callers",
+      "status": "PASS",
+      "summary": "The annotated dex-connector staking release (originally landed as v4.7.14, PR #71) remains merged and unchanged; hype-accumulator now pins the later v4.7.21 tag (a direct tag+master push per this project's documented dex-connector bump convention, not a PR — no staking-related change occurred between v4.7.14 and v4.7.21, confirmed by inspecting the intervening commits). pairtrade's production services were sunset 2026-09-06 and its dex-connector dependency is a local path, not a tag pin, so it no longer functions as a second active caller in the sense this gate originally described; hype-accumulator remains an active, correctly-pinned caller of the staking capability, which is what this gate actually tracks going forward.",
+      "evidence": [
+        {
+          "kind": "github_pr",
+          "repository": "shigeo-nakamura/dex-connector",
+          "number": 71,
+          "head_commit": "170a4b168a292b587bf0a51e6ff915588e867b0a",
+          "merge_commit": "110718e926ba89b9994e40aeb666c16fd6780829",
+          "url": "https://github.com/shigeo-nakamura/dex-connector/pull/71"
+        },
+        {
+          "kind": "github_pr",
+          "repository": "shigeo-nakamura/hype-accumulator",
+          "number": 45,
+          "head_commit": "17784aad969643911f1a8fc0d6b3bd35f6b974ca",
+          "merge_commit": "1a7f73fb80c1040cf6b90bd53d11363ea2830d51",
+          "url": "https://github.com/shigeo-nakamura/hype-accumulator/pull/45"
+        },
+        {
+          "kind": "verification_run",
+          "command": "git -C dex-connector rev-parse v4.7.21",
+          "result": "Tag resolves to 74ac00bf0d4a537e979fcb245995f9df1b4e8383, an ancestor of dex-connector origin/master"
+        }
+      ]
+    },
+    {
+      "id": "immutable_aggregate_evidence",
+      "status": "PASS",
+      "summary": "This timestamped append-only JSON snapshot has a companion SHA-256 digest and repository tests that enforce its closed gate set, source-reference shape, and immutable-history ordering; the test suite's evidence-file tuple was extended in the same change that added this file, per the append-only convention the previous snapshot's next_actions recorded.",
+      "evidence": [
+        {
+          "kind": "verification_run",
+          "command": "python3 -m unittest tests.test_stage1_evidence -v",
+          "result": "PASS"
+        }
+      ]
+    }
+  ],
+  "blocking_gate_ids": [
+    "full_workflow_fault_injection"
+  ],
+  "next_actions": [
+    {
+      "order": 1,
+      "action": "Complete the exact stage-4 small-notional probe plan (notional, slippage cap, signer/route, expiry, reconciliation, rollback) under bot-strategy#845 and present it for explicit operator approval before 2026-09-11."
+    },
+    {
+      "order": 2,
+      "action": "Do not enable or count staking transitions as live-verified until both actions have a venue-enforced acceptance deadline, signer capability is proven, the custody design is revised, and the exact operation receives explicit approval. A signer-free simulation may test orchestration mechanics only; it cannot change the full-workflow gate to PASS."
+    },
+    {
+      "order": 3,
+      "action": "Connect the durable order-finality flow to the capital ledger's exactly-once debit/release (bot-strategy#901 item 5, bot-strategy#929) before relying on the pacing ledger's admitted/deployable fields as post-probe evidence; until then, read the order journal and venue balance directly."
+    },
+    {
+      "order": 4,
+      "action": "After any later source-state change, create another append-only evidence snapshot; never rewrite this artifact."
+    }
+  ]
+}

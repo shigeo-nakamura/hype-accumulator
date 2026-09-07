@@ -14,6 +14,13 @@ EVIDENCE_DIR = ROOT / "docs" / "evidence"
 HISTORICAL_EVIDENCE = EVIDENCE_DIR / "stage1-offline-2026-08-25.json"
 PREVIOUS_EVIDENCE = EVIDENCE_DIR / "stage1-offline-2026-09-01.json"
 LATEST_EVIDENCE = EVIDENCE_DIR / "stage1-offline-2026-09-01T225915Z.json"
+# The newest snapshot, taken at the commit intended for the 2026-09-11 stage-4
+# probe (bot-strategy#845/#849). LATEST_EVIDENCE is kept pointed at its
+# original file rather than reassigned, so the existing narrative tests below
+# (which describe the specific 09-01 unmerged-to-merged v4.7.14 release
+# transition) keep testing unchanged, still-true content instead of being
+# repointed at unrelated later evidence.
+CURRENT_EVIDENCE = EVIDENCE_DIR / "stage1-offline-2026-09-07T162357Z.json"
 EVIDENCE_FILES = tuple(sorted(EVIDENCE_DIR.glob("stage1-offline-*.json")))
 EXPECTED_GATES = {
     "deterministic_strategy_and_pacing",
@@ -58,7 +65,7 @@ class Stage1EvidenceTests(unittest.TestCase):
     def test_companion_digest_matches_exact_bytes(self) -> None:
         self.assertEqual(
             EVIDENCE_FILES,
-            (HISTORICAL_EVIDENCE, PREVIOUS_EVIDENCE, LATEST_EVIDENCE),
+            (HISTORICAL_EVIDENCE, PREVIOUS_EVIDENCE, LATEST_EVIDENCE, CURRENT_EVIDENCE),
         )
         for evidence_path in EVIDENCE_FILES:
             with self.subTest(evidence=evidence_path.name):
@@ -204,6 +211,61 @@ class Stage1EvidenceTests(unittest.TestCase):
             "1251bb8dcc7b6f57dc248618f967c0e617ed0823",
         )
         self.assertNotIn("staking_release_and_active_callers", evidence["blocking_gate_ids"])
+
+    def test_current_source_state_pins_the_2026_09_11_launch_commit(self) -> None:
+        evidence = load_evidence(CURRENT_EVIDENCE)
+        source = evidence["source_state"]
+        release = source["dex_connector"]["release_candidate"]
+
+        self.assertEqual(source["hype_accumulator"]["ref"], "master")
+        self.assertEqual(
+            source["hype_accumulator"]["commit"],
+            "7ec4b96f81a2cea12064e4a766d0f6aa8ae113fd",
+        )
+        self.assertEqual(source["hype_accumulator"]["dex_connector_ref"], "v4.7.21")
+        self.assertEqual(release["version"], "4.7.21")
+        self.assertTrue(release["tag_present"])
+        self.assertRegex(release["tag_commit"], SHA_PATTERN)
+
+        verified_commits = {run["commit"] for run in evidence["verification_runs"]}
+        self.assertIn(source["hype_accumulator"]["commit"], verified_commits)
+
+    def test_current_evidence_records_progress_since_the_previous_snapshot(self) -> None:
+        evidence = load_evidence(CURRENT_EVIDENCE)
+        gates_by_id = {gate["id"]: gate for gate in evidence["required_gates"]}
+
+        # The durable order-finality wiring (PR #46) and the cross-workflow
+        # residual aggregator (PR #47) are real progress since the previous
+        # snapshot, but neither proves venue-enforced acceptance timing, and
+        # neither connects the order-finality flow to the capital ledger's
+        # exactly-once debit — the gate must stay FAIL, not flip to PASS.
+        workflow_gate = gates_by_id["full_workflow_fault_injection"]
+        self.assertEqual(workflow_gate["status"], "FAIL")
+        cited_prs = {
+            (item["repository"], item["number"])
+            for item in workflow_gate["evidence"]
+            if item["kind"] == "github_pr"
+        }
+        self.assertIn(("shigeo-nakamura/hype-accumulator", 46), cited_prs)
+        self.assertIn(("shigeo-nakamura/hype-accumulator", 47), cited_prs)
+
+        # The fee-reserve invariant (PR #48) and the S3 mirror ordering fix
+        # (PR #49) are cited as new evidence for the gates they actually
+        # strengthen.
+        fail_closed_prs = {
+            (item["repository"], item["number"])
+            for item in gates_by_id["fail_closed_configuration"]["evidence"]
+            if item["kind"] == "github_pr"
+        }
+        self.assertIn(("shigeo-nakamura/hype-accumulator", 48), fail_closed_prs)
+        observability_prs = {
+            (item["repository"], item["number"])
+            for item in gates_by_id["observability_and_durable_suppression"]["evidence"]
+            if item["kind"] == "github_pr"
+        }
+        self.assertIn(("shigeo-nakamura/hype-accumulator", 49), observability_prs)
+
+        self.assertEqual(evidence["blocking_gate_ids"], ["full_workflow_fault_injection"])
 
     def test_references_and_verification_results_are_well_formed(self) -> None:
         for evidence_path in EVIDENCE_FILES:
