@@ -2663,6 +2663,32 @@ impl DurableWorkflow {
         // duplicate-process-protection work (bot-strategy#929's remaining
         // scope), not this read primitive.
         let _append_lock = acquire_journal_append_lock(path)?;
+        // A crash between `compare_and_swap` advancing the protected head
+        // and this journal's own line being appended (or its pending marker
+        // cleared) leaves a recoverable, not corrupt, journal: the same gap
+        // `open_or_create` repairs via `recover_pending_append` before ever
+        // trusting a journal's committed records. Without recovering it
+        // here too, that gap instead reads as a rollback/head mismatch
+        // below, and the account stays blocked until an operator manually
+        // reopens the journal. The workflow_id needed to validate a pending
+        // append comes from replaying whatever is already committed; a
+        // journal with no committed lines yet (the pending append is its
+        // very first) has no independent source, so the pending's own
+        // workflow_id is used instead — there is nothing else to check it
+        // against in this read-only historical path.
+        if let Some(pending) = read_pending_append(path)? {
+            let committed = load_records(path)?;
+            let workflow_id = if committed.is_empty() {
+                pending.workflow_id.clone()
+            } else {
+                let events = committed
+                    .iter()
+                    .map(|record| record.event.clone())
+                    .collect::<Vec<_>>();
+                WorkflowState::replay(&events)?.workflow_id
+            };
+            recover_pending_append(path, &workflow_id, protected_head_store)?;
+        }
         let records = load_records(path)?;
         let Some(last) = records.last() else {
             return Ok(None);

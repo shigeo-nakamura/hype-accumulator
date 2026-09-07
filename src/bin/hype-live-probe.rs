@@ -257,14 +257,18 @@ impl HistoryDirectoryBinding {
         path
     }
 
-    /// Durably writes the binding on first use, or verifies an existing one
-    /// still matches.
-    /// Returns whether history for this `operational_params_path` was
-    /// already initialized before this call, so the caller can tell a
-    /// genuinely first-ever `prepare` (no directory yet is normal) apart
-    /// from one that already succeeded before (no directory now means it
-    /// was lost, not that it never existed).
-    fn write_once_and_verify(
+    /// Read-only: determines whether history for this
+    /// `operational_params_path` was already initialized, verifying an
+    /// existing binding still matches `history_directory` without writing
+    /// anything. Split out from [`Self::write_once_and_verify`] so a caller
+    /// that still needs to create `history_directory` (a genuinely
+    /// first-ever `prepare`) can do so *before* [`Self::persist_first_ever`]
+    /// durably commits the binding — persisting the binding first would let
+    /// a transient directory-creation failure's retry observe
+    /// `AlreadyInitialized` against a directory that was never actually
+    /// created, requiring manual directory creation or binding-file surgery
+    /// to recover.
+    fn check(
         operational_params_path: &str,
         history_directory: &str,
     ) -> Result<HistoryInitialization, Box<dyn std::error::Error>> {
@@ -274,7 +278,7 @@ impl HistoryDirectoryBinding {
         };
         // A read failure other than "no binding yet" (permission denied, a
         // truncated or non-UTF-8 file after a crash) must not be treated as
-        // a first-ever prepare: `fs::write` below would then silently
+        // a first-ever prepare: `persist_first_ever` would then silently
         // replace whatever evidence the file held, exactly the undetected
         // history_directory reset this binding exists to prevent.
         match fs::read_to_string(&path) {
@@ -291,20 +295,62 @@ impl HistoryDirectoryBinding {
                     )
                     .into());
                 }
-                return Ok(HistoryInitialization::AlreadyInitialized);
+                Ok(HistoryInitialization::AlreadyInitialized)
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(format!(
-                    "failed to read history-directory binding at {}: {err}; refusing to treat an \
-                     unreadable or corrupt binding as a first-ever prepare.",
-                    path.display()
-                )
-                .into());
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Ok(HistoryInitialization::FirstEver)
+            }
+            Err(err) => Err(format!(
+                "failed to read history-directory binding at {}: {err}; refusing to treat an \
+                 unreadable or corrupt binding as a first-ever prepare.",
+                path.display()
+            )
+            .into()),
+        }
+    }
+
+    /// Durably persists the binding for a first-ever prepare. Callers must
+    /// only invoke this after `history_directory` itself has been created
+    /// and verified available — see [`Self::check`]'s doc for why the order
+    /// matters.
+    fn persist_first_ever(
+        operational_params_path: &str,
+        history_directory: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let path = Self::path(operational_params_path);
+        let current = Self {
+            history_directory: history_directory.to_owned(),
+        };
+        fs::write(&path, serde_json::to_string_pretty(&current)?)?;
+        Ok(())
+    }
+
+    /// Durably writes the binding on first use, or verifies an existing one
+    /// still matches.
+    /// Returns whether history for this `operational_params_path` was
+    /// already initialized before this call, so the caller can tell a
+    /// genuinely first-ever `prepare` (no directory yet is normal) apart
+    /// from one that already succeeded before (no directory now means it
+    /// was lost, not that it never existed).
+    ///
+    /// Convenience wrapper over [`Self::check`] + [`Self::persist_first_ever`]
+    /// for callers (and tests) with nothing to create in between; `prepare`
+    /// itself must call the two steps separately around directory creation
+    /// instead of using this.
+    #[cfg(test)]
+    fn write_once_and_verify(
+        operational_params_path: &str,
+        history_directory: &str,
+    ) -> Result<HistoryInitialization, Box<dyn std::error::Error>> {
+        match Self::check(operational_params_path, history_directory)? {
+            HistoryInitialization::AlreadyInitialized => {
+                Ok(HistoryInitialization::AlreadyInitialized)
+            }
+            HistoryInitialization::FirstEver => {
+                Self::persist_first_ever(operational_params_path, history_directory)?;
+                Ok(HistoryInitialization::FirstEver)
             }
         }
-        fs::write(&path, serde_json::to_string_pretty(&current)?)?;
-        Ok(HistoryInitialization::FirstEver)
     }
 }
 
@@ -449,10 +495,8 @@ async fn prepare(
     // operator later editing operational.toml's history_directory would
     // otherwise go undetected, and the next prepare would silently
     // aggregate from an empty new location instead of failing closed.
-    let history_initialization = HistoryDirectoryBinding::write_once_and_verify(
-        operational_params_path,
-        &operational.history_directory,
-    )?;
+    let history_initialization =
+        HistoryDirectoryBinding::check(operational_params_path, &operational.history_directory)?;
     let journal_directory = PathBuf::from(&operational.history_directory);
     ensure_history_directory_available(history_initialization, &journal_directory)?;
     // Reached only when the directory already exists (the `AlreadyInitialized`
@@ -462,6 +506,16 @@ async fn prepare(
     // — the journal write, `PrepareTimeBinding`'s sidecar, protected-head
     // store — tries to write into it.
     fs::create_dir_all(&journal_directory)?;
+    // Persisted only now that the directory demonstrably exists: doing this
+    // before `create_dir_all` would let a transient creation failure's retry
+    // observe `AlreadyInitialized` against a directory that was never
+    // actually created (see `HistoryDirectoryBinding::check`'s doc).
+    if history_initialization == HistoryInitialization::FirstEver {
+        HistoryDirectoryBinding::persist_first_ever(
+            operational_params_path,
+            &operational.history_directory,
+        )?;
+    }
     validate_journal_path(journal_path, &journal_directory)?;
     // Fixes the network this journal is bound to before anything else reads
     // `config`/`operational` for a network-dependent value: refuses to
@@ -796,7 +850,7 @@ fn build_prepare_policies(
 /// the directory currently holds — new persisted state, out of scope for
 /// this aggregator-foundation PR (hype-accumulator#47), which the operator
 /// explicitly scoped narrowly (same reasoning as bot-strategy#943).
-/// hype-accumulator has no live capital today (DRY_RUN only, no order ever
+/// hype-accumulator has no live capital today (`DRY_RUN` only, no order ever
 /// signed), so the practical exposure is low until live use begins.
 fn ensure_history_directory_available(
     history_initialization: HistoryInitialization,

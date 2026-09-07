@@ -5245,13 +5245,14 @@ fn aggregate_terminal_residual_hype_ignores_non_journal_sidecar_files() {
 
     // Every sidecar file this codebase creates alongside a journal uses a
     // different extension than `.jsonl` and must never be misread as one.
+    // `.pending-append.json` is excluded here: unlike these others, its
+    // content is meaningfully consumed by the historical peek path (see
+    // `aggregate_terminal_residual_hype_fails_closed_on_a_corrupt_pending_append`
+    // and `aggregate_terminal_residual_hype_recovers_a_lost_completion_response`
+    // below), so garbage there is a distinct, deliberately-tested scenario
+    // rather than one this test's "always ignored" claim covers.
     fs::write(temp.path().join("day-1.jsonl.head"), b"not a journal").expect("write sidecar");
     fs::write(temp.path().join("day-1.jsonl.append.lock"), b"").expect("write sidecar");
-    fs::write(
-        temp.path().join("day-1.jsonl.pending-append.json"),
-        b"not a journal",
-    )
-    .expect("write sidecar");
     fs::write(
         temp.path().join("day-1.protected-head.json"),
         b"not a journal",
@@ -5273,6 +5274,106 @@ fn aggregate_terminal_residual_hype_ignores_non_journal_sidecar_files() {
     )
     .expect("sidecar files are never mistaken for journals");
     assert_eq!(aggregated, hype(3));
+}
+
+#[test]
+fn aggregate_terminal_residual_hype_fails_closed_on_a_corrupt_pending_append() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("day-1.jsonl");
+    complete_workflow_with_residual(&path, 3);
+
+    // A `.pending-append.json` left beside an otherwise-complete journal is
+    // never normal garbage: `recover_pending_append` must fail closed on it
+    // rather than the historical peek silently ignoring it, the same way
+    // `open_or_create`'s own recovery does on a live reopen.
+    fs::write(
+        temp.path().join("day-1.jsonl.pending-append.json"),
+        b"not a journal",
+    )
+    .expect("write corrupt pending append");
+
+    let error = DurableWorkflow::aggregate_terminal_residual_hype(
+        temp.path(),
+        None,
+        hype(3),
+        "signer-identity-hash-a",
+        &memory_protected_head_store_for,
+        &always_admissible,
+    )
+    .expect_err("a corrupt pending append must not be silently ignored");
+    assert!(matches!(error, WorkflowError::RollbackDetected(_)));
+}
+
+#[test]
+fn aggregate_terminal_residual_hype_recovers_a_lost_completion_response() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("day-1.jsonl");
+    let mut binding = binding();
+    binding.decision_id = distinct_decision_id(&path);
+    binding.inventory_before.spot_hype_atoms = hype(3);
+    binding.inventory_before.unconsumed_residual_spot_hype_atoms = hype(0);
+    binding.inventory_before.configured_residual_hype_atoms = hype(3);
+    let store = protected_head_store(&path);
+    let mut workflow = DurableWorkflow::open_or_create(
+        &path,
+        &binding,
+        store.clone(),
+        exchange_order_owner_store(&path),
+    )
+    .expect("initial workflow opens");
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
+    workflow
+        .observe_order_fill(
+            "residual-fill",
+            hype(3),
+            usdc(600_000),
+            usdc(610_000),
+            false,
+            at(3),
+        )
+        .expect("residual fill observed");
+    workflow
+        .finalize_order(
+            hype(3),
+            usdc(600_000),
+            usdc(610_000),
+            OrderFinality::Canceled,
+            at(4),
+        )
+        .expect("order finalized");
+    let evidence = bound_evidence(&workflow, &[("residual-fill", 3, 3)], at(5));
+    workflow
+        .record_staking_eligibility(Some(evidence), at(5))
+        .expect("eligibility recorded");
+
+    // Simulate a crash right after `compare_and_swap` durably advances the
+    // protected head for the completing transition, but before its local
+    // journal line lands (or its pending marker clears): `complete` sees
+    // its own response lost and returns an error, leaving only the pending
+    // append durably committed.
+    store.lose_next_compare_and_swap_response();
+    assert!(workflow.complete(at(6)).is_err());
+    let mut pending_path = path.as_os_str().to_os_string();
+    pending_path.push(".pending-append.json");
+    let pending_path = PathBuf::from(pending_path);
+    assert!(pending_path.exists());
+    drop(workflow);
+
+    // A historical aggregation peek (no `open_or_create` reopen in between)
+    // must recover this exactly as a live reopen would, not read the
+    // journal as rolled back relative to its now-advanced protected head.
+    let aggregated = DurableWorkflow::aggregate_terminal_residual_hype(
+        temp.path(),
+        None,
+        hype(3),
+        "signer-identity-hash-a",
+        &memory_protected_head_store_for,
+        &always_admissible,
+    )
+    .expect("a lost completion response recovers instead of reading as a rollback");
+    assert_eq!(aggregated, hype(3));
+    assert!(!pending_path.exists());
 }
 
 #[test]
