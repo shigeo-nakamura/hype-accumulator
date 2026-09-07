@@ -321,6 +321,7 @@ async fn prepare(
     operational_params_path: &str,
     journal_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    validate_journal_path_extension(journal_path)?;
     let now = Utc::now();
     let config = load_config(config_path, security_policy_path)?;
     config.validate_at(&ProcessEnvironment, now)?;
@@ -630,6 +631,28 @@ fn journal_directory_for(journal_path: &Path) -> PathBuf {
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
+/// `DurableWorkflow::aggregate_terminal_residual_hype` only ever
+/// rediscovers a `.jsonl` journal in its directory. A journal created with
+/// any other extension would complete normally today but become
+/// permanently invisible to every later `prepare`'s aggregation — and its
+/// own protected-head sidecar would then look orphaned, blocking the
+/// account entirely — so this is refused up front, before anything is
+/// written.
+fn validate_journal_path_extension(journal_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if Path::new(journal_path)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        != Some("jsonl")
+    {
+        return Err(format!(
+            "journal_path must end in exactly \".jsonl\" (lowercase) so later aggregation can \
+             rediscover it, got {journal_path:?}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn historical_protected_head_store_for(
     path: &Path,
 ) -> Result<Arc<dyn ProtectedWorkflowHeadStore>, WorkflowError> {
@@ -684,7 +707,17 @@ async fn build_signed_connector(
 
 #[cfg(test)]
 mod tests {
-    use super::{invocation, Invocation, PrepareTimeBinding};
+    use super::{invocation, validate_journal_path_extension, Invocation, PrepareTimeBinding};
+
+    #[test]
+    fn journal_path_extension_must_be_exactly_lowercase_jsonl() {
+        assert!(validate_journal_path_extension("journal.jsonl").is_ok());
+        assert!(validate_journal_path_extension("/tmp/day-1.jsonl").is_ok());
+        assert!(validate_journal_path_extension("journal.JSONL").is_err());
+        assert!(validate_journal_path_extension("journal.jsonl.bak").is_err());
+        assert!(validate_journal_path_extension("journal").is_err());
+        assert!(validate_journal_path_extension("journal.json").is_err());
+    }
 
     fn args(values: &[&str]) -> impl Iterator<Item = String> {
         values

@@ -139,7 +139,17 @@ pub async fn prepare_first_live_order_workflow(
         // doc): sums every completed past workflow's terminal residual
         // HYPE and fails closed if any historical journal is not yet
         // terminal or the sum exceeds this same call's live spot balance.
-        let aggregated_unconsumed_residual_spot_hype_atoms =
+        // Never capped at the currently configured target: a residual
+        // allocation a completed workflow already immutably classified
+        // must never later become staking-eligible just because a policy
+        // change lowered the target (docs/security/custody-threat-model.md
+        // — "a residual allocation can never later become staking-
+        // eligible" / "a terminal lot never becomes eligible again because
+        // fungible spot later increases"). `residual_hype_deficit` already
+        // treats an aggregate above the current target as zero deficit —
+        // no new residual is reserved from today's fill, but the earlier
+        // excess stays exactly what history says it is.
+        let unconsumed_residual_spot_hype_atoms =
             DurableWorkflow::aggregate_terminal_residual_hype(
                 journal_directory,
                 Some(journal_path),
@@ -147,19 +157,6 @@ pub async fn prepare_first_live_order_workflow(
                 &probe_binding.execution_identity_hash,
                 historical_protected_head_store_for,
             )?;
-        // Capped at the currently configured target, mirroring
-        // `residual_hype_deficit`'s own `min()` pattern within one
-        // workflow: history is immutable, so a policy that lowers
-        // `configured_residual_hype_atoms` below what earlier completed
-        // workflows already recorded must not permanently block every
-        // later `prepare` (`DecisionBinding::validate` requires
-        // `unconsumed_residual_spot_hype_atoms <=
-        // configured_residual_hype_atoms`). The excess above the new,
-        // smaller target correctly becomes eligible for this workflow's
-        // own split rather than staying reserved for a target that no
-        // longer applies.
-        let unconsumed_residual_spot_hype_atoms =
-            aggregated_unconsumed_residual_spot_hype_atoms.min(configured_residual_hype_atoms);
 
         let inventory_before = InventoryBaseline {
             execution_identity_hash: probe_binding.execution_identity_hash.clone(),

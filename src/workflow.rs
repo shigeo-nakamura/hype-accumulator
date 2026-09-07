@@ -275,10 +275,17 @@ impl DecisionBinding {
             || self.order_envelope.signer_identity_hash.trim().is_empty()
             || self.order_envelope.signer_identity_hash
                 != self.order_envelope.signer_identity_hash.trim()
+            // Physically bounded by spot balance — this remains a hard
+            // constraint. Deliberately NOT bounded by
+            // `configured_residual_hype_atoms`: an earlier, higher target
+            // can leave more genuinely reserved than the current target
+            // requires (a residual allocation can never later become
+            // staking-eligible just because the target was lowered, see
+            // docs/security/custody-threat-model.md); the excess is a real,
+            // immutable residual, not an error. `residual_hype_deficit`
+            // already treats that case as zero deficit.
             || self.inventory_before.unconsumed_residual_spot_hype_atoms
                 > self.inventory_before.spot_hype_atoms
-            || self.inventory_before.unconsumed_residual_spot_hype_atoms
-                > self.inventory_before.configured_residual_hype_atoms
             || self.planned_usdc.is_zero()
             || self.committed_usdc < self.planned_usdc
             || self.order_envelope.original_quantity_hype.is_zero()

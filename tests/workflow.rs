@@ -1708,31 +1708,86 @@ fn order_binding_caps_quantity_times_limit_notional() {
 }
 
 #[test]
-fn residual_lot_inventory_cannot_exceed_spot_or_its_configured_target() {
-    for invalid in ["aggregate-spot", "configured-target"] {
-        let valid = binding();
-        let mut inventory = valid.inventory_before;
-        match invalid {
-            "aggregate-spot" => {
-                inventory.spot_hype_atoms = hype(5);
-                inventory.unconsumed_residual_spot_hype_atoms = hype(6);
-            }
-            "configured-target" => {
-                inventory.configured_residual_hype_atoms = hype(10);
-                inventory.unconsumed_residual_spot_hype_atoms = hype(11);
-            }
-            _ => unreachable!("complete residual baseline fixture"),
-        }
-        assert!(matches!(
-            DecisionBinding::from_pacing_decision(
-                &decision(),
-                inventory,
-                valid.order_envelope,
-                valid.eligibility_policy,
-            ),
-            Err(WorkflowError::InvalidBinding(_))
-        ));
-    }
+fn residual_lot_inventory_cannot_exceed_spot() {
+    let valid = binding();
+    let mut inventory = valid.inventory_before;
+    inventory.spot_hype_atoms = hype(5);
+    inventory.unconsumed_residual_spot_hype_atoms = hype(6);
+    assert!(matches!(
+        DecisionBinding::from_pacing_decision(
+            &decision(),
+            inventory,
+            valid.order_envelope,
+            valid.eligibility_policy,
+        ),
+        Err(WorkflowError::InvalidBinding(_))
+    ));
+}
+
+#[test]
+fn residual_lot_inventory_may_exceed_its_configured_target() {
+    // A residual allocation a completed workflow already immutably
+    // classified must never later become staking-eligible just because a
+    // policy change lowered the target (custody-threat-model.md) — more
+    // already reserved than the current (lower) target requires is valid,
+    // not an error.
+    let valid = binding();
+    let mut inventory = valid.inventory_before;
+    inventory.spot_hype_atoms = hype(11);
+    inventory.configured_residual_hype_atoms = hype(10);
+    inventory.unconsumed_residual_spot_hype_atoms = hype(11);
+    let binding = DecisionBinding::from_pacing_decision(
+        &decision(),
+        inventory,
+        valid.order_envelope,
+        valid.eligibility_policy,
+    )
+    .expect("unconsumed residual above the configured target is valid");
+    assert_eq!(
+        binding.inventory_before.unconsumed_residual_spot_hype_atoms,
+        hype(11)
+    );
+}
+
+#[test]
+fn a_lower_configured_target_reserves_no_new_residual_when_history_already_exceeds_it() {
+    let mut binding = binding();
+    binding.inventory_before.spot_hype_atoms = hype(20);
+    binding.inventory_before.configured_residual_hype_atoms = hype(5);
+    binding.inventory_before.unconsumed_residual_spot_hype_atoms = hype(10);
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("lower-target.jsonl");
+    let mut workflow = reopen(&path, &binding);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
+    workflow
+        .observe_order_fill(
+            "fill",
+            hype(6),
+            usdc(1_200_000),
+            usdc(1_210_000),
+            false,
+            at(3),
+        )
+        .expect("fill observed");
+    workflow
+        .finalize_order(
+            hype(6),
+            usdc(1_200_000),
+            usdc(1_210_000),
+            OrderFinality::Canceled,
+            at(4),
+        )
+        .expect("order finalized");
+    let evidence = bound_evidence(&workflow, &[("fill", 6, 3)], at(5));
+    let eligibility = workflow
+        .record_staking_eligibility(Some(evidence), at(5))
+        .expect("eligibility recorded");
+    // Already-reserved 10 exceeds the new target of 5: zero deficit, so
+    // this workflow's entire fresh purchase becomes eligible, not
+    // residual.
+    assert_eq!(eligibility.residual_hype, hype(0));
+    assert_eq!(eligibility.eligible_hype, hype(6));
 }
 
 #[test]
