@@ -213,6 +213,65 @@ impl PrepareTimeBinding {
     }
 }
 
+/// Durably records which `operational.toml` `history_directory` the first
+/// `prepare` for this `operational_params_path` resolved, at a path
+/// derived from that stable file path (not from `history_directory`
+/// itself, which is exactly the value this exists to protect against
+/// silently drifting). `operational_params_path` is assumed operator-
+/// controlled and stable across invocations (fixed in a systemd unit or
+/// cron job), the same trust `config_path`/`security_policy_path` already
+/// get elsewhere in this binary — unlike `journal_path`, which varies day
+/// to day.
+///
+/// Without this, an operator editing `operational.toml`'s
+/// `history_directory` between `prepare` runs would go undetected:
+/// `validate_journal_path` only checks the *current* invocation's
+/// `journal_path` against the *current* `history_directory`, and
+/// `aggregate_terminal_residual_hype` then silently scans only the new,
+/// likely-empty directory — the live-balance upper bound cannot detect
+/// this undercount, since it only ever rejects a total that's too large.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct HistoryDirectoryBinding {
+    history_directory: String,
+}
+
+impl HistoryDirectoryBinding {
+    fn path(operational_params_path: &str) -> PathBuf {
+        let mut path = PathBuf::from(operational_params_path);
+        path.set_extension("history-directory-binding.json");
+        path
+    }
+
+    /// Durably writes the binding on first use, or verifies an existing one
+    /// still matches.
+    fn write_once_and_verify(
+        operational_params_path: &str,
+        history_directory: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let path = Self::path(operational_params_path);
+        let current = Self {
+            history_directory: history_directory.to_owned(),
+        };
+        if let Ok(existing) = fs::read_to_string(&path) {
+            let existing: Self = serde_json::from_str(&existing)?;
+            if existing != current {
+                return Err(format!(
+                    "operational.toml's history_directory is now {:?}, but the first prepare for \
+                     this operational_params_path recorded {:?}; history_directory must never \
+                     change once an account has any completed journals. Restore the original \
+                     value, or start a genuinely new account with a fresh \
+                     operational_params_path.",
+                    current.history_directory, existing.history_directory
+                )
+                .into());
+            }
+            return Ok(());
+        }
+        fs::write(&path, serde_json::to_string_pretty(&current)?)?;
+        Ok(())
+    }
+}
+
 const USAGE: &str = "usage:\n  hype-live-probe prepare <config.toml> <security-policy.toml> \
      <runtime-config.toml> <operational.toml> <journal.jsonl>\n  hype-live-probe submit \
      <config.toml> <security-policy.toml> <operational.toml> <journal.jsonl> --confirm \
@@ -349,6 +408,15 @@ async fn prepare(
     let config = load_config(config_path, security_policy_path)?;
     config.validate_at(&ProcessEnvironment, now)?;
     let operational = OperationalParams::from_toml(&fs::read_to_string(operational_params_path)?)?;
+    // Durably binds history_directory to the first value ever read for this
+    // operational_params_path, before trusting it for anything: an
+    // operator later editing operational.toml's history_directory would
+    // otherwise go undetected, and the next prepare would silently
+    // aggregate from an empty new location instead of failing closed.
+    HistoryDirectoryBinding::write_once_and_verify(
+        operational_params_path,
+        &operational.history_directory,
+    )?;
     let journal_directory = PathBuf::from(&operational.history_directory);
     validate_journal_path(journal_path, &journal_directory)?;
     // Fixes the network this journal is bound to before anything else reads
@@ -799,10 +867,55 @@ async fn build_signed_connector(
 #[cfg(test)]
 mod tests {
     use super::{
-        invocation, network_routing_admissible_for, validate_journal_path, Invocation,
-        PrepareTimeBinding,
+        invocation, network_routing_admissible_for, validate_journal_path, HistoryDirectoryBinding,
+        Invocation, PrepareTimeBinding,
     };
     use std::path::Path;
+
+    #[test]
+    fn history_directory_binding_write_once_is_idempotent_for_the_same_value() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let operational_params_path = directory.path().join("operational.toml");
+        let operational_params_path = operational_params_path.to_str().expect("utf8 path");
+        HistoryDirectoryBinding::write_once_and_verify(
+            operational_params_path,
+            "/opt/hype-accumulator/journals",
+        )
+        .expect("first write");
+        HistoryDirectoryBinding::write_once_and_verify(
+            operational_params_path,
+            "/opt/hype-accumulator/journals",
+        )
+        .expect("matching re-verify");
+    }
+
+    #[test]
+    fn history_directory_binding_rejects_a_changed_directory() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let operational_params_path = directory.path().join("operational.toml");
+        let operational_params_path = operational_params_path.to_str().expect("utf8 path");
+        HistoryDirectoryBinding::write_once_and_verify(
+            operational_params_path,
+            "/opt/hype-accumulator/journals",
+        )
+        .expect("first write");
+
+        // Simulates an operator editing operational.toml's
+        // history_directory after journals already exist under the
+        // original one.
+        assert!(HistoryDirectoryBinding::write_once_and_verify(
+            operational_params_path,
+            "/opt/hype-accumulator/journals-v2",
+        )
+        .is_err());
+
+        // The original value still verifies.
+        HistoryDirectoryBinding::write_once_and_verify(
+            operational_params_path,
+            "/opt/hype-accumulator/journals",
+        )
+        .expect("original value still verifies");
+    }
 
     #[test]
     fn journal_path_extension_must_be_exactly_lowercase_jsonl() {
