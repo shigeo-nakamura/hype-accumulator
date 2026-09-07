@@ -42,10 +42,12 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
+    io::Write,
     path::{Path, PathBuf},
     process,
     str::FromStr,
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[tokio::main]
@@ -313,6 +315,18 @@ impl HistoryDirectoryBinding {
     /// only invoke this after `history_directory` itself has been created
     /// and verified available — see [`Self::check`]'s doc for why the order
     /// matters.
+    ///
+    /// Writes through a `create_new` temporary file, fsyncs it, then
+    /// publishes it to `path` with a hard link (not a rename): both paths
+    /// are siblings by construction, so the link is an atomic, no-replace
+    /// publish primitive on the same filesystem — mirroring
+    /// `backup.rs::publish_file_noreplace`'s durability pattern. This gives
+    /// the binding true first-writer-wins semantics (a second, concurrent
+    /// first-ever `prepare` for the same `operational_params_path` fails
+    /// with `AlreadyExists` instead of silently overwriting the first
+    /// binding) and crash safety (a crash between the temporary write and
+    /// the link never leaves a partial file at `path`; a crash after the
+    /// link is indistinguishable from a completed write).
     fn persist_first_ever(
         operational_params_path: &str,
         history_directory: &str,
@@ -321,7 +335,42 @@ impl HistoryDirectoryBinding {
         let current = Self {
             history_directory: history_directory.to_owned(),
         };
-        fs::write(&path, serde_json::to_string_pretty(&current)?)?;
+        let payload = serde_json::to_string_pretty(&current)?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("history-directory-binding.json");
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(std::io::Error::other)?
+            .as_nanos();
+        let temporary = parent.join(format!(".{file_name}.{}.{nonce}.tmp", process::id()));
+        let write_result: Result<(), std::io::Error> = (|| {
+            let mut options = fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temporary)?;
+            file.write_all(payload.as_bytes())?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temporary);
+            return Err(error.into());
+        }
+        let link_result = fs::hard_link(&temporary, &path);
+        let _ = fs::remove_file(&temporary);
+        link_result?;
+        #[cfg(unix)]
+        fs::File::open(parent)?.sync_all()?;
         Ok(())
     }
 
@@ -498,6 +547,16 @@ async fn prepare(
     let history_initialization =
         HistoryDirectoryBinding::check(operational_params_path, &operational.history_directory)?;
     let journal_directory = PathBuf::from(&operational.history_directory);
+    // Validated before anything below acts on `journal_directory`, in
+    // particular before `persist_first_ever` durably (and irreversibly)
+    // commits history_directory below: on a genuinely first-ever prepare
+    // with a mismatched journal_path, an operator fixing the mistake would
+    // otherwise still find every retry rejected as a "directory change"
+    // against a binding that was written for an invocation that never
+    // actually created a workflow, requiring manual binding-file surgery to
+    // recover. This check is a pure path comparison with no side effects,
+    // so running it first costs nothing.
+    validate_journal_path(journal_path, &journal_directory)?;
     ensure_history_directory_available(history_initialization, &journal_directory)?;
     // Reached only when the directory already exists (the `AlreadyInitialized`
     // case above fails closed otherwise) or this is a genuinely first-ever
@@ -516,7 +575,6 @@ async fn prepare(
             &operational.history_directory,
         )?;
     }
-    validate_journal_path(journal_path, &journal_directory)?;
     // Fixes the network this journal is bound to before anything else reads
     // `config`/`operational` for a network-dependent value: refuses to
     // silently re-bind an already-prepared journal to a different network on
@@ -1085,6 +1143,47 @@ mod tests {
             std::fs::read_to_string(&binding_path).expect("binding still present"),
             "not valid json"
         );
+    }
+
+    #[test]
+    fn persist_first_ever_never_overwrites_an_existing_binding() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let operational_params_path = directory.path().join("operational.toml");
+        let operational_params_path = operational_params_path.to_str().expect("utf8 path");
+
+        HistoryDirectoryBinding::persist_first_ever(
+            operational_params_path,
+            "/opt/hype-accumulator/journals",
+        )
+        .expect("first persist");
+
+        // Simulates two concurrent first-ever `prepare` invocations for the
+        // same operational_params_path both observing `check` == FirstEver
+        // before either has persisted: the second `persist_first_ever` must
+        // fail rather than silently replacing the first writer's binding
+        // with a different (or even identical) value.
+        assert!(HistoryDirectoryBinding::persist_first_ever(
+            operational_params_path,
+            "/opt/hype-accumulator/journals-v2",
+        )
+        .is_err());
+
+        // The first writer's binding is untouched, and no stray temporary
+        // file is left behind in the directory.
+        let binding_path = HistoryDirectoryBinding::path(operational_params_path);
+        let persisted: HistoryDirectoryBinding =
+            serde_json::from_str(&std::fs::read_to_string(&binding_path).expect("binding present"))
+                .expect("valid json");
+        assert_eq!(
+            persisted.history_directory,
+            "/opt/hype-accumulator/journals"
+        );
+        let leftover_temp_files = std::fs::read_dir(directory.path())
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path() != binding_path)
+            .count();
+        assert_eq!(leftover_temp_files, 0);
     }
 
     #[test]
