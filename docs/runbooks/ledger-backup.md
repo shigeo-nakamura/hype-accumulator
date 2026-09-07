@@ -88,7 +88,7 @@ python3 scripts/ledger_backup_transfer.py \
   --bundle <absolute-new-bundle-directory> \
   --anchor <absolute-new-anchor-export> \
   --receipt <absolute-new-private-receipt.json> \
-  --verifier <absolute-hype-accumulator-binary> \
+  --verifier <absolute-resolved-hype-accumulator-binary> \
   --payload-bucket <versioned-payload-bucket> \
   --payload-owner <12-digit-account-id> \
   --payload-kms-key <full-payload-kms-key-arn> \
@@ -118,6 +118,18 @@ remain under the per-run capture root, which is removed after the operation.
 AWS CLI and verifier binaries must also be beneath root- or operator-owned
 ancestor directories that are not group/world writable.
 
+Every path argument is rejected if it contains a symlink component, the
+verifier included. A deployment that publishes its current release through a
+symlink must therefore pass the resolved release path, not the symlink:
+
+```text
+--verifier "$(readlink -f <install-root>/current/hype-accumulator)"
+```
+
+Passing the symlink fails with `verifier binary must not contain aliases or
+symlink components`. Resolving it also records which exact release verified the
+backup, rather than whichever release the symlink happens to point at later.
+
 Full replay and S3 `put-object`/`get-object` transfers have no wall-clock
 timeout by default, so backup size or recovery-host bandwidth alone cannot
 invalidate a correct backup. Control-plane calls retain a 120-second timeout.
@@ -146,7 +158,7 @@ python3 scripts/ledger_backup_transfer.py \
   download \
   --receipt <absolute-private-receipt.json> \
   --destination-root <absolute-new-download-root> \
-  --verifier <absolute-hype-accumulator-binary>
+  --verifier <absolute-resolved-hype-accumulator-binary>
 ```
 
 The destination parent and its ancestor chain must be root/operator controlled
