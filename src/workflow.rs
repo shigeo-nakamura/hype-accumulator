@@ -2810,6 +2810,23 @@ impl DurableWorkflow {
     /// refuses to guess at rather than silently misclassify the next
     /// decision's inventory.
     ///
+    /// Known residual risk, deliberately out of scope here (Codex review,
+    /// bot-strategy#929): a sale or transfer that consumes part of a
+    /// journal's residual allocation *after* that journal already reached
+    /// `Complete` cannot be attributed back to it — only movements
+    /// recorded in its own eligibility evidence, from *before*
+    /// `StakingEligibilityRecorded`, are ever subtracted (see
+    /// `residual_consumed_by_movements_hype`). The live-balance upper
+    /// bound above only fails closed when the account's *total* residual +
+    /// still-unstaked-eligible expectation exceeds what's actually there;
+    /// if enough unrelated spot HYPE happens to still cover the (now
+    /// overstated) total, a post-completion sale of specifically residual
+    /// HYPE passes silently. Closing this needs an account-wide ledger
+    /// attributing every movement to the specific allocation it consumed
+    /// across all journals, not just the one that created it — the
+    /// broader external-transfer/staking ledger this module's doc already
+    /// defers.
+    ///
     /// # Errors
     ///
     /// Returns an error if `journal_directory` cannot be read, if any
