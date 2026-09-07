@@ -31,29 +31,34 @@ use tokio::time::timeout;
 /// Upper bound on one mirror PUT. See the doc comment on `put` for why
 /// this exists even after the caller has released its own locks.
 ///
-/// This bound is also what keeps the mirror's write ordering safe
-/// (bot-strategy#920). The runtime deliberately releases its exclusive
-/// state-directory lock before awaiting this PUT, so two consecutive
-/// cycles' PUTs are not mutually excluded and a slow cycle N could in
-/// principle overwrite the newer object cycle N+1 already wrote. That
-/// interleaving needs cycle N's request to still be in flight when cycle
-/// N+1's completes, which cannot happen while this timeout stays far
-/// below the interval between cycles: the client abandons cycle N's
-/// request after this timeout, and cycle N+1 does not start until its
-/// schedule comes round — five minutes on the deployed
-/// `OnCalendar=*-*-* *:0/5:00` timer. Only one unit mirrors, so a key has
-/// a single writer rather than two racing ones:
-/// `hype-accumulator-dryrun.service` carries the `STATUS_S3_*`
-/// environment and the observer unit does not.
+/// Bounding one attempt is also what keeps a slow PUT from delaying the
+/// next scheduled cycle, which is the whole reason the caller drops its
+/// exclusive state-directory lock first. `put_timeout_cannot_delay_the_next_cycle`
+/// pins that: one attempt must stay far below the shortest supported
+/// writer schedule.
 ///
-/// The deployment half of that argument cannot be checked here — nothing
-/// in this process can observe its own systemd timer — so it is pinned as
-/// an assertion in `put_timeout_cannot_outlive_a_cycle` and written down
-/// in `docs/runbooks/signer-free-runtime.md`. Raising this timeout, adding
-/// retries around the PUT, scheduling a status writer more often than five
-/// minutes, or giving a second unit the `STATUS_S3_*` environment all
-/// reopen the race and need an actual ordering mechanism — a mirror-scoped
-/// lock, or a conditional write — rather than a bigger constant here.
+/// It is *not* what orders two cycles' writes (bot-strategy#920). The
+/// pre-PUT phase of a cycle — observation, movement history, persistence —
+/// has no bound of its own, so the interval between two PUT *starts* is
+/// not the interval between two timer ticks. Ordering comes from the
+/// deployment shape instead:
+///
+/// - Only one unit mirrors, so a key has a single writer rather than two
+///   racing ones: `hype-accumulator-dryrun.service` carries the
+///   `STATUS_S3_*` environment and the observer unit does not.
+/// - systemd runs at most one instance of a given service unit at a time,
+///   so that writer's cycle N+1 process does not start until cycle N's
+///   process has exited — which is after N's PUT completed or was
+///   abandoned. Two of its PUTs are therefore never in flight together,
+///   however long N's pre-PUT phase took.
+///
+/// Neither half is observable from inside this process, so both are
+/// written down in `docs/runbooks/signer-free-runtime.md`. Giving a second
+/// unit the `STATUS_S3_*` environment, mirroring from a long-lived
+/// process that can overlap its own writes, or adding retries that outlive
+/// a cycle each reopen the race and need an actual ordering mechanism — a
+/// mirror-scoped lock, or a conditional write — not a different constant
+/// here.
 const PUT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Error)]
@@ -133,13 +138,12 @@ mod tests {
     use std::sync::Mutex;
 
     /// The shortest scheduling interval any deployment may run a status
-    /// writer at; the other half of `PUT_TIMEOUT`'s ordering argument.
-    /// Matches the deployed `OnCalendar=*-*-* *:0/5:00` timer.
+    /// writer at. Matches the deployed `OnCalendar=*-*-* *:0/5:00` timer.
     const MIN_SUPPORTED_CYCLE_INTERVAL: Duration = Duration::from_secs(300);
 
-    /// How much shorter than a cycle one PUT attempt must stay. A PUT that
-    /// consumed a meaningful fraction of the interval would leave the
-    /// argument resting on timer accuracy alone.
+    /// How much shorter than a cycle one PUT attempt must stay. A PUT
+    /// consuming a meaningful fraction of the interval would eat into the
+    /// budget the next cycle needs.
     const MIN_CYCLE_INTERVAL_SAFETY_FACTOR: u64 = 10;
 
     // Env var access must serialize: `from_env` reads process env vars,
@@ -155,24 +159,30 @@ mod tests {
         }
     }
 
-    /// bot-strategy#920: the mirror's write ordering rests on an inequality
-    /// between these two constants rather than on a lock. Raising
-    /// `PUT_TIMEOUT`, or adding retries whose total budget exceeds it,
-    /// silently reopens the stale-write race unless a real ordering
-    /// mechanism comes with it — fail here rather than in production.
+    /// One mirror attempt must stay far below the shortest supported
+    /// writer schedule, so a slow or unresponsive S3 endpoint cannot push
+    /// the next scheduled cycle out (bot-strategy#914's P1, preserved by
+    /// bot-strategy#920's disposition). Raising `PUT_TIMEOUT`, or adding
+    /// retries whose total budget exceeds it, reintroduces that risk
+    /// silently — fail here rather than in production.
+    ///
+    /// This bounds mirror-induced schedule slip, *not* write ordering:
+    /// see `PUT_TIMEOUT`'s own comment for why ordering rests on the
+    /// deployment shape rather than on this inequality.
     ///
     /// A `const _: () = assert!(..)` in the module body would be stronger,
     /// but the dead-code lint does not count a use inside one, so both
     /// constants would then need an `#[allow(dead_code)]` that would also
     /// hide genuinely unused constants later.
     #[test]
-    fn put_timeout_cannot_outlive_a_cycle() {
+    fn put_timeout_cannot_delay_the_next_cycle() {
         assert!(
             PUT_TIMEOUT.as_secs() * MIN_CYCLE_INTERVAL_SAFETY_FACTOR
                 <= MIN_SUPPORTED_CYCLE_INTERVAL.as_secs(),
             "one PUT attempt ({PUT_TIMEOUT:?}) must stay at least \
              {MIN_CYCLE_INTERVAL_SAFETY_FACTOR}x shorter than the shortest supported cycle \
-             interval ({MIN_SUPPORTED_CYCLE_INTERVAL:?}); see this module's ordering argument"
+             interval ({MIN_SUPPORTED_CYCLE_INTERVAL:?}), so a stalled mirror cannot delay the \
+             next cycle"
         );
     }
 
