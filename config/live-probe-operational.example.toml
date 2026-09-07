@@ -34,3 +34,9 @@ order_timeout_seconds = 10
 # Order book depth requested from the connector for the worst-case price
 # computation.
 order_book_depth = 5
+
+# Every `prepare`d journal for this account must live directly in this one
+# directory — never date-partitioned into subdirectories, or later
+# aggregation (bot-strategy#929) will never rediscover the earlier ones.
+# Fix this once and never change it for an account with any history.
+history_directory = "/opt/hype-accumulator/journals"

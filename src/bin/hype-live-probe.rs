@@ -70,6 +70,13 @@ struct OperationalParams {
     max_taker_book_age_ms: u64,
     order_timeout_seconds: u64,
     order_book_depth: usize,
+    // Every journal for this account must live directly in this one
+    // directory — never derived from a per-invocation `journal_path`, which
+    // a differently-shaped future caller (e.g. a date-partitioned daily
+    // scheduler) could vary without ever meaning to change where history is
+    // aggregated from. Fixed here, in a file the operator reviews and edits
+    // deliberately, not inferred.
+    history_directory: String,
 }
 
 impl OperationalParams {
@@ -338,11 +345,12 @@ async fn prepare(
     operational_params_path: &str,
     journal_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    validate_journal_path_extension(journal_path)?;
     let now = Utc::now();
     let config = load_config(config_path, security_policy_path)?;
     config.validate_at(&ProcessEnvironment, now)?;
     let operational = OperationalParams::from_toml(&fs::read_to_string(operational_params_path)?)?;
+    let journal_directory = PathBuf::from(&operational.history_directory);
+    validate_journal_path(journal_path, &journal_directory)?;
     // Fixes the network this journal is bound to before anything else reads
     // `config`/`operational` for a network-dependent value: refuses to
     // silently re-bind an already-prepared journal to a different network on
@@ -417,7 +425,6 @@ async fn prepare(
 
     let (protected_head_store, owner_store) = build_stores(journal_path)?;
     let journal = PathBuf::from(journal_path);
-    let journal_directory = journal_directory_for(&journal);
 
     // `signal_evidence_valid_through_at` is not `policy_acknowledgement_valid_through_at`
     // (an unrelated quantity that happens to also be a `DateTime<Utc>`) — no
@@ -654,29 +661,42 @@ fn build_prepare_policies(
     (envelope_policy, eligibility_policy)
 }
 
-fn journal_directory_for(journal_path: &Path) -> PathBuf {
-    journal_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
-}
-
 /// `DurableWorkflow::aggregate_terminal_residual_hype` only ever
-/// rediscovers a `.jsonl` journal in its directory. A journal created with
-/// any other extension would complete normally today but become
-/// permanently invisible to every later `prepare`'s aggregation — and its
-/// own protected-head sidecar would then look orphaned, blocking the
-/// account entirely — so this is refused up front, before anything is
-/// written.
-fn validate_journal_path_extension(journal_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if Path::new(journal_path)
-        .extension()
-        .and_then(std::ffi::OsStr::to_str)
-        != Some("jsonl")
-    {
+/// rediscovers a `.jsonl` journal directly inside one stable directory. A
+/// journal with any other extension would complete normally today but
+/// become permanently invisible to every later `prepare`'s aggregation —
+/// and its own protected-head sidecar would then look orphaned, blocking
+/// the account entirely. Likewise, a journal placed outside
+/// `history_directory` (e.g. a caller date-partitioning `journal_path` by
+/// subdirectory, with no durable registry or configured root requiring
+/// every invocation to share one parent) would itself never be
+/// rediscovered by a later run's aggregation, silently omitting whatever
+/// residual it goes on to record. Both are refused up front, before
+/// anything is written, rather than letting either the extension or the
+/// directory choice quietly break history discovery later.
+fn validate_journal_path(
+    journal_path: &str,
+    history_directory: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = Path::new(journal_path);
+    if path.extension().and_then(std::ffi::OsStr::to_str) != Some("jsonl") {
         return Err(format!(
             "journal_path must end in exactly \".jsonl\" (lowercase) so later aggregation can \
              rediscover it, got {journal_path:?}"
+        )
+        .into());
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if parent != history_directory {
+        return Err(format!(
+            "journal_path's directory ({}) does not match operational.toml's configured \
+             history_directory ({}); every journal for this account must live directly in the \
+             same configured history_directory, or later aggregation will never rediscover it",
+            parent.display(),
+            history_directory.display()
         )
         .into());
     }
@@ -779,18 +799,45 @@ async fn build_signed_connector(
 #[cfg(test)]
 mod tests {
     use super::{
-        invocation, network_routing_admissible_for, validate_journal_path_extension, Invocation,
+        invocation, network_routing_admissible_for, validate_journal_path, Invocation,
         PrepareTimeBinding,
     };
+    use std::path::Path;
 
     #[test]
     fn journal_path_extension_must_be_exactly_lowercase_jsonl() {
-        assert!(validate_journal_path_extension("journal.jsonl").is_ok());
-        assert!(validate_journal_path_extension("/tmp/day-1.jsonl").is_ok());
-        assert!(validate_journal_path_extension("journal.JSONL").is_err());
-        assert!(validate_journal_path_extension("journal.jsonl.bak").is_err());
-        assert!(validate_journal_path_extension("journal").is_err());
-        assert!(validate_journal_path_extension("journal.json").is_err());
+        let history = Path::new("/opt/hype-accumulator/journals");
+        assert!(
+            validate_journal_path("/opt/hype-accumulator/journals/journal.jsonl", history).is_ok()
+        );
+        assert!(
+            validate_journal_path("/opt/hype-accumulator/journals/journal.JSONL", history).is_err()
+        );
+        assert!(
+            validate_journal_path("/opt/hype-accumulator/journals/journal.jsonl.bak", history)
+                .is_err()
+        );
+        assert!(validate_journal_path("/opt/hype-accumulator/journals/journal", history).is_err());
+        assert!(
+            validate_journal_path("/opt/hype-accumulator/journals/journal.json", history).is_err()
+        );
+    }
+
+    #[test]
+    fn journal_path_must_live_directly_in_the_configured_history_directory() {
+        let history = Path::new("/opt/hype-accumulator/journals");
+        assert!(
+            validate_journal_path("/opt/hype-accumulator/journals/day-1.jsonl", history).is_ok()
+        );
+        // A date-partitioned subdirectory would make this journal
+        // permanently invisible to later aggregation, which only ever
+        // scans `history_directory` itself.
+        assert!(validate_journal_path(
+            "/opt/hype-accumulator/journals/2026-09-07/day.jsonl",
+            history
+        )
+        .is_err());
+        assert!(validate_journal_path("/some/other/place/day-1.jsonl", history).is_err());
     }
 
     fn args(values: &[&str]) -> impl Iterator<Item = String> {
