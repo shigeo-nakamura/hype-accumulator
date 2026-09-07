@@ -23,7 +23,7 @@
 use chrono::Utc;
 use dex_connector::{HyperliquidAccountConfig, HyperliquidConnector, HyperliquidConnectorConfig};
 use hype_accumulator::{
-    config::{Config, ProcessEnvironment},
+    config::{Config, EffectiveLiveOrderPolicy, ProcessEnvironment},
     live_decision::prepare_first_live_order_workflow,
     live_probe::{reconcile_prepared_order, HyperliquidLiveProbe, LiveProbeBinding},
     monitor::{trade_cadence_label, HypeAttribution, HyperliquidObserver},
@@ -35,17 +35,19 @@ use hype_accumulator::{
     workflow::{
         DurableWorkflow, EligibilityPolicyBinding, ExchangeOrderOwnerStore,
         FileExchangeOrderOwnerStore, FileProtectedWorkflowHeadStore, HypeAtoms,
-        ProtectedWorkflowHeadStore,
+        ProtectedWorkflowHeadStore, WorkflowError,
     },
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
+    io::Write,
     path::{Path, PathBuf},
     process,
     str::FromStr,
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[tokio::main]
@@ -70,6 +72,22 @@ struct OperationalParams {
     max_taker_book_age_ms: u64,
     order_timeout_seconds: u64,
     order_book_depth: usize,
+    // Every journal for this account must live directly in this one
+    // directory — never derived from a per-invocation `journal_path`, which
+    // a differently-shaped future caller (e.g. a date-partitioned daily
+    // scheduler) could vary without ever meaning to change where history is
+    // aggregated from. Fixed here, in a file the operator reviews and edits
+    // deliberately, not inferred.
+    //
+    // Optional, not required, even though only `prepare` ever reads it:
+    // `submit`/`reconcile` parse this same shared struct out of an
+    // operational.toml that may predate this field, to recover an in-flight
+    // order after an upgrade. A hard-required field here would make those
+    // two commands fail to even parse a still-otherwise-valid legacy file,
+    // forcing an operator to edit unrelated configuration before recovery —
+    // see `prepare`'s explicit `ok_or` below for where this is actually
+    // enforced.
+    history_directory: Option<String>,
 }
 
 impl OperationalParams {
@@ -168,14 +186,20 @@ impl PrepareTimeBinding {
         Ok(())
     }
 
-    fn verify(journal_path: &str, current: &Self) -> Result<(), Box<dyn std::error::Error>> {
+    fn read(journal_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let path = Self::path(journal_path);
-        let recorded: Self = serde_json::from_str(&fs::read_to_string(&path).map_err(|_| {
-            format!(
-                "no prepare-time binding recorded at {}; run `prepare` first",
-                path.display()
-            )
-        })?)?;
+        Ok(serde_json::from_str(&fs::read_to_string(&path).map_err(
+            |_| {
+                format!(
+                    "no prepare-time binding recorded at {}; run `prepare` first",
+                    path.display()
+                )
+            },
+        )?)?)
+    }
+
+    fn verify(journal_path: &str, current: &Self) -> Result<(), Box<dyn std::error::Error>> {
+        let recorded = Self::read(journal_path)?;
         if recorded != *current {
             return Err(format!(
                 "config.toml/operational.toml now resolve to {current:?}, but this journal was \
@@ -186,6 +210,205 @@ impl PrepareTimeBinding {
             .into());
         }
         Ok(())
+    }
+
+    /// Unlike [`Self::verify`] (exact equality, used before ever submitting
+    /// a signed action against a specific endpoint), historical-journal
+    /// aggregation only cares about the stable network/routing identity: a
+    /// benign endpoint change (URL migration, failover) must not
+    /// permanently exclude every already-completed journal's residual just
+    /// because their immutable, write-once bindings recorded the old URL.
+    const fn same_network_and_routing_as(&self, other: &Self) -> bool {
+        self.is_mainnet == other.is_mainnet
+            && self.requires_vault_address_routing == other.requires_vault_address_routing
+    }
+}
+
+/// Durably records which `operational.toml` `history_directory` the first
+/// `prepare` for this `operational_params_path` resolved, at a path
+/// derived from that stable file path (not from `history_directory`
+/// itself, which is exactly the value this exists to protect against
+/// silently drifting). `operational_params_path` is assumed operator-
+/// controlled and stable across invocations (fixed in a systemd unit or
+/// cron job), the same trust `config_path`/`security_policy_path` already
+/// get elsewhere in this binary — unlike `journal_path`, which varies day
+/// to day.
+///
+/// Without this, an operator editing `operational.toml`'s
+/// `history_directory` between `prepare` runs would go undetected:
+/// `validate_journal_path` only checks the *current* invocation's
+/// `journal_path` against the *current* `history_directory`, and
+/// `aggregate_terminal_residual_hype` then silently scans only the new,
+/// likely-empty directory — the live-balance upper bound cannot detect
+/// this undercount, since it only ever rejects a total that's too large.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryInitialization {
+    FirstEver,
+    AlreadyInitialized,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct HistoryDirectoryBinding {
+    history_directory: String,
+}
+
+impl HistoryDirectoryBinding {
+    /// Keyed by `operational_params_path` itself, not by the execution
+    /// account it protects — the cleaner key, `execution_identity_hash`,
+    /// isn't available until after the KMS-decrypted connector is built,
+    /// several steps later in `prepare()`. This means copying or renaming
+    /// the operational file gives the same account a fresh, empty binding
+    /// namespace, undetected. Deliberately deferred (bot-strategy#943,
+    /// same class of gap as bot-strategy#942): `operational_params_path` is
+    /// operator-controlled infrastructure (systemd unit / cron job), not
+    /// attacker-reachable, and hype-accumulator has no live capital today.
+    fn path(operational_params_path: &str) -> PathBuf {
+        let mut path = PathBuf::from(operational_params_path);
+        path.set_extension("history-directory-binding.json");
+        path
+    }
+
+    /// Read-only: determines whether history for this
+    /// `operational_params_path` was already initialized, verifying an
+    /// existing binding still matches `history_directory` without writing
+    /// anything. Split out from [`Self::write_once_and_verify`] so a caller
+    /// that still needs to create `history_directory` (a genuinely
+    /// first-ever `prepare`) can do so *before* [`Self::persist_first_ever`]
+    /// durably commits the binding — persisting the binding first would let
+    /// a transient directory-creation failure's retry observe
+    /// `AlreadyInitialized` against a directory that was never actually
+    /// created, requiring manual directory creation or binding-file surgery
+    /// to recover.
+    fn check(
+        operational_params_path: &str,
+        history_directory: &str,
+    ) -> Result<HistoryInitialization, Box<dyn std::error::Error>> {
+        let path = Self::path(operational_params_path);
+        let current = Self {
+            history_directory: history_directory.to_owned(),
+        };
+        // A read failure other than "no binding yet" (permission denied, a
+        // truncated or non-UTF-8 file after a crash) must not be treated as
+        // a first-ever prepare: `persist_first_ever` would then silently
+        // replace whatever evidence the file held, exactly the undetected
+        // history_directory reset this binding exists to prevent.
+        match fs::read_to_string(&path) {
+            Ok(existing) => {
+                let existing: Self = serde_json::from_str(&existing)?;
+                if existing != current {
+                    return Err(format!(
+                        "operational.toml's history_directory is now {:?}, but the first prepare \
+                         for this operational_params_path recorded {:?}; history_directory must \
+                         never change once an account has any completed journals. Restore the \
+                         original value, or start a genuinely new account with a fresh \
+                         operational_params_path.",
+                        current.history_directory, existing.history_directory
+                    )
+                    .into());
+                }
+                Ok(HistoryInitialization::AlreadyInitialized)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Ok(HistoryInitialization::FirstEver)
+            }
+            Err(err) => Err(format!(
+                "failed to read history-directory binding at {}: {err}; refusing to treat an \
+                 unreadable or corrupt binding as a first-ever prepare.",
+                path.display()
+            )
+            .into()),
+        }
+    }
+
+    /// Durably persists the binding for a first-ever prepare. Callers must
+    /// only invoke this after `history_directory` itself has been created
+    /// and verified available — see [`Self::check`]'s doc for why the order
+    /// matters.
+    ///
+    /// Writes through a `create_new` temporary file, fsyncs it, then
+    /// publishes it to `path` with a hard link (not a rename): both paths
+    /// are siblings by construction, so the link is an atomic, no-replace
+    /// publish primitive on the same filesystem — mirroring
+    /// `backup.rs::publish_file_noreplace`'s durability pattern. This gives
+    /// the binding true first-writer-wins semantics (a second, concurrent
+    /// first-ever `prepare` for the same `operational_params_path` fails
+    /// with `AlreadyExists` instead of silently overwriting the first
+    /// binding) and crash safety (a crash between the temporary write and
+    /// the link never leaves a partial file at `path`; a crash after the
+    /// link is indistinguishable from a completed write).
+    fn persist_first_ever(
+        operational_params_path: &str,
+        history_directory: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let path = Self::path(operational_params_path);
+        let current = Self {
+            history_directory: history_directory.to_owned(),
+        };
+        let payload = serde_json::to_string_pretty(&current)?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("history-directory-binding.json");
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(std::io::Error::other)?
+            .as_nanos();
+        let temporary = parent.join(format!(".{file_name}.{}.{nonce}.tmp", process::id()));
+        let write_result: Result<(), std::io::Error> = (|| {
+            let mut options = fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temporary)?;
+            file.write_all(payload.as_bytes())?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temporary);
+            return Err(error.into());
+        }
+        let link_result = fs::hard_link(&temporary, &path);
+        let _ = fs::remove_file(&temporary);
+        link_result?;
+        #[cfg(unix)]
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+
+    /// Durably writes the binding on first use, or verifies an existing one
+    /// still matches.
+    /// Returns whether history for this `operational_params_path` was
+    /// already initialized before this call, so the caller can tell a
+    /// genuinely first-ever `prepare` (no directory yet is normal) apart
+    /// from one that already succeeded before (no directory now means it
+    /// was lost, not that it never existed).
+    ///
+    /// Convenience wrapper over [`Self::check`] + [`Self::persist_first_ever`]
+    /// for callers (and tests) with nothing to create in between; `prepare`
+    /// itself must call the two steps separately around directory creation
+    /// instead of using this.
+    #[cfg(test)]
+    fn write_once_and_verify(
+        operational_params_path: &str,
+        history_directory: &str,
+    ) -> Result<HistoryInitialization, Box<dyn std::error::Error>> {
+        match Self::check(operational_params_path, history_directory)? {
+            HistoryInitialization::AlreadyInitialized => {
+                Ok(HistoryInitialization::AlreadyInitialized)
+            }
+            HistoryInitialization::FirstEver => {
+                Self::persist_first_ever(operational_params_path, history_directory)?;
+                Ok(HistoryInitialization::FirstEver)
+            }
+        }
     }
 }
 
@@ -325,11 +548,53 @@ async fn prepare(
     let config = load_config(config_path, security_policy_path)?;
     config.validate_at(&ProcessEnvironment, now)?;
     let operational = OperationalParams::from_toml(&fs::read_to_string(operational_params_path)?)?;
+    // The only place `history_directory` is required: `submit`/`reconcile`
+    // never read it (see the field's doc comment), so a legacy
+    // operational.toml that predates this field parses fine for them, but
+    // `prepare` cannot proceed without a directory to bind history to.
+    let history_directory = operational
+        .history_directory
+        .as_deref()
+        .ok_or("operational.toml is missing history_directory, required by `prepare`")?;
+    // Durably binds history_directory to the first value ever read for this
+    // operational_params_path, before trusting it for anything: an
+    // operator later editing operational.toml's history_directory would
+    // otherwise go undetected, and the next prepare would silently
+    // aggregate from an empty new location instead of failing closed.
+    let history_initialization =
+        HistoryDirectoryBinding::check(operational_params_path, history_directory)?;
+    let journal_directory = PathBuf::from(history_directory);
+    // Validated before anything below acts on `journal_directory`, in
+    // particular before `persist_first_ever` durably (and irreversibly)
+    // commits history_directory below: on a genuinely first-ever prepare
+    // with a mismatched journal_path, an operator fixing the mistake would
+    // otherwise still find every retry rejected as a "directory change"
+    // against a binding that was written for an invocation that never
+    // actually created a workflow, requiring manual binding-file surgery to
+    // recover. This check is a pure path comparison with no side effects,
+    // so running it first costs nothing.
+    validate_journal_path(journal_path, &journal_directory)?;
+    ensure_history_directory_available(history_initialization, &journal_directory)?;
+    // Reached only when the directory already exists (the `AlreadyInitialized`
+    // case above fails closed otherwise) or this is a genuinely first-ever
+    // prepare, so creating it here is a no-op in the former case and turns
+    // the latter's "missing is normal" into "present before anything below
+    // — the journal write, `PrepareTimeBinding`'s sidecar, protected-head
+    // store — tries to write into it.
+    fs::create_dir_all(&journal_directory)?;
+    // Persisted only now that the directory demonstrably exists: doing this
+    // before `create_dir_all` would let a transient creation failure's retry
+    // observe `AlreadyInitialized` against a directory that was never
+    // actually created (see `HistoryDirectoryBinding::check`'s doc).
+    if history_initialization == HistoryInitialization::FirstEver {
+        HistoryDirectoryBinding::persist_first_ever(operational_params_path, history_directory)?;
+    }
     // Fixes the network this journal is bound to before anything else reads
     // `config`/`operational` for a network-dependent value: refuses to
     // silently re-bind an already-prepared journal to a different network on
     // a later `prepare` retry.
-    PrepareTimeBinding::resolved(&config, &operational)?.write_once(journal_path)?;
+    let prepare_time_binding = PrepareTimeBinding::resolved(&config, &operational)?;
+    prepare_time_binding.write_once(journal_path)?;
 
     // Decrypts the signer now, even though the signal-free
     // `SignerFreeRuntime::apply_cycle` below (inside
@@ -351,23 +616,8 @@ async fn prepare(
     let now = Utc::now();
     let effective = config.effective_live_order_policy(&ProcessEnvironment, now)?;
     let policy_version = config.effective_security_policy_digest(&ProcessEnvironment, now)?;
-    let envelope_policy = OrderEnvelopeFreshnessPolicy {
-        max_venue_clock_lag_ms: effective.max_venue_clock_lag_ms,
-        venue_clock_evidence_stale_after_seconds: effective
-            .venue_clock_evidence_stale_after_seconds,
-        book_stale_after_seconds: effective.book_stale_after_seconds,
-        account_history_stale_after_seconds: effective.account_history_stale_after_seconds,
-        fee_schedule_stale_after_seconds: effective.fee_schedule_stale_after_seconds,
-        signal_stale_after_seconds: effective.signal_stale_after_seconds,
-        order_timeout_seconds: operational.order_timeout_seconds,
-        max_slippage_bps: effective.max_slippage_bps,
-        order_book_depth: operational.order_book_depth,
-    };
-    let eligibility_policy = EligibilityPolicyBinding {
-        policy_version,
-        fill_registration_deadline_seconds: effective.fill_registration_deadline_seconds,
-        lot_eligibility_max_age_seconds: effective.lot_eligibility_max_age_seconds,
-    };
+    let (envelope_policy, eligibility_policy) =
+        build_prepare_policies(&effective, &operational, policy_version);
     let configured_residual_hype_atoms = HypeAtoms::from_atoms(effective.residual_hype_wei);
 
     let runtime_config = RuntimeConfig::from_toml(&fs::read_to_string(runtime_config_path)?)?
@@ -422,6 +672,7 @@ async fn prepare(
     // `now` and bound it by the same `signal_stale_after_seconds` window.
     let signal_evidence_valid_through_at =
         now + chrono::TimeDelta::seconds(i64::try_from(effective.signal_stale_after_seconds)?);
+    let network_routing_admissible = network_routing_admissible_for(&prepare_time_binding);
     let workflow = prepare_first_live_order_workflow(
         &connector,
         &mut runtime,
@@ -432,6 +683,9 @@ async fn prepare(
         eligibility_policy,
         configured_residual_hype_atoms,
         &journal,
+        &journal_directory,
+        &historical_protected_head_store_for,
+        &network_routing_admissible,
         protected_head_store,
         owner_store,
         now,
@@ -604,8 +858,7 @@ type WorkflowStores = (
 );
 
 fn build_stores(journal_path: &str) -> Result<WorkflowStores, Box<dyn std::error::Error>> {
-    let mut head_path = PathBuf::from(journal_path);
-    head_path.set_extension("protected-head.json");
+    let head_path = DurableWorkflow::protected_head_path_for(Path::new(journal_path));
     let protected_head_store: Arc<dyn ProtectedWorkflowHeadStore> =
         Arc::new(FileProtectedWorkflowHeadStore::new(head_path)?);
     // Deliberately outside the per-journal path: this store must be shared
@@ -619,6 +872,166 @@ fn build_stores(journal_path: &str) -> Result<WorkflowStores, Box<dyn std::error
     let owner_store: Arc<dyn ExchangeOrderOwnerStore> =
         Arc::new(FileExchangeOrderOwnerStore::new(owner_store_path)?);
     Ok((protected_head_store, owner_store))
+}
+
+fn build_prepare_policies(
+    effective: &EffectiveLiveOrderPolicy,
+    operational: &OperationalParams,
+    policy_version: String,
+) -> (OrderEnvelopeFreshnessPolicy, EligibilityPolicyBinding) {
+    let envelope_policy = OrderEnvelopeFreshnessPolicy {
+        max_venue_clock_lag_ms: effective.max_venue_clock_lag_ms,
+        venue_clock_evidence_stale_after_seconds: effective
+            .venue_clock_evidence_stale_after_seconds,
+        book_stale_after_seconds: effective.book_stale_after_seconds,
+        account_history_stale_after_seconds: effective.account_history_stale_after_seconds,
+        fee_schedule_stale_after_seconds: effective.fee_schedule_stale_after_seconds,
+        signal_stale_after_seconds: effective.signal_stale_after_seconds,
+        order_timeout_seconds: operational.order_timeout_seconds,
+        max_slippage_bps: effective.max_slippage_bps,
+        order_book_depth: operational.order_book_depth,
+    };
+    let eligibility_policy = EligibilityPolicyBinding {
+        policy_version,
+        fill_registration_deadline_seconds: effective.fill_registration_deadline_seconds,
+        lot_eligibility_max_age_seconds: effective.lot_eligibility_max_age_seconds,
+    };
+    (envelope_policy, eligibility_policy)
+}
+
+/// A missing `journal_directory` is only ever the normal state before this
+/// account's genuinely first-ever `prepare` (aggregation then correctly
+/// treats it as zero historical journals). Once history has been
+/// initialized before, its disappearance — deleted, unmounted, unavailable
+/// storage — must fail closed: silently proceeding would let
+/// `open_or_create` recreate an empty directory and every prior residual
+/// allocation vanish from aggregation without a trace, since the
+/// live-balance check only ever rejects a total that's too large, never
+/// one that's suspiciously small.
+///
+/// Residual gap, deliberately deferred (bot-strategy#944, same class of gap
+/// as bot-strategy#943): this is an `is_dir()` check, not a content check.
+/// An unmounted journal filesystem can leave an ordinary, empty mount-point
+/// directory behind, and a directory deleted then recreated empty passes
+/// this check exactly the same way a genuinely-preserved one would —
+/// `aggregate_terminal_residual_hype` then returns zero from a directory
+/// that "exists" but no longer holds any journals. Closing this needs a
+/// durable, account-specific manifest or journal-count high-water mark
+/// recorded in `HistoryDirectoryBinding` (which lives outside
+/// `journal_directory` and so survives its loss) and checked against what
+/// the directory currently holds — new persisted state, out of scope for
+/// this aggregator-foundation PR (hype-accumulator#47), which the operator
+/// explicitly scoped narrowly (same reasoning as bot-strategy#943).
+/// hype-accumulator has no live capital today (`DRY_RUN` only, no order ever
+/// signed), so the practical exposure is low until live use begins.
+fn ensure_history_directory_available(
+    history_initialization: HistoryInitialization,
+    journal_directory: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if history_initialization == HistoryInitialization::AlreadyInitialized
+        && !journal_directory.is_dir()
+    {
+        return Err(format!(
+            "history_directory {} was already initialized for this account but does not exist \
+             (deleted, unmounted, or unavailable?); refusing to silently start aggregating from \
+             an empty directory. Restore it before running prepare again.",
+            journal_directory.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// `DurableWorkflow::aggregate_terminal_residual_hype` only ever
+/// rediscovers a `.jsonl` journal directly inside one stable directory. A
+/// journal with any other extension would complete normally today but
+/// become permanently invisible to every later `prepare`'s aggregation —
+/// and its own protected-head sidecar would then look orphaned, blocking
+/// the account entirely. Likewise, a journal placed outside
+/// `history_directory` (e.g. a caller date-partitioning `journal_path` by
+/// subdirectory, with no durable registry or configured root requiring
+/// every invocation to share one parent) would itself never be
+/// rediscovered by a later run's aggregation, silently omitting whatever
+/// residual it goes on to record. Both are refused up front, before
+/// anything is written, rather than letting either the extension or the
+/// directory choice quietly break history discovery later.
+fn validate_journal_path(
+    journal_path: &str,
+    history_directory: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = Path::new(journal_path);
+    if path.extension().and_then(std::ffi::OsStr::to_str) != Some("jsonl") {
+        return Err(format!(
+            "journal_path must end in exactly \".jsonl\" (lowercase) so later aggregation can \
+             rediscover it, got {journal_path:?}"
+        )
+        .into());
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if parent != history_directory {
+        return Err(format!(
+            "journal_path's directory ({}) does not match operational.toml's configured \
+             history_directory ({}); every journal for this account must live directly in the \
+             same configured history_directory, or later aggregation will never rediscover it",
+            parent.display(),
+            history_directory.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn historical_protected_head_store_for(
+    path: &Path,
+) -> Result<Arc<dyn ProtectedWorkflowHeadStore>, WorkflowError> {
+    let head_path = DurableWorkflow::protected_head_path_for(path);
+    FileProtectedWorkflowHeadStore::new(head_path)
+        .map(|store| Arc::new(store) as Arc<dyn ProtectedWorkflowHeadStore>)
+        .map_err(WorkflowError::ProtectedHead)
+}
+
+/// `execution_identity_hash` alone does not distinguish testnet from
+/// mainnet, or one vault-address routing mode from another, for the same
+/// address — this checks each historical journal's own `PrepareTimeBinding`
+/// sidecar against `current`, so a foreign-network or foreign-routing
+/// journal sharing this directory is rejected by
+/// `aggregate_terminal_residual_hype` rather than silently aggregated.
+///
+/// Known residual risk, deliberately out of scope here: this reads the
+/// sidecar `.network-binding.json` written by plain `fs::write`, not a
+/// journal's own hash-chained, protected-head-anchored content — an
+/// attacker with write access to just this file (not the journal itself)
+/// could still relabel a testnet journal's residual as mainnet-admissible
+/// without invalidating the journal's own protected head. Closing this
+/// fully means either folding network/routing identity into
+/// `live_probe.rs`'s already-merged `execution_identity_hash` computation,
+/// or building an independent protection mechanism for this sidecar —
+/// both out of scope for this aggregator-foundation PR. Tracked in
+/// bot-strategy#942.
+fn network_routing_admissible_for(
+    current: &PrepareTimeBinding,
+) -> impl Fn(&Path) -> Result<(), WorkflowError> + '_ {
+    move |path: &Path| {
+        let path_str = path.to_str().ok_or_else(|| {
+            WorkflowError::CorruptJournal(format!(
+                "{}: journal path is not valid UTF-8",
+                path.display()
+            ))
+        })?;
+        let recorded = PrepareTimeBinding::read(path_str)
+            .map_err(|error| WorkflowError::CorruptJournal(error.to_string()))?;
+        if !recorded.same_network_and_routing_as(current) {
+            return Err(WorkflowError::CorruptJournal(format!(
+                "{path_str}: journal was prepared under a different network or vault-address \
+                 routing mode ({recorded:?}) than the account currently being aggregated for \
+                 ({current:?})"
+            )));
+        }
+        Ok(())
+    }
 }
 
 fn box_error<E: std::error::Error + 'static>(error: E) -> Box<dyn std::error::Error> {
@@ -666,7 +1079,191 @@ async fn build_signed_connector(
 
 #[cfg(test)]
 mod tests {
-    use super::{invocation, Invocation, PrepareTimeBinding};
+    use super::{
+        invocation, network_routing_admissible_for, validate_journal_path, HistoryDirectoryBinding,
+        HistoryInitialization, Invocation, PrepareTimeBinding,
+    };
+    use std::path::Path;
+
+    #[test]
+    fn history_directory_binding_distinguishes_first_ever_from_already_initialized() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let operational_params_path = directory.path().join("operational.toml");
+        let operational_params_path = operational_params_path.to_str().expect("utf8 path");
+        let first = HistoryDirectoryBinding::write_once_and_verify(
+            operational_params_path,
+            "/opt/hype-accumulator/journals",
+        )
+        .expect("first write");
+        assert_eq!(first, HistoryInitialization::FirstEver);
+
+        let second = HistoryDirectoryBinding::write_once_and_verify(
+            operational_params_path,
+            "/opt/hype-accumulator/journals",
+        )
+        .expect("matching re-verify");
+        assert_eq!(second, HistoryInitialization::AlreadyInitialized);
+    }
+
+    #[test]
+    fn history_directory_binding_rejects_a_changed_directory() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let operational_params_path = directory.path().join("operational.toml");
+        let operational_params_path = operational_params_path.to_str().expect("utf8 path");
+        HistoryDirectoryBinding::write_once_and_verify(
+            operational_params_path,
+            "/opt/hype-accumulator/journals",
+        )
+        .expect("first write");
+
+        // Simulates an operator editing operational.toml's
+        // history_directory after journals already exist under the
+        // original one.
+        assert!(HistoryDirectoryBinding::write_once_and_verify(
+            operational_params_path,
+            "/opt/hype-accumulator/journals-v2",
+        )
+        .is_err());
+
+        // The original value still verifies.
+        HistoryDirectoryBinding::write_once_and_verify(
+            operational_params_path,
+            "/opt/hype-accumulator/journals",
+        )
+        .expect("original value still verifies");
+    }
+
+    #[test]
+    fn history_directory_binding_fails_closed_on_an_unreadable_binding() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let operational_params_path = directory.path().join("operational.toml");
+        let operational_params_path = operational_params_path.to_str().expect("utf8 path");
+
+        // A binding file that exists but isn't valid JSON (truncated write,
+        // corruption after a crash) must never be treated as "no binding
+        // yet" — that would silently let a changed history_directory
+        // through as though this were a first-ever prepare.
+        let binding_path = HistoryDirectoryBinding::path(operational_params_path);
+        std::fs::write(&binding_path, b"not valid json").expect("write corrupt binding");
+
+        assert!(HistoryDirectoryBinding::write_once_and_verify(
+            operational_params_path,
+            "/opt/hype-accumulator/journals",
+        )
+        .is_err());
+
+        // The corrupt file must be left alone, not silently overwritten.
+        assert_eq!(
+            std::fs::read_to_string(&binding_path).expect("binding still present"),
+            "not valid json"
+        );
+    }
+
+    #[test]
+    fn persist_first_ever_never_overwrites_an_existing_binding() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let operational_params_path = directory.path().join("operational.toml");
+        let operational_params_path = operational_params_path.to_str().expect("utf8 path");
+
+        HistoryDirectoryBinding::persist_first_ever(
+            operational_params_path,
+            "/opt/hype-accumulator/journals",
+        )
+        .expect("first persist");
+
+        // Simulates two concurrent first-ever `prepare` invocations for the
+        // same operational_params_path both observing `check` == FirstEver
+        // before either has persisted: the second `persist_first_ever` must
+        // fail rather than silently replacing the first writer's binding
+        // with a different (or even identical) value.
+        assert!(HistoryDirectoryBinding::persist_first_ever(
+            operational_params_path,
+            "/opt/hype-accumulator/journals-v2",
+        )
+        .is_err());
+
+        // The first writer's binding is untouched, and no stray temporary
+        // file is left behind in the directory.
+        let binding_path = HistoryDirectoryBinding::path(operational_params_path);
+        let persisted: HistoryDirectoryBinding =
+            serde_json::from_str(&std::fs::read_to_string(&binding_path).expect("binding present"))
+                .expect("valid json");
+        assert_eq!(
+            persisted.history_directory,
+            "/opt/hype-accumulator/journals"
+        );
+        let leftover_temp_files = std::fs::read_dir(directory.path())
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path() != binding_path)
+            .count();
+        assert_eq!(leftover_temp_files, 0);
+    }
+
+    #[test]
+    fn ensure_history_directory_available_only_requires_the_directory_when_already_initialized() {
+        use super::ensure_history_directory_available;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let missing = temp.path().join("does-not-exist");
+
+        // A genuinely first-ever prepare finding no directory yet is normal.
+        assert!(
+            ensure_history_directory_available(HistoryInitialization::FirstEver, &missing).is_ok()
+        );
+
+        // Once history was already initialized before, the same missing
+        // directory must fail closed rather than silently restart empty.
+        assert!(ensure_history_directory_available(
+            HistoryInitialization::AlreadyInitialized,
+            &missing,
+        )
+        .is_err());
+
+        // An existing directory always passes, regardless of
+        // initialization state.
+        assert!(ensure_history_directory_available(
+            HistoryInitialization::AlreadyInitialized,
+            temp.path(),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn journal_path_extension_must_be_exactly_lowercase_jsonl() {
+        let history = Path::new("/opt/hype-accumulator/journals");
+        assert!(
+            validate_journal_path("/opt/hype-accumulator/journals/journal.jsonl", history).is_ok()
+        );
+        assert!(
+            validate_journal_path("/opt/hype-accumulator/journals/journal.JSONL", history).is_err()
+        );
+        assert!(
+            validate_journal_path("/opt/hype-accumulator/journals/journal.jsonl.bak", history)
+                .is_err()
+        );
+        assert!(validate_journal_path("/opt/hype-accumulator/journals/journal", history).is_err());
+        assert!(
+            validate_journal_path("/opt/hype-accumulator/journals/journal.json", history).is_err()
+        );
+    }
+
+    #[test]
+    fn journal_path_must_live_directly_in_the_configured_history_directory() {
+        let history = Path::new("/opt/hype-accumulator/journals");
+        assert!(
+            validate_journal_path("/opt/hype-accumulator/journals/day-1.jsonl", history).is_ok()
+        );
+        // A date-partitioned subdirectory would make this journal
+        // permanently invisible to later aggregation, which only ever
+        // scans `history_directory` itself.
+        assert!(validate_journal_path(
+            "/opt/hype-accumulator/journals/2026-09-07/day.jsonl",
+            history
+        )
+        .is_err());
+        assert!(validate_journal_path("/some/other/place/day-1.jsonl", history).is_err());
+    }
 
     fn args(values: &[&str]) -> impl Iterator<Item = String> {
         values
@@ -774,6 +1371,26 @@ mod tests {
     }
 
     #[test]
+    fn operational_params_without_history_directory_still_parses_for_submit_and_reconcile() {
+        // A legacy operational.toml written before `history_directory`
+        // existed must still deserialize: `submit`/`reconcile` never read
+        // that field (only `prepare` does, and enforces its presence
+        // itself), so requiring it here would block recovering an
+        // already-prepared or already-submitted order after an upgrade.
+        let legacy_toml = r#"
+            is_mainnet = false
+            max_taker_notional_usdc = "25.0"
+            max_taker_slippage_bps = 20
+            max_taker_book_age_ms = 5000
+            order_timeout_seconds = 10
+            order_book_depth = 5
+        "#;
+        let operational = super::OperationalParams::from_toml(legacy_toml)
+            .expect("legacy operational.toml without history_directory must still parse");
+        assert!(operational.history_directory.is_none());
+    }
+
+    #[test]
     fn rejects_submit_without_the_literal_confirm_flag() {
         // A caller must pass the `--confirm` flag literally, not just any
         // 7-argument submit invocation — this is the one thing standing
@@ -843,6 +1460,74 @@ mod tests {
         // The unchanged binding still verifies.
         PrepareTimeBinding::verify(journal_path, &prepared_with_vault_routing)
             .expect("matching binding verifies");
+    }
+
+    #[test]
+    fn network_routing_admissible_for_rejects_a_different_network_or_routing_mode() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mainnet_path = directory.path().join("mainnet.jsonl");
+        let mainnet_path_str = mainnet_path.to_str().expect("utf8 path");
+        let mainnet =
+            PrepareTimeBinding::new("https://api.hyperliquid.xyz".to_owned(), true, false);
+        mainnet
+            .write_once(mainnet_path_str)
+            .expect("mainnet journal prepared");
+
+        let testnet_path = directory.path().join("testnet.jsonl");
+        let testnet_path_str = testnet_path.to_str().expect("utf8 path");
+        let testnet = PrepareTimeBinding::new(
+            "https://api.hyperliquid-testnet.xyz".to_owned(),
+            false,
+            false,
+        );
+        testnet
+            .write_once(testnet_path_str)
+            .expect("testnet journal prepared");
+
+        let vault_routed_path = directory.path().join("vault.jsonl");
+        let vault_routed_path_str = vault_routed_path.to_str().expect("utf8 path");
+        let vault_routed =
+            PrepareTimeBinding::new("https://api.hyperliquid.xyz".to_owned(), true, true);
+        vault_routed
+            .write_once(vault_routed_path_str)
+            .expect("vault-routed journal prepared");
+
+        let admissible_for_mainnet = network_routing_admissible_for(&mainnet);
+        assert!(
+            admissible_for_mainnet(&mainnet_path).is_ok(),
+            "a journal prepared under the same network and routing mode is admissible"
+        );
+        assert!(
+            admissible_for_mainnet(&testnet_path).is_err(),
+            "a testnet journal must not be aggregated into a mainnet run"
+        );
+        assert!(
+            admissible_for_mainnet(&vault_routed_path).is_err(),
+            "a different vault-address routing mode must not be aggregated together"
+        );
+    }
+
+    #[test]
+    fn network_routing_admissible_for_tolerates_a_benign_endpoint_change() {
+        // A completed journal's write-once binding can never be updated;
+        // an endpoint URL migration or failover on the same network must
+        // not permanently exclude every already-completed journal, unlike
+        // `PrepareTimeBinding::verify`'s exact-equality check (correct for
+        // its own submit-safety purpose, wrong for aggregation).
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("day-1.jsonl");
+        let path_str = path.to_str().expect("utf8 path");
+        PrepareTimeBinding::new("https://api.hyperliquid.xyz".to_owned(), true, false)
+            .write_once(path_str)
+            .expect("journal prepared against the old endpoint");
+
+        let current_after_endpoint_migration =
+            PrepareTimeBinding::new("https://api2.hyperliquid.xyz".to_owned(), true, false);
+        let admissible = network_routing_admissible_for(&current_after_endpoint_migration);
+        assert!(
+            admissible(&path).is_ok(),
+            "a same-network, same-routing journal remains admissible across an endpoint change"
+        );
     }
 
     #[test]

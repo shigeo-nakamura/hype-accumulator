@@ -38,6 +38,7 @@ const EXCHANGE_ORDER_OWNER_CONFLICT_REASON: &str =
     "exchange order ID is already owned by another workflow";
 const EXCHANGE_FILL_OWNER_CONFLICT_REASON: &str =
     "exchange fill ID is already owned by another workflow";
+const PROTECTED_HEAD_SUFFIX: &str = ".protected-head.json";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -61,6 +62,10 @@ impl HypeAtoms {
 
     fn checked_sub(self, other: Self) -> Option<Self> {
         self.0.checked_sub(other.0).map(Self)
+    }
+
+    fn checked_add(self, other: Self) -> Option<Self> {
+        self.0.checked_add(other.0).map(Self)
     }
 }
 
@@ -270,10 +275,17 @@ impl DecisionBinding {
             || self.order_envelope.signer_identity_hash.trim().is_empty()
             || self.order_envelope.signer_identity_hash
                 != self.order_envelope.signer_identity_hash.trim()
+            // Physically bounded by spot balance — this remains a hard
+            // constraint. Deliberately NOT bounded by
+            // `configured_residual_hype_atoms`: an earlier, higher target
+            // can leave more genuinely reserved than the current target
+            // requires (a residual allocation can never later become
+            // staking-eligible just because the target was lowered, see
+            // docs/security/custody-threat-model.md); the excess is a real,
+            // immutable residual, not an error. `residual_hype_deficit`
+            // already treats that case as zero deficit.
             || self.inventory_before.unconsumed_residual_spot_hype_atoms
                 > self.inventory_before.spot_hype_atoms
-            || self.inventory_before.unconsumed_residual_spot_hype_atoms
-                > self.inventory_before.configured_residual_hype_atoms
             || self.planned_usdc.is_zero()
             || self.committed_usdc < self.planned_usdc
             || self.order_envelope.original_quantity_hype.is_zero()
@@ -725,6 +737,8 @@ pub struct WorkflowState {
     debited_usdc: UsdcMicros,
     residual_hype: HypeAtoms,
     staking_eligible_hype: HypeAtoms,
+    #[serde(default)]
+    residual_consumed_by_movements_hype: HypeAtoms,
     eligibility_workflow_id: Option<String>,
     staking_target_hype: HypeAtoms,
     #[serde(default)]
@@ -823,6 +837,33 @@ impl WorkflowState {
         }
     }
 
+    /// Returns this workflow's residual/eligible HYPE split, net of any
+    /// residual HYPE a bound movement already recorded as consumed (e.g. a
+    /// sale) before eligibility was recorded, only once it is durably
+    /// terminal (`stage() == WorkflowStage::Complete`).
+    ///
+    /// `residual_hype`/`staking_eligible_hype` are set once, at
+    /// `StakingEligibilityRecorded`, and never change again — but a
+    /// non-terminal workflow (mid-flight, or stuck in `ManualReview`) has
+    /// not yet had its split reconciled to conclusion and must not be
+    /// counted as HYPE left behind by a finished day. Returns `None`
+    /// otherwise; callers aggregating across historical journals must treat
+    /// that as fail-closed, not as zero. Use [`Self::staking_eligibility`]
+    /// instead for the raw, pre-movement split.
+    #[must_use]
+    pub fn terminal_staking_eligibility(&self) -> Option<StakingEligibility> {
+        if !matches!(self.stage, WorkflowStage::Complete) {
+            return None;
+        }
+        Some(StakingEligibility {
+            residual_hype: self
+                .residual_hype
+                .checked_sub(self.residual_consumed_by_movements_hype)
+                .unwrap_or_default(),
+            eligible_hype: self.staking_eligible_hype,
+        })
+    }
+
     #[must_use]
     pub const fn staking_target_hype(&self) -> HypeAtoms {
         self.staking_target_hype
@@ -890,6 +931,7 @@ impl WorkflowState {
             debited_usdc: UsdcMicros::from_micros(0),
             residual_hype: HypeAtoms::default(),
             staking_eligible_hype: HypeAtoms::default(),
+            residual_consumed_by_movements_hype: HypeAtoms::default(),
             eligibility_workflow_id: None,
             staking_target_hype: HypeAtoms::default(),
             staking_confirmed_hype: HypeAtoms::default(),
@@ -1111,8 +1153,24 @@ impl WorkflowState {
                         "eligibility workflow identity does not match its complete evidence".into(),
                     ));
                 }
+                // Validated above (`validate_eligibility_evidence` ->
+                // `validate_bound_movements`) to never exceed
+                // `residual_hype`, but recomputed independently here rather
+                // than trusted from that pass, matching this transition's
+                // own re-derive-everything style.
+                let consumed_by_movements = match evidence.as_deref() {
+                    None => Some(0_u64),
+                    Some(evidence) => evidence.movements.iter().try_fold(0_u64, |sum, movement| {
+                        sum.checked_add(movement.consumed_hype.as_atoms())
+                    }),
+                }
+                .map(HypeAtoms::from_atoms)
+                .ok_or_else(|| {
+                    WorkflowError::CorruptJournal("residual movement consumption overflowed".into())
+                })?;
                 self.residual_hype = *residual_hype;
                 self.staking_eligible_hype = *eligible_hype;
+                self.residual_consumed_by_movements_hype = consumed_by_movements;
                 self.eligibility_workflow_id = Some(eligibility_workflow_id.clone());
                 self.stage = WorkflowStage::StakingEligibilityRecorded;
             }
@@ -1973,6 +2031,24 @@ pub trait ProtectedWorkflowHeadStore: Send + Sync {
     ) -> Result<bool, String>;
 }
 
+/// Constructs one journal path's independent protected-head store, for
+/// [`DurableWorkflow::aggregate_terminal_residual_hype`] to verify each
+/// historical journal it scans (they each need their own store instance,
+/// unlike [`DurableWorkflow::open_or_create`]'s single caller-supplied one
+/// for the current journal).
+pub type ProtectedHeadStoreFactory<'a> =
+    dyn Fn(&Path) -> Result<Arc<dyn ProtectedWorkflowHeadStore>, WorkflowError> + 'a;
+
+/// Checks one historical journal path against whatever execution context
+/// `workflow.rs` itself has no notion of — network selection, vault-address
+/// routing mode, or any other caller-defined admissibility criterion for
+/// [`DurableWorkflow::aggregate_terminal_residual_hype`] — returning an
+/// error to exclude it from aggregation as a whole (matching that
+/// function's `execution_identity_hash` mismatch precedent: journals for a
+/// different context sharing this directory is a configuration error, not
+/// silently worked around).
+pub type JournalAdmissibilityCheck<'a> = dyn Fn(&Path) -> Result<(), WorkflowError> + 'a;
+
 /// File-backed [`ProtectedWorkflowHeadStore`], one instance per stable
 /// decision identity (construct with a path derived from that identity, e.g.
 /// `<state_dir>/workflow-heads/<decision_id>.json`; never share one instance
@@ -2552,6 +2628,350 @@ impl DurableWorkflow {
             .collect::<Vec<_>>();
         let state = WorkflowState::replay(&events)?;
         Ok(Some(state.binding))
+    }
+
+    /// Reads, replays, and verifies one workflow journal's full state
+    /// against its own independently protected head, without acquiring the
+    /// append lock.
+    ///
+    /// This is a read-only historical peek, not a live open: it never
+    /// acquires the append lock and never reconciles exchange order/fill
+    /// ownership. It does perform the same protected-head check
+    /// [`Self::open_or_create`] performs before ever trusting a non-empty
+    /// journal, so a journal replaced or rolled back on mutable storage
+    /// since its own head was last durably confirmed is rejected, not
+    /// silently trusted — only safe to use for aggregating already-durable,
+    /// immutable history (see [`Self::aggregate_terminal_residual_hype`]),
+    /// never as a substitute for [`Self::open_or_create`] before appending
+    /// to a journal.
+    fn peek_verified_terminal_state(
+        path: &Path,
+        protected_head_store: &dyn ProtectedWorkflowHeadStore,
+    ) -> Result<Option<WorkflowState>, WorkflowError> {
+        // Held only for this read: a concurrent submit/reconcile against
+        // this same journal — unusual once Complete, but not structurally
+        // prevented; reconcile remains callable afterward and can still
+        // durably move a terminal-adjacent journal to ManualReview on late
+        // contradictory evidence (see
+        // `fresh_late_order_evidence_durably_invalidates_terminal_results`)
+        // — fails this read closed with `ConcurrentModification` instead of
+        // racing a live write. This does not by itself stop that journal's
+        // state from changing again the moment after this lock is released
+        // and before the caller's own new workflow commits; closing that
+        // ordering window needs a lock spanning the whole daily decision,
+        // which belongs with the still-separate daily-scheduler /
+        // duplicate-process-protection work (bot-strategy#929's remaining
+        // scope), not this read primitive.
+        let _append_lock = acquire_journal_append_lock(path)?;
+        // A crash between `compare_and_swap` advancing the protected head
+        // and this journal's own line being appended (or its pending marker
+        // cleared) leaves a recoverable, not corrupt, journal: the same gap
+        // `open_or_create` repairs via `recover_pending_append` before ever
+        // trusting a journal's committed records. Without recovering it
+        // here too, that gap instead reads as a rollback/head mismatch
+        // below, and the account stays blocked until an operator manually
+        // reopens the journal. The workflow_id needed to validate a pending
+        // append comes from replaying whatever is already committed; a
+        // journal with no committed lines yet (the pending append is its
+        // very first) has no independent source, so the pending's own
+        // workflow_id is used instead — there is nothing else to check it
+        // against in this read-only historical path.
+        if let Some(pending) = read_pending_append(path)? {
+            let committed = load_records(path)?;
+            let workflow_id = if committed.is_empty() {
+                pending.workflow_id.clone()
+            } else {
+                let events = committed
+                    .iter()
+                    .map(|record| record.event.clone())
+                    .collect::<Vec<_>>();
+                WorkflowState::replay(&events)?.workflow_id
+            };
+            recover_pending_append(path, &workflow_id, protected_head_store)?;
+        }
+        let records = load_records(path)?;
+        let Some(last) = records.last() else {
+            return Ok(None);
+        };
+        let events = records
+            .iter()
+            .map(|record| record.event.clone())
+            .collect::<Vec<_>>();
+        let state = WorkflowState::replay(&events)?;
+        let file_len = fs::metadata(path).map_err(WorkflowError::io)?.len();
+        let expected_protected_head = protected_head_for(last, &state.workflow_id, file_len);
+        let protected_head = protected_head_store
+            .load()
+            .map_err(WorkflowError::ProtectedHead)?;
+        if protected_head.as_ref() != Some(&expected_protected_head) {
+            return Err(WorkflowError::RollbackDetected(format!(
+                "{}: historical journal does not match its independently protected head",
+                path.display()
+            )));
+        }
+        Ok(Some(state))
+    }
+
+    /// Lists every `.jsonl` journal directly in `journal_directory` (sorted,
+    /// symlinks rejected, `exclude_path` skipped by file name), and fails
+    /// closed on an orphaned `<stem>.protected-head.json` sidecar with no
+    /// corresponding `.jsonl` (its journal deleted or renamed after
+    /// completion) — see [`Self::aggregate_terminal_residual_hype`]'s doc
+    /// for why. Returns `Ok(None)` when `journal_directory` does not exist
+    /// yet (no historical journals yet, not a corrupt or unreadable state).
+    fn scan_journal_paths(
+        journal_directory: &Path,
+        exclude_path: Option<&Path>,
+    ) -> Result<Option<Vec<PathBuf>>, WorkflowError> {
+        let exclude_name = exclude_path.and_then(Path::file_name);
+        let mut journal_paths = Vec::new();
+        let mut protected_head_stems: BTreeSet<String> = BTreeSet::new();
+        let entries = match fs::read_dir(journal_directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(WorkflowError::io(error)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(WorkflowError::io)?;
+            let path = entry.path();
+            let file_name_str = entry.file_name();
+            let file_name_str = file_name_str.to_str();
+            if let Some(stem) =
+                file_name_str.and_then(|name| name.strip_suffix(PROTECTED_HEAD_SUFFIX))
+            {
+                protected_head_stems.insert(stem.to_owned());
+                continue;
+            }
+            if path.extension().and_then(std::ffi::OsStr::to_str) != Some("jsonl") {
+                continue;
+            }
+            if exclude_name.is_some() && path.file_name() == exclude_name {
+                continue;
+            }
+            // `DirEntry::file_type` does not follow symlinks; a symlinked
+            // journal would otherwise silently fail `is_file()` below and
+            // be skipped rather than aggregated, hiding real residual HYPE
+            // instead of failing closed on it. Matches this crate's
+            // existing symlink posture for every other security-relevant
+            // file open (`FileProtectedWorkflowHeadStore`,
+            // `FileExchangeOrderOwnerStore`).
+            reject_linked_file(&path).map_err(WorkflowError::io)?;
+            let file_type = entry.file_type().map_err(WorkflowError::io)?;
+            if !file_type.is_file() {
+                return Err(WorkflowError::CorruptJournal(format!(
+                    "{}: expected a regular file journal",
+                    path.display()
+                )));
+            }
+            journal_paths.push(path);
+        }
+        journal_paths.sort();
+
+        for path in &journal_paths {
+            if let Some(stem) = path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .and_then(|name| name.strip_suffix(".jsonl"))
+            {
+                protected_head_stems.remove(stem);
+            }
+        }
+        if let Some(excluded_stem) = exclude_name
+            .and_then(std::ffi::OsStr::to_str)
+            .and_then(|name| name.strip_suffix(".jsonl"))
+        {
+            protected_head_stems.remove(excluded_stem);
+        }
+        if let Some(orphan_stem) = protected_head_stems.into_iter().next() {
+            return Err(WorkflowError::CorruptJournal(format!(
+                "{orphan_stem}{PROTECTED_HEAD_SUFFIX}: orphaned protected-head file has no \
+                 corresponding .jsonl journal in {}",
+                journal_directory.display()
+            )));
+        }
+
+        Ok(Some(journal_paths))
+    }
+
+    /// Sums the terminal residual HYPE left behind by every completed
+    /// workflow journal in `journal_directory` that belongs to
+    /// `execution_identity_hash`, then reconciles that sum — plus every
+    /// still-unstaked terminal eligible HYPE, which is physically in spot
+    /// alongside residual until it is actually delegated — against a live
+    /// spot balance read. Only the residual portion is returned.
+    ///
+    /// Every regular file directly in `journal_directory` whose name ends
+    /// in `.jsonl` is treated as a workflow journal (this codebase's own
+    /// sidecar files — checkpoints, locks, pending-append markers, the
+    /// observed-fills accumulator, the owner store — never use that
+    /// extension, so this cannot mistake one for a journal). A `.jsonl`-
+    /// named symlink or non-regular entry is rejected, not silently
+    /// skipped — skipping it could hide real residual HYPE instead of
+    /// failing closed on it. `exclude_path`, when given, is skipped by
+    /// file name and should be the caller's own in-flight journal for
+    /// today's decision, which is never "past". `protected_head_store_for`
+    /// constructs the independent protected-head store for one journal
+    /// path (see [`Self::protected_head_path_for`] for the conventional
+    /// per-journal path). `journal_admissible` lets the caller reject a
+    /// journal on criteria this module has no notion of — network
+    /// selection, vault-address routing mode, or anything else scoping
+    /// what "the same account" means beyond `execution_identity_hash`
+    /// alone (a testnet and a mainnet journal for the same address must
+    /// never be aggregated together, for one).
+    ///
+    /// Fails closed rather than guessing: a journal found in the directory
+    /// that is empty, not yet `Complete`, does not match its own protected
+    /// head, belongs to a different execution identity or fails
+    /// `journal_admissible` (journals for multiple accounts, networks, or
+    /// routing modes must never share a directory, but this is checked
+    /// rather than merely documented), duplicates a `workflow_id` already
+    /// aggregated from another file (a copy or hard link would otherwise
+    /// double-count the same workflow), or is concurrently locked by
+    /// another process is an error, not a skip. A total that exceeds the
+    /// live spot balance is also an error — this account's own history
+    /// expects more HYPE in spot than is actually there, which this
+    /// function cannot explain (a sale or external transfer of residual or
+    /// still-unstaked eligible HYPE, tracked nowhere yet — seeing it
+    /// through is the still-open external-transfer ledger work) and
+    /// refuses to guess at rather than silently misclassify the next
+    /// decision's inventory.
+    ///
+    /// Known residual risk, deliberately out of scope here (Codex review,
+    /// bot-strategy#929): a sale or transfer that consumes part of a
+    /// journal's residual allocation *after* that journal already reached
+    /// `Complete` cannot be attributed back to it — only movements
+    /// recorded in its own eligibility evidence, from *before*
+    /// `StakingEligibilityRecorded`, are ever subtracted (see
+    /// `residual_consumed_by_movements_hype`). The live-balance upper
+    /// bound above only fails closed when the account's *total* residual +
+    /// still-unstaked-eligible expectation exceeds what's actually there;
+    /// if enough unrelated spot HYPE happens to still cover the (now
+    /// overstated) total, a post-completion sale of specifically residual
+    /// HYPE passes silently. Closing this needs an account-wide ledger
+    /// attributing every movement to the specific allocation it consumed
+    /// across all journals, not just the one that created it — the
+    /// broader external-transfer/staking ledger this module's doc already
+    /// defers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `journal_directory` cannot be read, if any
+    /// journal in it is empty, corrupt, rolled back, foreign, duplicated,
+    /// concurrently locked, missing its terminal residual/eligible split,
+    /// or overflows on summation, or if the aggregated total exceeds
+    /// `live_spot_hype_atoms`.
+    pub fn aggregate_terminal_residual_hype(
+        journal_directory: &Path,
+        exclude_path: Option<&Path>,
+        live_spot_hype_atoms: HypeAtoms,
+        execution_identity_hash: &str,
+        protected_head_store_for: &ProtectedHeadStoreFactory<'_>,
+        journal_admissible: &JournalAdmissibilityCheck<'_>,
+    ) -> Result<HypeAtoms, WorkflowError> {
+        let Some(journal_paths) = Self::scan_journal_paths(journal_directory, exclude_path)? else {
+            // No directory yet means no historical journals yet — this is
+            // the normal state before this execution account's very first
+            // workflow, not a corrupt or unreadable one.
+            return Ok(HypeAtoms::from_atoms(0));
+        };
+
+        let overflowed = |what: &str| {
+            WorkflowError::CorruptJournal(format!(
+                "aggregated {what} HYPE across historical journals overflowed"
+            ))
+        };
+
+        let mut aggregated_residual = HypeAtoms::from_atoms(0);
+        // Reconciled against more than just residual HYPE: eligible HYPE
+        // is only actually moved out of spot once it is durably delegated
+        // (`delegated_hype() >= eligible_hype`; today's hard-disabled
+        // staking policy means this is never reachable in production, but
+        // the offline-staking-simulation feature does exercise it). Until
+        // then it is still physically sitting in spot alongside residual,
+        // and omitting it from this reconciliation would let an external
+        // sale or transfer of that HYPE go undetected — the live balance
+        // would still cover the (too-small) residual-only total even
+        // though real HYPE this account's own history expects is missing.
+        let mut aggregated_still_in_spot = HypeAtoms::from_atoms(0);
+        let mut seen_workflow_ids: BTreeSet<String> = BTreeSet::new();
+        for path in &journal_paths {
+            journal_admissible(path)?;
+            let protected_head_store = protected_head_store_for(path)?;
+            let Some(state) =
+                Self::peek_verified_terminal_state(path, protected_head_store.as_ref())?
+            else {
+                return Err(WorkflowError::NonTerminalHistoricalJournal(format!(
+                    "{}: journal is empty (a crash before its first durable append, or \
+                     truncation) and its terminal state is unknown",
+                    path.display()
+                )));
+            };
+            if state.binding().inventory_before.execution_identity_hash != execution_identity_hash {
+                return Err(WorkflowError::CorruptJournal(format!(
+                    "{}: journal belongs to a different execution identity than the account \
+                     being aggregated for — journals for multiple accounts must never share a \
+                     directory",
+                    path.display()
+                )));
+            }
+            if !seen_workflow_ids.insert(state.workflow_id().to_owned()) {
+                return Err(WorkflowError::CorruptJournal(format!(
+                    "{}: workflow {} was already aggregated from another journal in this \
+                     directory (a copy or hard link would double-count it)",
+                    path.display(),
+                    state.workflow_id()
+                )));
+            }
+            let Some(eligibility) = state.terminal_staking_eligibility() else {
+                return Err(WorkflowError::NonTerminalHistoricalJournal(format!(
+                    "{}: workflow {} has not reached a terminal stage (stage={:?})",
+                    path.display(),
+                    state.workflow_id(),
+                    state.stage()
+                )));
+            };
+            let still_in_spot = if state.delegated_hype() >= eligibility.eligible_hype {
+                eligibility.residual_hype
+            } else {
+                eligibility
+                    .residual_hype
+                    .checked_add(eligibility.eligible_hype)
+                    .ok_or_else(|| overflowed("still-in-spot"))?
+            };
+            aggregated_residual = aggregated_residual
+                .checked_add(eligibility.residual_hype)
+                .ok_or_else(|| overflowed("residual"))?;
+            aggregated_still_in_spot = aggregated_still_in_spot
+                .checked_add(still_in_spot)
+                .ok_or_else(|| overflowed("still-in-spot"))?;
+        }
+
+        if aggregated_still_in_spot > live_spot_hype_atoms {
+            return Err(WorkflowError::ResidualReconciliationGap(format!(
+                "aggregated {} HYPE atoms still expected in spot across {} historical \
+                 journal(s) exceeds live spot balance {} HYPE atoms",
+                aggregated_still_in_spot.as_atoms(),
+                journal_paths.len(),
+                live_spot_hype_atoms.as_atoms()
+            )));
+        }
+
+        Ok(aggregated_residual)
+    }
+
+    /// The conventional independent protected-head-store path for a
+    /// journal, so a caller building a `protected_head_store_for` factory
+    /// for [`Self::aggregate_terminal_residual_hype`] uses the same
+    /// per-journal naming convention its own [`Self::open_or_create`]
+    /// caller already uses for the current journal.
+    #[must_use]
+    pub fn protected_head_path_for(journal_path: &Path) -> PathBuf {
+        let mut path = journal_path.to_path_buf();
+        // Must stay byte-consistent with `PROTECTED_HEAD_SUFFIX`, which
+        // `aggregate_terminal_residual_hype` strips to detect an orphaned
+        // protected-head file whose `.jsonl` journal has vanished.
+        path.set_extension(PROTECTED_HEAD_SUFFIX.trim_start_matches('.'));
+        path
     }
 
     /// Opens or creates one append-only workflow journal.
@@ -4518,6 +4938,10 @@ pub enum WorkflowError {
     Io(String),
     #[error("journal serialization failed: {0}")]
     Json(String),
+    #[error("historical workflow journal is not terminal: {0}")]
+    NonTerminalHistoricalJournal(String),
+    #[error("aggregated residual HYPE does not reconcile against the live spot balance: {0}")]
+    ResidualReconciliationGap(String),
 }
 
 fn append_result_commit_status(

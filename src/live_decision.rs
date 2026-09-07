@@ -6,21 +6,22 @@
 //!
 //! [`InventoryBaseline`]'s staking and delegated fields are asserted to be
 //! exactly zero — verified against a live read, never merely assumed — and
-//! a nonzero read fails closed rather than guessing. The
-//! unconsumed-residual field, by contrast, is asserted zero with **no live
-//! verification**: no cross-workflow ledger anywhere in this crate
-//! aggregates unconsumed residual HYPE left behind by prior completed
-//! workflows (each `DurableWorkflow`'s own `residual_hype` is tracked only
-//! inside that one workflow's journal, see `workflow.rs`), so there is
-//! nothing to read. Its correctness therefore rests entirely on the
-//! staking/delegation checks: an account with zero staking and zero
-//! delegation cannot have any prior workflow that ever reached the staking
-//! stage, and therefore cannot have left an unconsumed residual behind.
-//! This chain of reasoning — not an independent check — is what makes
-//! asserting zero here safe, and it breaks the moment this module is ever
-//! called more than once for the same account. Building genuine
-//! cross-workflow residual/staking tracking is required before this module
-//! can support anything beyond an account's first live economic action.
+//! a nonzero read fails closed rather than guessing. The unconsumed-residual
+//! field is now genuinely computed, not assumed:
+//! [`crate::workflow::DurableWorkflow::aggregate_terminal_residual_hype`]
+//! sums the terminal `residual_hype` left behind by every completed
+//! workflow journal in `journal_directory` (see `workflow.rs`) and
+//! reconciles that sum against this same call's live spot balance read,
+//! failing closed on any journal that is not yet terminal or on a sum that
+//! exceeds the live balance. This function remains restricted to an
+//! account's first live economic action for a narrower reason than before:
+//! no cross-workflow ledger in this crate yet tracks staking or delegation
+//! across days (bot-strategy#929's remaining scope), so the zero
+//! staking/delegation check above is still what this module's safety
+//! depends on beyond residual HYPE. Building that ledger, a daily
+//! scheduler, and observer/dashboard attribution wiring is required before
+//! this module can support anything beyond an account's first live
+//! economic action.
 
 use crate::{
     hype_asset::hype_usdc_market_metadata_digest,
@@ -31,7 +32,8 @@ use crate::{
     runtime::{RuntimeCycleInput, RuntimeError, SignerFreeRuntime},
     workflow::{
         DecisionBinding, DurableWorkflow, EligibilityPolicyBinding, ExchangeOrderOwnerStore,
-        HypeAtoms, InventoryBaseline, ProtectedWorkflowHeadStore, WorkflowError,
+        HypeAtoms, InventoryBaseline, JournalAdmissibilityCheck, ProtectedHeadStoreFactory,
+        ProtectedWorkflowHeadStore, WorkflowError,
     },
 };
 use chrono::{DateTime, Utc};
@@ -75,7 +77,13 @@ pub enum LiveDecisionError {
 /// directly, matching `order_envelope.rs`'s existing pattern).
 /// `signal_evidence_valid_through_at` and
 /// `policy_acknowledgement_valid_through_at` likewise come from state this
-/// module does not own.
+/// module does not own. `journal_directory` must be a directory dedicated to
+/// this execution account's own workflow journals under the exact same
+/// network and vault-address routing mode as this call — `historical_
+/// journal_admissible` is where the caller enforces that, since this
+/// module has no notion of either (see
+/// [`crate::workflow::DurableWorkflow::aggregate_terminal_residual_hype`])
+/// — and should ordinarily be `journal_path`'s parent directory.
 ///
 /// # Errors
 ///
@@ -97,6 +105,9 @@ pub async fn prepare_first_live_order_workflow(
     eligibility_policy: EligibilityPolicyBinding,
     configured_residual_hype_atoms: HypeAtoms,
     journal_path: &Path,
+    journal_directory: &Path,
+    historical_protected_head_store_for: &ProtectedHeadStoreFactory<'_>,
+    historical_journal_admissible: &JournalAdmissibilityCheck<'_>,
     protected_head_store: Arc<dyn ProtectedWorkflowHeadStore>,
     exchange_order_owner_store: Arc<dyn ExchangeOrderOwnerStore>,
     now: DateTime<Utc>,
@@ -128,13 +139,29 @@ pub async fn prepare_first_live_order_workflow(
         let (staking_hype_atoms, delegated_hype_atoms) = first_live_probe_staking_atoms(&staking)?;
         let spot_hype_atoms = hype_atoms_from_decimal(spot_hype_balance(&balance))?;
 
-        // Asserted, not independently checked (see module doc): there is
-        // nothing to read that would verify this directly. Its
-        // correctness rests entirely on the just-verified zero
-        // staking/delegation above — no prior workflow ever reached the
-        // staking stage, so none could have left an unconsumed residual
-        // behind.
-        let unconsumed_residual_spot_hype_atoms = HypeAtoms::from_atoms(0);
+        // Genuinely aggregated and reconciled, not assumed (see module
+        // doc): sums every completed past workflow's terminal residual
+        // HYPE and fails closed if any historical journal is not yet
+        // terminal or the sum exceeds this same call's live spot balance.
+        // Never capped at the currently configured target: a residual
+        // allocation a completed workflow already immutably classified
+        // must never later become staking-eligible just because a policy
+        // change lowered the target (docs/security/custody-threat-model.md
+        // — "a residual allocation can never later become staking-
+        // eligible" / "a terminal lot never becomes eligible again because
+        // fungible spot later increases"). `residual_hype_deficit` already
+        // treats an aggregate above the current target as zero deficit —
+        // no new residual is reserved from today's fill, but the earlier
+        // excess stays exactly what history says it is.
+        let unconsumed_residual_spot_hype_atoms =
+            DurableWorkflow::aggregate_terminal_residual_hype(
+                journal_directory,
+                Some(journal_path),
+                spot_hype_atoms,
+                &probe_binding.execution_identity_hash,
+                historical_protected_head_store_for,
+                historical_journal_admissible,
+            )?;
 
         let inventory_before = InventoryBaseline {
             execution_identity_hash: probe_binding.execution_identity_hash.clone(),
