@@ -118,7 +118,11 @@ hash-chained state *before* creating it (`live_journal_intents`), after every
 fallible network read; a decision with such a record is never released by
 absence — if its journal is present, `reconcile` it; if it is missing, the
 history directory was lost (deleted and recreated empty, unmounted) and must
-be restored from backup first (bot-strategy#944). Only a decision with no
+be restored from backup first (bot-strategy#944). The same records act as a
+manifest for `prepare`: before it touches the venue or aggregates history,
+every recorded intent must resolve to a present journal bound to exactly
+that decision (`JournalIntentUnresolved` otherwise), so lost history blocks
+new orders instead of silently aggregating to zero. Only a decision with no
 intent record **and** no journal in the verified directory is released. A decision that **no** journal binds can never have
 produced a venue action — signing is only reachable through `submit`, which
 needs a committed binding in that directory — so it is settled at zero

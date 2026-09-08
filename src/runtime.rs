@@ -871,6 +871,25 @@ impl SignerFreeRuntime {
             .map(PathBuf::as_path)
     }
 
+    /// Every journal intent this runtime has recorded (decision ID → journal
+    /// path), i.e. the manifest of journals that must exist for its history
+    /// to be considered intact.
+    #[must_use]
+    pub const fn live_journal_intents(&self) -> &BTreeMap<String, PathBuf> {
+        &self.state.live_journal_intents
+    }
+
+    /// The runtime's own identity view of `decision_id`, if it exists.
+    #[must_use]
+    pub fn decision_identity(&self, decision_id: &str) -> Option<LiveDecisionIdentity> {
+        self.state
+            .pacing
+            .decisions()
+            .values()
+            .find(|decision| decision.decision_id == decision_id)
+            .map(LiveDecisionIdentity::of)
+    }
+
     /// Durably records, BEFORE the journal is created, that the live
     /// decision `identity` is about to be bound by the workflow journal at
     /// `journal_path`. Committed through the same pending/commit cycle

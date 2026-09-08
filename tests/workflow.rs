@@ -5680,3 +5680,71 @@ fn frozen_state_rejects_stale_instances_and_blocks_concurrent_appends() {
         })
         .expect("current instance");
 }
+
+#[cfg(feature = "live-probe")]
+#[test]
+fn recorded_journal_intents_must_resolve_to_their_journals() {
+    use hype_accumulator::{
+        live_decision::{verify_recorded_journal_intents, LiveDecisionError},
+        runtime::LiveDecisionIdentity,
+    };
+    use std::collections::BTreeMap;
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("day-1.jsonl");
+    let decision = decision();
+    let binding = binding();
+    drop(reopen(&path, &binding));
+    let identity_of =
+        |id: &str| (id == decision.decision_id).then(|| LiveDecisionIdentity::of(&decision));
+    let mut intents = BTreeMap::new();
+    intents.insert(decision.decision_id.clone(), path.clone());
+    let today = temp.path().join("day-2.jsonl");
+
+    // Present and bound as declared: intact.
+    verify_recorded_journal_intents(&intents, &today, identity_of).expect("intact history");
+
+    // The current cycle's own intent may not have a journal yet (retry after
+    // a crash between the intent record and the journal write).
+    let mut with_today = intents.clone();
+    with_today.insert("fixed-dca:today".to_owned(), today.clone());
+    verify_recorded_journal_intents(&with_today, &today, identity_of).expect("own journal pending");
+
+    // A different decision's journal missing = lost history.
+    let mut lost = intents.clone();
+    lost.insert("fixed-dca:lost".to_owned(), temp.path().join("gone.jsonl"));
+    assert!(matches!(
+        verify_recorded_journal_intents(&lost, &today, identity_of),
+        Err(LiveDecisionError::JournalIntentUnresolved {
+            reason: "is missing",
+            ..
+        })
+    ));
+
+    // A journal bound to a different decision than declared.
+    let mut swapped = BTreeMap::new();
+    swapped.insert("fixed-dca:other".to_owned(), path.clone());
+    let other_identity = |id: &str| {
+        (id == "fixed-dca:other").then(|| {
+            let mut other = decision.clone();
+            other.decision_id = "fixed-dca:other".to_owned();
+            LiveDecisionIdentity::of(&other)
+        })
+    };
+    assert!(matches!(
+        verify_recorded_journal_intents(&swapped, &today, other_identity),
+        Err(LiveDecisionError::JournalIntentUnresolved {
+            reason: "is bound to a different decision",
+            ..
+        })
+    ));
+
+    // The declared journal deleted and recreated empty.
+    fs::write(&path, b"").expect("truncate journal");
+    assert!(matches!(
+        verify_recorded_journal_intents(&intents, &today, identity_of),
+        Err(LiveDecisionError::JournalIntentUnresolved {
+            reason: "has no committed binding",
+            ..
+        })
+    ));
+}
