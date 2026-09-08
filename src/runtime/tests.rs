@@ -2625,6 +2625,13 @@ fn live_settlement_converts_the_commitment_to_spend_exactly_once() {
         UsdcMicros::default()
     );
     assert_eq!(runtime.ledger.state().spent_usdc(), debited);
+    // Metrics are republished from the settled state without waiting for a
+    // scheduled cycle.
+    let metrics = std::fs::read_to_string(&runtime_config.metrics_path).expect("metrics file");
+    #[allow(clippy::cast_precision_loss)]
+    let spent_usdc = debited.as_micros() as f64 / 1_000_000.0;
+    assert!(metrics.contains(&format!("hype_accumulator_spent_usdc {spent_usdc}")));
+    assert!(metrics.contains("hype_accumulator_committed_usdc 0"));
     let invested = runtime
         .state
         .pacing

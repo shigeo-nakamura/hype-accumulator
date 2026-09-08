@@ -11,9 +11,14 @@ hype-live-probe reconcile config.local.toml security-policy.local.toml runtime.l
 ```
 
 Use the same reviewed endpoint, network selection, execution account, routing
-mode, runtime config, and journal that `prepare` used. Only the public
-execution-account environment variable is needed. Do not source a signer
-environment file. The command never loads signing material, decrypts a key,
+mode, runtime config, and journal that `prepare` used. The public
+execution-account environment variable is needed, and — because the command
+settles the pacing decision in the signer-free runtime once the order is
+final — so is the parent-account variable named by the policy's
+`admitted_parent_account_env` when `funding_mode = "designated_parent_funding"`
+(the runtime refuses to open under a different funding route). Source the
+observer environment file, never a signer environment file. The command
+never loads signing material, decrypts a key,
 reserves a nonce, submits an exchange action, or recomputes a daily decision.
 Once the order is durably final it does settle the pacing decision that
 `prepare` committed in the signer-free runtime (`mode=settled ...`), from the

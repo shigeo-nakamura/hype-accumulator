@@ -1068,6 +1068,9 @@ impl SignerFreeRuntime {
         )?;
         self.ensure_runtime_lock_current()?;
         self.state = commit_pending_cycle(&self.config, &self.limits, &mut self.ledger, &pending)?;
+        // Committed and durable; the derived metrics must not keep showing
+        // the pre-settlement commitment until some later scheduled cycle.
+        self.publish_metrics(settled_at)?;
         Ok(LiveSettlementOutcome::Settled)
     }
 
@@ -1611,6 +1614,34 @@ impl SignerFreeRuntime {
         write_metrics_atomic(&self.config.metrics_path, &metrics)?;
         write_status_atomic(&self.config.status_path, &status)?;
         Ok(report)
+    }
+
+    /// Republishes the metrics file from the current committed state. Used
+    /// after a live settlement changes committed/spent capital outside a
+    /// scheduled cycle, when the recurring cycle that would normally refresh
+    /// it is (by the probe runbook) stopped. The public dashboard status is
+    /// venue-observation-bound and keeps refreshing through the observer
+    /// timer, which stays active during a probe.
+    fn publish_metrics(&self, observed_at: DateTime<Utc>) -> Result<(), RuntimeError> {
+        let signal = match fs::read_to_string(self.config.signal_snapshot_path()) {
+            Ok(payload) => SignalSnapshot::from_json(&payload).ok(),
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let metrics = MetricsSnapshot::from_runtime(
+            observed_at,
+            &self.state.pacing,
+            &self.limits,
+            self.ledger.state(),
+            &[],
+            signal.as_ref(),
+            self.state.api_errors_total,
+            self.state.stale_signal_events_total,
+            self.state.dry_run_actions_total,
+            self.config.stuck_after_seconds,
+        )?;
+        write_metrics_atomic(&self.config.metrics_path, &metrics)?;
+        Ok(())
     }
 
     fn ensure_runtime_lock_current(&self) -> Result<(), RuntimeError> {
