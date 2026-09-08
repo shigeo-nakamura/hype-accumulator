@@ -29,7 +29,7 @@ use crate::{
     order_envelope::{
         assemble_order_envelope_binding, OrderEnvelopeError, OrderEnvelopeFreshnessPolicy,
     },
-    runtime::{RuntimeCycleInput, RuntimeError, SignerFreeRuntime},
+    runtime::{LiveDecisionIdentity, RuntimeCycleInput, RuntimeError, SignerFreeRuntime},
     workflow::{
         DecisionBinding, DurableWorkflow, EligibilityPolicyBinding, ExchangeOrderOwnerStore,
         HypeAtoms, InventoryBaseline, JournalAdmissibilityCheck, ProtectedHeadStoreFactory,
@@ -191,6 +191,12 @@ pub async fn prepare_first_live_order_workflow(
         )?
     };
 
+    // Declared in the runtime's hash-chained state BEFORE the journal is
+    // created (and after every fallible network read above, so a failure
+    // there leaves the decision provably journal-less and releasable). Once
+    // recorded, `hype-live-probe release` can never treat this decision as
+    // unbound by absence — even if the journal directory is later lost.
+    runtime.record_live_journal_intent(&LiveDecisionIdentity::of(&decision), journal_path, now)?;
     let mut workflow = DurableWorkflow::open_or_create(
         journal_path,
         &binding,

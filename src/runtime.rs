@@ -546,6 +546,12 @@ struct RuntimeState {
     /// prepared into; write-once, part of the committed cycle hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     live_history_directory: Option<PathBuf>,
+    /// Decision ID → journal path recorded by `prepare` immediately BEFORE
+    /// it creates that journal (hash-chained). A decision listed here may
+    /// have a submit-capable journal even if the directory no longer shows
+    /// one, so absence from the directory can never release it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    live_journal_intents: BTreeMap<String, PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -612,6 +618,7 @@ impl RuntimeState {
             last_committed_cycle_hash: None,
             parent_funding_route: None,
             live_history_directory: None,
+            live_journal_intents: BTreeMap::new(),
         }
     }
 }
@@ -850,6 +857,93 @@ impl SignerFreeRuntime {
     #[must_use]
     pub fn live_history_directory(&self) -> Option<&Path> {
         self.state.live_history_directory.as_deref()
+    }
+
+    /// The journal path `prepare` durably declared for `decision_id` before
+    /// creating it, if any. `Some` means a journal may exist (or may have
+    /// existed and been lost with its directory), so the decision can only
+    /// be resolved through that journal, never by absence.
+    #[must_use]
+    pub fn live_journal_intent(&self, decision_id: &str) -> Option<&Path> {
+        self.state
+            .live_journal_intents
+            .get(decision_id)
+            .map(PathBuf::as_path)
+    }
+
+    /// Durably records, BEFORE the journal is created, that the live
+    /// decision `identity` is about to be bound by the workflow journal at
+    /// `journal_path`. Committed through the same pending/commit cycle
+    /// machinery (hash-chained, protected-anchor-backed), so a journal that
+    /// later disappears with its directory still leaves the runtime knowing
+    /// the decision was bound. Idempotent for the same path (a retried
+    /// `prepare` after a crash between this record and the journal write);
+    /// a different path, a settled decision, or an identity mismatch fails
+    /// closed without touching state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError`] for an unknown/settled decision, an identity
+    /// mismatch, a conflicting path, or ledger/persistence failures.
+    pub fn record_live_journal_intent(
+        &mut self,
+        identity: &LiveDecisionIdentity,
+        journal_path: &Path,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<LiveSettlementOutcome, RuntimeError> {
+        self.ensure_runtime_lock_current()?;
+        let decision_id = identity.decision_id.as_str();
+        let decision = self
+            .state
+            .pacing
+            .decisions()
+            .values()
+            .find(|decision| decision.decision_id == decision_id)
+            .cloned()
+            .ok_or(PacingError::UnknownDecision)?;
+        if let Some(field) = identity.mismatch_against(&decision) {
+            return Err(RuntimeError::LiveDecisionMismatch(field));
+        }
+        if decision.settled || decision.planned_usdc.is_zero() {
+            return Err(RuntimeError::InvalidCycle(
+                "journal intent requires an unsettled planned decision".to_owned(),
+            ));
+        }
+        match self.state.live_journal_intents.get(decision_id) {
+            Some(recorded) if recorded == journal_path => {
+                return Ok(LiveSettlementOutcome::AlreadySettled);
+            }
+            Some(recorded) => {
+                return Err(RuntimeError::LiveHistoryDirectoryMismatch(format!(
+                    "decision {decision_id} already declared journal {} but {} was requested",
+                    recorded.display(),
+                    journal_path.display()
+                )));
+            }
+            None => {}
+        }
+        if recorded_at < decision.decided_at {
+            return Err(RuntimeError::InvalidCycle(
+                "journal intent predates its decision".to_owned(),
+            ));
+        }
+        let mut next_state = self.state.clone();
+        next_state
+            .live_journal_intents
+            .insert(decision_id.to_owned(), journal_path.to_path_buf());
+        let pending = PendingRuntimeCycle::new(recorded_at, next_state, Vec::new())?;
+        let replayed = self
+            .ledger
+            .validate_append_batch(&pending_cycle_ledger_events(&pending))?;
+        ensure_capital_totals_match(&pending.body.state.pacing, &replayed)?;
+        self.ensure_runtime_lock_current()?;
+        write_private_json_atomic(
+            self.config.state_directory.join(PENDING_CYCLE_FILE_NAME),
+            &pending,
+        )?;
+        self.ensure_runtime_lock_current()?;
+        self.state = commit_pending_cycle(&self.config, &self.limits, &mut self.ledger, &pending)?;
+        Ok(LiveSettlementOutcome::Settled)
     }
 
     /// Planned decisions that a live cycle committed and nothing has settled

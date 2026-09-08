@@ -2908,3 +2908,100 @@ fn live_cycles_bind_the_runtime_to_one_history_directory() {
         })
         .expect("same-directory live replay");
 }
+
+#[test]
+fn journal_intent_is_recorded_before_the_journal_and_survives_reopen() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = start + TimeDelta::hours(1);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-approved", deposit_at, 100);
+    let admission = approvals("deposit-approved", deposit_at, deposit_at);
+    let signal = signal(decision_at);
+    let journal = Path::new("/var/lib/hype-accumulator/journals/2026-07-06.jsonl");
+
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
+    let decision = live_planned_decision(
+        &mut runtime,
+        start,
+        decision_at,
+        &movement,
+        &admission,
+        &signal,
+    )
+    .decision()
+    .expect("planned decision")
+    .clone();
+    assert_eq!(runtime.live_journal_intent(&decision.decision_id), None);
+    let head_before = runtime.state.last_committed_cycle_hash.clone();
+
+    // Identity mismatch and a backdated record fail closed without a write.
+    let mut other = LiveDecisionIdentity::of(&decision);
+    other.capital_snapshot_hash = "0".repeat(64);
+    assert!(runtime
+        .record_live_journal_intent(&other, journal, decision_at)
+        .is_err());
+    assert!(runtime
+        .record_live_journal_intent(
+            &LiveDecisionIdentity::of(&decision),
+            journal,
+            decision_at - TimeDelta::seconds(1)
+        )
+        .is_err());
+    assert_eq!(runtime.state.last_committed_cycle_hash, head_before);
+
+    let recorded_at = decision_at + TimeDelta::seconds(30);
+    assert_eq!(
+        runtime
+            .record_live_journal_intent(&LiveDecisionIdentity::of(&decision), journal, recorded_at)
+            .expect("intent recorded"),
+        LiveSettlementOutcome::Settled
+    );
+    assert_eq!(
+        runtime.live_journal_intent(&decision.decision_id),
+        Some(journal)
+    );
+    assert_ne!(runtime.state.last_committed_cycle_hash, head_before);
+    let head_after = runtime.state.last_committed_cycle_hash.clone();
+
+    // Same path again (retry after a crash before the journal write) is a
+    // no-op; a different path is a conflict.
+    assert_eq!(
+        runtime
+            .record_live_journal_intent(&LiveDecisionIdentity::of(&decision), journal, recorded_at)
+            .expect("idempotent"),
+        LiveSettlementOutcome::AlreadySettled
+    );
+    assert_eq!(runtime.state.last_committed_cycle_hash, head_after);
+    assert!(matches!(
+        runtime.record_live_journal_intent(
+            &LiveDecisionIdentity::of(&decision),
+            Path::new("/elsewhere/2026-07-06.jsonl"),
+            recorded_at
+        ),
+        Err(RuntimeError::LiveHistoryDirectoryMismatch(_))
+    ));
+    drop(runtime);
+
+    // Hash-chained: it is still there after a reopen, and the decision can
+    // still be settled from the fill afterwards; a settled decision can no
+    // longer take an intent.
+    let mut reopened = SignerFreeRuntime::open(runtime_config, limits()).expect("reopen runtime");
+    assert_eq!(
+        reopened.live_journal_intent(&decision.decision_id),
+        Some(journal)
+    );
+    reopened
+        .settle_live_decision(
+            &LiveDecisionIdentity::of(&decision),
+            UsdcMicros::default(),
+            UsdcMicros::default(),
+            recorded_at + TimeDelta::minutes(1),
+        )
+        .expect("settle after intent");
+    assert!(reopened
+        .record_live_journal_intent(&LiveDecisionIdentity::of(&decision), journal, recorded_at)
+        .is_err());
+}

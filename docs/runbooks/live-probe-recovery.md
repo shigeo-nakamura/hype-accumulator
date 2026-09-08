@@ -112,7 +112,14 @@ journal that exists elsewhere. It then scans that directory with the same protec
 verification `prepare`'s aggregation uses (symlinks and non-regular entries
 rejected, orphaned protected heads, empty or rolled-back/truncated journals,
 duplicate bindings and inadmissible journals all fail the whole scan closed)
-and reads each journal's committed binding. A decision that **no** journal binds can never have
+and reads each journal's committed binding. Independently of the directory,
+`prepare` records the journal path it is about to create in the runtime's
+hash-chained state *before* creating it (`live_journal_intents`), after every
+fallible network read; a decision with such a record is never released by
+absence — if its journal is present, `reconcile` it; if it is missing, the
+history directory was lost (deleted and recreated empty, unmounted) and must
+be restored from backup first (bot-strategy#944). Only a decision with no
+intent record **and** no journal in the verified directory is released. A decision that **no** journal binds can never have
 produced a venue action — signing is only reachable through `submit`, which
 needs a committed binding in that directory — so it is settled at zero
 (`mode=released ...`), releasing the commitment. A decision that **is** bound

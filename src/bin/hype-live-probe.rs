@@ -1017,6 +1017,21 @@ fn release(
         )
     })?;
     for decision in unsettled {
+        // Recorded by `prepare` before it created the journal: this decision
+        // was (or was about to be) bound, so absence from the directory —
+        // including a directory deleted and recreated empty, or an unmounted
+        // mount point — is never proof it was not submitted.
+        if let Some(intent) = runtime.live_journal_intent(&decision.decision_id) {
+            return Err(format!(
+                "decision {} declared workflow journal {} before it was created; refusing to \
+                 release committed capital by absence. If that journal is present, run \
+                 `reconcile` on it; if it is missing, the history directory was lost — restore \
+                 it from backup (bot-strategy#944) before anything else.",
+                decision.decision_id,
+                intent.display()
+            )
+            .into());
+        }
         if let Some(journal_path) = bound.get(&decision.decision_id) {
             return Err(format!(
                 "decision {} is bound by workflow journal {}; refusing to release committed \
