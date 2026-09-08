@@ -133,3 +133,17 @@ release, so a concurrent `prepare` cannot slip a new journal in between.
 A prepared-but-never-submitted order (journal exists, operator declined) is
 therefore *not* releasable today; do not run `prepare` unless you intend to
 submit, and treat that state as manual review until #929 lands.
+
+## Settlement is final; late contradictory evidence is a manual review
+
+`submit`/`reconcile` settle the pacing decision once the workflow holds a
+durable terminal result. If fresh venue evidence later contradicts that
+result (a fill discovered after a canceled/unfilled finalization), the
+workflow moves itself to `ManualReview`; `reconcile` then refuses to settle
+the contested totals (`workflow is in ManualReview`), and a settlement that
+was already written from the earlier totals cannot be corrected by this
+binary — `settle_live_decision` rejects a conflicting replay rather than
+silently overwriting the ledger. Resolving that state needs a durable
+settlement-correction event across pacing/ledger/runtime, which is
+bot-strategy#901's remaining scope; until then treat it as a manual review
+with the journal, the reconcile output, and the runtime state preserved.

@@ -5617,3 +5617,22 @@ fn bound_decision_ids_fails_closed_on_empty_orphaned_rolled_back_or_inadmissible
     .expect("directory exists");
     assert_eq!(bound.len(), 1);
 }
+
+#[cfg(feature = "live-probe")]
+#[test]
+fn bound_decision_identity_matches_the_runtime_view_of_the_same_decision() {
+    use hype_accumulator::{live_decision::bound_decision_identity, runtime::LiveDecisionIdentity};
+    let decision = decision();
+    let binding = binding();
+    assert_eq!(
+        bound_decision_identity(&binding),
+        LiveDecisionIdentity::of(&decision)
+    );
+    // Any drift between the two views is a mismatch, not a near-match.
+    let mut other = decision.clone();
+    other.capital_snapshot_hash = "capital-snapshot-b".to_owned();
+    assert_ne!(
+        bound_decision_identity(&binding),
+        LiveDecisionIdentity::of(&other)
+    );
+}

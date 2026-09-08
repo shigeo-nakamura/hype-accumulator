@@ -29,7 +29,10 @@ use crate::{
     order_envelope::{
         assemble_order_envelope_binding, OrderEnvelopeError, OrderEnvelopeFreshnessPolicy,
     },
-    runtime::{LiveDecisionIdentity, RuntimeCycleInput, RuntimeError, SignerFreeRuntime},
+    runtime::{
+        LiveDecisionAllocation, LiveDecisionIdentity, RuntimeCycleInput, RuntimeError,
+        SignerFreeRuntime,
+    },
     workflow::{
         DecisionBinding, DurableWorkflow, EligibilityPolicyBinding, ExchangeOrderOwnerStore,
         HypeAtoms, InventoryBaseline, JournalAdmissibilityCheck, ProtectedHeadStoreFactory,
@@ -66,6 +69,39 @@ pub enum LiveDecisionError {
     Workflow(#[from] WorkflowError),
     #[error("live HYPE balance is not exactly representable")]
     InvalidBalance,
+    #[error(
+        "journal is already bound to decision {existing} but this cycle's decision is {current}; \
+         a journal path is never reused across decisions"
+    )]
+    JournalBoundToAnotherDecision { existing: String, current: String },
+}
+
+/// The workflow's durable copy of the pacing decision it was bound to, in
+/// the form the signer-free runtime verifies against its own decision
+/// (`SignerFreeRuntime::settle_live_decision`,
+/// `SignerFreeRuntime::record_live_journal_intent`) before moving capital.
+#[must_use]
+pub fn bound_decision_identity(binding: &DecisionBinding) -> LiveDecisionIdentity {
+    let mut allocations = binding
+        .capital_commitments
+        .iter()
+        .map(|commitment| LiveDecisionAllocation {
+            tranche_id: commitment.event_id.clone(),
+            planned_usdc: commitment.planned_usdc,
+            committed_usdc: commitment.committed_usdc,
+        })
+        .collect::<Vec<_>>();
+    allocations.sort_by(|left, right| left.tranche_id.cmp(&right.tranche_id));
+    LiveDecisionIdentity {
+        decision_id: binding.decision_id.clone(),
+        decision_date: binding.decision_date,
+        decided_at: binding.decided_at,
+        capital_snapshot_hash: binding.capital_snapshot_hash.clone(),
+        input_snapshot_hash: binding.input_snapshot_hash.clone(),
+        planned_usdc: binding.planned_usdc,
+        committed_usdc: binding.committed_usdc,
+        allocations,
+    }
 }
 
 /// Computes today's pacing decision (if one is due) and durably prepares its
@@ -125,7 +161,18 @@ pub async fn prepare_first_live_order_workflow(
     // the exact durably committed binding and would permanently fail
     // `open_or_create`'s replay-match check. Reusing whatever binding is
     // already on disk — skipping every live read below — makes retry safe.
+    let identity = LiveDecisionIdentity::of(&decision);
     let binding = if let Some(existing) = DurableWorkflow::peek_committed_binding(journal_path)? {
+        // A journal already on disk must be *this* decision's retry, never a
+        // reused path from another day: otherwise the intent below would
+        // pin this decision to a foreign journal that `reconcile` can never
+        // settle it from and `release` would then refuse forever.
+        if bound_decision_identity(&existing) != identity {
+            return Err(LiveDecisionError::JournalBoundToAnotherDecision {
+                existing: existing.decision_id,
+                current: identity.decision_id,
+            });
+        }
         existing
     } else {
         let probe_binding =
@@ -196,7 +243,7 @@ pub async fn prepare_first_live_order_workflow(
     // there leaves the decision provably journal-less and releasable). Once
     // recorded, `hype-live-probe release` can never treat this decision as
     // unbound by absence — even if the journal directory is later lost.
-    runtime.record_live_journal_intent(&LiveDecisionIdentity::of(&decision), journal_path, now)?;
+    runtime.record_live_journal_intent(&identity, journal_path, now)?;
     let mut workflow = DurableWorkflow::open_or_create(
         journal_path,
         &binding,

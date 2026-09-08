@@ -24,21 +24,21 @@ use chrono::Utc;
 use dex_connector::{HyperliquidAccountConfig, HyperliquidConnector, HyperliquidConnectorConfig};
 use hype_accumulator::{
     config::{Config, EffectiveLiveOrderPolicy, ProcessEnvironment},
-    live_decision::prepare_first_live_order_workflow,
+    live_decision::{bound_decision_identity, prepare_first_live_order_workflow},
     live_probe::{reconcile_prepared_order, HyperliquidLiveProbe, LiveProbeBinding},
     monitor::{trade_cadence_label, HypeAttribution, HyperliquidObserver},
     order_envelope::OrderEnvelopeFreshnessPolicy,
     pacing::{PacingLimits, UsdcMicros},
     runtime::{
-        AdmissionApprovals, DecisionMode, LiveDecisionAllocation, LiveDecisionIdentity,
-        RuntimeConfig, RuntimeCycleInput, SignerFreeRuntime,
+        AdmissionApprovals, DecisionMode, LiveDecisionIdentity, RuntimeConfig, RuntimeCycleInput,
+        SignerFreeRuntime,
     },
     signal::SignalSnapshot,
     signer::resolve_signer_private_key,
     workflow::{
         DurableWorkflow, EligibilityPolicyBinding, ExchangeOrderOwnerStore,
         FileExchangeOrderOwnerStore, FileProtectedWorkflowHeadStore, HypeAtoms,
-        ProtectedWorkflowHeadStore, WorkflowError,
+        ProtectedWorkflowHeadStore, WorkflowError, WorkflowStage,
     },
 };
 use rust_decimal::Decimal;
@@ -872,6 +872,18 @@ fn settle_finalized_decision(
         println!("mode=settlement-deferred decision={decision_id} durable_finality=false");
         return Ok(());
     }
+    // Fresh late venue evidence that contradicts a terminal result moves the
+    // workflow to ManualReview; its recorded totals are then contested and
+    // must not be written into the capital ledger (see the runbook: a
+    // settlement already made from the earlier totals cannot be corrected
+    // here — bot-strategy#901).
+    if state.stage() == WorkflowStage::ManualReview {
+        return Err(format!(
+            "decision {decision_id}: workflow is in ManualReview (contradictory late venue \
+             evidence); refusing to settle contested totals — resolve the review first"
+        )
+        .into());
+    }
     let mut runtime = open_signer_free_runtime(config, runtime_config_path)?;
     let filled_usdc = state.filled_usdc();
     let debited_usdc = state.debited_usdc();
@@ -882,34 +894,6 @@ fn settle_finalized_decision(
         debited_usdc.as_micros()
     );
     Ok(())
-}
-
-/// The workflow's durable copy of the pacing decision it was bound to, in
-/// the form `SignerFreeRuntime::settle_live_decision` verifies against the
-/// runtime's own decision before moving any capital.
-fn bound_decision_identity(
-    binding: &hype_accumulator::workflow::DecisionBinding,
-) -> LiveDecisionIdentity {
-    let mut allocations = binding
-        .capital_commitments
-        .iter()
-        .map(|commitment| LiveDecisionAllocation {
-            tranche_id: commitment.event_id.clone(),
-            planned_usdc: commitment.planned_usdc,
-            committed_usdc: commitment.committed_usdc,
-        })
-        .collect::<Vec<_>>();
-    allocations.sort_by(|left, right| left.tranche_id.cmp(&right.tranche_id));
-    LiveDecisionIdentity {
-        decision_id: binding.decision_id.clone(),
-        decision_date: binding.decision_date,
-        decided_at: binding.decided_at,
-        capital_snapshot_hash: binding.capital_snapshot_hash.clone(),
-        input_snapshot_hash: binding.input_snapshot_hash.clone(),
-        planned_usdc: binding.planned_usdc,
-        committed_usdc: binding.committed_usdc,
-        allocations,
-    }
 }
 
 fn open_signer_free_runtime(
