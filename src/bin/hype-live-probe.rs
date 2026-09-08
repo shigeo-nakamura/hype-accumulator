@@ -28,9 +28,10 @@ use hype_accumulator::{
     live_probe::{reconcile_prepared_order, HyperliquidLiveProbe, LiveProbeBinding},
     monitor::{trade_cadence_label, HypeAttribution, HyperliquidObserver},
     order_envelope::OrderEnvelopeFreshnessPolicy,
-    pacing::PacingLimits,
+    pacing::{PacingLimits, UsdcMicros},
     runtime::{
-        AdmissionApprovals, DecisionMode, RuntimeConfig, RuntimeCycleInput, SignerFreeRuntime,
+        AdmissionApprovals, DecisionMode, LiveDecisionAllocation, LiveDecisionIdentity,
+        RuntimeConfig, RuntimeCycleInput, SignerFreeRuntime,
     },
     signal::SignalSnapshot,
     signer::resolve_signer_private_key,
@@ -418,7 +419,9 @@ const USAGE: &str = "usage:\n  hype-live-probe prepare <config.toml> <security-p
      <runtime-config.toml> <operational.toml> <journal.jsonl>\n  hype-live-probe submit \
      <config.toml> <security-policy.toml> <runtime-config.toml> <operational.toml> \
      <journal.jsonl> --confirm <client_order_id>\n  hype-live-probe reconcile <config.toml> \
-     <security-policy.toml> <runtime-config.toml> <operational.toml> <journal.jsonl>";
+     <security-policy.toml> <runtime-config.toml> <operational.toml> <journal.jsonl>\n  \
+     hype-live-probe release <config.toml> <security-policy.toml> <runtime-config.toml> \
+     <operational.toml>";
 
 #[derive(Debug, Eq, PartialEq)]
 enum Invocation {
@@ -443,6 +446,12 @@ enum Invocation {
         operational_params_path: String,
         journal_path: String,
         confirm_client_order_id: String,
+    },
+    Release {
+        config_path: String,
+        security_policy_path: String,
+        runtime_config_path: String,
+        operational_params_path: String,
     },
 }
 
@@ -485,6 +494,16 @@ where
                 operational_params_path: operational_params_path.clone(),
                 journal_path: journal_path.clone(),
                 confirm_client_order_id: confirm_client_order_id.clone(),
+            })
+        }
+        [command, config_path, security_policy_path, runtime_config_path, operational_params_path]
+            if command == "release" =>
+        {
+            Ok(Invocation::Release {
+                config_path: config_path.clone(),
+                security_policy_path: security_policy_path.clone(),
+                runtime_config_path: runtime_config_path.clone(),
+                operational_params_path: operational_params_path.clone(),
             })
         }
         _ => Err(USAGE),
@@ -544,6 +563,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await
         }
+        Invocation::Release {
+            config_path,
+            security_policy_path,
+            runtime_config_path,
+            operational_params_path,
+        } => release(
+            &config_path,
+            &security_policy_path,
+            &runtime_config_path,
+            &operational_params_path,
+        ),
     }
 }
 
@@ -831,25 +861,157 @@ fn settle_finalized_decision(
     observation: &hype_accumulator::live_probe::ProbeReconciliation,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let state = workflow.state();
-    let decision_id = state.binding().decision_id.clone();
+    let identity = bound_decision_identity(state.binding());
+    let decision_id = identity.decision_id.clone();
     if !observation.durable_finality {
         println!("mode=settlement-deferred decision={decision_id} durable_finality=false");
         return Ok(());
     }
-    let runtime_config = RuntimeConfig::from_toml(&fs::read_to_string(runtime_config_path)?)?
-        .with_parent_funding_route(config.parent_funding_route(&ProcessEnvironment)?);
-    let limits = PacingLimits::from_config(config)?;
-    let mut runtime = SignerFreeRuntime::open(runtime_config, limits)?;
+    let mut runtime = open_signer_free_runtime(config, runtime_config_path)?;
     let filled_usdc = state.filled_usdc();
     let debited_usdc = state.debited_usdc();
-    let outcome =
-        runtime.settle_live_decision(&decision_id, filled_usdc, debited_usdc, Utc::now())?;
+    let outcome = runtime.settle_live_decision(&identity, filled_usdc, debited_usdc, Utc::now())?;
     println!(
         "mode=settled decision={decision_id} filled_usdc={} debited_usdc={} outcome={outcome:?}",
         filled_usdc.as_micros(),
         debited_usdc.as_micros()
     );
     Ok(())
+}
+
+/// The workflow's durable copy of the pacing decision it was bound to, in
+/// the form `SignerFreeRuntime::settle_live_decision` verifies against the
+/// runtime's own decision before moving any capital.
+fn bound_decision_identity(
+    binding: &hype_accumulator::workflow::DecisionBinding,
+) -> LiveDecisionIdentity {
+    let mut allocations = binding
+        .capital_commitments
+        .iter()
+        .map(|commitment| LiveDecisionAllocation {
+            tranche_id: commitment.event_id.clone(),
+            planned_usdc: commitment.planned_usdc,
+            committed_usdc: commitment.committed_usdc,
+        })
+        .collect::<Vec<_>>();
+    allocations.sort_by(|left, right| left.tranche_id.cmp(&right.tranche_id));
+    LiveDecisionIdentity {
+        decision_id: binding.decision_id.clone(),
+        decision_date: binding.decision_date,
+        decided_at: binding.decided_at,
+        capital_snapshot_hash: binding.capital_snapshot_hash.clone(),
+        input_snapshot_hash: binding.input_snapshot_hash.clone(),
+        planned_usdc: binding.planned_usdc,
+        committed_usdc: binding.committed_usdc,
+        allocations,
+    }
+}
+
+fn open_signer_free_runtime(
+    config: &Config,
+    runtime_config_path: &str,
+) -> Result<SignerFreeRuntime, Box<dyn std::error::Error>> {
+    let runtime_config = RuntimeConfig::from_toml(&fs::read_to_string(runtime_config_path)?)?
+        .with_parent_funding_route(config.parent_funding_route(&ProcessEnvironment)?);
+    let limits = PacingLimits::from_config(config)?;
+    Ok(SignerFreeRuntime::open(runtime_config, limits)?)
+}
+
+/// Releases live planned decisions that provably never reached a signer.
+///
+/// `prepare` commits the day's decision in the runtime cycle *before* the
+/// execution workflow journal is created, so a failure or crash between the
+/// two (envelope assembly, inventory aggregation, journal I/O) leaves capital
+/// committed with no order that could ever settle it — and every later
+/// decision day fails closed as `PriorDecisionUnsettled`. Signing is only
+/// possible through `submit`, which requires a committed workflow binding in
+/// the operational config's bound `history_directory`; so a decision that no
+/// journal in that directory binds can never have produced a venue action,
+/// and settling it at zero is safe. A decision that *is* bound by a journal
+/// is deliberately refused here: its order may exist at the venue, and only
+/// durable finality (`reconcile`) or gap-free conclusive-absence evidence
+/// (not constructible yet, bot-strategy#929) may resolve it.
+fn release(
+    config_path: &str,
+    security_policy_path: &str,
+    runtime_config_path: &str,
+    operational_params_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = load_config(config_path, security_policy_path)?;
+    let operational = OperationalParams::from_toml(&fs::read_to_string(operational_params_path)?)?;
+    let history_directory = operational
+        .history_directory
+        .as_deref()
+        .ok_or("operational.toml is missing history_directory, required by `release`")?;
+    // Same write-once binding `prepare` enforces: the directory scanned below
+    // must be the one every prepare for this operational config wrote to.
+    let history_initialization =
+        HistoryDirectoryBinding::check(operational_params_path, history_directory)?;
+    if history_initialization == HistoryInitialization::FirstEver {
+        return Err(
+            "history_directory was never initialized for this operational config; no \
+                    prepare ever ran through it, so nothing it produced can be released here"
+                .into(),
+        );
+    }
+    let journal_directory = PathBuf::from(history_directory);
+    ensure_history_directory_available(history_initialization, &journal_directory)?;
+    let bound = decisions_bound_by_journals(&journal_directory)?;
+
+    // Holds the exclusive runtime lock for the whole scan-and-release, so a
+    // concurrent `prepare` (which opens the runtime before creating its
+    // journal) cannot interleave a new journal between the scan and the
+    // release.
+    let mut runtime = open_signer_free_runtime(&config, runtime_config_path)?;
+    let unsettled = runtime.unsettled_planned_decisions();
+    if unsettled.is_empty() {
+        println!("mode=nothing-to-release");
+        return Ok(());
+    }
+    for decision in unsettled {
+        if let Some(journal_path) = bound.get(&decision.decision_id) {
+            return Err(format!(
+                "decision {} is bound by workflow journal {}; refusing to release committed \
+                 capital while an order may exist at the venue. Run `reconcile` on that journal \
+                 to reach durable finality (conclusive absence evidence is bot-strategy#929).",
+                decision.decision_id,
+                journal_path.display()
+            )
+            .into());
+        }
+        let outcome = runtime.settle_live_decision(
+            &LiveDecisionIdentity::of(&decision),
+            UsdcMicros::default(),
+            UsdcMicros::default(),
+            Utc::now(),
+        )?;
+        println!(
+            "mode=released decision={} committed_usdc={} outcome={outcome:?}",
+            decision.decision_id,
+            decision.committed_usdc.as_micros()
+        );
+    }
+    Ok(())
+}
+
+/// Every decision ID some `.jsonl` workflow journal directly inside
+/// `journal_directory` is durably bound to. A journal whose committed
+/// binding cannot be read fails the whole scan closed: an unreadable journal
+/// might be the one binding the decision under consideration.
+fn decisions_bound_by_journals(
+    journal_directory: &Path,
+) -> Result<std::collections::BTreeMap<String, PathBuf>, Box<dyn std::error::Error>> {
+    let mut bound = std::collections::BTreeMap::new();
+    for entry in fs::read_dir(journal_directory)? {
+        let path = entry?.path();
+        if !path.is_file() || path.extension().and_then(std::ffi::OsStr::to_str) != Some("jsonl") {
+            continue;
+        }
+        if let Some(binding) = DurableWorkflow::peek_committed_binding(&path)? {
+            bound.insert(binding.decision_id, path);
+        }
+    }
+    Ok(bound)
 }
 
 fn print_observation(
@@ -1487,6 +1649,36 @@ mod tests {
         let operational = super::OperationalParams::from_toml(legacy_toml)
             .expect("legacy operational.toml without history_directory must still parse");
         assert!(operational.history_directory.is_none());
+    }
+
+    #[test]
+    fn parses_a_release_invocation_without_a_journal() {
+        assert_eq!(
+            invocation(args(&[
+                "release",
+                "config.toml",
+                "policy.toml",
+                "runtime.toml",
+                "operational.toml",
+            ])),
+            Ok(Invocation::Release {
+                config_path: "config.toml".to_owned(),
+                security_policy_path: "policy.toml".to_owned(),
+                runtime_config_path: "runtime.toml".to_owned(),
+                operational_params_path: "operational.toml".to_owned(),
+            })
+        );
+        // A journal argument is not accepted: release scans the bound
+        // history directory itself and must never be pointed at one file.
+        assert!(invocation(args(&[
+            "release",
+            "config.toml",
+            "policy.toml",
+            "runtime.toml",
+            "operational.toml",
+            "journal.jsonl",
+        ]))
+        .is_err());
     }
 
     #[test]

@@ -20,7 +20,12 @@ Once the order is durably final it does settle the pacing decision that
 same durable fill evidence, so the capital ledger's commitment is released or
 converted to spend exactly once; before finality it prints
 `mode=settlement-deferred` and every later decision day stays blocked as
-`PriorDecisionUnsettled` until this command is rerun. It checks the
+`PriorDecisionUnsettled` until this command is rerun. Settlement is bound to
+the runtime that produced the decision: the journal's durable copy of the
+decision (date, `decided_at`, capital/input snapshot hashes, planned and
+committed amounts, tranche allocations) must match the runtime's own decision
+field-for-field, so pointing the command at a different `runtime.toml` fails
+closed instead of settling someone else's same-dated decision. It checks the
 prepare-time network/routing binding and protected workflow journal, then
 checks the account and market against the durable prepared action before
 querying the exact CLOID. Halted operation, revoked keys, and expired live
@@ -83,3 +88,32 @@ requirements:
   gates. The current policy still rejects automatic staking.
 
 No output of this command is a scheduled-live approval or a staking approval.
+
+## Releasing a decision that never reached a signer
+
+`prepare` commits the day's pacing decision in the runtime cycle *before* the
+workflow journal exists. If it then fails or crashes before the journal is
+created (envelope assembly, inventory aggregation, journal I/O), the capital
+stays committed with no order that could ever settle it, and every later
+decision day fails closed as `PriorDecisionUnsettled`. Release it with:
+
+```text
+hype-live-probe release config.local.toml security-policy.local.toml runtime.local.toml operational.local.toml
+```
+
+It takes no journal argument on purpose: it scans the operational config's
+write-once bound `history_directory` for every `.jsonl` journal and reads
+each committed binding. A decision that **no** journal binds can never have
+produced a venue action — signing is only reachable through `submit`, which
+needs a committed binding in that directory — so it is settled at zero
+(`mode=released ...`), releasing the commitment. A decision that **is** bound
+by a journal is refused, with the journal path in the error: its order may
+exist at the venue, and only `reconcile` reaching durable finality (or
+gap-free conclusive-absence evidence, which this binary cannot construct yet
+— bot-strategy#929) may resolve it. An unreadable journal fails the whole
+scan closed. The exclusive runtime lock is held for the entire scan-and-
+release, so a concurrent `prepare` cannot slip a new journal in between.
+
+A prepared-but-never-submitted order (journal exists, operator declined) is
+therefore *not* releasable today; do not run `prepare` unless you intend to
+submit, and treat that state as manual review until #929 lands.

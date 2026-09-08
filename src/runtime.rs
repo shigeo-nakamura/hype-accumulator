@@ -650,6 +650,83 @@ pub struct RuntimeCycleInput<'a> {
     pub decision_mode: DecisionMode,
 }
 
+/// One tranche allocation of a live planned decision, as bound into the
+/// execution workflow (`DecisionBinding::capital_commitments`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveDecisionAllocation {
+    pub tranche_id: String,
+    pub planned_usdc: UsdcMicros,
+    pub committed_usdc: UsdcMicros,
+}
+
+/// The complete identity of the pacing decision an execution workflow was
+/// bound to. Decision IDs are only date-derived (`fixed-dca:<date>`), so a
+/// settlement must prove it is talking to the runtime that produced the
+/// bound decision: every field here is copied from the workflow's durable
+/// `DecisionBinding` and compared against the runtime's own decision before
+/// any capital moves. A different runtime (or a rewritten one) fails closed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveDecisionIdentity {
+    pub decision_id: String,
+    pub decision_date: chrono::NaiveDate,
+    pub decided_at: DateTime<Utc>,
+    pub capital_snapshot_hash: String,
+    pub input_snapshot_hash: String,
+    pub planned_usdc: UsdcMicros,
+    pub committed_usdc: UsdcMicros,
+    pub allocations: Vec<LiveDecisionAllocation>,
+}
+
+impl LiveDecisionIdentity {
+    /// Identity of a pacing decision as the runtime itself holds it.
+    #[must_use]
+    pub fn of(decision: &DailyDecision) -> Self {
+        let mut allocations = decision
+            .allocations
+            .iter()
+            .map(|allocation| LiveDecisionAllocation {
+                tranche_id: allocation.tranche_id.clone(),
+                planned_usdc: allocation.planned_usdc,
+                committed_usdc: allocation.committed_usdc,
+            })
+            .collect::<Vec<_>>();
+        allocations.sort_by(|left, right| left.tranche_id.cmp(&right.tranche_id));
+        Self {
+            decision_id: decision.decision_id.clone(),
+            decision_date: decision.decision_date,
+            decided_at: decision.decided_at,
+            capital_snapshot_hash: decision.capital_snapshot_hash.clone(),
+            input_snapshot_hash: decision.input_snapshot_hash.clone(),
+            planned_usdc: decision.planned_usdc,
+            committed_usdc: decision.committed_usdc,
+            allocations,
+        }
+    }
+
+    fn mismatch_against(&self, decision: &DailyDecision) -> Option<&'static str> {
+        let expected = Self::of(decision);
+        if self.decision_id != expected.decision_id {
+            Some("decision_id")
+        } else if self.decision_date != expected.decision_date {
+            Some("decision_date")
+        } else if self.decided_at != expected.decided_at {
+            Some("decided_at")
+        } else if self.capital_snapshot_hash != expected.capital_snapshot_hash {
+            Some("capital_snapshot_hash")
+        } else if self.input_snapshot_hash != expected.input_snapshot_hash {
+            Some("input_snapshot_hash")
+        } else if self.planned_usdc != expected.planned_usdc {
+            Some("planned_usdc")
+        } else if self.committed_usdc != expected.committed_usdc {
+            Some("committed_usdc")
+        } else if self.allocations != expected.allocations {
+            Some("allocations")
+        } else {
+            None
+        }
+    }
+}
+
 /// Outcome of [`SignerFreeRuntime::settle_live_decision`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LiveSettlementOutcome {
@@ -754,28 +831,46 @@ impl SignerFreeRuntime {
         })
     }
 
+    /// Planned decisions that a live cycle committed and nothing has settled
+    /// yet. Empty for a runtime that has only ever run `DRY_RUN` cycles.
+    #[must_use]
+    pub fn unsettled_planned_decisions(&self) -> Vec<DailyDecision> {
+        self.state
+            .pacing
+            .decisions()
+            .values()
+            .filter(|decision| !decision.settled && !decision.planned_usdc.is_zero())
+            .cloned()
+            .collect()
+    }
+
     /// Durably settles a live planned decision from its reconciled terminal
     /// fill: `filled_usdc` is the cumulative filled notional and
     /// `debited_usdc` the cumulative cash debit including fees, both taken
     /// from the execution workflow's durable `OrderFinalized` evidence. A
     /// canceled/expired unfilled order settles at zero, releasing the
-    /// commitment. Repeating the exact settlement is idempotent; a
-    /// conflicting replay, an overfill, or a debit above the commitment
-    /// fails closed without touching runtime state.
+    /// commitment. `identity` is the workflow's durable copy of the decision
+    /// it was bound to; every field must match this runtime's own decision,
+    /// so a settlement can never land on a different runtime that happens to
+    /// hold a decision with the same date-derived ID. Repeating the exact
+    /// settlement is idempotent; a conflicting replay, an overfill, or a
+    /// debit above the commitment fails closed without touching runtime
+    /// state.
     ///
     /// # Errors
     ///
-    /// Returns [`RuntimeError`] for an unknown or zero-planned decision, a
-    /// conflicting or over-committed settlement, a settlement dated before
-    /// the decision, or ledger/persistence failures.
+    /// Returns [`RuntimeError`] for an unknown or zero-planned decision, an
+    /// identity mismatch, a conflicting or over-committed settlement, a
+    /// settlement dated before the decision, or ledger/persistence failures.
     pub fn settle_live_decision(
         &mut self,
-        decision_id: &str,
+        identity: &LiveDecisionIdentity,
         filled_usdc: UsdcMicros,
         debited_usdc: UsdcMicros,
         settled_at: DateTime<Utc>,
     ) -> Result<LiveSettlementOutcome, RuntimeError> {
         self.ensure_runtime_lock_current()?;
+        let decision_id = identity.decision_id.as_str();
         let decision = self
             .state
             .pacing
@@ -784,6 +879,9 @@ impl SignerFreeRuntime {
             .find(|decision| decision.decision_id == decision_id)
             .cloned()
             .ok_or(PacingError::UnknownDecision)?;
+        if let Some(field) = identity.mismatch_against(&decision) {
+            return Err(RuntimeError::LiveDecisionMismatch(field));
+        }
         if decision.settled {
             // Delegates the exact-replay-vs-conflict distinction to pacing so
             // the two never disagree; a matching replay writes nothing.
@@ -2256,6 +2354,8 @@ pub enum RuntimeError {
     UnsafeRuntimeLock,
     #[error("runtime counter overflowed")]
     CounterOverflow,
+    #[error("live settlement identity does not match this runtime's decision ({0})")]
+    LiveDecisionMismatch(&'static str),
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]

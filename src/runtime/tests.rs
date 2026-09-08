@@ -2562,7 +2562,7 @@ fn live_settlement_converts_the_commitment_to_spend_exactly_once() {
     // Settlement dated before the decision is refused.
     assert!(runtime
         .settle_live_decision(
-            &decision.decision_id,
+            &LiveDecisionIdentity::of(&decision),
             filled,
             debited,
             decision_at - TimeDelta::seconds(1),
@@ -2570,13 +2570,15 @@ fn live_settlement_converts_the_commitment_to_spend_exactly_once() {
         .is_err());
     // Unknown decision, overfill, and a debit above the commitment all fail
     // closed without touching state.
+    let mut unknown = LiveDecisionIdentity::of(&decision);
+    unknown.decision_id = "fixed-dca:2026-07-05".to_owned();
     assert!(runtime
-        .settle_live_decision("fixed-dca:2026-07-05", filled, debited, decision_at)
+        .settle_live_decision(&unknown, filled, debited, decision_at)
         .is_err());
     let overfill = UsdcMicros::from_micros(planned + 1);
     assert!(runtime
         .settle_live_decision(
-            &decision.decision_id,
+            &LiveDecisionIdentity::of(&decision),
             overfill,
             overfill,
             decision_at + TimeDelta::minutes(1),
@@ -2584,7 +2586,7 @@ fn live_settlement_converts_the_commitment_to_spend_exactly_once() {
         .is_err());
     assert!(runtime
         .settle_live_decision(
-            &decision.decision_id,
+            &LiveDecisionIdentity::of(&decision),
             filled,
             UsdcMicros::from_micros(decision.committed_usdc.as_micros() + 1),
             decision_at + TimeDelta::minutes(1),
@@ -2599,7 +2601,12 @@ fn live_settlement_converts_the_commitment_to_spend_exactly_once() {
     let settled_at = decision_at + TimeDelta::minutes(2);
     assert_eq!(
         runtime
-            .settle_live_decision(&decision.decision_id, filled, debited, settled_at)
+            .settle_live_decision(
+                &LiveDecisionIdentity::of(&decision),
+                filled,
+                debited,
+                settled_at
+            )
             .expect("settle from the terminal fill"),
         LiveSettlementOutcome::Settled
     );
@@ -2628,14 +2635,19 @@ fn live_settlement_converts_the_commitment_to_spend_exactly_once() {
     let head_before = runtime.state.last_committed_cycle_hash.clone();
     assert_eq!(
         runtime
-            .settle_live_decision(&decision.decision_id, filled, debited, settled_at)
+            .settle_live_decision(
+                &LiveDecisionIdentity::of(&decision),
+                filled,
+                debited,
+                settled_at
+            )
             .expect("idempotent replay"),
         LiveSettlementOutcome::AlreadySettled
     );
     assert_eq!(runtime.state.last_committed_cycle_hash, head_before);
     assert!(runtime
         .settle_live_decision(
-            &decision.decision_id,
+            &LiveDecisionIdentity::of(&decision),
             decision.planned_usdc,
             decision.planned_usdc,
             settled_at
@@ -2698,7 +2710,7 @@ fn live_settlement_at_zero_releases_an_unfilled_commitment() {
     assert_eq!(
         runtime
             .settle_live_decision(
-                &decision.decision_id,
+                &LiveDecisionIdentity::of(&decision),
                 UsdcMicros::default(),
                 UsdcMicros::default(),
                 decision_at + TimeDelta::seconds(30),
@@ -2714,4 +2726,81 @@ fn live_settlement_at_zero_releases_an_unfilled_commitment() {
     assert_eq!(runtime.ledger.state().spent_usdc(), UsdcMicros::default());
     drop(runtime);
     SignerFreeRuntime::open(runtime_config, limits()).expect("reopen after zero settlement");
+}
+
+#[test]
+fn live_settlement_refuses_a_decision_identity_from_another_runtime() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = start + TimeDelta::hours(1);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-approved", deposit_at, 100);
+    let admission = approvals("deposit-approved", deposit_at, deposit_at);
+    let signal = signal(decision_at);
+
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
+    let report = live_planned_decision(
+        &mut runtime,
+        start,
+        decision_at,
+        &movement,
+        &admission,
+        &signal,
+    );
+    let decision = report.decision().expect("planned decision").clone();
+    assert_eq!(
+        runtime.unsettled_planned_decisions(),
+        vec![decision.clone()]
+    );
+    let head_before = runtime.state.last_committed_cycle_hash.clone();
+    let settled_at = decision_at + TimeDelta::minutes(2);
+
+    // Same date-derived ID, but a binding produced by a different runtime
+    // state (capital snapshot / input snapshot / amounts / tranches) must
+    // never settle this runtime's decision — and must not touch it.
+    let mut other_capital = LiveDecisionIdentity::of(&decision);
+    other_capital.capital_snapshot_hash = "0".repeat(64);
+    let mut other_signal = LiveDecisionIdentity::of(&decision);
+    other_signal.input_snapshot_hash = "1".repeat(64);
+    let mut other_amount = LiveDecisionIdentity::of(&decision);
+    other_amount.planned_usdc = UsdcMicros::from_micros(decision.planned_usdc.as_micros() - 1);
+    let mut other_tranche = LiveDecisionIdentity::of(&decision);
+    other_tranche.allocations[0].tranche_id = "deposit-other".to_owned();
+    let mut other_clock = LiveDecisionIdentity::of(&decision);
+    other_clock.decided_at = decision_at + TimeDelta::days(1);
+    for (identity, field) in [
+        (other_capital, "capital_snapshot_hash"),
+        (other_signal, "input_snapshot_hash"),
+        (other_amount, "planned_usdc"),
+        (other_tranche, "allocations"),
+        (other_clock, "decided_at"),
+    ] {
+        match runtime.settle_live_decision(
+            &identity,
+            UsdcMicros::default(),
+            UsdcMicros::default(),
+            settled_at,
+        ) {
+            Err(RuntimeError::LiveDecisionMismatch(mismatch)) => assert_eq!(mismatch, field),
+            other => panic!("expected an identity mismatch on {field}, got {other:?}"),
+        }
+        assert!(!runtime.state.pacing.decisions()[&decision.decision_date].settled);
+        assert_eq!(runtime.state.last_committed_cycle_hash, head_before);
+    }
+
+    // The genuine identity settles, after which nothing is left unsettled.
+    assert_eq!(
+        runtime
+            .settle_live_decision(
+                &LiveDecisionIdentity::of(&decision),
+                UsdcMicros::default(),
+                UsdcMicros::default(),
+                settled_at,
+            )
+            .expect("genuine identity settles"),
+        LiveSettlementOutcome::Settled
+    );
+    assert!(runtime.unsettled_planned_decisions().is_empty());
 }
