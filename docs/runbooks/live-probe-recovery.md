@@ -7,14 +7,30 @@ to resolve that ambiguity. The persisted CLOID remains the only order to query.
 The `live-probe` feature includes an unsigned recovery command:
 
 ```text
-hype-live-probe reconcile config.local.toml security-policy.local.toml operational.local.toml journal.jsonl
+hype-live-probe reconcile config.local.toml security-policy.local.toml runtime.local.toml operational.local.toml journal.jsonl
 ```
 
 Use the same reviewed endpoint, network selection, execution account, routing
-mode, and journal that `prepare` used. Only the public execution-account
-environment variable is needed. Do not source a signer environment file.
-The command never loads signing material, decrypts a key, reserves a nonce,
-submits an exchange action, or recomputes a daily decision. It checks the
+mode, runtime config, and journal that `prepare` used. The public
+execution-account environment variable is needed, and — because the command
+settles the pacing decision in the signer-free runtime once the order is
+final — so is the parent-account variable named by the policy's
+`admitted_parent_account_env` when `funding_mode = "designated_parent_funding"`
+(the runtime refuses to open under a different funding route). Source the
+observer environment file, never a signer environment file. The command
+never loads signing material, decrypts a key,
+reserves a nonce, submits an exchange action, or recomputes a daily decision.
+Once the order is durably final it does settle the pacing decision that
+`prepare` committed in the signer-free runtime (`mode=settled ...`), from the
+same durable fill evidence, so the capital ledger's commitment is released or
+converted to spend exactly once; before finality it prints
+`mode=settlement-deferred` and every later decision day stays blocked as
+`PriorDecisionUnsettled` until this command is rerun. Settlement is bound to
+the runtime that produced the decision: the journal's durable copy of the
+decision (date, `decided_at`, capital/input snapshot hashes, planned and
+committed amounts, tranche allocations) must match the runtime's own decision
+field-for-field, so pointing the command at a different `runtime.toml` fails
+closed instead of settling someone else's same-dated decision. It checks the
 prepare-time network/routing binding and protected workflow journal, then
 checks the account and market against the durable prepared action before
 querying the exact CLOID. Halted operation, revoked keys, and expired live
@@ -77,3 +93,71 @@ requirements:
   gates. The current policy still rejects automatic staking.
 
 No output of this command is a scheduled-live approval or a staking approval.
+
+## Releasing a decision that never reached a signer
+
+`prepare` commits the day's pacing decision in the runtime cycle *before* the
+workflow journal exists. If it then fails or crashes before the journal is
+created (envelope assembly, inventory aggregation, journal I/O), the capital
+stays committed with no order that could ever settle it, and every later
+decision day fails closed as `PriorDecisionUnsettled`. Release it with:
+
+```text
+hype-live-probe release config.local.toml security-policy.local.toml runtime.local.toml operational.local.toml
+```
+
+It takes no journal argument on purpose. The runtime records, in its
+hash-chained committed state, the canonical `history_directory` its live
+decisions were prepared into (first live `prepare` binds it; a later live
+`prepare` naming another directory fails closed), and `release` refuses to
+run unless the operational config's bound `history_directory` is that same
+directory — so a renamed or copied operational config, which would bind a
+fresh, empty history namespace, cannot be used to "prove" absence of a
+journal that exists elsewhere. It then scans that directory with the same protected-history
+verification `prepare`'s aggregation uses (symlinks and non-regular entries
+rejected, orphaned protected heads, empty or rolled-back/truncated journals,
+duplicate bindings and inadmissible journals all fail the whole scan closed)
+and reads each journal's committed binding. Independently of the directory,
+`prepare` records the journal path it is about to create in the runtime's
+hash-chained state *before* creating it (`live_journal_intents`), after every
+fallible network read; a decision with such a record is never released by
+absence — if its journal is present, `reconcile` it; if it is missing, the
+history directory was lost (deleted and recreated empty, unmounted) and must
+be restored from backup first (bot-strategy#944). The same records act as a
+manifest for `prepare`: before it touches the venue or aggregates history,
+every recorded intent must resolve to a present journal bound to exactly
+that decision (`JournalIntentUnresolved` otherwise), so lost history blocks
+new orders instead of silently aggregating to zero. Only a decision with no
+intent record **and** no journal in the verified directory is released. A decision that **no** journal binds can never have
+produced a venue action — signing is only reachable through `submit`, which
+needs a committed binding in that directory — so it is settled at zero
+(`mode=released ...`), releasing the commitment. A decision that **is** bound
+by a journal is refused, with the journal path in the error: its order may
+exist at the venue, and only `reconcile` reaching durable finality (or
+gap-free conclusive-absence evidence, which this binary cannot construct yet
+— bot-strategy#929) may resolve it. An unreadable journal fails the whole
+scan closed. The exclusive runtime lock is held for the entire scan-and-
+release, so a concurrent `prepare` cannot slip a new journal in between.
+
+A prepared-but-never-submitted order (journal exists, operator declined) is
+therefore *not* releasable today; do not run `prepare` unless you intend to
+submit, and treat that state as manual review until #929 lands.
+
+## Settlement is final; late contradictory evidence is a manual review
+
+`submit`/`reconcile` settle the pacing decision once the workflow holds a
+durable terminal result. If fresh venue evidence later contradicts that
+result (a fill discovered after a canceled/unfilled finalization), the
+workflow moves itself to `ManualReview`; `reconcile` then refuses to settle
+the contested totals (`workflow is in ManualReview`). The settlement itself
+runs with the journal's append lock held and only after re-verifying that
+the journal has not advanced since this invocation loaded it, so an
+overlapping `submit`/`reconcile` cannot slip a late fill in between the
+check and the runtime commit (it fails with `ConcurrentModification` and is
+simply rerun). A settlement that
+was already written from the earlier totals cannot be corrected by this
+binary — `settle_live_decision` rejects a conflicting replay rather than
+silently overwriting the ledger. Resolving that state needs a durable
+settlement-correction event across pacing/ledger/runtime, which is
+bot-strategy#901's remaining scope; until then treat it as a manual review
+with the journal, the reconcile output, and the runtime state preserved.

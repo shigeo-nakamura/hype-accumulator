@@ -2598,6 +2598,61 @@ pub struct DurableWorkflow {
 }
 
 impl DurableWorkflow {
+    /// Runs `action` against this instance's state while holding the
+    /// journal's exclusive append lock, after verifying under that lock that
+    /// the on-disk journal still matches what this instance loaded (same
+    /// file length, same record count, same independently protected head).
+    /// A concurrent appender (another `submit`/`reconcile` recording, say, a
+    /// late fill that moves the workflow to `ManualReview`) fails with
+    /// `ConcurrentModification` instead of interleaving, and an instance
+    /// that is already stale fails closed before `action` runs. Intended
+    /// for the capital settlement that must be derived from exactly the
+    /// terminal totals this instance observed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkflowError::ConcurrentModification`] when the lock is
+    /// held elsewhere or the journal advanced since this instance loaded
+    /// it, an I/O or protected-head error, or whatever `action` returns.
+    pub fn with_frozen_state<T, E>(
+        &self,
+        action: impl FnOnce(&WorkflowState) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<WorkflowError>,
+    {
+        let _append_lock = acquire_journal_append_lock(&self.path)?;
+        let file_len = fs::metadata(&self.path).map_err(WorkflowError::io)?.len();
+        let records = load_records(&self.path)?;
+        let protected_head = self
+            .protected_head_store
+            .load()
+            .map_err(WorkflowError::ProtectedHead)?;
+        // Length/count/head equality alone would accept a journal swapped
+        // for a different internally valid chain of the same size: the
+        // on-disk records must replay to exactly this instance's state AND
+        // their computed terminal head must be the one the independent
+        // store protects.
+        let replayed = WorkflowState::replay(
+            &records
+                .iter()
+                .map(|record| record.event.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        let expected_head = records
+            .last()
+            .map(|last| protected_head_for(last, &replayed.workflow_id, file_len));
+        if file_len != self.file_len
+            || records.len() != self.records.len()
+            || replayed != self.state
+            || protected_head != self.protected_head
+            || protected_head != expected_head
+        {
+            return Err(WorkflowError::ConcurrentModification.into());
+        }
+        action(&self.state)
+    }
+
     /// Reads the decision binding already durably committed to this
     /// journal, if any, without a lock or a caller-supplied binding to
     /// validate against.
@@ -2957,6 +3012,60 @@ impl DurableWorkflow {
         }
 
         Ok(aggregated_residual)
+    }
+
+    /// Every pacing decision ID some workflow journal directly inside
+    /// `journal_directory` is durably bound to, mapped to that journal —
+    /// verified exactly the way [`Self::aggregate_terminal_residual_hype`]
+    /// verifies history, because "no journal binds this decision" is only
+    /// evidence if the directory is known to be intact: symlinks and
+    /// non-regular entries are rejected, an orphaned `<stem>.protected-head`
+    /// sidecar (its journal deleted or renamed) fails closed, every journal
+    /// is replayed and matched against its independently protected head
+    /// (rollback, truncation, or replacement is detected), an empty journal
+    /// fails closed (a crash before its first durable append or a truncation
+    /// — whether its order exists is unknown), and two journals bound to the
+    /// same decision fail closed (a copy would hide which one actually
+    /// submitted). Terminal and non-terminal journals both count: a still
+    /// in-flight order binds its decision just as firmly. Returns
+    /// `Ok(None)` when `journal_directory` does not exist yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkflowError`] for any of the integrity failures above,
+    /// an inadmissible journal, or unreadable files.
+    pub fn bound_decision_ids(
+        journal_directory: &Path,
+        protected_head_store_for: &ProtectedHeadStoreFactory<'_>,
+        journal_admissible: &JournalAdmissibilityCheck<'_>,
+    ) -> Result<Option<BTreeMap<String, PathBuf>>, WorkflowError> {
+        let Some(journal_paths) = Self::scan_journal_paths(journal_directory, None)? else {
+            return Ok(None);
+        };
+        let mut bound: BTreeMap<String, PathBuf> = BTreeMap::new();
+        for path in journal_paths {
+            journal_admissible(&path)?;
+            let protected_head_store = protected_head_store_for(&path)?;
+            let Some(state) =
+                Self::peek_verified_terminal_state(&path, protected_head_store.as_ref())?
+            else {
+                return Err(WorkflowError::NonTerminalHistoricalJournal(format!(
+                    "{}: journal is empty (a crash before its first durable append, or \
+                     truncation); whether its order exists is unknown",
+                    path.display()
+                )));
+            };
+            let decision_id = state.binding().decision_id.clone();
+            if let Some(previous) = bound.insert(decision_id.clone(), path.clone()) {
+                return Err(WorkflowError::CorruptJournal(format!(
+                    "{} and {}: two journals are bound to decision {decision_id} (a copy or \
+                     hard link would hide which one submitted)",
+                    previous.display(),
+                    path.display()
+                )));
+            }
+        }
+        Ok(Some(bound))
     }
 
     /// The conventional independent protected-head-store path for a

@@ -24,18 +24,21 @@ use chrono::Utc;
 use dex_connector::{HyperliquidAccountConfig, HyperliquidConnector, HyperliquidConnectorConfig};
 use hype_accumulator::{
     config::{Config, EffectiveLiveOrderPolicy, ProcessEnvironment},
-    live_decision::prepare_first_live_order_workflow,
+    live_decision::{bound_decision_identity, prepare_first_live_order_workflow},
     live_probe::{reconcile_prepared_order, HyperliquidLiveProbe, LiveProbeBinding},
     monitor::{trade_cadence_label, HypeAttribution, HyperliquidObserver},
     order_envelope::OrderEnvelopeFreshnessPolicy,
-    pacing::PacingLimits,
-    runtime::{AdmissionApprovals, RuntimeConfig, RuntimeCycleInput, SignerFreeRuntime},
+    pacing::{PacingLimits, UsdcMicros},
+    runtime::{
+        AdmissionApprovals, DecisionMode, LiveDecisionIdentity, RuntimeConfig, RuntimeCycleInput,
+        SignerFreeRuntime,
+    },
     signal::SignalSnapshot,
     signer::resolve_signer_private_key,
     workflow::{
         DurableWorkflow, EligibilityPolicyBinding, ExchangeOrderOwnerStore,
         FileExchangeOrderOwnerStore, FileProtectedWorkflowHeadStore, HypeAtoms,
-        ProtectedWorkflowHeadStore, WorkflowError,
+        ProtectedWorkflowHeadStore, WorkflowError, WorkflowStage,
     },
 };
 use rust_decimal::Decimal;
@@ -414,15 +417,18 @@ impl HistoryDirectoryBinding {
 
 const USAGE: &str = "usage:\n  hype-live-probe prepare <config.toml> <security-policy.toml> \
      <runtime-config.toml> <operational.toml> <journal.jsonl>\n  hype-live-probe submit \
-     <config.toml> <security-policy.toml> <operational.toml> <journal.jsonl> --confirm \
-     <client_order_id>\n  hype-live-probe reconcile <config.toml> <security-policy.toml> \
-     <operational.toml> <journal.jsonl>";
+     <config.toml> <security-policy.toml> <runtime-config.toml> <operational.toml> \
+     <journal.jsonl> --confirm <client_order_id>\n  hype-live-probe reconcile <config.toml> \
+     <security-policy.toml> <runtime-config.toml> <operational.toml> <journal.jsonl>\n  \
+     hype-live-probe release <config.toml> <security-policy.toml> <runtime-config.toml> \
+     <operational.toml>";
 
 #[derive(Debug, Eq, PartialEq)]
 enum Invocation {
     Reconcile {
         config_path: String,
         security_policy_path: String,
+        runtime_config_path: String,
         operational_params_path: String,
         journal_path: String,
     },
@@ -436,9 +442,16 @@ enum Invocation {
     Submit {
         config_path: String,
         security_policy_path: String,
+        runtime_config_path: String,
         operational_params_path: String,
         journal_path: String,
         confirm_client_order_id: String,
+    },
+    Release {
+        config_path: String,
+        security_policy_path: String,
+        runtime_config_path: String,
+        operational_params_path: String,
     },
 }
 
@@ -448,12 +461,13 @@ where
 {
     let args = args.collect::<Vec<_>>();
     match args.as_slice() {
-        [command, config_path, security_policy_path, operational_params_path, journal_path]
+        [command, config_path, security_policy_path, runtime_config_path, operational_params_path, journal_path]
             if command == "reconcile" =>
         {
             Ok(Invocation::Reconcile {
                 config_path: config_path.clone(),
                 security_policy_path: security_policy_path.clone(),
+                runtime_config_path: runtime_config_path.clone(),
                 operational_params_path: operational_params_path.clone(),
                 journal_path: journal_path.clone(),
             })
@@ -470,15 +484,26 @@ where
                 journal_path: journal_path.clone(),
             })
         }
-        [command, config_path, security_policy_path, operational_params_path, journal_path, confirm_flag, confirm_client_order_id]
+        [command, config_path, security_policy_path, runtime_config_path, operational_params_path, journal_path, confirm_flag, confirm_client_order_id]
             if command == "submit" && confirm_flag == "--confirm" =>
         {
             Ok(Invocation::Submit {
                 config_path: config_path.clone(),
                 security_policy_path: security_policy_path.clone(),
+                runtime_config_path: runtime_config_path.clone(),
                 operational_params_path: operational_params_path.clone(),
                 journal_path: journal_path.clone(),
                 confirm_client_order_id: confirm_client_order_id.clone(),
+            })
+        }
+        [command, config_path, security_policy_path, runtime_config_path, operational_params_path]
+            if command == "release" =>
+        {
+            Ok(Invocation::Release {
+                config_path: config_path.clone(),
+                security_policy_path: security_policy_path.clone(),
+                runtime_config_path: runtime_config_path.clone(),
+                operational_params_path: operational_params_path.clone(),
             })
         }
         _ => Err(USAGE),
@@ -490,12 +515,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Invocation::Reconcile {
             config_path,
             security_policy_path,
+            runtime_config_path,
             operational_params_path,
             journal_path,
         } => {
             reconcile(
                 &config_path,
                 &security_policy_path,
+                &runtime_config_path,
                 &operational_params_path,
                 &journal_path,
             )
@@ -521,6 +548,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Invocation::Submit {
             config_path,
             security_policy_path,
+            runtime_config_path,
             operational_params_path,
             journal_path,
             confirm_client_order_id,
@@ -528,12 +556,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             submit(
                 &config_path,
                 &security_policy_path,
+                &runtime_config_path,
                 &operational_params_path,
                 &journal_path,
                 &confirm_client_order_id,
             )
             .await
         }
+        Invocation::Release {
+            config_path,
+            security_policy_path,
+            runtime_config_path,
+            operational_params_path,
+        } => release(
+            &config_path,
+            &security_policy_path,
+            &runtime_config_path,
+            &operational_params_path,
+        ),
     }
 }
 
@@ -582,6 +622,9 @@ async fn prepare(
     // — the journal write, `PrepareTimeBinding`'s sidecar, protected-head
     // store — tries to write into it.
     fs::create_dir_all(&journal_directory)?;
+    // Canonical so the runtime's hash-chained namespace binding cannot be
+    // dodged with an alias of the same directory.
+    let live_history_directory = fs::canonicalize(&journal_directory)?;
     // Persisted only now that the directory demonstrably exists: doing this
     // before `create_dir_all` would let a transient creation failure's retry
     // observe `AlreadyInitialized` against a directory that was never
@@ -669,6 +712,7 @@ async fn prepare(
         capital_history_complete,
         manual_pause: config.manual_halt,
         api_errors,
+        decision_mode: decision_mode_for(&config, live_history_directory),
     };
 
     let (protected_head_store, owner_store) = build_stores(journal_path)?;
@@ -706,7 +750,7 @@ async fn prepare(
     println!("mode=prepared journal={journal_path}");
     println!("{action:#?}");
     println!(
-        "\nReview the values above carefully. To submit this exact order, run:\n  hype-live-probe submit {config_path} {security_policy_path} {operational_params_path} {journal_path} --confirm {}",
+        "\nReview the values above carefully. To submit this exact order, run:\n  hype-live-probe submit {config_path} {security_policy_path} {runtime_config_path} {operational_params_path} {journal_path} --confirm {}",
         workflow.state().client_order_id()
     );
     Ok(())
@@ -715,6 +759,7 @@ async fn prepare(
 async fn submit(
     config_path: &str,
     security_policy_path: &str,
+    runtime_config_path: &str,
     operational_params_path: &str,
     journal_path: &str,
     confirm_client_order_id: &str,
@@ -749,6 +794,13 @@ async fn submit(
     println!("mode=submitting journal={journal_path}");
     println!("{action:#?}");
 
+    // Before any economic action (and before decrypting the signer): the
+    // runtime this order will settle into must be reachable, unlocked, hold
+    // this journal's decision unsettled, and have declared this journal for
+    // it. A settlement-side failure discovered only after the venue accepted
+    // the order would leave the commitment unsettled behind a live fill.
+    preflight_settlement_runtime(&config, runtime_config_path, &workflow, journal_path)?;
+
     let connector = build_signed_connector(&config, &operational, journal_path).await?;
     // Must be the market-metadata digest `prepare` bound into the action
     // (`hype_asset::hype_usdc_market_metadata_digest`), NOT
@@ -776,14 +828,311 @@ async fn submit(
     let reconciliation = probe
         .reconcile(&mut workflow, Path::new(journal_path), Utc::now())
         .await;
-    match &reconciliation {
-        Ok(observation) => print_observation(observation)?,
-        Err(_) => eprintln!(
+    let settlement = if let Ok(observation) = &reconciliation {
+        print_observation(observation)?;
+        // Closes the loop from terminal fill evidence back to the capital
+        // ledger (#901 item 5). Runs after every reconciliation attempt that
+        // reached the venue; a failure here leaves the order's own evidence
+        // intact and is retried by the signer-free `reconcile`.
+        settle_finalized_decision(&config, runtime_config_path, &workflow, observation)
+    } else {
+        eprintln!(
             "reconciliation unavailable; run the signer-free reconcile command; do not resubmit"
-        ),
-    }
+        );
+        Ok(())
+    };
     submission?;
     reconciliation?;
+    settlement?;
+    Ok(())
+}
+
+/// Settles the workflow's pacing decision in the signer-free runtime from the
+/// durable terminal fill evidence, once the order is final. Before finality
+/// nothing is written: the decision stays committed-but-unsettled, which
+/// blocks every later decision day (`PriorDecisionUnsettled`) until the
+/// signer-free `reconcile` observes the terminal state and settles it.
+/// Idempotent — repeating it after a successful settlement writes nothing.
+/// Live policy (`dry_run = false`): the new planned decision is left
+/// unsettled so the execution workflow can bind it, and the runtime binds
+/// itself to `history_directory` (the namespace the journal is created in).
+/// A `DRY_RUN` pair keeps zero-settling it in-cycle, so `prepare` still fails
+/// closed at the binding.
+fn decision_mode_for(config: &Config, history_directory: PathBuf) -> DecisionMode {
+    if config.dry_run {
+        DecisionMode::DryRun
+    } else {
+        DecisionMode::Live { history_directory }
+    }
+}
+
+fn settle_finalized_decision(
+    config: &Config,
+    runtime_config_path: &str,
+    workflow: &DurableWorkflow,
+    observation: &hype_accumulator::live_probe::ProbeReconciliation,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let identity = bound_decision_identity(workflow.state().binding());
+    let decision_id = identity.decision_id.clone();
+    if !observation.durable_finality {
+        println!("mode=settlement-deferred decision={decision_id} durable_finality=false");
+        return Ok(());
+    }
+    // A terminal result already on the journal is only settleable from a
+    // reconciliation that could see every fill row: with the venue's bounded
+    // recent-fill window aged out, `record_reconciliation` records nothing
+    // new (no contradictory evidence, no ManualReview) while the authoritative
+    // cumulative quantity may already exceed what the journal froze.
+    if !observation.fills_complete {
+        println!(
+            "mode=settlement-deferred decision={decision_id} fills_complete=false (rerun \
+             reconcile once the order's fill rows are fully visible)"
+        );
+        return Ok(());
+    }
+    // Holds the journal's append lock through the runtime commit and first
+    // re-verifies this instance is not stale: a concurrent `submit`/
+    // `reconcile` that has meanwhile appended (a late fill, ManualReview)
+    // fails closed here instead of letting the earlier totals settle.
+    workflow.with_frozen_state(|state| -> Result<(), Box<dyn std::error::Error>> {
+        // Fresh late venue evidence that contradicts a terminal result moves
+        // the workflow to ManualReview; its recorded totals are then
+        // contested and must not be written into the capital ledger (see the
+        // runbook: a settlement already made from the earlier totals cannot
+        // be corrected here — bot-strategy#901).
+        if state.stage() == WorkflowStage::ManualReview {
+            return Err(format!(
+                "decision {decision_id}: workflow is in ManualReview (contradictory late venue \
+                 evidence); refusing to settle contested totals — resolve the review first"
+            )
+            .into());
+        }
+        // The authoritative quantity this reconciliation observed must be the
+        // one the journal's terminal result was frozen from; anything else is
+        // late evidence the journal has not absorbed yet.
+        if observation.filled_hype != state.purchased_hype() {
+            return Err(format!(
+                "decision {decision_id}: venue reports {} HYPE atoms filled but the journal's \
+                 terminal result holds {}; refusing to settle stale totals — resolve as manual \
+                 review",
+                observation.filled_hype.as_atoms(),
+                state.purchased_hype().as_atoms()
+            )
+            .into());
+        }
+        let mut runtime = open_signer_free_runtime(config, runtime_config_path)?;
+        let filled_usdc = state.filled_usdc();
+        let debited_usdc = state.debited_usdc();
+        let outcome =
+            runtime.settle_live_decision(&identity, filled_usdc, debited_usdc, Utc::now())?;
+        println!(
+            "mode=settled decision={decision_id} filled_usdc={} debited_usdc={} outcome={outcome:?}",
+            filled_usdc.as_micros(),
+            debited_usdc.as_micros()
+        );
+        Ok(())
+    })
+}
+
+/// Opens the runtime `submit` will later settle into and checks, before the
+/// order is sent, that the settlement cannot fail for a reason that was
+/// knowable up front: the runtime opens (path readable, not locked, funding
+/// route matches), it holds exactly the decision this journal is bound to
+/// (full identity match), that decision is still unsettled, and the runtime
+/// declared this very journal for it. The lock is released again before the
+/// venue call; settlement re-verifies everything under its own lock.
+fn preflight_settlement_runtime(
+    config: &Config,
+    runtime_config_path: &str,
+    workflow: &DurableWorkflow,
+    journal_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let identity = bound_decision_identity(workflow.state().binding());
+    let runtime = open_signer_free_runtime(config, runtime_config_path)?;
+    let decision_id = identity.decision_id.as_str();
+    match runtime.decision_identity(decision_id) {
+        Some(held) if held == identity => {}
+        Some(_) => {
+            return Err(format!(
+                "runtime holds decision {decision_id} but its identity differs from this \
+                 journal's binding; refusing to submit an order that could not be settled"
+            )
+            .into())
+        }
+        None => {
+            return Err(format!(
+                "runtime does not hold decision {decision_id}; refusing to submit an order that \
+                 could not be settled"
+            )
+            .into())
+        }
+    }
+    if !runtime
+        .unsettled_planned_decisions()
+        .iter()
+        .any(|decision| decision.decision_id == decision_id)
+    {
+        return Err(format!(
+            "decision {decision_id} is already settled in the runtime; refusing to submit"
+        )
+        .into());
+    }
+    let declared = runtime.live_journal_intent(decision_id);
+    let this_journal = fs::canonicalize(journal_path)?;
+    if declared.map(fs::canonicalize).transpose()?.as_deref() != Some(this_journal.as_path()) {
+        return Err(format!(
+            "runtime declared journal {} for decision {decision_id}, not {journal_path}; \
+             refusing to submit",
+            declared.map_or_else(|| "<none>".to_owned(), |path| path.display().to_string())
+        )
+        .into());
+    }
+    println!("mode=settlement-preflight-ok decision={decision_id}");
+    Ok(())
+}
+
+fn open_signer_free_runtime(
+    config: &Config,
+    runtime_config_path: &str,
+) -> Result<SignerFreeRuntime, Box<dyn std::error::Error>> {
+    let runtime_config = RuntimeConfig::from_toml(&fs::read_to_string(runtime_config_path)?)?
+        .with_parent_funding_route(config.parent_funding_route(&ProcessEnvironment)?);
+    let limits = PacingLimits::from_config(config)?;
+    Ok(SignerFreeRuntime::open(runtime_config, limits)?)
+}
+
+/// Releases live planned decisions that provably never reached a signer.
+///
+/// `prepare` commits the day's decision in the runtime cycle *before* the
+/// execution workflow journal is created, so a failure or crash between the
+/// two (envelope assembly, inventory aggregation, journal I/O) leaves capital
+/// committed with no order that could ever settle it — and every later
+/// decision day fails closed as `PriorDecisionUnsettled`. Signing is only
+/// possible through `submit`, which requires a committed workflow binding in
+/// the operational config's bound `history_directory`; so a decision that no
+/// journal in that directory binds can never have produced a venue action,
+/// and settling it at zero is safe. A decision that *is* bound by a journal
+/// is deliberately refused here: its order may exist at the venue, and only
+/// durable finality (`reconcile`) or gap-free conclusive-absence evidence
+/// (not constructible yet, bot-strategy#929) may resolve it.
+fn release(
+    config_path: &str,
+    security_policy_path: &str,
+    runtime_config_path: &str,
+    operational_params_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = load_config(config_path, security_policy_path)?;
+    let operational = OperationalParams::from_toml(&fs::read_to_string(operational_params_path)?)?;
+    let history_directory = operational
+        .history_directory
+        .as_deref()
+        .ok_or("operational.toml is missing history_directory, required by `release`")?;
+    // Same write-once binding `prepare` enforces: the directory scanned below
+    // must be the one every prepare for this operational config wrote to.
+    let history_initialization =
+        HistoryDirectoryBinding::check(operational_params_path, history_directory)?;
+    if history_initialization == HistoryInitialization::FirstEver {
+        return Err(
+            "history_directory was never initialized for this operational config; no \
+                    prepare ever ran through it, so nothing it produced can be released here"
+                .into(),
+        );
+    }
+    let journal_directory = PathBuf::from(history_directory);
+    ensure_history_directory_available(history_initialization, &journal_directory)?;
+
+    // The exclusive runtime lock is taken BEFORE the journal scan and held
+    // through settlement: `prepare` opens the runtime before it creates its
+    // journal, so while this process holds the lock no new journal can
+    // appear, and the scan below cannot go stale between reading the
+    // directory and releasing a decision.
+    let mut runtime = open_signer_free_runtime(&config, runtime_config_path)?;
+    let unsettled = runtime.unsettled_planned_decisions();
+    if unsettled.is_empty() {
+        println!("mode=nothing-to-release");
+        return Ok(());
+    }
+    // The runtime records (hash-chained, write-once) the directory its live
+    // decisions were prepared into. Scanning any other directory — a renamed
+    // or copied operational config binds a fresh, empty namespace — would
+    // "prove" absence of a journal that exists elsewhere.
+    let bound_history_directory = fs::canonicalize(&journal_directory)?;
+    match runtime.live_history_directory() {
+        Some(recorded) if recorded == bound_history_directory => {}
+        Some(recorded) => {
+            return Err(format!(
+                "this runtime's live decisions were prepared into {} but this operational \
+                 config binds {}; refusing to treat absence from the wrong directory as proof \
+                 of non-submission",
+                recorded.display(),
+                bound_history_directory.display()
+            )
+            .into());
+        }
+        None => {
+            return Err(
+                "this runtime never recorded a live history directory, so its \
+                        unsettled decision cannot be proven unbound from here"
+                    .into(),
+            );
+        }
+    }
+    // Same protected-history verification `prepare`'s aggregation applies:
+    // symlinks, orphaned protected heads, rolled-back/truncated/empty
+    // journals and duplicate bindings all fail closed, and every journal must
+    // pass the same network/routing admissibility check.
+    let prepare_time_binding = PrepareTimeBinding::resolved(&config, &operational)?;
+    let network_routing_admissible = network_routing_admissible_for(&prepare_time_binding);
+    let bound = DurableWorkflow::bound_decision_ids(
+        &journal_directory,
+        &historical_protected_head_store_for,
+        &network_routing_admissible,
+    )?
+    .ok_or_else(|| {
+        format!(
+            "history_directory {} does not exist although it was already initialized; \
+             refusing to treat a missing directory as proof of absence",
+            journal_directory.display()
+        )
+    })?;
+    for decision in unsettled {
+        // Recorded by `prepare` before it created the journal: this decision
+        // was (or was about to be) bound, so absence from the directory —
+        // including a directory deleted and recreated empty, or an unmounted
+        // mount point — is never proof it was not submitted.
+        if let Some(intent) = runtime.live_journal_intent(&decision.decision_id) {
+            return Err(format!(
+                "decision {} declared workflow journal {} before it was created; refusing to \
+                 release committed capital by absence. If that journal is present, run \
+                 `reconcile` on it; if it is missing, the history directory was lost — restore \
+                 it from backup (bot-strategy#944) before anything else.",
+                decision.decision_id,
+                intent.display()
+            )
+            .into());
+        }
+        if let Some(journal_path) = bound.get(&decision.decision_id) {
+            return Err(format!(
+                "decision {} is bound by workflow journal {}; refusing to release committed \
+                 capital while an order may exist at the venue. Run `reconcile` on that journal \
+                 to reach durable finality (conclusive absence evidence is bot-strategy#929).",
+                decision.decision_id,
+                journal_path.display()
+            )
+            .into());
+        }
+        let outcome = runtime.settle_live_decision(
+            &LiveDecisionIdentity::of(&decision),
+            UsdcMicros::default(),
+            UsdcMicros::default(),
+            Utc::now(),
+        )?;
+        println!(
+            "mode=released decision={} committed_usdc={} outcome={outcome:?}",
+            decision.decision_id,
+            decision.committed_usdc.as_micros()
+        );
+    }
     Ok(())
 }
 
@@ -801,6 +1150,7 @@ fn print_observation(
 async fn reconcile(
     config_path: &str,
     security_policy_path: &str,
+    runtime_config_path: &str,
     operational_params_path: &str,
     journal_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -826,6 +1176,9 @@ async fn reconcile(
     )
     .await?;
     print_observation(&observation)?;
+    // Signer-free like everything else here: settling the pacing decision
+    // needs only the durable fill evidence and the runtime ledger.
+    settle_finalized_decision(&config, runtime_config_path, &workflow, &observation)?;
     Ok(())
 }
 
@@ -1311,6 +1664,7 @@ mod tests {
                 "submit",
                 "config.toml",
                 "security-policy.toml",
+                "runtime.toml",
                 "operational.toml",
                 "journal.jsonl",
                 "--confirm",
@@ -1319,6 +1673,7 @@ mod tests {
             Ok(Invocation::Submit {
                 config_path: "config.toml".to_owned(),
                 security_policy_path: "security-policy.toml".to_owned(),
+                runtime_config_path: "runtime.toml".to_owned(),
                 operational_params_path: "operational.toml".to_owned(),
                 journal_path: "journal.jsonl".to_owned(),
                 confirm_client_order_id: "0xabc123".to_owned(),
@@ -1327,21 +1682,39 @@ mod tests {
     }
 
     #[test]
-    fn recovery_accepts_no_confirmation_or_runtime_arguments() {
-        assert!(matches!(
+    fn recovery_takes_the_runtime_config_but_no_confirmation() {
+        assert_eq!(
             invocation(args(&[
                 "reconcile",
                 "config.toml",
                 "policy.toml",
+                "runtime.toml",
                 "operational.toml",
                 "journal.jsonl"
             ])),
-            Ok(Invocation::Reconcile { .. })
-        ));
+            Ok(Invocation::Reconcile {
+                config_path: "config.toml".to_owned(),
+                security_policy_path: "policy.toml".to_owned(),
+                runtime_config_path: "runtime.toml".to_owned(),
+                operational_params_path: "operational.toml".to_owned(),
+                journal_path: "journal.jsonl".to_owned(),
+            })
+        );
+        // The pre-settlement 5-argument shape must be rejected rather than
+        // silently reinterpreted with a shifted argument.
         assert!(invocation(args(&[
             "reconcile",
             "config.toml",
             "policy.toml",
+            "operational.toml",
+            "journal.jsonl"
+        ]))
+        .is_err());
+        assert!(invocation(args(&[
+            "reconcile",
+            "config.toml",
+            "policy.toml",
+            "runtime.toml",
             "operational.toml",
             "journal.jsonl",
             "--confirm",
@@ -1401,17 +1774,60 @@ mod tests {
     }
 
     #[test]
+    fn parses_a_release_invocation_without_a_journal() {
+        assert_eq!(
+            invocation(args(&[
+                "release",
+                "config.toml",
+                "policy.toml",
+                "runtime.toml",
+                "operational.toml",
+            ])),
+            Ok(Invocation::Release {
+                config_path: "config.toml".to_owned(),
+                security_policy_path: "policy.toml".to_owned(),
+                runtime_config_path: "runtime.toml".to_owned(),
+                operational_params_path: "operational.toml".to_owned(),
+            })
+        );
+        // A journal argument is not accepted: release scans the bound
+        // history directory itself and must never be pointed at one file.
+        assert!(invocation(args(&[
+            "release",
+            "config.toml",
+            "policy.toml",
+            "runtime.toml",
+            "operational.toml",
+            "journal.jsonl",
+        ]))
+        .is_err());
+    }
+
+    #[test]
     fn rejects_submit_without_the_literal_confirm_flag() {
         // A caller must pass the `--confirm` flag literally, not just any
-        // 7-argument submit invocation — this is the one thing standing
+        // 8-argument submit invocation — this is the one thing standing
         // between an operator and an actual signed submission.
+        assert!(invocation(args(&[
+            "submit",
+            "config.toml",
+            "security-policy.toml",
+            "runtime.toml",
+            "operational.toml",
+            "journal.jsonl",
+            "--yes",
+            "0xabc123",
+        ]))
+        .is_err());
+        // The pre-settlement 7-argument shape (no runtime config) is rejected
+        // outright instead of being parsed with shifted paths.
         assert!(invocation(args(&[
             "submit",
             "config.toml",
             "security-policy.toml",
             "operational.toml",
             "journal.jsonl",
-            "--yes",
+            "--confirm",
             "0xabc123",
         ]))
         .is_err());

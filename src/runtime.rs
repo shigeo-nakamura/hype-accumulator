@@ -542,6 +542,16 @@ struct RuntimeState {
     last_committed_cycle_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     parent_funding_route: Option<ParentFundingRoute>,
+    /// Workflow-journal namespace every live decision of this runtime is
+    /// prepared into; write-once, part of the committed cycle hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    live_history_directory: Option<PathBuf>,
+    /// Decision ID → journal path recorded by `prepare` immediately BEFORE
+    /// it creates that journal (hash-chained). A decision listed here may
+    /// have a submit-capable journal even if the directory no longer shows
+    /// one, so absence from the directory can never release it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    live_journal_intents: BTreeMap<String, PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -607,8 +617,42 @@ impl RuntimeState {
             dry_run_actions_total: 0,
             last_committed_cycle_hash: None,
             parent_funding_route: None,
+            live_history_directory: None,
+            live_journal_intents: BTreeMap::new(),
         }
     }
+}
+
+/// How a cycle treats a NEW planned purchase decision.
+///
+/// The signer-free runtime never constructs an economic action itself in
+/// either mode. The difference is only what happens to the capital a new
+/// planned decision commits:
+///
+/// * [`DecisionMode::DryRun`] — the recurring, halted `DRY_RUN` cycle. A new
+///   planned decision is immediately settled at zero fill / zero debit in
+///   the same cycle (`decision:<id>:dry-run-settlement`), so no commitment
+///   ever outlives the cycle and no later settlement is expected.
+/// * [`DecisionMode::Live`] — the live-probe `prepare` path. A new planned
+///   decision is committed and left **unsettled**; the execution workflow
+///   binds it (`DecisionBinding::from_pacing_decision` refuses a settled
+///   decision), and the caller must later settle it from the reconciled
+///   terminal fill via [`SignerFreeRuntime::settle_live_decision`]. Until
+///   that happens every later decision day fails closed as
+///   `PriorDecisionUnsettled`, so a forgotten settlement can never be
+///   silently compounded by a second purchase.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DecisionMode {
+    DryRun,
+    /// `history_directory` is the (canonical) workflow-journal namespace the
+    /// caller will create this decision's journal in. The runtime records it
+    /// in its hash-chained state on the first live cycle and refuses any
+    /// later live cycle naming a different directory, so `release` can
+    /// prove "no journal in *this* directory binds the decision" is the
+    /// same statement as "no journal anywhere binds it".
+    Live {
+        history_directory: PathBuf,
+    },
 }
 
 /// One closed movement-history and account-observation cycle.
@@ -623,6 +667,94 @@ pub struct RuntimeCycleInput<'a> {
     pub capital_history_complete: bool,
     pub manual_pause: bool,
     pub api_errors: u64,
+    pub decision_mode: DecisionMode,
+}
+
+/// One tranche allocation of a live planned decision, as bound into the
+/// execution workflow (`DecisionBinding::capital_commitments`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveDecisionAllocation {
+    pub tranche_id: String,
+    pub planned_usdc: UsdcMicros,
+    pub committed_usdc: UsdcMicros,
+}
+
+/// The complete identity of the pacing decision an execution workflow was
+/// bound to. Decision IDs are only date-derived (`fixed-dca:<date>`), so a
+/// settlement must prove it is talking to the runtime that produced the
+/// bound decision: every field here is copied from the workflow's durable
+/// `DecisionBinding` and compared against the runtime's own decision before
+/// any capital moves. A different runtime (or a rewritten one) fails closed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveDecisionIdentity {
+    pub decision_id: String,
+    pub decision_date: chrono::NaiveDate,
+    pub decided_at: DateTime<Utc>,
+    pub capital_snapshot_hash: String,
+    pub input_snapshot_hash: String,
+    pub planned_usdc: UsdcMicros,
+    pub committed_usdc: UsdcMicros,
+    pub allocations: Vec<LiveDecisionAllocation>,
+}
+
+impl LiveDecisionIdentity {
+    /// Identity of a pacing decision as the runtime itself holds it.
+    #[must_use]
+    pub fn of(decision: &DailyDecision) -> Self {
+        let mut allocations = decision
+            .allocations
+            .iter()
+            .map(|allocation| LiveDecisionAllocation {
+                tranche_id: allocation.tranche_id.clone(),
+                planned_usdc: allocation.planned_usdc,
+                committed_usdc: allocation.committed_usdc,
+            })
+            .collect::<Vec<_>>();
+        allocations.sort_by(|left, right| left.tranche_id.cmp(&right.tranche_id));
+        Self {
+            decision_id: decision.decision_id.clone(),
+            decision_date: decision.decision_date,
+            decided_at: decision.decided_at,
+            capital_snapshot_hash: decision.capital_snapshot_hash.clone(),
+            input_snapshot_hash: decision.input_snapshot_hash.clone(),
+            planned_usdc: decision.planned_usdc,
+            committed_usdc: decision.committed_usdc,
+            allocations,
+        }
+    }
+
+    fn mismatch_against(&self, decision: &DailyDecision) -> Option<&'static str> {
+        let expected = Self::of(decision);
+        if self.decision_id != expected.decision_id {
+            Some("decision_id")
+        } else if self.decision_date != expected.decision_date {
+            Some("decision_date")
+        } else if self.decided_at != expected.decided_at {
+            Some("decided_at")
+        } else if self.capital_snapshot_hash != expected.capital_snapshot_hash {
+            Some("capital_snapshot_hash")
+        } else if self.input_snapshot_hash != expected.input_snapshot_hash {
+            Some("input_snapshot_hash")
+        } else if self.planned_usdc != expected.planned_usdc {
+            Some("planned_usdc")
+        } else if self.committed_usdc != expected.committed_usdc {
+            Some("committed_usdc")
+        } else if self.allocations != expected.allocations {
+            Some("allocations")
+        } else {
+            None
+        }
+    }
+}
+
+/// Outcome of [`SignerFreeRuntime::settle_live_decision`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LiveSettlementOutcome {
+    /// This call durably settled the decision and committed the ledger cycle.
+    Settled,
+    /// The decision was already settled with exactly these amounts; nothing
+    /// was written (idempotent replay after a crash or a repeated reconcile).
+    AlreadySettled,
 }
 
 /// Private, durable cycle evidence. Public status/metrics remain identifier-free.
@@ -717,6 +849,232 @@ impl SignerFreeRuntime {
             #[cfg(unix)]
             _directory_lock: directory_lock,
         })
+    }
+
+    /// The workflow-journal namespace this runtime's live decisions were
+    /// prepared into (recorded, hash-chained, on the first live cycle);
+    /// `None` for a runtime that has only ever run `DRY_RUN` cycles.
+    #[must_use]
+    pub fn live_history_directory(&self) -> Option<&Path> {
+        self.state.live_history_directory.as_deref()
+    }
+
+    /// The journal path `prepare` durably declared for `decision_id` before
+    /// creating it, if any. `Some` means a journal may exist (or may have
+    /// existed and been lost with its directory), so the decision can only
+    /// be resolved through that journal, never by absence.
+    #[must_use]
+    pub fn live_journal_intent(&self, decision_id: &str) -> Option<&Path> {
+        self.state
+            .live_journal_intents
+            .get(decision_id)
+            .map(PathBuf::as_path)
+    }
+
+    /// Every journal intent this runtime has recorded (decision ID → journal
+    /// path), i.e. the manifest of journals that must exist for its history
+    /// to be considered intact.
+    #[must_use]
+    pub const fn live_journal_intents(&self) -> &BTreeMap<String, PathBuf> {
+        &self.state.live_journal_intents
+    }
+
+    /// The runtime's own identity view of `decision_id`, if it exists.
+    #[must_use]
+    pub fn decision_identity(&self, decision_id: &str) -> Option<LiveDecisionIdentity> {
+        self.state
+            .pacing
+            .decisions()
+            .values()
+            .find(|decision| decision.decision_id == decision_id)
+            .map(LiveDecisionIdentity::of)
+    }
+
+    /// Durably records, BEFORE the journal is created, that the live
+    /// decision `identity` is about to be bound by the workflow journal at
+    /// `journal_path`. Committed through the same pending/commit cycle
+    /// machinery (hash-chained, protected-anchor-backed), so a journal that
+    /// later disappears with its directory still leaves the runtime knowing
+    /// the decision was bound. Idempotent for the same path (a retried
+    /// `prepare` after a crash between this record and the journal write);
+    /// a different path, a settled decision, or an identity mismatch fails
+    /// closed without touching state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError`] for an unknown/settled decision, an identity
+    /// mismatch, a conflicting path, or ledger/persistence failures.
+    pub fn record_live_journal_intent(
+        &mut self,
+        identity: &LiveDecisionIdentity,
+        journal_path: &Path,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<LiveSettlementOutcome, RuntimeError> {
+        self.ensure_runtime_lock_current()?;
+        let decision_id = identity.decision_id.as_str();
+        let decision = self
+            .state
+            .pacing
+            .decisions()
+            .values()
+            .find(|decision| decision.decision_id == decision_id)
+            .cloned()
+            .ok_or(PacingError::UnknownDecision)?;
+        if let Some(field) = identity.mismatch_against(&decision) {
+            return Err(RuntimeError::LiveDecisionMismatch(field));
+        }
+        if decision.settled || decision.planned_usdc.is_zero() {
+            return Err(RuntimeError::InvalidCycle(
+                "journal intent requires an unsettled planned decision".to_owned(),
+            ));
+        }
+        match self.state.live_journal_intents.get(decision_id) {
+            Some(recorded) if recorded == journal_path => {
+                return Ok(LiveSettlementOutcome::AlreadySettled);
+            }
+            Some(recorded) => {
+                return Err(RuntimeError::LiveHistoryDirectoryMismatch(format!(
+                    "decision {decision_id} already declared journal {} but {} was requested",
+                    recorded.display(),
+                    journal_path.display()
+                )));
+            }
+            None => {}
+        }
+        // One journal file belongs to exactly one decision for the life of
+        // this runtime: reusing a filename a previous decision declared would
+        // let a new journal stand in for lost history.
+        if let Some((owner, _)) = self
+            .state
+            .live_journal_intents
+            .iter()
+            .find(|(_, recorded)| recorded.as_path() == journal_path)
+        {
+            return Err(RuntimeError::LiveHistoryDirectoryMismatch(format!(
+                "journal {} is already declared by decision {owner}; a journal path is never \
+                 reused across decisions",
+                journal_path.display()
+            )));
+        }
+        if recorded_at < decision.decided_at {
+            return Err(RuntimeError::InvalidCycle(
+                "journal intent predates its decision".to_owned(),
+            ));
+        }
+        let mut next_state = self.state.clone();
+        next_state
+            .live_journal_intents
+            .insert(decision_id.to_owned(), journal_path.to_path_buf());
+        let pending = PendingRuntimeCycle::new(recorded_at, next_state, Vec::new())?;
+        let replayed = self
+            .ledger
+            .validate_append_batch(&pending_cycle_ledger_events(&pending))?;
+        ensure_capital_totals_match(&pending.body.state.pacing, &replayed)?;
+        self.ensure_runtime_lock_current()?;
+        write_private_json_atomic(
+            self.config.state_directory.join(PENDING_CYCLE_FILE_NAME),
+            &pending,
+        )?;
+        self.ensure_runtime_lock_current()?;
+        self.state = commit_pending_cycle(&self.config, &self.limits, &mut self.ledger, &pending)?;
+        Ok(LiveSettlementOutcome::Settled)
+    }
+
+    /// Planned decisions that a live cycle committed and nothing has settled
+    /// yet. Empty for a runtime that has only ever run `DRY_RUN` cycles.
+    #[must_use]
+    pub fn unsettled_planned_decisions(&self) -> Vec<DailyDecision> {
+        self.state
+            .pacing
+            .decisions()
+            .values()
+            .filter(|decision| !decision.settled && !decision.planned_usdc.is_zero())
+            .cloned()
+            .collect()
+    }
+
+    /// Durably settles a live planned decision from its reconciled terminal
+    /// fill: `filled_usdc` is the cumulative filled notional and
+    /// `debited_usdc` the cumulative cash debit including fees, both taken
+    /// from the execution workflow's durable `OrderFinalized` evidence. A
+    /// canceled/expired unfilled order settles at zero, releasing the
+    /// commitment. `identity` is the workflow's durable copy of the decision
+    /// it was bound to; every field must match this runtime's own decision,
+    /// so a settlement can never land on a different runtime that happens to
+    /// hold a decision with the same date-derived ID. Repeating the exact
+    /// settlement is idempotent; a conflicting replay, an overfill, or a
+    /// debit above the commitment fails closed without touching runtime
+    /// state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError`] for an unknown or zero-planned decision, an
+    /// identity mismatch, a conflicting or over-committed settlement, a
+    /// settlement dated before the decision, or ledger/persistence failures.
+    pub fn settle_live_decision(
+        &mut self,
+        identity: &LiveDecisionIdentity,
+        filled_usdc: UsdcMicros,
+        debited_usdc: UsdcMicros,
+        settled_at: DateTime<Utc>,
+    ) -> Result<LiveSettlementOutcome, RuntimeError> {
+        self.ensure_runtime_lock_current()?;
+        let decision_id = identity.decision_id.as_str();
+        let decision = self
+            .state
+            .pacing
+            .decisions()
+            .values()
+            .find(|decision| decision.decision_id == decision_id)
+            .cloned()
+            .ok_or(PacingError::UnknownDecision)?;
+        if let Some(field) = identity.mismatch_against(&decision) {
+            return Err(RuntimeError::LiveDecisionMismatch(field));
+        }
+        if decision.settled {
+            // Delegates the exact-replay-vs-conflict distinction to pacing so
+            // the two never disagree; a matching replay writes nothing.
+            let mut probe = self.state.pacing.clone();
+            probe.settle_decision(decision_id, filled_usdc, debited_usdc)?;
+            // A retry after a commit whose metrics publication failed must
+            // still leave the derived outputs current.
+            self.publish_metrics(settled_at)?;
+            return Ok(LiveSettlementOutcome::AlreadySettled);
+        }
+        if settled_at < decision.decided_at {
+            return Err(RuntimeError::InvalidCycle(
+                "live settlement predates its decision".to_owned(),
+            ));
+        }
+        let mut next_state = self.state.clone();
+        next_state
+            .pacing
+            .settle_decision(decision_id, filled_usdc, debited_usdc)?;
+        next_state.pacing.validate_for_limits(&self.limits)?;
+        let ledger_events = vec![LedgerEvent {
+            event_id: format!("decision:{decision_id}:live-settlement"),
+            occurred_at: settled_at,
+            kind: LedgerEventKind::CapitalSettled {
+                commitment_id: format!("commitment:{decision_id}"),
+                debited_usdc,
+            },
+        }];
+        let pending = PendingRuntimeCycle::new(settled_at, next_state, ledger_events)?;
+        let replayed = self
+            .ledger
+            .validate_append_batch(&pending_cycle_ledger_events(&pending))?;
+        ensure_capital_totals_match(&pending.body.state.pacing, &replayed)?;
+        self.ensure_runtime_lock_current()?;
+        write_private_json_atomic(
+            self.config.state_directory.join(PENDING_CYCLE_FILE_NAME),
+            &pending,
+        )?;
+        self.ensure_runtime_lock_current()?;
+        self.state = commit_pending_cycle(&self.config, &self.limits, &mut self.ledger, &pending)?;
+        // Committed and durable; the derived metrics must not keep showing
+        // the pre-settlement commitment until some later scheduled cycle.
+        self.publish_metrics(settled_at)?;
+        Ok(LiveSettlementOutcome::Settled)
     }
 
     /// Returns the inclusive start of the next overlapping movement query.
@@ -1017,6 +1375,18 @@ impl SignerFreeRuntime {
         next_state
             .parent_funding_route
             .clone_from(&self.config.parent_funding_route);
+        if let DecisionMode::Live { history_directory } = &input.decision_mode {
+            match &next_state.live_history_directory {
+                Some(bound) if bound != history_directory => {
+                    return Err(RuntimeError::LiveHistoryDirectoryMismatch(format!(
+                        "this runtime's live decisions are bound to {} but the cycle names {}",
+                        bound.display(),
+                        history_directory.display()
+                    )));
+                }
+                _ => next_state.live_history_directory = Some(history_directory.clone()),
+            }
+        }
         let mut ledger_events = Vec::new();
         let decision_result = if let Some(decision) = existing_decision {
             next_state.pacing.reconcile_capital_preserving_admissions(
@@ -1083,7 +1453,12 @@ impl SignerFreeRuntime {
                 Err(error) => return Err(error.into()),
             };
             if let Some(result) = &mut decision {
-                ledger_events.extend(dry_run_decision_events(&mut next_state.pacing, result)?);
+                ledger_events.extend(match input.decision_mode {
+                    DecisionMode::DryRun => {
+                        dry_run_decision_events(&mut next_state.pacing, result)?
+                    }
+                    DecisionMode::Live { .. } => live_decision_events(result)?,
+                });
             }
             next_state.pacing.reconcile_capital_preserving_admissions(
                 &capital_events,
@@ -1148,7 +1523,13 @@ impl SignerFreeRuntime {
             },
         };
         if let Some(result) = &decision_result {
-            if result.is_new() && !result.decision().planned_usdc.is_zero() {
+            // Counts economic actions the DRY_RUN cycle suppressed. A live
+            // cycle suppresses nothing: its planned decision is handed to the
+            // execution workflow instead.
+            if matches!(input.decision_mode, DecisionMode::DryRun)
+                && result.is_new()
+                && !result.decision().planned_usdc.is_zero()
+            {
                 next_state.dry_run_actions_total = next_state
                     .dry_run_actions_total
                     .checked_add(1)
@@ -1196,7 +1577,7 @@ impl SignerFreeRuntime {
                 .as_ref()
                 .map(|result| result.decision().clone()),
             new_decision: decision_result.as_ref().is_some_and(DecisionResult::is_new),
-            economic_action_suppressed: true,
+            economic_action_suppressed: matches!(input.decision_mode, DecisionMode::DryRun),
             signed_action_created: false,
             signal_available: decision_evidence.signal_available,
             boundary_balance_available: decision_evidence.boundary_balance_available,
@@ -1236,6 +1617,34 @@ impl SignerFreeRuntime {
         write_metrics_atomic(&self.config.metrics_path, &metrics)?;
         write_status_atomic(&self.config.status_path, &status)?;
         Ok(report)
+    }
+
+    /// Republishes the metrics file from the current committed state. Used
+    /// after a live settlement changes committed/spent capital outside a
+    /// scheduled cycle, when the recurring cycle that would normally refresh
+    /// it is (by the probe runbook) stopped. The public dashboard status is
+    /// venue-observation-bound and keeps refreshing through the observer
+    /// timer, which stays active during a probe.
+    fn publish_metrics(&self, observed_at: DateTime<Utc>) -> Result<(), RuntimeError> {
+        let signal = match fs::read_to_string(self.config.signal_snapshot_path()) {
+            Ok(payload) => SignalSnapshot::from_json(&payload).ok(),
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let metrics = MetricsSnapshot::from_runtime(
+            observed_at,
+            &self.state.pacing,
+            &self.limits,
+            self.ledger.state(),
+            &[],
+            signal.as_ref(),
+            self.state.api_errors_total,
+            self.state.stale_signal_events_total,
+            self.state.dry_run_actions_total,
+            self.config.stuck_after_seconds,
+        )?;
+        write_metrics_atomic(&self.config.metrics_path, &metrics)?;
+        Ok(())
     }
 
     fn ensure_runtime_lock_current(&self) -> Result<(), RuntimeError> {
@@ -1899,6 +2308,15 @@ fn dry_run_decision_events(
     Ok(events)
 }
 
+/// Live-mode counterpart of [`dry_run_decision_events`]: records the
+/// commitment/plan (or skip) exactly like `DRY_RUN` does but deliberately does
+/// NOT settle a new planned decision, leaving its capital committed for the
+/// execution workflow. Settlement follows from the reconciled terminal fill
+/// through [`SignerFreeRuntime::settle_live_decision`].
+fn live_decision_events(result: &DecisionResult) -> Result<Vec<LedgerEvent>, RuntimeError> {
+    decision_events(result.decision())
+}
+
 fn decision_events(decision: &DailyDecision) -> Result<Vec<LedgerEvent>, RuntimeError> {
     if decision.planned_usdc.is_zero() {
         let reason = serde_json::to_value(decision.reason)?
@@ -2131,6 +2549,10 @@ pub enum RuntimeError {
     UnsafeRuntimeLock,
     #[error("runtime counter overflowed")]
     CounterOverflow,
+    #[error("live settlement identity does not match this runtime's decision ({0})")]
+    LiveDecisionMismatch(&'static str),
+    #[error("live history directory mismatch: {0}")]
+    LiveHistoryDirectoryMismatch(String),
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]

@@ -258,6 +258,7 @@ fn producer_snapshot_makes_the_boundary_decision_purchase_eligible() {
             capital_history_complete: true,
             manual_pause: false,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect("producer snapshot binds to the configured boundary");
 
@@ -281,6 +282,7 @@ fn producer_snapshot_makes_the_boundary_decision_purchase_eligible() {
             capital_history_complete: true,
             manual_pause: false,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect("yesterday's snapshot cannot serve today's boundary");
     assert!(!stale_report.signal_available);
@@ -427,6 +429,7 @@ fn runtime_lock_replacement_blocks_a_second_runtime_and_stops_the_holder() {
             capital_history_complete: true,
             manual_pause: true,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect_err("holder fails closed after runtime lock replacement");
     assert!(matches!(error, RuntimeError::UnsafeRuntimeLock));
@@ -604,6 +607,7 @@ fn directional_send_counterparty_does_not_authorize_capital_admission() {
             capital_history_complete: true,
             manual_pause: false,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect("known directional transfer can be observed");
     assert!(report.capital_history_complete);
@@ -628,6 +632,7 @@ fn directional_send_counterparty_does_not_authorize_capital_admission() {
             capital_history_complete: true,
             manual_pause: false,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         }),
         Err(RuntimeError::UnknownAdmissionApproval(_))
     ));
@@ -653,6 +658,7 @@ fn unapproved_deposit_stays_unallocated_and_missing_signal_is_durable_skip() {
             capital_history_complete: true,
             manual_pause: false,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect("dry-run cycle");
     let decision = report.decision().expect("durable decision");
@@ -704,6 +710,7 @@ fn stale_account_observation_fails_before_runtime_state_changes() {
             capital_history_complete: true,
             manual_pause: true,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect_err("stale balance must fail closed");
     assert!(matches!(error, RuntimeError::InvalidCycle(message) if message.contains("stale")));
@@ -739,6 +746,7 @@ fn approved_deposit_plans_once_and_same_day_restart_replays_without_second_actio
             capital_history_complete: true,
             manual_pause: false,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect("first dry-run cycle");
     assert!(first.is_new_decision());
@@ -775,6 +783,7 @@ fn approved_deposit_plans_once_and_same_day_restart_replays_without_second_actio
             capital_history_complete: true,
             manual_pause: false,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect("same-day replay");
     assert!(!replay.is_new_decision());
@@ -796,6 +805,7 @@ fn approved_deposit_plans_once_and_same_day_restart_replays_without_second_actio
             capital_history_complete: true,
             manual_pause: false,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect("next-day dry-run plan");
     assert!(next.is_new_decision());
@@ -837,6 +847,7 @@ fn boundary_mismatched_signal_becomes_a_durable_unavailable_skip() {
             capital_history_complete: true,
             manual_pause: false,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect("mismatched signal fails closed without failing the cycle");
 
@@ -877,6 +888,7 @@ fn boundary_mismatched_signal_becomes_a_durable_unavailable_skip() {
             capital_history_complete: true,
             manual_pause: false,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect("later valid signal cannot replace decision-time evidence");
     assert!(!replay.is_new_decision());
@@ -909,6 +921,7 @@ fn existing_decision_preserves_missing_boundary_balance_evidence() {
             capital_history_complete: false,
             manual_pause: false,
             api_errors: 1,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect("incomplete history records a durable skip");
     assert_eq!(
@@ -932,6 +945,7 @@ fn existing_decision_preserves_missing_boundary_balance_evidence() {
             capital_history_complete: true,
             manual_pause: false,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect("complete retry keeps decision-time boundary evidence");
     assert!(!replay.is_new_decision());
@@ -972,6 +986,7 @@ fn later_approval_cannot_redistribute_journaled_admission() {
             capital_history_complete: true,
             manual_pause: false,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect("later tranche consumes the append-only admission cap");
     assert_eq!(
@@ -994,6 +1009,7 @@ fn later_approval_cannot_redistribute_journaled_admission() {
             capital_history_complete: true,
             manual_pause: false,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect("older approval preserves the journaled admission allocation");
     assert_eq!(
@@ -1038,6 +1054,7 @@ fn newly_admitted_deposit_is_committed_before_a_dependent_withdrawal() {
             capital_history_complete: true,
             manual_pause: false,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect("deposit and dependent withdrawal reconcile in one cycle");
 
@@ -1072,6 +1089,7 @@ fn newly_admitted_deposit_is_committed_before_a_dependent_withdrawal() {
             capital_history_complete: true,
             manual_pause: false,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect("overlap scan reuses the durable withdrawal reconciliation time");
     assert!(replay.decision().is_none());
@@ -1108,6 +1126,7 @@ fn delayed_cycle_preserves_a_preboundary_withdrawal_identity() {
             capital_history_complete: true,
             manual_pause: false,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect("pre-boundary withdrawal remains identical across both reconciliations");
 
@@ -1146,6 +1165,7 @@ fn delayed_cycle_preserves_a_preboundary_withdrawal_identity() {
             capital_history_complete: true,
             manual_pause: false,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect("overlap replay keeps the boundary reconciliation timestamp");
     assert!(!replay.is_new_decision());
@@ -1182,6 +1202,7 @@ fn delayed_cycle_reconstructs_boundary_balance_before_a_later_withdrawal() {
             capital_history_complete: true,
             manual_pause: false,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect("delayed dry-run cycle");
 
@@ -1221,6 +1242,7 @@ fn delayed_decision_removes_a_later_deposit_from_boundary_balance() {
             capital_history_complete: true,
             manual_pause: false,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect("delayed dry-run cycle");
 
@@ -1271,6 +1293,7 @@ fn movement_during_balance_request_window_makes_boundary_balance_unavailable() {
             capital_history_complete: true,
             manual_pause: false,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect("ambiguous balance window records a fail-closed skip");
 
@@ -1304,6 +1327,7 @@ fn private_runtime_artifacts_are_owner_only() {
             capital_history_complete: true,
             manual_pause: true,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect("dry-run cycle");
 
@@ -1344,6 +1368,7 @@ fn unknown_approval_fails_closed_without_creating_capital() {
             capital_history_complete: true,
             manual_pause: true,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect_err("unknown approval must fail");
     assert!(matches!(error, RuntimeError::UnknownAdmissionApproval(_)));
@@ -1375,6 +1400,7 @@ fn future_approval_is_rejected_before_persistence_and_can_be_corrected() {
             capital_history_complete: true,
             manual_pause: false,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect_err("future approval evidence fails before persistence");
     assert!(
@@ -1399,6 +1425,7 @@ fn future_approval_is_rejected_before_persistence_and_can_be_corrected() {
             capital_history_complete: true,
             manual_pause: false,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect("corrected approval recovers without manual state repair");
     assert_eq!(
@@ -1435,6 +1462,7 @@ fn unknown_approval_is_deferred_only_while_history_is_incomplete() {
             capital_history_complete: false,
             manual_pause: false,
             api_errors: 1,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect("unknown approval is deferred during history outage");
     assert_eq!(
@@ -1459,6 +1487,7 @@ fn unknown_approval_is_deferred_only_while_history_is_incomplete() {
             capital_history_complete: true,
             manual_pause: false,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect("complete history validates and applies the deferred approval");
     assert_eq!(
@@ -1589,6 +1618,7 @@ fn committed_runtime_state_rollback_is_rejected_by_protected_cycle_head() {
             capital_history_complete: true,
             manual_pause: true,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect("committed cycle");
     let mut rolled_back = runtime.state.clone();
@@ -1626,6 +1656,7 @@ fn committed_runtime_state_content_tampering_is_rejected_by_cycle_proof() {
             capital_history_complete: true,
             manual_pause: true,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect("committed cycle");
     let mut tampered = runtime.state.clone();
@@ -1663,6 +1694,7 @@ fn missing_committed_cycle_proof_fails_closed() {
             capital_history_complete: true,
             manual_pause: true,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .expect("committed cycle");
     fs::remove_file(
@@ -1742,6 +1774,7 @@ fn funding_cycle(
         capital_history_complete: true,
         manual_pause: true,
         api_errors: 0,
+        decision_mode: DecisionMode::DryRun,
     })
 }
 
@@ -1927,6 +1960,7 @@ fn parent_funding_respects_300_daily_cap_and_late_funding_cannot_create_second_p
             capital_history_complete: true,
             manual_pause: false,
             api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
         })
         .unwrap();
     assert_eq!(first.decision().unwrap().planned_usdc, usd(300));
@@ -2357,4 +2391,664 @@ fn explicit_admission_artifact_rejects_invalid_microunit_values() {
         }]});
         assert!(AdmissionApprovals::from_json(&wire.to_string()).is_err());
     }
+}
+
+fn live_mode() -> DecisionMode {
+    DecisionMode::Live {
+        history_directory: PathBuf::from("/var/lib/hype-accumulator/journals"),
+    }
+}
+
+fn live_planned_decision(
+    runtime: &mut SignerFreeRuntime,
+    start: DateTime<Utc>,
+    decision_at: DateTime<Utc>,
+    movement: &HyperliquidAccountMovement,
+    admission: &AdmissionApprovals,
+    signal: &SignalSnapshot,
+) -> RuntimeCycleReport {
+    runtime
+        .apply_cycle(RuntimeCycleInput {
+            observed_at: decision_at,
+            scan_start_ms: ms(start),
+            scan_end_ms: ms(decision_at),
+            movements: std::slice::from_ref(movement),
+            approvals: admission,
+            signal: Some(signal),
+            accumulator: status(decision_at, 100.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+            decision_mode: live_mode(),
+        })
+        .expect("live cycle")
+}
+
+#[test]
+fn live_cycle_leaves_the_planned_decision_committed_and_unsettled() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = start + TimeDelta::hours(1);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-approved", deposit_at, 100);
+    let admission = approvals("deposit-approved", deposit_at, deposit_at);
+    let signal = signal(decision_at);
+
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
+    let first = live_planned_decision(
+        &mut runtime,
+        start,
+        decision_at,
+        &movement,
+        &admission,
+        &signal,
+    );
+    let decision = first.decision().expect("planned decision").clone();
+    assert!(first.is_new_decision());
+    assert_eq!(decision.reason, DecisionReason::Planned);
+    assert!(!decision.planned_usdc.is_zero());
+    // The whole point of live mode: nothing settles the decision in-cycle,
+    // so the execution workflow can bind it and its capital stays committed
+    // in both the pacing state and the replayed ledger.
+    assert!(!decision.settled);
+    assert_eq!(decision.filled_usdc, UsdcMicros::default());
+    assert_eq!(decision.debited_usdc, UsdcMicros::default());
+    assert!(!first.economic_action_suppressed);
+    assert!(!first.signed_action_created);
+    assert_eq!(
+        runtime.ledger.state().committed_usdc(),
+        decision.committed_usdc
+    );
+    assert_eq!(runtime.ledger.state().spent_usdc(), UsdcMicros::default());
+    assert_eq!(runtime.state.dry_run_actions_total, 0);
+    assert!(runtime.ledger.state().last_runtime_cycle_hash().is_some());
+    let ledger_events = std::fs::read_to_string(
+        runtime_config
+            .state_directory
+            .join(LEDGER_DIRECTORY_NAME)
+            .join("ledger.jsonl"),
+    )
+    .expect("ledger journal");
+    assert!(ledger_events.contains(":commitment"));
+    assert!(!ledger_events.contains("dry-run-settlement"));
+    drop(runtime);
+
+    // A same-day replay (crash between prepare's cycle and the workflow
+    // commit) hands back the same unsettled decision instead of a second one.
+    let replay_at = decision_at + TimeDelta::minutes(5);
+    let mut reopened =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("reopen runtime");
+    let replay = reopened
+        .apply_cycle(RuntimeCycleInput {
+            observed_at: replay_at,
+            scan_start_ms: ms(start),
+            scan_end_ms: ms(replay_at),
+            movements: std::slice::from_ref(&movement),
+            approvals: &admission,
+            signal: Some(&signal),
+            accumulator: status(replay_at, 100.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+            decision_mode: live_mode(),
+        })
+        .expect("same-day live replay");
+    assert!(!replay.is_new_decision());
+    assert!(!replay.decision().expect("existing decision").settled);
+    assert_eq!(reopened.state.pacing.decisions().len(), 1);
+
+    // Until the fill settles it, the next decision day fails closed rather
+    // than stacking a second purchase on an unsettled commitment.
+    let next_decision_at = at(2026, 7, 7, 12, 0);
+    let next_signal = signal_for(next_decision_at, "2026-07-07");
+    let next_scan_start_ms = reopened.next_scan_start_ms();
+    let next = reopened
+        .apply_cycle(RuntimeCycleInput {
+            observed_at: next_decision_at,
+            scan_start_ms: next_scan_start_ms,
+            scan_end_ms: ms(next_decision_at),
+            movements: &[movement],
+            approvals: &admission,
+            signal: Some(&next_signal),
+            accumulator: status(next_decision_at, 100.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+            decision_mode: live_mode(),
+        })
+        .expect("next-day live cycle");
+    assert!(next.is_new_decision());
+    let next_decision = next.decision().expect("next-day decision");
+    assert_eq!(next_decision.reason, DecisionReason::PriorDecisionUnsettled);
+    assert!(next_decision.planned_usdc.is_zero());
+    assert_eq!(
+        reopened.ledger.state().committed_usdc(),
+        decision.committed_usdc
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn live_settlement_converts_the_commitment_to_spend_exactly_once() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = start + TimeDelta::hours(1);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-approved", deposit_at, 100);
+    let admission = approvals("deposit-approved", deposit_at, deposit_at);
+    let signal = signal(decision_at);
+    // A fee/spread reserve so the commitment has headroom above the plan and
+    // a debit above the filled notional (fees) is exercised.
+    let mut reserve_limits = limits();
+    reserve_limits.fee_spread_reserve_bps = 25;
+
+    let mut runtime = SignerFreeRuntime::open(runtime_config.clone(), reserve_limits.clone())
+        .expect("open runtime");
+    let report = live_planned_decision(
+        &mut runtime,
+        start,
+        decision_at,
+        &movement,
+        &admission,
+        &signal,
+    );
+    let decision = report.decision().expect("planned decision").clone();
+    let planned = decision.planned_usdc.as_micros();
+    assert!(planned > 10_000);
+    assert!(decision.committed_usdc > decision.planned_usdc);
+    // Partial fill below the plan, debit above the fill (fees) but within
+    // the commitment's reserve headroom.
+    let filled = UsdcMicros::from_micros(planned - 10_000);
+    let debited = UsdcMicros::from_micros(planned - 5_000);
+    assert!(debited > filled && debited <= decision.committed_usdc);
+
+    // Settlement dated before the decision is refused.
+    assert!(runtime
+        .settle_live_decision(
+            &LiveDecisionIdentity::of(&decision),
+            filled,
+            debited,
+            decision_at - TimeDelta::seconds(1),
+        )
+        .is_err());
+    // Unknown decision, overfill, and a debit above the commitment all fail
+    // closed without touching state.
+    let mut unknown = LiveDecisionIdentity::of(&decision);
+    unknown.decision_id = "fixed-dca:2026-07-05".to_owned();
+    assert!(runtime
+        .settle_live_decision(&unknown, filled, debited, decision_at)
+        .is_err());
+    let overfill = UsdcMicros::from_micros(planned + 1);
+    assert!(runtime
+        .settle_live_decision(
+            &LiveDecisionIdentity::of(&decision),
+            overfill,
+            overfill,
+            decision_at + TimeDelta::minutes(1),
+        )
+        .is_err());
+    assert!(runtime
+        .settle_live_decision(
+            &LiveDecisionIdentity::of(&decision),
+            filled,
+            UsdcMicros::from_micros(decision.committed_usdc.as_micros() + 1),
+            decision_at + TimeDelta::minutes(1),
+        )
+        .is_err());
+    assert!(!runtime.state.pacing.decisions()[&decision.decision_date].settled);
+    assert_eq!(
+        runtime.ledger.state().committed_usdc(),
+        decision.committed_usdc
+    );
+
+    let settled_at = decision_at + TimeDelta::minutes(2);
+    assert_eq!(
+        runtime
+            .settle_live_decision(
+                &LiveDecisionIdentity::of(&decision),
+                filled,
+                debited,
+                settled_at
+            )
+            .expect("settle from the terminal fill"),
+        LiveSettlementOutcome::Settled
+    );
+    let settled = runtime.state.pacing.decisions()[&decision.decision_date].clone();
+    assert!(settled.settled);
+    assert_eq!(settled.filled_usdc, filled);
+    assert_eq!(settled.debited_usdc, debited);
+    assert_eq!(
+        runtime.ledger.state().committed_usdc(),
+        UsdcMicros::default()
+    );
+    assert_eq!(runtime.ledger.state().spent_usdc(), debited);
+    // Metrics are republished from the settled state without waiting for a
+    // scheduled cycle.
+    let metrics = std::fs::read_to_string(&runtime_config.metrics_path).expect("metrics file");
+    #[allow(clippy::cast_precision_loss)]
+    let spent_usdc = debited.as_micros() as f64 / 1_000_000.0;
+    assert!(metrics.contains(&format!("hype_accumulator_spent_usdc {spent_usdc}")));
+    assert!(metrics.contains("hype_accumulator_committed_usdc 0"));
+    let invested = runtime
+        .state
+        .pacing
+        .deposits()
+        .values()
+        .map(|tranche| tranche.invested_usdc)
+        .fold(UsdcMicros::default(), |acc, value| {
+            UsdcMicros::from_micros(acc.as_micros() + value.as_micros())
+        });
+    assert_eq!(invested, debited);
+
+    // Exact replay is idempotent and writes nothing; a conflicting replay
+    // fails closed.
+    let head_before = runtime.state.last_committed_cycle_hash.clone();
+    // ...and an idempotent replay republishes the derived outputs even if
+    // the first publication had been lost.
+    std::fs::remove_file(&runtime_config.metrics_path).expect("drop metrics file");
+    assert_eq!(
+        runtime
+            .settle_live_decision(
+                &LiveDecisionIdentity::of(&decision),
+                filled,
+                debited,
+                settled_at
+            )
+            .expect("idempotent replay"),
+        LiveSettlementOutcome::AlreadySettled
+    );
+    assert_eq!(runtime.state.last_committed_cycle_hash, head_before);
+    assert!(std::fs::read_to_string(&runtime_config.metrics_path)
+        .expect("metrics republished on replay")
+        .contains(&format!("hype_accumulator_spent_usdc {spent_usdc}")));
+    assert!(runtime
+        .settle_live_decision(
+            &LiveDecisionIdentity::of(&decision),
+            decision.planned_usdc,
+            decision.planned_usdc,
+            settled_at
+        )
+        .is_err());
+    drop(runtime);
+
+    // The settled state survives a reopen (ledger/anchor/state agree) and
+    // the next decision day plans again instead of failing closed.
+    let mut reopened =
+        SignerFreeRuntime::open(runtime_config, reserve_limits).expect("reopen after settlement");
+    let next_decision_at = at(2026, 7, 7, 12, 0);
+    let next_signal = signal_for(next_decision_at, "2026-07-07");
+    let next_scan_start_ms = reopened.next_scan_start_ms();
+    let next = reopened
+        .apply_cycle(RuntimeCycleInput {
+            observed_at: next_decision_at,
+            scan_start_ms: next_scan_start_ms,
+            scan_end_ms: ms(next_decision_at),
+            movements: &[movement],
+            approvals: &admission,
+            signal: Some(&next_signal),
+            accumulator: status(next_decision_at, 100.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+            decision_mode: live_mode(),
+        })
+        .expect("next-day live cycle after settlement");
+    let next_decision = next.decision().expect("next-day decision");
+    assert!(next.is_new_decision());
+    assert_eq!(next_decision.reason, DecisionReason::Planned);
+    assert!(!next_decision.settled);
+}
+
+#[test]
+fn live_settlement_at_zero_releases_an_unfilled_commitment() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = start + TimeDelta::hours(1);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-approved", deposit_at, 100);
+    let admission = approvals("deposit-approved", deposit_at, deposit_at);
+    let signal = signal(decision_at);
+
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
+    let report = live_planned_decision(
+        &mut runtime,
+        start,
+        decision_at,
+        &movement,
+        &admission,
+        &signal,
+    );
+    let decision = report.decision().expect("planned decision").clone();
+    // An IOC canceled unfilled finalizes at zero: the commitment is released
+    // and nothing is recorded as spent.
+    assert_eq!(
+        runtime
+            .settle_live_decision(
+                &LiveDecisionIdentity::of(&decision),
+                UsdcMicros::default(),
+                UsdcMicros::default(),
+                decision_at + TimeDelta::seconds(30),
+            )
+            .expect("zero settlement"),
+        LiveSettlementOutcome::Settled
+    );
+    assert!(runtime.state.pacing.decisions()[&decision.decision_date].settled);
+    assert_eq!(
+        runtime.ledger.state().committed_usdc(),
+        UsdcMicros::default()
+    );
+    assert_eq!(runtime.ledger.state().spent_usdc(), UsdcMicros::default());
+    drop(runtime);
+    SignerFreeRuntime::open(runtime_config, limits()).expect("reopen after zero settlement");
+}
+
+#[test]
+fn live_settlement_refuses_a_decision_identity_from_another_runtime() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = start + TimeDelta::hours(1);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-approved", deposit_at, 100);
+    let admission = approvals("deposit-approved", deposit_at, deposit_at);
+    let signal = signal(decision_at);
+
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
+    let report = live_planned_decision(
+        &mut runtime,
+        start,
+        decision_at,
+        &movement,
+        &admission,
+        &signal,
+    );
+    let decision = report.decision().expect("planned decision").clone();
+    assert_eq!(
+        runtime.unsettled_planned_decisions(),
+        vec![decision.clone()]
+    );
+    let head_before = runtime.state.last_committed_cycle_hash.clone();
+    let settled_at = decision_at + TimeDelta::minutes(2);
+
+    // Same date-derived ID, but a binding produced by a different runtime
+    // state (capital snapshot / input snapshot / amounts / tranches) must
+    // never settle this runtime's decision — and must not touch it.
+    let mut other_capital = LiveDecisionIdentity::of(&decision);
+    other_capital.capital_snapshot_hash = "0".repeat(64);
+    let mut other_signal = LiveDecisionIdentity::of(&decision);
+    other_signal.input_snapshot_hash = "1".repeat(64);
+    let mut other_amount = LiveDecisionIdentity::of(&decision);
+    other_amount.planned_usdc = UsdcMicros::from_micros(decision.planned_usdc.as_micros() - 1);
+    let mut other_tranche = LiveDecisionIdentity::of(&decision);
+    other_tranche.allocations[0].tranche_id = "deposit-other".to_owned();
+    let mut other_clock = LiveDecisionIdentity::of(&decision);
+    other_clock.decided_at = decision_at + TimeDelta::days(1);
+    for (identity, field) in [
+        (other_capital, "capital_snapshot_hash"),
+        (other_signal, "input_snapshot_hash"),
+        (other_amount, "planned_usdc"),
+        (other_tranche, "allocations"),
+        (other_clock, "decided_at"),
+    ] {
+        match runtime.settle_live_decision(
+            &identity,
+            UsdcMicros::default(),
+            UsdcMicros::default(),
+            settled_at,
+        ) {
+            Err(RuntimeError::LiveDecisionMismatch(mismatch)) => assert_eq!(mismatch, field),
+            other => panic!("expected an identity mismatch on {field}, got {other:?}"),
+        }
+        assert!(!runtime.state.pacing.decisions()[&decision.decision_date].settled);
+        assert_eq!(runtime.state.last_committed_cycle_hash, head_before);
+    }
+
+    // The genuine identity settles, after which nothing is left unsettled.
+    assert_eq!(
+        runtime
+            .settle_live_decision(
+                &LiveDecisionIdentity::of(&decision),
+                UsdcMicros::default(),
+                UsdcMicros::default(),
+                settled_at,
+            )
+            .expect("genuine identity settles"),
+        LiveSettlementOutcome::Settled
+    );
+    assert!(runtime.unsettled_planned_decisions().is_empty());
+}
+
+#[test]
+fn live_cycles_bind_the_runtime_to_one_history_directory() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = start + TimeDelta::hours(1);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-approved", deposit_at, 100);
+    let admission = approvals("deposit-approved", deposit_at, deposit_at);
+    let signal = signal(decision_at);
+
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
+    assert_eq!(runtime.live_history_directory(), None);
+    // A DRY_RUN cycle never binds a namespace.
+    runtime
+        .apply_cycle(RuntimeCycleInput {
+            observed_at: start + TimeDelta::hours(2),
+            scan_start_ms: ms(start),
+            scan_end_ms: ms(start + TimeDelta::hours(2)),
+            movements: std::slice::from_ref(&movement),
+            approvals: &admission,
+            signal: None,
+            accumulator: status(start + TimeDelta::hours(2), 100.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
+        })
+        .expect("dry-run cycle");
+    assert_eq!(runtime.live_history_directory(), None);
+
+    live_planned_decision(
+        &mut runtime,
+        start,
+        decision_at,
+        &movement,
+        &admission,
+        &signal,
+    );
+    assert_eq!(
+        runtime.live_history_directory(),
+        Some(Path::new("/var/lib/hype-accumulator/journals"))
+    );
+    let head = runtime.state.last_committed_cycle_hash.clone();
+    drop(runtime);
+
+    // The binding is part of the committed state and survives a reopen; a
+    // live cycle naming another directory fails closed before any change.
+    let mut reopened =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("reopen runtime");
+    assert_eq!(
+        reopened.live_history_directory(),
+        Some(Path::new("/var/lib/hype-accumulator/journals"))
+    );
+    let replay_at = decision_at + TimeDelta::minutes(5);
+    let result = reopened.apply_cycle(RuntimeCycleInput {
+        observed_at: replay_at,
+        scan_start_ms: ms(start),
+        scan_end_ms: ms(replay_at),
+        movements: std::slice::from_ref(&movement),
+        approvals: &admission,
+        signal: Some(&signal),
+        accumulator: status(replay_at, 100.0),
+        capital_history_complete: true,
+        manual_pause: false,
+        api_errors: 0,
+        decision_mode: DecisionMode::Live {
+            history_directory: PathBuf::from("/somewhere/else"),
+        },
+    });
+    assert!(matches!(
+        result,
+        Err(RuntimeError::LiveHistoryDirectoryMismatch(_))
+    ));
+    assert_eq!(reopened.state.last_committed_cycle_hash, head);
+    assert_eq!(
+        reopened.live_history_directory(),
+        Some(Path::new("/var/lib/hype-accumulator/journals"))
+    );
+    // The same directory keeps working (same-day replay).
+    reopened
+        .apply_cycle(RuntimeCycleInput {
+            observed_at: replay_at,
+            scan_start_ms: ms(start),
+            scan_end_ms: ms(replay_at),
+            movements: std::slice::from_ref(&movement),
+            approvals: &admission,
+            signal: Some(&signal),
+            accumulator: status(replay_at, 100.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+            decision_mode: live_mode(),
+        })
+        .expect("same-directory live replay");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn journal_intent_is_recorded_before_the_journal_and_survives_reopen() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = start + TimeDelta::hours(1);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-approved", deposit_at, 100);
+    let admission = approvals("deposit-approved", deposit_at, deposit_at);
+    let signal = signal(decision_at);
+    let journal = Path::new("/var/lib/hype-accumulator/journals/2026-07-06.jsonl");
+
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
+    let decision = live_planned_decision(
+        &mut runtime,
+        start,
+        decision_at,
+        &movement,
+        &admission,
+        &signal,
+    )
+    .decision()
+    .expect("planned decision")
+    .clone();
+    assert_eq!(runtime.live_journal_intent(&decision.decision_id), None);
+    let head_before = runtime.state.last_committed_cycle_hash.clone();
+
+    // Identity mismatch and a backdated record fail closed without a write.
+    let mut other = LiveDecisionIdentity::of(&decision);
+    other.capital_snapshot_hash = "0".repeat(64);
+    assert!(runtime
+        .record_live_journal_intent(&other, journal, decision_at)
+        .is_err());
+    assert!(runtime
+        .record_live_journal_intent(
+            &LiveDecisionIdentity::of(&decision),
+            journal,
+            decision_at - TimeDelta::seconds(1)
+        )
+        .is_err());
+    assert_eq!(runtime.state.last_committed_cycle_hash, head_before);
+
+    let recorded_at = decision_at + TimeDelta::seconds(30);
+    assert_eq!(
+        runtime
+            .record_live_journal_intent(&LiveDecisionIdentity::of(&decision), journal, recorded_at)
+            .expect("intent recorded"),
+        LiveSettlementOutcome::Settled
+    );
+    assert_eq!(
+        runtime.live_journal_intent(&decision.decision_id),
+        Some(journal)
+    );
+    assert_ne!(runtime.state.last_committed_cycle_hash, head_before);
+    let head_after = runtime.state.last_committed_cycle_hash.clone();
+
+    // Same path again (retry after a crash before the journal write) is a
+    // no-op; a different path is a conflict.
+    assert_eq!(
+        runtime
+            .record_live_journal_intent(&LiveDecisionIdentity::of(&decision), journal, recorded_at)
+            .expect("idempotent"),
+        LiveSettlementOutcome::AlreadySettled
+    );
+    assert_eq!(runtime.state.last_committed_cycle_hash, head_after);
+    assert!(matches!(
+        runtime.record_live_journal_intent(
+            &LiveDecisionIdentity::of(&decision),
+            Path::new("/elsewhere/2026-07-06.jsonl"),
+            recorded_at
+        ),
+        Err(RuntimeError::LiveHistoryDirectoryMismatch(_))
+    ));
+
+    // A later decision can never claim the same journal file.
+    runtime
+        .settle_live_decision(
+            &LiveDecisionIdentity::of(&decision),
+            UsdcMicros::default(),
+            UsdcMicros::default(),
+            recorded_at + TimeDelta::minutes(1),
+        )
+        .expect("settle day one");
+    let next_decision_at = at(2026, 7, 7, 12, 0);
+    let next_signal = signal_for(next_decision_at, "2026-07-07");
+    let next_scan_start_ms = runtime.next_scan_start_ms();
+    let next = runtime
+        .apply_cycle(RuntimeCycleInput {
+            observed_at: next_decision_at,
+            scan_start_ms: next_scan_start_ms,
+            scan_end_ms: ms(next_decision_at),
+            movements: std::slice::from_ref(&movement),
+            approvals: &admission,
+            signal: Some(&next_signal),
+            accumulator: status(next_decision_at, 100.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+            decision_mode: live_mode(),
+        })
+        .expect("next-day live cycle")
+        .decision()
+        .expect("next-day decision")
+        .clone();
+    assert_eq!(next.reason, DecisionReason::Planned);
+    assert!(matches!(
+        runtime.record_live_journal_intent(
+            &LiveDecisionIdentity::of(&next),
+            journal,
+            next_decision_at + TimeDelta::seconds(30)
+        ),
+        Err(RuntimeError::LiveHistoryDirectoryMismatch(_))
+    ));
+    assert_eq!(runtime.live_journal_intent(&next.decision_id), None);
+    drop(runtime);
+
+    // Hash-chained: still there after a reopen; a settled decision can no
+    // longer take an intent.
+    let reopened = SignerFreeRuntime::open(runtime_config, limits()).expect("reopen runtime");
+    assert_eq!(
+        reopened.live_journal_intent(&decision.decision_id),
+        Some(journal)
+    );
+    let mut reopened = reopened;
+    assert!(reopened
+        .record_live_journal_intent(&LiveDecisionIdentity::of(&decision), journal, recorded_at)
+        .is_err());
 }

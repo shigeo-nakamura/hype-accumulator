@@ -29,7 +29,10 @@ use crate::{
     order_envelope::{
         assemble_order_envelope_binding, OrderEnvelopeError, OrderEnvelopeFreshnessPolicy,
     },
-    runtime::{RuntimeCycleInput, RuntimeError, SignerFreeRuntime},
+    runtime::{
+        LiveDecisionAllocation, LiveDecisionIdentity, RuntimeCycleInput, RuntimeError,
+        SignerFreeRuntime,
+    },
     workflow::{
         DecisionBinding, DurableWorkflow, EligibilityPolicyBinding, ExchangeOrderOwnerStore,
         HypeAtoms, InventoryBaseline, JournalAdmissibilityCheck, ProtectedHeadStoreFactory,
@@ -42,7 +45,11 @@ use dex_connector::{
     HyperliquidStakingSummary,
 };
 use rust_decimal::Decimal;
-use std::{path::Path, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -66,6 +73,99 @@ pub enum LiveDecisionError {
     Workflow(#[from] WorkflowError),
     #[error("live HYPE balance is not exactly representable")]
     InvalidBalance,
+    #[error(
+        "journal is already bound to decision {existing} but this cycle's decision is {current}; \
+         a journal path is never reused across decisions"
+    )]
+    JournalBoundToAnotherDecision { existing: String, current: String },
+    #[error(
+        "recorded journal intent for decision {decision_id} does not resolve: {journal} {reason}; \
+         history is lost or tampered — restore it before preparing another order \
+         (bot-strategy#944)"
+    )]
+    JournalIntentUnresolved {
+        decision_id: String,
+        journal: String,
+        reason: &'static str,
+    },
+}
+
+/// Checks that every journal intent the runtime recorded resolves to a
+/// present, verified journal bound to exactly that decision — except the
+/// current decision's own intent when its journal does not exist yet (a
+/// retry after a crash between the intent record and the journal write);
+/// a *different* decision's missing journal at that same path is lost
+/// history, never a retry. This is
+/// the manifest that turns a deleted-and-recreated or unmounted
+/// `history_directory` into a hard failure before any history is aggregated
+/// or any new order prepared (bot-strategy#944).
+///
+/// # Errors
+///
+/// Returns [`LiveDecisionError::JournalIntentUnresolved`] for a missing
+/// journal, a journal with no committed binding, or one bound to a
+/// different decision identity; propagates journal read errors.
+pub fn verify_recorded_journal_intents(
+    intents: &BTreeMap<String, PathBuf>,
+    current_decision_id: &str,
+    current_journal_path: &Path,
+    identity_of: impl Fn(&str) -> Option<LiveDecisionIdentity>,
+) -> Result<(), LiveDecisionError> {
+    for (decision_id, journal) in intents {
+        let unresolved = |reason: &'static str| LiveDecisionError::JournalIntentUnresolved {
+            decision_id: decision_id.clone(),
+            journal: journal.display().to_string(),
+            reason,
+        };
+        if !journal.exists() {
+            // Only the decision being prepared right now may lack its journal
+            // (crash between the intent record and the journal write). A
+            // different decision's intent naming the same file is lost
+            // history that a new journal must never paper over.
+            if journal == current_journal_path && decision_id == current_decision_id {
+                continue;
+            }
+            return Err(unresolved("is missing"));
+        }
+        let Some(binding) = DurableWorkflow::peek_committed_binding(journal)? else {
+            return Err(unresolved("has no committed binding"));
+        };
+        let Some(expected) = identity_of(decision_id) else {
+            return Err(unresolved("names a decision this runtime does not hold"));
+        };
+        if bound_decision_identity(&binding) != expected {
+            return Err(unresolved("is bound to a different decision"));
+        }
+    }
+    Ok(())
+}
+
+/// The workflow's durable copy of the pacing decision it was bound to, in
+/// the form the signer-free runtime verifies against its own decision
+/// (`SignerFreeRuntime::settle_live_decision`,
+/// `SignerFreeRuntime::record_live_journal_intent`) before moving capital.
+#[must_use]
+pub fn bound_decision_identity(binding: &DecisionBinding) -> LiveDecisionIdentity {
+    let mut allocations = binding
+        .capital_commitments
+        .iter()
+        .map(|commitment| LiveDecisionAllocation {
+            tranche_id: commitment.event_id.clone(),
+            planned_usdc: commitment.planned_usdc,
+            committed_usdc: commitment.committed_usdc,
+        })
+        .collect::<Vec<_>>();
+    allocations.sort_by(|left, right| left.tranche_id.cmp(&right.tranche_id));
+    LiveDecisionIdentity {
+        decision_id: binding.decision_id.clone(),
+        decision_date: binding.decision_date,
+        decided_at: binding.decided_at,
+        capital_snapshot_hash: binding.capital_snapshot_hash.clone(),
+        input_snapshot_hash: binding.input_snapshot_hash.clone(),
+        planned_usdc: binding.planned_usdc,
+        committed_usdc: binding.committed_usdc,
+        allocations,
+    }
 }
 
 /// Computes today's pacing decision (if one is due) and durably prepares its
@@ -117,6 +217,14 @@ pub async fn prepare_first_live_order_workflow(
         .decision()
         .ok_or(LiveDecisionError::NoDecisionDue)?
         .clone();
+    // Before touching the venue or aggregating history: every journal this
+    // runtime ever declared must still be there and bound as declared.
+    verify_recorded_journal_intents(
+        runtime.live_journal_intents(),
+        &decision.decision_id,
+        journal_path,
+        |id| runtime.decision_identity(id),
+    )?;
 
     // A crash between `open_or_create` durably committing the first
     // attempt's binding and `prepare_order` completing must be retryable.
@@ -125,7 +233,18 @@ pub async fn prepare_first_live_order_workflow(
     // the exact durably committed binding and would permanently fail
     // `open_or_create`'s replay-match check. Reusing whatever binding is
     // already on disk — skipping every live read below — makes retry safe.
+    let identity = LiveDecisionIdentity::of(&decision);
     let binding = if let Some(existing) = DurableWorkflow::peek_committed_binding(journal_path)? {
+        // A journal already on disk must be *this* decision's retry, never a
+        // reused path from another day: otherwise the intent below would
+        // pin this decision to a foreign journal that `reconcile` can never
+        // settle it from and `release` would then refuse forever.
+        if bound_decision_identity(&existing) != identity {
+            return Err(LiveDecisionError::JournalBoundToAnotherDecision {
+                existing: existing.decision_id,
+                current: identity.decision_id,
+            });
+        }
         existing
     } else {
         let probe_binding =
@@ -191,6 +310,12 @@ pub async fn prepare_first_live_order_workflow(
         )?
     };
 
+    // Declared in the runtime's hash-chained state BEFORE the journal is
+    // created (and after every fallible network read above, so a failure
+    // there leaves the decision provably journal-less and releasable). Once
+    // recorded, `hype-live-probe release` can never treat this decision as
+    // unbound by absence — even if the journal directory is later lost.
+    runtime.record_live_journal_intent(&identity, journal_path, now)?;
     let mut workflow = DurableWorkflow::open_or_create(
         journal_path,
         &binding,

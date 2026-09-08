@@ -5500,3 +5500,298 @@ fn aggregate_terminal_residual_hype_fails_closed_on_a_reconciliation_gap() {
         Err(WorkflowError::ResidualReconciliationGap(_))
     ));
 }
+
+#[test]
+fn bound_decision_ids_maps_every_verified_journal_including_in_flight_ones() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let completed = complete_workflow_with_residual(&temp.path().join("day-1.jsonl"), 2);
+
+    // A prepared-but-never-submitted journal binds its decision just as
+    // firmly as a completed one: its order may still be submitted.
+    let in_flight_path = temp.path().join("day-2.jsonl");
+    let mut in_flight = binding();
+    in_flight.decision_id = distinct_decision_id(&in_flight_path);
+    let mut workflow = reopen(&in_flight_path, &in_flight);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    drop(workflow);
+    // Sidecars that are not journals are ignored, as in aggregation.
+    fs::write(temp.path().join("day-2.network-binding.json"), b"{}").expect("write sidecar");
+
+    let bound = DurableWorkflow::bound_decision_ids(
+        temp.path(),
+        &memory_protected_head_store_for,
+        &always_admissible,
+    )
+    .expect("scan")
+    .expect("directory exists");
+    assert_eq!(bound.len(), 2);
+    assert_eq!(
+        bound[&completed.decision_id],
+        temp.path().join("day-1.jsonl")
+    );
+    assert_eq!(bound[&in_flight.decision_id], in_flight_path);
+
+    assert_eq!(
+        DurableWorkflow::bound_decision_ids(
+            &temp.path().join("never-created"),
+            &memory_protected_head_store_for,
+            &always_admissible,
+        )
+        .expect("missing directory is not an error"),
+        None
+    );
+}
+
+#[test]
+fn bound_decision_ids_fails_closed_on_empty_orphaned_rolled_back_or_inadmissible_journals() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("day-1.jsonl");
+    complete_workflow_with_residual(&path, 2);
+    let intact = fs::read(&path).expect("journal bytes");
+
+    // Empty journal: a crash before the first durable append, or a
+    // truncation — whether its order exists is unknown.
+    fs::write(temp.path().join("day-2.jsonl"), b"").expect("write empty journal");
+    assert!(matches!(
+        DurableWorkflow::bound_decision_ids(
+            temp.path(),
+            &memory_protected_head_store_for,
+            &always_admissible
+        ),
+        Err(WorkflowError::NonTerminalHistoricalJournal(_))
+    ));
+    fs::remove_file(temp.path().join("day-2.jsonl")).expect("remove empty journal");
+
+    // Orphaned protected head: its journal was deleted or renamed.
+    fs::write(temp.path().join("gone.protected-head.json"), b"stale").expect("write orphan");
+    assert!(matches!(
+        DurableWorkflow::bound_decision_ids(
+            temp.path(),
+            &memory_protected_head_store_for,
+            &always_admissible
+        ),
+        Err(WorkflowError::CorruptJournal(_))
+    ));
+    fs::remove_file(temp.path().join("gone.protected-head.json")).expect("remove orphan");
+
+    // Rolled back / truncated journal: the file no longer matches its
+    // independently protected head, so its binding cannot be trusted.
+    let first_line_end = intact
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .expect("journal has at least one line");
+    fs::write(&path, &intact[..=first_line_end]).expect("truncate journal to its first record");
+    assert!(matches!(
+        DurableWorkflow::bound_decision_ids(
+            temp.path(),
+            &memory_protected_head_store_for,
+            &always_admissible
+        ),
+        Err(WorkflowError::RollbackDetected(_))
+    ));
+    fs::write(&path, &intact).expect("restore journal");
+
+    // The caller's admissibility check is applied to every journal.
+    let inadmissible = |journal: &Path| -> Result<(), WorkflowError> {
+        Err(WorkflowError::CorruptJournal(format!(
+            "{}: inadmissible for this test",
+            journal.display()
+        )))
+    };
+    assert!(matches!(
+        DurableWorkflow::bound_decision_ids(
+            temp.path(),
+            &memory_protected_head_store_for,
+            &inadmissible
+        ),
+        Err(WorkflowError::CorruptJournal(_))
+    ));
+
+    // Intact again: the completed journal is bound as before.
+    let bound = DurableWorkflow::bound_decision_ids(
+        temp.path(),
+        &memory_protected_head_store_for,
+        &always_admissible,
+    )
+    .expect("scan")
+    .expect("directory exists");
+    assert_eq!(bound.len(), 1);
+}
+
+#[cfg(feature = "live-probe")]
+#[test]
+fn bound_decision_identity_matches_the_runtime_view_of_the_same_decision() {
+    use hype_accumulator::{live_decision::bound_decision_identity, runtime::LiveDecisionIdentity};
+    let decision = decision();
+    let binding = binding();
+    assert_eq!(
+        bound_decision_identity(&binding),
+        LiveDecisionIdentity::of(&decision)
+    );
+    // Any drift between the two views is a mismatch, not a near-match.
+    let mut other = decision.clone();
+    other.capital_snapshot_hash = "capital-snapshot-b".to_owned();
+    assert_ne!(
+        bound_decision_identity(&binding),
+        LiveDecisionIdentity::of(&other)
+    );
+}
+
+#[test]
+fn frozen_state_rejects_stale_instances_and_blocks_concurrent_appends() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("frozen.jsonl");
+    let binding = binding();
+    let first = reopen(&path, &binding);
+
+    // A fresh instance sees exactly what is on disk.
+    let stage = first
+        .with_frozen_state(|state| -> Result<_, WorkflowError> { Ok(state.stage()) })
+        .expect("fresh instance is not stale");
+    assert_eq!(stage, WorkflowStage::Decided);
+
+    // While one instance holds the frozen state, nobody else can append.
+    let mut second = reopen(&path, &binding);
+    first
+        .with_frozen_state(|_| -> Result<(), WorkflowError> {
+            assert!(matches!(
+                second.prepare_order(at(1)),
+                Err(WorkflowError::ConcurrentModification)
+            ));
+            Ok(())
+        })
+        .expect("holder runs");
+
+    // Once the other instance has appended, the first is stale and must
+    // fail closed before running the action.
+    ready(second.prepare_order(at(1)).expect("order prepared"));
+    let mut ran = false;
+    let result = first.with_frozen_state(|_| -> Result<(), WorkflowError> {
+        ran = true;
+        Ok(())
+    });
+    assert!(matches!(result, Err(WorkflowError::ConcurrentModification)));
+    assert!(!ran);
+    // The instance that did the append is current.
+    second
+        .with_frozen_state(|state| -> Result<(), WorkflowError> {
+            assert!(state.pending_action().is_some());
+            Ok(())
+        })
+        .expect("current instance");
+}
+
+#[cfg(feature = "live-probe")]
+#[test]
+fn recorded_journal_intents_must_resolve_to_their_journals() {
+    use hype_accumulator::{
+        live_decision::{verify_recorded_journal_intents, LiveDecisionError},
+        runtime::LiveDecisionIdentity,
+    };
+    use std::collections::BTreeMap;
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("day-1.jsonl");
+    let decision = decision();
+    let binding = binding();
+    drop(reopen(&path, &binding));
+    let identity_of =
+        |id: &str| (id == decision.decision_id).then(|| LiveDecisionIdentity::of(&decision));
+    let mut intents = BTreeMap::new();
+    intents.insert(decision.decision_id.clone(), path.clone());
+    let today = temp.path().join("day-2.jsonl");
+
+    // Present and bound as declared: intact.
+    verify_recorded_journal_intents(&intents, "fixed-dca:today", &today, identity_of)
+        .expect("intact history");
+
+    // The current cycle's own intent may not have a journal yet (retry after
+    // a crash between the intent record and the journal write).
+    let mut with_today = intents.clone();
+    with_today.insert("fixed-dca:today".to_owned(), today.clone());
+    verify_recorded_journal_intents(&with_today, "fixed-dca:today", &today, identity_of)
+        .expect("own journal pending");
+    // ...but a *different* decision's intent at that same path is lost
+    // history, even though the file name is the one being prepared now.
+    let mut reused = intents.clone();
+    reused.insert("fixed-dca:earlier".to_owned(), today.clone());
+    assert!(matches!(
+        verify_recorded_journal_intents(&reused, "fixed-dca:today", &today, identity_of),
+        Err(LiveDecisionError::JournalIntentUnresolved {
+            reason: "is missing",
+            ..
+        })
+    ));
+
+    // A different decision's journal missing = lost history.
+    let mut lost = intents.clone();
+    lost.insert("fixed-dca:lost".to_owned(), temp.path().join("gone.jsonl"));
+    assert!(matches!(
+        verify_recorded_journal_intents(&lost, "fixed-dca:today", &today, identity_of),
+        Err(LiveDecisionError::JournalIntentUnresolved {
+            reason: "is missing",
+            ..
+        })
+    ));
+
+    // A journal bound to a different decision than declared.
+    let mut swapped = BTreeMap::new();
+    swapped.insert("fixed-dca:other".to_owned(), path.clone());
+    let other_identity = |id: &str| {
+        (id == "fixed-dca:other").then(|| {
+            let mut other = decision.clone();
+            other.decision_id = "fixed-dca:other".to_owned();
+            LiveDecisionIdentity::of(&other)
+        })
+    };
+    assert!(matches!(
+        verify_recorded_journal_intents(&swapped, "fixed-dca:today", &today, other_identity),
+        Err(LiveDecisionError::JournalIntentUnresolved {
+            reason: "is bound to a different decision",
+            ..
+        })
+    ));
+
+    // The declared journal deleted and recreated empty.
+    fs::write(&path, b"").expect("truncate journal");
+    assert!(matches!(
+        verify_recorded_journal_intents(&intents, "fixed-dca:today", &today, identity_of),
+        Err(LiveDecisionError::JournalIntentUnresolved {
+            reason: "has no committed binding",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn frozen_state_rejects_a_journal_swapped_for_another_valid_chain_of_the_same_size() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path_a = temp.path().join("a.jsonl");
+    let path_b = temp.path().join("b.jsonl");
+    let first = reopen(&path_a, &binding());
+    // Same shape, different content: only a same-length hash differs, so the
+    // other journal has the same byte length and record count.
+    let mut other = binding();
+    other.capital_snapshot_hash = "capital-snapshot-b".to_owned();
+    drop(reopen(&path_b, &other));
+    let bytes_a = fs::read(&path_a).expect("journal a");
+    let bytes_b = fs::read(&path_b).expect("journal b");
+    assert_eq!(bytes_a.len(), bytes_b.len());
+    assert_ne!(bytes_a, bytes_b);
+
+    // Swap the journal's storage under the loaded instance, leaving its
+    // protected head store untouched.
+    fs::write(&path_a, &bytes_b).expect("swap journal contents");
+    let mut ran = false;
+    let result = first.with_frozen_state(|_| -> Result<(), WorkflowError> {
+        ran = true;
+        Ok(())
+    });
+    assert!(matches!(result, Err(WorkflowError::ConcurrentModification)));
+    assert!(!ran);
+
+    // Restored, the instance is current again.
+    fs::write(&path_a, &bytes_a).expect("restore journal contents");
+    first
+        .with_frozen_state(|_| -> Result<(), WorkflowError> { Ok(()) })
+        .expect("restored journal matches the instance");
+}
