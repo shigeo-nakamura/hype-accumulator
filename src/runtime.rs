@@ -1036,6 +1036,9 @@ impl SignerFreeRuntime {
             // the two never disagree; a matching replay writes nothing.
             let mut probe = self.state.pacing.clone();
             probe.settle_decision(decision_id, filled_usdc, debited_usdc)?;
+            // A retry after a commit whose metrics publication failed must
+            // still leave the derived outputs current.
+            self.publish_metrics(settled_at)?;
             return Ok(LiveSettlementOutcome::AlreadySettled);
         }
         if settled_at < decision.decided_at {
