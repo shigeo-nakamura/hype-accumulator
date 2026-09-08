@@ -2646,6 +2646,9 @@ fn live_settlement_converts_the_commitment_to_spend_exactly_once() {
     // Exact replay is idempotent and writes nothing; a conflicting replay
     // fails closed.
     let head_before = runtime.state.last_committed_cycle_hash.clone();
+    // ...and an idempotent replay republishes the derived outputs even if
+    // the first publication had been lost.
+    std::fs::remove_file(&runtime_config.metrics_path).expect("drop metrics file");
     assert_eq!(
         runtime
             .settle_live_decision(
@@ -2658,6 +2661,9 @@ fn live_settlement_converts_the_commitment_to_spend_exactly_once() {
         LiveSettlementOutcome::AlreadySettled
     );
     assert_eq!(runtime.state.last_committed_cycle_hash, head_before);
+    assert!(std::fs::read_to_string(&runtime_config.metrics_path)
+        .expect("metrics republished on replay")
+        .contains(&format!("hype_accumulator_spent_usdc {spent_usdc}")));
     assert!(runtime
         .settle_live_decision(
             &LiveDecisionIdentity::of(&decision),
