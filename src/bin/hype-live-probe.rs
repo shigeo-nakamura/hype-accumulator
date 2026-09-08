@@ -29,7 +29,9 @@ use hype_accumulator::{
     monitor::{trade_cadence_label, HypeAttribution, HyperliquidObserver},
     order_envelope::OrderEnvelopeFreshnessPolicy,
     pacing::PacingLimits,
-    runtime::{AdmissionApprovals, RuntimeConfig, RuntimeCycleInput, SignerFreeRuntime},
+    runtime::{
+        AdmissionApprovals, DecisionMode, RuntimeConfig, RuntimeCycleInput, SignerFreeRuntime,
+    },
     signal::SignalSnapshot,
     signer::resolve_signer_private_key,
     workflow::{
@@ -414,15 +416,16 @@ impl HistoryDirectoryBinding {
 
 const USAGE: &str = "usage:\n  hype-live-probe prepare <config.toml> <security-policy.toml> \
      <runtime-config.toml> <operational.toml> <journal.jsonl>\n  hype-live-probe submit \
-     <config.toml> <security-policy.toml> <operational.toml> <journal.jsonl> --confirm \
-     <client_order_id>\n  hype-live-probe reconcile <config.toml> <security-policy.toml> \
-     <operational.toml> <journal.jsonl>";
+     <config.toml> <security-policy.toml> <runtime-config.toml> <operational.toml> \
+     <journal.jsonl> --confirm <client_order_id>\n  hype-live-probe reconcile <config.toml> \
+     <security-policy.toml> <runtime-config.toml> <operational.toml> <journal.jsonl>";
 
 #[derive(Debug, Eq, PartialEq)]
 enum Invocation {
     Reconcile {
         config_path: String,
         security_policy_path: String,
+        runtime_config_path: String,
         operational_params_path: String,
         journal_path: String,
     },
@@ -436,6 +439,7 @@ enum Invocation {
     Submit {
         config_path: String,
         security_policy_path: String,
+        runtime_config_path: String,
         operational_params_path: String,
         journal_path: String,
         confirm_client_order_id: String,
@@ -448,12 +452,13 @@ where
 {
     let args = args.collect::<Vec<_>>();
     match args.as_slice() {
-        [command, config_path, security_policy_path, operational_params_path, journal_path]
+        [command, config_path, security_policy_path, runtime_config_path, operational_params_path, journal_path]
             if command == "reconcile" =>
         {
             Ok(Invocation::Reconcile {
                 config_path: config_path.clone(),
                 security_policy_path: security_policy_path.clone(),
+                runtime_config_path: runtime_config_path.clone(),
                 operational_params_path: operational_params_path.clone(),
                 journal_path: journal_path.clone(),
             })
@@ -470,12 +475,13 @@ where
                 journal_path: journal_path.clone(),
             })
         }
-        [command, config_path, security_policy_path, operational_params_path, journal_path, confirm_flag, confirm_client_order_id]
+        [command, config_path, security_policy_path, runtime_config_path, operational_params_path, journal_path, confirm_flag, confirm_client_order_id]
             if command == "submit" && confirm_flag == "--confirm" =>
         {
             Ok(Invocation::Submit {
                 config_path: config_path.clone(),
                 security_policy_path: security_policy_path.clone(),
+                runtime_config_path: runtime_config_path.clone(),
                 operational_params_path: operational_params_path.clone(),
                 journal_path: journal_path.clone(),
                 confirm_client_order_id: confirm_client_order_id.clone(),
@@ -490,12 +496,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Invocation::Reconcile {
             config_path,
             security_policy_path,
+            runtime_config_path,
             operational_params_path,
             journal_path,
         } => {
             reconcile(
                 &config_path,
                 &security_policy_path,
+                &runtime_config_path,
                 &operational_params_path,
                 &journal_path,
             )
@@ -521,6 +529,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Invocation::Submit {
             config_path,
             security_policy_path,
+            runtime_config_path,
             operational_params_path,
             journal_path,
             confirm_client_order_id,
@@ -528,6 +537,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             submit(
                 &config_path,
                 &security_policy_path,
+                &runtime_config_path,
                 &operational_params_path,
                 &journal_path,
                 &confirm_client_order_id,
@@ -669,6 +679,7 @@ async fn prepare(
         capital_history_complete,
         manual_pause: config.manual_halt,
         api_errors,
+        decision_mode: decision_mode_for(&config),
     };
 
     let (protected_head_store, owner_store) = build_stores(journal_path)?;
@@ -706,7 +717,7 @@ async fn prepare(
     println!("mode=prepared journal={journal_path}");
     println!("{action:#?}");
     println!(
-        "\nReview the values above carefully. To submit this exact order, run:\n  hype-live-probe submit {config_path} {security_policy_path} {operational_params_path} {journal_path} --confirm {}",
+        "\nReview the values above carefully. To submit this exact order, run:\n  hype-live-probe submit {config_path} {security_policy_path} {runtime_config_path} {operational_params_path} {journal_path} --confirm {}",
         workflow.state().client_order_id()
     );
     Ok(())
@@ -715,6 +726,7 @@ async fn prepare(
 async fn submit(
     config_path: &str,
     security_policy_path: &str,
+    runtime_config_path: &str,
     operational_params_path: &str,
     journal_path: &str,
     confirm_client_order_id: &str,
@@ -776,14 +788,67 @@ async fn submit(
     let reconciliation = probe
         .reconcile(&mut workflow, Path::new(journal_path), Utc::now())
         .await;
-    match &reconciliation {
-        Ok(observation) => print_observation(observation)?,
-        Err(_) => eprintln!(
+    let settlement = if let Ok(observation) = &reconciliation {
+        print_observation(observation)?;
+        // Closes the loop from terminal fill evidence back to the capital
+        // ledger (#901 item 5). Runs after every reconciliation attempt that
+        // reached the venue; a failure here leaves the order's own evidence
+        // intact and is retried by the signer-free `reconcile`.
+        settle_finalized_decision(&config, runtime_config_path, &workflow, observation)
+    } else {
+        eprintln!(
             "reconciliation unavailable; run the signer-free reconcile command; do not resubmit"
-        ),
-    }
+        );
+        Ok(())
+    };
     submission?;
     reconciliation?;
+    settlement?;
+    Ok(())
+}
+
+/// Settles the workflow's pacing decision in the signer-free runtime from the
+/// durable terminal fill evidence, once the order is final. Before finality
+/// nothing is written: the decision stays committed-but-unsettled, which
+/// blocks every later decision day (`PriorDecisionUnsettled`) until the
+/// signer-free `reconcile` observes the terminal state and settles it.
+/// Idempotent — repeating it after a successful settlement writes nothing.
+/// Live policy (`dry_run = false`): the new planned decision is left
+/// unsettled so the execution workflow can bind it. A `DRY_RUN` pair keeps
+/// zero-settling it in-cycle, so `prepare` still fails closed at the binding.
+const fn decision_mode_for(config: &Config) -> DecisionMode {
+    if config.dry_run {
+        DecisionMode::DryRun
+    } else {
+        DecisionMode::Live
+    }
+}
+
+fn settle_finalized_decision(
+    config: &Config,
+    runtime_config_path: &str,
+    workflow: &DurableWorkflow,
+    observation: &hype_accumulator::live_probe::ProbeReconciliation,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let state = workflow.state();
+    let decision_id = state.binding().decision_id.clone();
+    if !observation.durable_finality {
+        println!("mode=settlement-deferred decision={decision_id} durable_finality=false");
+        return Ok(());
+    }
+    let runtime_config = RuntimeConfig::from_toml(&fs::read_to_string(runtime_config_path)?)?
+        .with_parent_funding_route(config.parent_funding_route(&ProcessEnvironment)?);
+    let limits = PacingLimits::from_config(config)?;
+    let mut runtime = SignerFreeRuntime::open(runtime_config, limits)?;
+    let filled_usdc = state.filled_usdc();
+    let debited_usdc = state.debited_usdc();
+    let outcome =
+        runtime.settle_live_decision(&decision_id, filled_usdc, debited_usdc, Utc::now())?;
+    println!(
+        "mode=settled decision={decision_id} filled_usdc={} debited_usdc={} outcome={outcome:?}",
+        filled_usdc.as_micros(),
+        debited_usdc.as_micros()
+    );
     Ok(())
 }
 
@@ -801,6 +866,7 @@ fn print_observation(
 async fn reconcile(
     config_path: &str,
     security_policy_path: &str,
+    runtime_config_path: &str,
     operational_params_path: &str,
     journal_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -826,6 +892,9 @@ async fn reconcile(
     )
     .await?;
     print_observation(&observation)?;
+    // Signer-free like everything else here: settling the pacing decision
+    // needs only the durable fill evidence and the runtime ledger.
+    settle_finalized_decision(&config, runtime_config_path, &workflow, &observation)?;
     Ok(())
 }
 
@@ -1311,6 +1380,7 @@ mod tests {
                 "submit",
                 "config.toml",
                 "security-policy.toml",
+                "runtime.toml",
                 "operational.toml",
                 "journal.jsonl",
                 "--confirm",
@@ -1319,6 +1389,7 @@ mod tests {
             Ok(Invocation::Submit {
                 config_path: "config.toml".to_owned(),
                 security_policy_path: "security-policy.toml".to_owned(),
+                runtime_config_path: "runtime.toml".to_owned(),
                 operational_params_path: "operational.toml".to_owned(),
                 journal_path: "journal.jsonl".to_owned(),
                 confirm_client_order_id: "0xabc123".to_owned(),
@@ -1327,21 +1398,39 @@ mod tests {
     }
 
     #[test]
-    fn recovery_accepts_no_confirmation_or_runtime_arguments() {
-        assert!(matches!(
+    fn recovery_takes_the_runtime_config_but_no_confirmation() {
+        assert_eq!(
             invocation(args(&[
                 "reconcile",
                 "config.toml",
                 "policy.toml",
+                "runtime.toml",
                 "operational.toml",
                 "journal.jsonl"
             ])),
-            Ok(Invocation::Reconcile { .. })
-        ));
+            Ok(Invocation::Reconcile {
+                config_path: "config.toml".to_owned(),
+                security_policy_path: "policy.toml".to_owned(),
+                runtime_config_path: "runtime.toml".to_owned(),
+                operational_params_path: "operational.toml".to_owned(),
+                journal_path: "journal.jsonl".to_owned(),
+            })
+        );
+        // The pre-settlement 5-argument shape must be rejected rather than
+        // silently reinterpreted with a shifted argument.
         assert!(invocation(args(&[
             "reconcile",
             "config.toml",
             "policy.toml",
+            "operational.toml",
+            "journal.jsonl"
+        ]))
+        .is_err());
+        assert!(invocation(args(&[
+            "reconcile",
+            "config.toml",
+            "policy.toml",
+            "runtime.toml",
             "operational.toml",
             "journal.jsonl",
             "--confirm",
@@ -1403,15 +1492,28 @@ mod tests {
     #[test]
     fn rejects_submit_without_the_literal_confirm_flag() {
         // A caller must pass the `--confirm` flag literally, not just any
-        // 7-argument submit invocation — this is the one thing standing
+        // 8-argument submit invocation — this is the one thing standing
         // between an operator and an actual signed submission.
+        assert!(invocation(args(&[
+            "submit",
+            "config.toml",
+            "security-policy.toml",
+            "runtime.toml",
+            "operational.toml",
+            "journal.jsonl",
+            "--yes",
+            "0xabc123",
+        ]))
+        .is_err());
+        // The pre-settlement 7-argument shape (no runtime config) is rejected
+        // outright instead of being parsed with shifted paths.
         assert!(invocation(args(&[
             "submit",
             "config.toml",
             "security-policy.toml",
             "operational.toml",
             "journal.jsonl",
-            "--yes",
+            "--confirm",
             "0xabc123",
         ]))
         .is_err());

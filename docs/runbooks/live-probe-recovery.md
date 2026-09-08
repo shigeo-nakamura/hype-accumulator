@@ -7,14 +7,20 @@ to resolve that ambiguity. The persisted CLOID remains the only order to query.
 The `live-probe` feature includes an unsigned recovery command:
 
 ```text
-hype-live-probe reconcile config.local.toml security-policy.local.toml operational.local.toml journal.jsonl
+hype-live-probe reconcile config.local.toml security-policy.local.toml runtime.local.toml operational.local.toml journal.jsonl
 ```
 
 Use the same reviewed endpoint, network selection, execution account, routing
-mode, and journal that `prepare` used. Only the public execution-account
-environment variable is needed. Do not source a signer environment file.
-The command never loads signing material, decrypts a key, reserves a nonce,
-submits an exchange action, or recomputes a daily decision. It checks the
+mode, runtime config, and journal that `prepare` used. Only the public
+execution-account environment variable is needed. Do not source a signer
+environment file. The command never loads signing material, decrypts a key,
+reserves a nonce, submits an exchange action, or recomputes a daily decision.
+Once the order is durably final it does settle the pacing decision that
+`prepare` committed in the signer-free runtime (`mode=settled ...`), from the
+same durable fill evidence, so the capital ledger's commitment is released or
+converted to spend exactly once; before finality it prints
+`mode=settlement-deferred` and every later decision day stays blocked as
+`PriorDecisionUnsettled` until this command is rerun. It checks the
 prepare-time network/routing binding and protected workflow journal, then
 checks the account and market against the durable prepared action before
 querying the exact CLOID. Halted operation, revoked keys, and expired live

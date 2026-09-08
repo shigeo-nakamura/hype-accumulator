@@ -611,6 +611,30 @@ impl RuntimeState {
     }
 }
 
+/// How a cycle treats a NEW planned purchase decision.
+///
+/// The signer-free runtime never constructs an economic action itself in
+/// either mode. The difference is only what happens to the capital a new
+/// planned decision commits:
+///
+/// * [`DecisionMode::DryRun`] — the recurring, halted `DRY_RUN` cycle. A new
+///   planned decision is immediately settled at zero fill / zero debit in
+///   the same cycle (`decision:<id>:dry-run-settlement`), so no commitment
+///   ever outlives the cycle and no later settlement is expected.
+/// * [`DecisionMode::Live`] — the live-probe `prepare` path. A new planned
+///   decision is committed and left **unsettled**; the execution workflow
+///   binds it (`DecisionBinding::from_pacing_decision` refuses a settled
+///   decision), and the caller must later settle it from the reconciled
+///   terminal fill via [`SignerFreeRuntime::settle_live_decision`]. Until
+///   that happens every later decision day fails closed as
+///   `PriorDecisionUnsettled`, so a forgotten settlement can never be
+///   silently compounded by a second purchase.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DecisionMode {
+    DryRun,
+    Live,
+}
+
 /// One closed movement-history and account-observation cycle.
 pub struct RuntimeCycleInput<'a> {
     pub observed_at: DateTime<Utc>,
@@ -623,6 +647,17 @@ pub struct RuntimeCycleInput<'a> {
     pub capital_history_complete: bool,
     pub manual_pause: bool,
     pub api_errors: u64,
+    pub decision_mode: DecisionMode,
+}
+
+/// Outcome of [`SignerFreeRuntime::settle_live_decision`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LiveSettlementOutcome {
+    /// This call durably settled the decision and committed the ledger cycle.
+    Settled,
+    /// The decision was already settled with exactly these amounts; nothing
+    /// was written (idempotent replay after a crash or a repeated reconcile).
+    AlreadySettled,
 }
 
 /// Private, durable cycle evidence. Public status/metrics remain identifier-free.
@@ -717,6 +752,76 @@ impl SignerFreeRuntime {
             #[cfg(unix)]
             _directory_lock: directory_lock,
         })
+    }
+
+    /// Durably settles a live planned decision from its reconciled terminal
+    /// fill: `filled_usdc` is the cumulative filled notional and
+    /// `debited_usdc` the cumulative cash debit including fees, both taken
+    /// from the execution workflow's durable `OrderFinalized` evidence. A
+    /// canceled/expired unfilled order settles at zero, releasing the
+    /// commitment. Repeating the exact settlement is idempotent; a
+    /// conflicting replay, an overfill, or a debit above the commitment
+    /// fails closed without touching runtime state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError`] for an unknown or zero-planned decision, a
+    /// conflicting or over-committed settlement, a settlement dated before
+    /// the decision, or ledger/persistence failures.
+    pub fn settle_live_decision(
+        &mut self,
+        decision_id: &str,
+        filled_usdc: UsdcMicros,
+        debited_usdc: UsdcMicros,
+        settled_at: DateTime<Utc>,
+    ) -> Result<LiveSettlementOutcome, RuntimeError> {
+        self.ensure_runtime_lock_current()?;
+        let decision = self
+            .state
+            .pacing
+            .decisions()
+            .values()
+            .find(|decision| decision.decision_id == decision_id)
+            .cloned()
+            .ok_or(PacingError::UnknownDecision)?;
+        if decision.settled {
+            // Delegates the exact-replay-vs-conflict distinction to pacing so
+            // the two never disagree; a matching replay writes nothing.
+            let mut probe = self.state.pacing.clone();
+            probe.settle_decision(decision_id, filled_usdc, debited_usdc)?;
+            return Ok(LiveSettlementOutcome::AlreadySettled);
+        }
+        if settled_at < decision.decided_at {
+            return Err(RuntimeError::InvalidCycle(
+                "live settlement predates its decision".to_owned(),
+            ));
+        }
+        let mut next_state = self.state.clone();
+        next_state
+            .pacing
+            .settle_decision(decision_id, filled_usdc, debited_usdc)?;
+        next_state.pacing.validate_for_limits(&self.limits)?;
+        let ledger_events = vec![LedgerEvent {
+            event_id: format!("decision:{decision_id}:live-settlement"),
+            occurred_at: settled_at,
+            kind: LedgerEventKind::CapitalSettled {
+                commitment_id: format!("commitment:{decision_id}"),
+                debited_usdc,
+            },
+        }];
+        let pending = PendingRuntimeCycle::new(settled_at, next_state, ledger_events)?;
+        let replayed = self
+            .ledger
+            .validate_append_batch(&pending_cycle_ledger_events(&pending))?;
+        ensure_capital_totals_match(&pending.body.state.pacing, &replayed)?;
+        self.ensure_runtime_lock_current()?;
+        write_private_json_atomic(
+            self.config.state_directory.join(PENDING_CYCLE_FILE_NAME),
+            &pending,
+        )?;
+        self.ensure_runtime_lock_current()?;
+        self.state = commit_pending_cycle(&self.config, &self.limits, &mut self.ledger, &pending)?;
+        Ok(LiveSettlementOutcome::Settled)
     }
 
     /// Returns the inclusive start of the next overlapping movement query.
@@ -1083,7 +1188,12 @@ impl SignerFreeRuntime {
                 Err(error) => return Err(error.into()),
             };
             if let Some(result) = &mut decision {
-                ledger_events.extend(dry_run_decision_events(&mut next_state.pacing, result)?);
+                ledger_events.extend(match input.decision_mode {
+                    DecisionMode::DryRun => {
+                        dry_run_decision_events(&mut next_state.pacing, result)?
+                    }
+                    DecisionMode::Live => live_decision_events(result)?,
+                });
             }
             next_state.pacing.reconcile_capital_preserving_admissions(
                 &capital_events,
@@ -1148,7 +1258,13 @@ impl SignerFreeRuntime {
             },
         };
         if let Some(result) = &decision_result {
-            if result.is_new() && !result.decision().planned_usdc.is_zero() {
+            // Counts economic actions the DRY_RUN cycle suppressed. A live
+            // cycle suppresses nothing: its planned decision is handed to the
+            // execution workflow instead.
+            if input.decision_mode == DecisionMode::DryRun
+                && result.is_new()
+                && !result.decision().planned_usdc.is_zero()
+            {
                 next_state.dry_run_actions_total = next_state
                     .dry_run_actions_total
                     .checked_add(1)
@@ -1196,7 +1312,7 @@ impl SignerFreeRuntime {
                 .as_ref()
                 .map(|result| result.decision().clone()),
             new_decision: decision_result.as_ref().is_some_and(DecisionResult::is_new),
-            economic_action_suppressed: true,
+            economic_action_suppressed: input.decision_mode == DecisionMode::DryRun,
             signed_action_created: false,
             signal_available: decision_evidence.signal_available,
             boundary_balance_available: decision_evidence.boundary_balance_available,
@@ -1897,6 +2013,15 @@ fn dry_run_decision_events(
         *result = DecisionResult::New(settled);
     }
     Ok(events)
+}
+
+/// Live-mode counterpart of [`dry_run_decision_events`]: records the
+/// commitment/plan (or skip) exactly like `DRY_RUN` does but deliberately does
+/// NOT settle a new planned decision, leaving its capital committed for the
+/// execution workflow. Settlement follows from the reconciled terminal fill
+/// through [`SignerFreeRuntime::settle_live_decision`].
+fn live_decision_events(result: &DecisionResult) -> Result<Vec<LedgerEvent>, RuntimeError> {
+    decision_events(result.decision())
 }
 
 fn decision_events(decision: &DailyDecision) -> Result<Vec<LedgerEvent>, RuntimeError> {

@@ -6,7 +6,9 @@ use hype_accumulator::{
     exchange::UnavailableLiveExchange,
     monitor::{trade_cadence_label, HypeAttribution, HyperliquidObserver},
     pacing::PacingLimits,
-    runtime::{AdmissionApprovals, RuntimeConfig, RuntimeCycleInput, SignerFreeRuntime},
+    runtime::{
+        AdmissionApprovals, DecisionMode, RuntimeConfig, RuntimeCycleInput, SignerFreeRuntime,
+    },
     signal::SignalSnapshot,
     signal_source::{
         build_snapshot, core_health_label, plan_snapshot, publish_snapshot,
@@ -311,6 +313,7 @@ async fn run_dry_run_cycle(
         capital_history_complete,
         manual_pause: config.manual_halt,
         api_errors,
+        decision_mode: DecisionMode::DryRun,
     })?;
     // Release the exclusive runtime/state-directory lock before the S3
     // mirror's network call: `runtime` (and the `File` locks it owns) would
