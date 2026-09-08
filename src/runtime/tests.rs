@@ -2393,6 +2393,12 @@ fn explicit_admission_artifact_rejects_invalid_microunit_values() {
     }
 }
 
+fn live_mode() -> DecisionMode {
+    DecisionMode::Live {
+        history_directory: PathBuf::from("/var/lib/hype-accumulator/journals"),
+    }
+}
+
 fn live_planned_decision(
     runtime: &mut SignerFreeRuntime,
     start: DateTime<Utc>,
@@ -2413,7 +2419,7 @@ fn live_planned_decision(
             capital_history_complete: true,
             manual_pause: false,
             api_errors: 0,
-            decision_mode: DecisionMode::Live,
+            decision_mode: live_mode(),
         })
         .expect("live cycle")
 }
@@ -2486,7 +2492,7 @@ fn live_cycle_leaves_the_planned_decision_committed_and_unsettled() {
             capital_history_complete: true,
             manual_pause: false,
             api_errors: 0,
-            decision_mode: DecisionMode::Live,
+            decision_mode: live_mode(),
         })
         .expect("same-day live replay");
     assert!(!replay.is_new_decision());
@@ -2510,7 +2516,7 @@ fn live_cycle_leaves_the_planned_decision_committed_and_unsettled() {
             capital_history_complete: true,
             manual_pause: false,
             api_errors: 0,
-            decision_mode: DecisionMode::Live,
+            decision_mode: live_mode(),
         })
         .expect("next-day live cycle");
     assert!(next.is_new_decision());
@@ -2674,7 +2680,7 @@ fn live_settlement_converts_the_commitment_to_spend_exactly_once() {
             capital_history_complete: true,
             manual_pause: false,
             api_errors: 0,
-            decision_mode: DecisionMode::Live,
+            decision_mode: live_mode(),
         })
         .expect("next-day live cycle after settlement");
     let next_decision = next.decision().expect("next-day decision");
@@ -2803,4 +2809,102 @@ fn live_settlement_refuses_a_decision_identity_from_another_runtime() {
         LiveSettlementOutcome::Settled
     );
     assert!(runtime.unsettled_planned_decisions().is_empty());
+}
+
+#[test]
+fn live_cycles_bind_the_runtime_to_one_history_directory() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = start + TimeDelta::hours(1);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-approved", deposit_at, 100);
+    let admission = approvals("deposit-approved", deposit_at, deposit_at);
+    let signal = signal(decision_at);
+
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
+    assert_eq!(runtime.live_history_directory(), None);
+    // A DRY_RUN cycle never binds a namespace.
+    runtime
+        .apply_cycle(RuntimeCycleInput {
+            observed_at: start + TimeDelta::hours(2),
+            scan_start_ms: ms(start),
+            scan_end_ms: ms(start + TimeDelta::hours(2)),
+            movements: std::slice::from_ref(&movement),
+            approvals: &admission,
+            signal: None,
+            accumulator: status(start + TimeDelta::hours(2), 100.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+            decision_mode: DecisionMode::DryRun,
+        })
+        .expect("dry-run cycle");
+    assert_eq!(runtime.live_history_directory(), None);
+
+    live_planned_decision(
+        &mut runtime,
+        start,
+        decision_at,
+        &movement,
+        &admission,
+        &signal,
+    );
+    assert_eq!(
+        runtime.live_history_directory(),
+        Some(Path::new("/var/lib/hype-accumulator/journals"))
+    );
+    let head = runtime.state.last_committed_cycle_hash.clone();
+    drop(runtime);
+
+    // The binding is part of the committed state and survives a reopen; a
+    // live cycle naming another directory fails closed before any change.
+    let mut reopened =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("reopen runtime");
+    assert_eq!(
+        reopened.live_history_directory(),
+        Some(Path::new("/var/lib/hype-accumulator/journals"))
+    );
+    let replay_at = decision_at + TimeDelta::minutes(5);
+    let result = reopened.apply_cycle(RuntimeCycleInput {
+        observed_at: replay_at,
+        scan_start_ms: ms(start),
+        scan_end_ms: ms(replay_at),
+        movements: std::slice::from_ref(&movement),
+        approvals: &admission,
+        signal: Some(&signal),
+        accumulator: status(replay_at, 100.0),
+        capital_history_complete: true,
+        manual_pause: false,
+        api_errors: 0,
+        decision_mode: DecisionMode::Live {
+            history_directory: PathBuf::from("/somewhere/else"),
+        },
+    });
+    assert!(matches!(
+        result,
+        Err(RuntimeError::LiveHistoryDirectoryMismatch(_))
+    ));
+    assert_eq!(reopened.state.last_committed_cycle_hash, head);
+    assert_eq!(
+        reopened.live_history_directory(),
+        Some(Path::new("/var/lib/hype-accumulator/journals"))
+    );
+    // The same directory keeps working (same-day replay).
+    reopened
+        .apply_cycle(RuntimeCycleInput {
+            observed_at: replay_at,
+            scan_start_ms: ms(start),
+            scan_end_ms: ms(replay_at),
+            movements: std::slice::from_ref(&movement),
+            approvals: &admission,
+            signal: Some(&signal),
+            accumulator: status(replay_at, 100.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+            decision_mode: live_mode(),
+        })
+        .expect("same-directory live replay");
 }

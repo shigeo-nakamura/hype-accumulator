@@ -101,8 +101,14 @@ decision day fails closed as `PriorDecisionUnsettled`. Release it with:
 hype-live-probe release config.local.toml security-policy.local.toml runtime.local.toml operational.local.toml
 ```
 
-It takes no journal argument on purpose: it scans the operational config's
-write-once bound `history_directory` with the same protected-history
+It takes no journal argument on purpose. The runtime records, in its
+hash-chained committed state, the canonical `history_directory` its live
+decisions were prepared into (first live `prepare` binds it; a later live
+`prepare` naming another directory fails closed), and `release` refuses to
+run unless the operational config's bound `history_directory` is that same
+directory — so a renamed or copied operational config, which would bind a
+fresh, empty history namespace, cannot be used to "prove" absence of a
+journal that exists elsewhere. It then scans that directory with the same protected-history
 verification `prepare`'s aggregation uses (symlinks and non-regular entries
 rejected, orphaned protected heads, empty or rolled-back/truncated journals,
 duplicate bindings and inadmissible journals all fail the whole scan closed)

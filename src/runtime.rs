@@ -542,6 +542,10 @@ struct RuntimeState {
     last_committed_cycle_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     parent_funding_route: Option<ParentFundingRoute>,
+    /// Workflow-journal namespace every live decision of this runtime is
+    /// prepared into; write-once, part of the committed cycle hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    live_history_directory: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -607,6 +611,7 @@ impl RuntimeState {
             dry_run_actions_total: 0,
             last_committed_cycle_hash: None,
             parent_funding_route: None,
+            live_history_directory: None,
         }
     }
 }
@@ -629,10 +634,18 @@ impl RuntimeState {
 ///   that happens every later decision day fails closed as
 ///   `PriorDecisionUnsettled`, so a forgotten settlement can never be
 ///   silently compounded by a second purchase.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DecisionMode {
     DryRun,
-    Live,
+    /// `history_directory` is the (canonical) workflow-journal namespace the
+    /// caller will create this decision's journal in. The runtime records it
+    /// in its hash-chained state on the first live cycle and refuses any
+    /// later live cycle naming a different directory, so `release` can
+    /// prove "no journal in *this* directory binds the decision" is the
+    /// same statement as "no journal anywhere binds it".
+    Live {
+        history_directory: PathBuf,
+    },
 }
 
 /// One closed movement-history and account-observation cycle.
@@ -829,6 +842,14 @@ impl SignerFreeRuntime {
             #[cfg(unix)]
             _directory_lock: directory_lock,
         })
+    }
+
+    /// The workflow-journal namespace this runtime's live decisions were
+    /// prepared into (recorded, hash-chained, on the first live cycle);
+    /// `None` for a runtime that has only ever run `DRY_RUN` cycles.
+    #[must_use]
+    pub fn live_history_directory(&self) -> Option<&Path> {
+        self.state.live_history_directory.as_deref()
     }
 
     /// Planned decisions that a live cycle committed and nothing has settled
@@ -1220,6 +1241,18 @@ impl SignerFreeRuntime {
         next_state
             .parent_funding_route
             .clone_from(&self.config.parent_funding_route);
+        if let DecisionMode::Live { history_directory } = &input.decision_mode {
+            match &next_state.live_history_directory {
+                Some(bound) if bound != history_directory => {
+                    return Err(RuntimeError::LiveHistoryDirectoryMismatch(format!(
+                        "this runtime's live decisions are bound to {} but the cycle names {}",
+                        bound.display(),
+                        history_directory.display()
+                    )));
+                }
+                _ => next_state.live_history_directory = Some(history_directory.clone()),
+            }
+        }
         let mut ledger_events = Vec::new();
         let decision_result = if let Some(decision) = existing_decision {
             next_state.pacing.reconcile_capital_preserving_admissions(
@@ -1290,7 +1323,7 @@ impl SignerFreeRuntime {
                     DecisionMode::DryRun => {
                         dry_run_decision_events(&mut next_state.pacing, result)?
                     }
-                    DecisionMode::Live => live_decision_events(result)?,
+                    DecisionMode::Live { .. } => live_decision_events(result)?,
                 });
             }
             next_state.pacing.reconcile_capital_preserving_admissions(
@@ -1359,7 +1392,7 @@ impl SignerFreeRuntime {
             // Counts economic actions the DRY_RUN cycle suppressed. A live
             // cycle suppresses nothing: its planned decision is handed to the
             // execution workflow instead.
-            if input.decision_mode == DecisionMode::DryRun
+            if matches!(input.decision_mode, DecisionMode::DryRun)
                 && result.is_new()
                 && !result.decision().planned_usdc.is_zero()
             {
@@ -1410,7 +1443,7 @@ impl SignerFreeRuntime {
                 .as_ref()
                 .map(|result| result.decision().clone()),
             new_decision: decision_result.as_ref().is_some_and(DecisionResult::is_new),
-            economic_action_suppressed: input.decision_mode == DecisionMode::DryRun,
+            economic_action_suppressed: matches!(input.decision_mode, DecisionMode::DryRun),
             signed_action_created: false,
             signal_available: decision_evidence.signal_available,
             boundary_balance_available: decision_evidence.boundary_balance_available,
@@ -2356,6 +2389,8 @@ pub enum RuntimeError {
     CounterOverflow,
     #[error("live settlement identity does not match this runtime's decision ({0})")]
     LiveDecisionMismatch(&'static str),
+    #[error("live history directory mismatch: {0}")]
+    LiveHistoryDirectoryMismatch(String),
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]

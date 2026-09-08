@@ -622,6 +622,9 @@ async fn prepare(
     // — the journal write, `PrepareTimeBinding`'s sidecar, protected-head
     // store — tries to write into it.
     fs::create_dir_all(&journal_directory)?;
+    // Canonical so the runtime's hash-chained namespace binding cannot be
+    // dodged with an alias of the same directory.
+    let live_history_directory = fs::canonicalize(&journal_directory)?;
     // Persisted only now that the directory demonstrably exists: doing this
     // before `create_dir_all` would let a transient creation failure's retry
     // observe `AlreadyInitialized` against a directory that was never
@@ -709,7 +712,7 @@ async fn prepare(
         capital_history_complete,
         manual_pause: config.manual_halt,
         api_errors,
-        decision_mode: decision_mode_for(&config),
+        decision_mode: decision_mode_for(&config, live_history_directory),
     };
 
     let (protected_head_store, owner_store) = build_stores(journal_path)?;
@@ -844,13 +847,15 @@ async fn submit(
 /// signer-free `reconcile` observes the terminal state and settles it.
 /// Idempotent — repeating it after a successful settlement writes nothing.
 /// Live policy (`dry_run = false`): the new planned decision is left
-/// unsettled so the execution workflow can bind it. A `DRY_RUN` pair keeps
-/// zero-settling it in-cycle, so `prepare` still fails closed at the binding.
-const fn decision_mode_for(config: &Config) -> DecisionMode {
+/// unsettled so the execution workflow can bind it, and the runtime binds
+/// itself to `history_directory` (the namespace the journal is created in).
+/// A `DRY_RUN` pair keeps zero-settling it in-cycle, so `prepare` still fails
+/// closed at the binding.
+fn decision_mode_for(config: &Config, history_directory: PathBuf) -> DecisionMode {
     if config.dry_run {
         DecisionMode::DryRun
     } else {
-        DecisionMode::Live
+        DecisionMode::Live { history_directory }
     }
 }
 
@@ -963,6 +968,36 @@ fn release(
     // appear, and the scan below cannot go stale between reading the
     // directory and releasing a decision.
     let mut runtime = open_signer_free_runtime(&config, runtime_config_path)?;
+    let unsettled = runtime.unsettled_planned_decisions();
+    if unsettled.is_empty() {
+        println!("mode=nothing-to-release");
+        return Ok(());
+    }
+    // The runtime records (hash-chained, write-once) the directory its live
+    // decisions were prepared into. Scanning any other directory — a renamed
+    // or copied operational config binds a fresh, empty namespace — would
+    // "prove" absence of a journal that exists elsewhere.
+    let bound_history_directory = fs::canonicalize(&journal_directory)?;
+    match runtime.live_history_directory() {
+        Some(recorded) if recorded == bound_history_directory => {}
+        Some(recorded) => {
+            return Err(format!(
+                "this runtime's live decisions were prepared into {} but this operational \
+                 config binds {}; refusing to treat absence from the wrong directory as proof \
+                 of non-submission",
+                recorded.display(),
+                bound_history_directory.display()
+            )
+            .into());
+        }
+        None => {
+            return Err(
+                "this runtime never recorded a live history directory, so its \
+                        unsettled decision cannot be proven unbound from here"
+                    .into(),
+            );
+        }
+    }
     // Same protected-history verification `prepare`'s aggregation applies:
     // symlinks, orphaned protected heads, rolled-back/truncated/empty
     // journals and duplicate bindings all fail closed, and every journal must
@@ -981,11 +1016,6 @@ fn release(
             journal_directory.display()
         )
     })?;
-    let unsettled = runtime.unsettled_planned_decisions();
-    if unsettled.is_empty() {
-        println!("mode=nothing-to-release");
-        return Ok(());
-    }
     for decision in unsettled {
         if let Some(journal_path) = bound.get(&decision.decision_id) {
             return Err(format!(
