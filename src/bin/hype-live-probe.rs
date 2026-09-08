@@ -963,7 +963,24 @@ fn release(
     // appear, and the scan below cannot go stale between reading the
     // directory and releasing a decision.
     let mut runtime = open_signer_free_runtime(&config, runtime_config_path)?;
-    let bound = decisions_bound_by_journals(&journal_directory)?;
+    // Same protected-history verification `prepare`'s aggregation applies:
+    // symlinks, orphaned protected heads, rolled-back/truncated/empty
+    // journals and duplicate bindings all fail closed, and every journal must
+    // pass the same network/routing admissibility check.
+    let prepare_time_binding = PrepareTimeBinding::resolved(&config, &operational)?;
+    let network_routing_admissible = network_routing_admissible_for(&prepare_time_binding);
+    let bound = DurableWorkflow::bound_decision_ids(
+        &journal_directory,
+        &historical_protected_head_store_for,
+        &network_routing_admissible,
+    )?
+    .ok_or_else(|| {
+        format!(
+            "history_directory {} does not exist although it was already initialized; \
+             refusing to treat a missing directory as proof of absence",
+            journal_directory.display()
+        )
+    })?;
     let unsettled = runtime.unsettled_planned_decisions();
     if unsettled.is_empty() {
         println!("mode=nothing-to-release");
@@ -993,26 +1010,6 @@ fn release(
         );
     }
     Ok(())
-}
-
-/// Every decision ID some `.jsonl` workflow journal directly inside
-/// `journal_directory` is durably bound to. A journal whose committed
-/// binding cannot be read fails the whole scan closed: an unreadable journal
-/// might be the one binding the decision under consideration.
-fn decisions_bound_by_journals(
-    journal_directory: &Path,
-) -> Result<std::collections::BTreeMap<String, PathBuf>, Box<dyn std::error::Error>> {
-    let mut bound = std::collections::BTreeMap::new();
-    for entry in fs::read_dir(journal_directory)? {
-        let path = entry?.path();
-        if !path.is_file() || path.extension().and_then(std::ffi::OsStr::to_str) != Some("jsonl") {
-            continue;
-        }
-        if let Some(binding) = DurableWorkflow::peek_committed_binding(&path)? {
-            bound.insert(binding.decision_id, path);
-        }
-    }
-    Ok(bound)
 }
 
 fn print_observation(

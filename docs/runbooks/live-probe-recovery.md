@@ -102,8 +102,11 @@ hype-live-probe release config.local.toml security-policy.local.toml runtime.loc
 ```
 
 It takes no journal argument on purpose: it scans the operational config's
-write-once bound `history_directory` for every `.jsonl` journal and reads
-each committed binding. A decision that **no** journal binds can never have
+write-once bound `history_directory` with the same protected-history
+verification `prepare`'s aggregation uses (symlinks and non-regular entries
+rejected, orphaned protected heads, empty or rolled-back/truncated journals,
+duplicate bindings and inadmissible journals all fail the whole scan closed)
+and reads each journal's committed binding. A decision that **no** journal binds can never have
 produced a venue action — signing is only reachable through `submit`, which
 needs a committed binding in that directory — so it is settled at zero
 (`mode=released ...`), releasing the commitment. A decision that **is** bound

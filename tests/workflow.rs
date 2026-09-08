@@ -5500,3 +5500,120 @@ fn aggregate_terminal_residual_hype_fails_closed_on_a_reconciliation_gap() {
         Err(WorkflowError::ResidualReconciliationGap(_))
     ));
 }
+
+#[test]
+fn bound_decision_ids_maps_every_verified_journal_including_in_flight_ones() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let completed = complete_workflow_with_residual(&temp.path().join("day-1.jsonl"), 2);
+
+    // A prepared-but-never-submitted journal binds its decision just as
+    // firmly as a completed one: its order may still be submitted.
+    let in_flight_path = temp.path().join("day-2.jsonl");
+    let mut in_flight = binding();
+    in_flight.decision_id = distinct_decision_id(&in_flight_path);
+    let mut workflow = reopen(&in_flight_path, &in_flight);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    drop(workflow);
+    // Sidecars that are not journals are ignored, as in aggregation.
+    fs::write(temp.path().join("day-2.network-binding.json"), b"{}").expect("write sidecar");
+
+    let bound = DurableWorkflow::bound_decision_ids(
+        temp.path(),
+        &memory_protected_head_store_for,
+        &always_admissible,
+    )
+    .expect("scan")
+    .expect("directory exists");
+    assert_eq!(bound.len(), 2);
+    assert_eq!(
+        bound[&completed.decision_id],
+        temp.path().join("day-1.jsonl")
+    );
+    assert_eq!(bound[&in_flight.decision_id], in_flight_path);
+
+    assert_eq!(
+        DurableWorkflow::bound_decision_ids(
+            &temp.path().join("never-created"),
+            &memory_protected_head_store_for,
+            &always_admissible,
+        )
+        .expect("missing directory is not an error"),
+        None
+    );
+}
+
+#[test]
+fn bound_decision_ids_fails_closed_on_empty_orphaned_rolled_back_or_inadmissible_journals() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("day-1.jsonl");
+    complete_workflow_with_residual(&path, 2);
+    let intact = fs::read(&path).expect("journal bytes");
+
+    // Empty journal: a crash before the first durable append, or a
+    // truncation — whether its order exists is unknown.
+    fs::write(temp.path().join("day-2.jsonl"), b"").expect("write empty journal");
+    assert!(matches!(
+        DurableWorkflow::bound_decision_ids(
+            temp.path(),
+            &memory_protected_head_store_for,
+            &always_admissible
+        ),
+        Err(WorkflowError::NonTerminalHistoricalJournal(_))
+    ));
+    fs::remove_file(temp.path().join("day-2.jsonl")).expect("remove empty journal");
+
+    // Orphaned protected head: its journal was deleted or renamed.
+    fs::write(temp.path().join("gone.protected-head.json"), b"stale").expect("write orphan");
+    assert!(matches!(
+        DurableWorkflow::bound_decision_ids(
+            temp.path(),
+            &memory_protected_head_store_for,
+            &always_admissible
+        ),
+        Err(WorkflowError::CorruptJournal(_))
+    ));
+    fs::remove_file(temp.path().join("gone.protected-head.json")).expect("remove orphan");
+
+    // Rolled back / truncated journal: the file no longer matches its
+    // independently protected head, so its binding cannot be trusted.
+    let first_line_end = intact
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .expect("journal has at least one line");
+    fs::write(&path, &intact[..=first_line_end]).expect("truncate journal to its first record");
+    assert!(matches!(
+        DurableWorkflow::bound_decision_ids(
+            temp.path(),
+            &memory_protected_head_store_for,
+            &always_admissible
+        ),
+        Err(WorkflowError::RollbackDetected(_))
+    ));
+    fs::write(&path, &intact).expect("restore journal");
+
+    // The caller's admissibility check is applied to every journal.
+    let inadmissible = |journal: &Path| -> Result<(), WorkflowError> {
+        Err(WorkflowError::CorruptJournal(format!(
+            "{}: inadmissible for this test",
+            journal.display()
+        )))
+    };
+    assert!(matches!(
+        DurableWorkflow::bound_decision_ids(
+            temp.path(),
+            &memory_protected_head_store_for,
+            &inadmissible
+        ),
+        Err(WorkflowError::CorruptJournal(_))
+    ));
+
+    // Intact again: the completed journal is bound as before.
+    let bound = DurableWorkflow::bound_decision_ids(
+        temp.path(),
+        &memory_protected_head_store_for,
+        &always_admissible,
+    )
+    .expect("scan")
+    .expect("directory exists");
+    assert_eq!(bound.len(), 1);
+}

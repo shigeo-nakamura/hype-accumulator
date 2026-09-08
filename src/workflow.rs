@@ -2959,6 +2959,60 @@ impl DurableWorkflow {
         Ok(aggregated_residual)
     }
 
+    /// Every pacing decision ID some workflow journal directly inside
+    /// `journal_directory` is durably bound to, mapped to that journal —
+    /// verified exactly the way [`Self::aggregate_terminal_residual_hype`]
+    /// verifies history, because "no journal binds this decision" is only
+    /// evidence if the directory is known to be intact: symlinks and
+    /// non-regular entries are rejected, an orphaned `<stem>.protected-head`
+    /// sidecar (its journal deleted or renamed) fails closed, every journal
+    /// is replayed and matched against its independently protected head
+    /// (rollback, truncation, or replacement is detected), an empty journal
+    /// fails closed (a crash before its first durable append or a truncation
+    /// — whether its order exists is unknown), and two journals bound to the
+    /// same decision fail closed (a copy would hide which one actually
+    /// submitted). Terminal and non-terminal journals both count: a still
+    /// in-flight order binds its decision just as firmly. Returns
+    /// `Ok(None)` when `journal_directory` does not exist yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkflowError`] for any of the integrity failures above,
+    /// an inadmissible journal, or unreadable files.
+    pub fn bound_decision_ids(
+        journal_directory: &Path,
+        protected_head_store_for: &ProtectedHeadStoreFactory<'_>,
+        journal_admissible: &JournalAdmissibilityCheck<'_>,
+    ) -> Result<Option<BTreeMap<String, PathBuf>>, WorkflowError> {
+        let Some(journal_paths) = Self::scan_journal_paths(journal_directory, None)? else {
+            return Ok(None);
+        };
+        let mut bound: BTreeMap<String, PathBuf> = BTreeMap::new();
+        for path in journal_paths {
+            journal_admissible(&path)?;
+            let protected_head_store = protected_head_store_for(&path)?;
+            let Some(state) =
+                Self::peek_verified_terminal_state(&path, protected_head_store.as_ref())?
+            else {
+                return Err(WorkflowError::NonTerminalHistoricalJournal(format!(
+                    "{}: journal is empty (a crash before its first durable append, or \
+                     truncation); whether its order exists is unknown",
+                    path.display()
+                )));
+            };
+            let decision_id = state.binding().decision_id.clone();
+            if let Some(previous) = bound.insert(decision_id.clone(), path.clone()) {
+                return Err(WorkflowError::CorruptJournal(format!(
+                    "{} and {}: two journals are bound to decision {decision_id} (a copy or \
+                     hard link would hide which one submitted)",
+                    previous.display(),
+                    path.display()
+                )));
+            }
+        }
+        Ok(Some(bound))
+    }
+
     /// The conventional independent protected-head-store path for a
     /// journal, so a caller building a `protected_head_store_for` factory
     /// for [`Self::aggregate_terminal_residual_hype`] uses the same
