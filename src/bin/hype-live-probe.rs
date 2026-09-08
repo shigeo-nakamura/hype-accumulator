@@ -956,13 +956,14 @@ fn release(
     }
     let journal_directory = PathBuf::from(history_directory);
     ensure_history_directory_available(history_initialization, &journal_directory)?;
-    let bound = decisions_bound_by_journals(&journal_directory)?;
 
-    // Holds the exclusive runtime lock for the whole scan-and-release, so a
-    // concurrent `prepare` (which opens the runtime before creating its
-    // journal) cannot interleave a new journal between the scan and the
-    // release.
+    // The exclusive runtime lock is taken BEFORE the journal scan and held
+    // through settlement: `prepare` opens the runtime before it creates its
+    // journal, so while this process holds the lock no new journal can
+    // appear, and the scan below cannot go stale between reading the
+    // directory and releasing a decision.
     let mut runtime = open_signer_free_runtime(&config, runtime_config_path)?;
+    let bound = decisions_bound_by_journals(&journal_directory)?;
     let unsettled = runtime.unsettled_planned_decisions();
     if unsettled.is_empty() {
         println!("mode=nothing-to-release");
