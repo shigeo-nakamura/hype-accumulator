@@ -794,6 +794,13 @@ async fn submit(
     println!("mode=submitting journal={journal_path}");
     println!("{action:#?}");
 
+    // Before any economic action (and before decrypting the signer): the
+    // runtime this order will settle into must be reachable, unlocked, hold
+    // this journal's decision unsettled, and have declared this journal for
+    // it. A settlement-side failure discovered only after the venue accepted
+    // the order would leave the commitment unsettled behind a live fill.
+    preflight_settlement_runtime(&config, runtime_config_path, &workflow, journal_path)?;
+
     let connector = build_signed_connector(&config, &operational, journal_path).await?;
     // Must be the market-metadata digest `prepare` bound into the action
     // (`hype_asset::hype_usdc_market_metadata_digest`), NOT
@@ -900,6 +907,63 @@ fn settle_finalized_decision(
         );
         Ok(())
     })
+}
+
+/// Opens the runtime `submit` will later settle into and checks, before the
+/// order is sent, that the settlement cannot fail for a reason that was
+/// knowable up front: the runtime opens (path readable, not locked, funding
+/// route matches), it holds exactly the decision this journal is bound to
+/// (full identity match), that decision is still unsettled, and the runtime
+/// declared this very journal for it. The lock is released again before the
+/// venue call; settlement re-verifies everything under its own lock.
+fn preflight_settlement_runtime(
+    config: &Config,
+    runtime_config_path: &str,
+    workflow: &DurableWorkflow,
+    journal_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let identity = bound_decision_identity(workflow.state().binding());
+    let runtime = open_signer_free_runtime(config, runtime_config_path)?;
+    let decision_id = identity.decision_id.as_str();
+    match runtime.decision_identity(decision_id) {
+        Some(held) if held == identity => {}
+        Some(_) => {
+            return Err(format!(
+                "runtime holds decision {decision_id} but its identity differs from this \
+                 journal's binding; refusing to submit an order that could not be settled"
+            )
+            .into())
+        }
+        None => {
+            return Err(format!(
+                "runtime does not hold decision {decision_id}; refusing to submit an order that \
+                 could not be settled"
+            )
+            .into())
+        }
+    }
+    if !runtime
+        .unsettled_planned_decisions()
+        .iter()
+        .any(|decision| decision.decision_id == decision_id)
+    {
+        return Err(format!(
+            "decision {decision_id} is already settled in the runtime; refusing to submit"
+        )
+        .into());
+    }
+    let declared = runtime.live_journal_intent(decision_id);
+    let this_journal = fs::canonicalize(journal_path)?;
+    if declared.map(fs::canonicalize).transpose()?.as_deref() != Some(this_journal.as_path()) {
+        return Err(format!(
+            "runtime declared journal {} for decision {decision_id}, not {journal_path}; \
+             refusing to submit",
+            declared.map_or_else(|| "<none>".to_owned(), |path| path.display().to_string())
+        )
+        .into());
+    }
+    println!("mode=settlement-preflight-ok decision={decision_id}");
+    Ok(())
 }
 
 fn open_signer_free_runtime(
