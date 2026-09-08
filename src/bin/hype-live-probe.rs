@@ -865,35 +865,41 @@ fn settle_finalized_decision(
     workflow: &DurableWorkflow,
     observation: &hype_accumulator::live_probe::ProbeReconciliation,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let state = workflow.state();
-    let identity = bound_decision_identity(state.binding());
+    let identity = bound_decision_identity(workflow.state().binding());
     let decision_id = identity.decision_id.clone();
     if !observation.durable_finality {
         println!("mode=settlement-deferred decision={decision_id} durable_finality=false");
         return Ok(());
     }
-    // Fresh late venue evidence that contradicts a terminal result moves the
-    // workflow to ManualReview; its recorded totals are then contested and
-    // must not be written into the capital ledger (see the runbook: a
-    // settlement already made from the earlier totals cannot be corrected
-    // here — bot-strategy#901).
-    if state.stage() == WorkflowStage::ManualReview {
-        return Err(format!(
-            "decision {decision_id}: workflow is in ManualReview (contradictory late venue \
-             evidence); refusing to settle contested totals — resolve the review first"
-        )
-        .into());
-    }
-    let mut runtime = open_signer_free_runtime(config, runtime_config_path)?;
-    let filled_usdc = state.filled_usdc();
-    let debited_usdc = state.debited_usdc();
-    let outcome = runtime.settle_live_decision(&identity, filled_usdc, debited_usdc, Utc::now())?;
-    println!(
-        "mode=settled decision={decision_id} filled_usdc={} debited_usdc={} outcome={outcome:?}",
-        filled_usdc.as_micros(),
-        debited_usdc.as_micros()
-    );
-    Ok(())
+    // Holds the journal's append lock through the runtime commit and first
+    // re-verifies this instance is not stale: a concurrent `submit`/
+    // `reconcile` that has meanwhile appended (a late fill, ManualReview)
+    // fails closed here instead of letting the earlier totals settle.
+    workflow.with_frozen_state(|state| -> Result<(), Box<dyn std::error::Error>> {
+        // Fresh late venue evidence that contradicts a terminal result moves
+        // the workflow to ManualReview; its recorded totals are then
+        // contested and must not be written into the capital ledger (see the
+        // runbook: a settlement already made from the earlier totals cannot
+        // be corrected here — bot-strategy#901).
+        if state.stage() == WorkflowStage::ManualReview {
+            return Err(format!(
+                "decision {decision_id}: workflow is in ManualReview (contradictory late venue \
+                 evidence); refusing to settle contested totals — resolve the review first"
+            )
+            .into());
+        }
+        let mut runtime = open_signer_free_runtime(config, runtime_config_path)?;
+        let filled_usdc = state.filled_usdc();
+        let debited_usdc = state.debited_usdc();
+        let outcome =
+            runtime.settle_live_decision(&identity, filled_usdc, debited_usdc, Utc::now())?;
+        println!(
+            "mode=settled decision={decision_id} filled_usdc={} debited_usdc={} outcome={outcome:?}",
+            filled_usdc.as_micros(),
+            debited_usdc.as_micros()
+        );
+        Ok(())
+    })
 }
 
 fn open_signer_free_runtime(

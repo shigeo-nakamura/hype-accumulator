@@ -140,7 +140,12 @@ submit, and treat that state as manual review until #929 lands.
 durable terminal result. If fresh venue evidence later contradicts that
 result (a fill discovered after a canceled/unfilled finalization), the
 workflow moves itself to `ManualReview`; `reconcile` then refuses to settle
-the contested totals (`workflow is in ManualReview`), and a settlement that
+the contested totals (`workflow is in ManualReview`). The settlement itself
+runs with the journal's append lock held and only after re-verifying that
+the journal has not advanced since this invocation loaded it, so an
+overlapping `submit`/`reconcile` cannot slip a late fill in between the
+check and the runtime commit (it fails with `ConcurrentModification` and is
+simply rerun). A settlement that
 was already written from the earlier totals cannot be corrected by this
 binary — `settle_live_decision` rejects a conflicting replay rather than
 silently overwriting the ledger. Resolving that state needs a durable

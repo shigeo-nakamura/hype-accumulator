@@ -2598,6 +2598,45 @@ pub struct DurableWorkflow {
 }
 
 impl DurableWorkflow {
+    /// Runs `action` against this instance's state while holding the
+    /// journal's exclusive append lock, after verifying under that lock that
+    /// the on-disk journal still matches what this instance loaded (same
+    /// file length, same record count, same independently protected head).
+    /// A concurrent appender (another `submit`/`reconcile` recording, say, a
+    /// late fill that moves the workflow to `ManualReview`) fails with
+    /// `ConcurrentModification` instead of interleaving, and an instance
+    /// that is already stale fails closed before `action` runs. Intended
+    /// for the capital settlement that must be derived from exactly the
+    /// terminal totals this instance observed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkflowError::ConcurrentModification`] when the lock is
+    /// held elsewhere or the journal advanced since this instance loaded
+    /// it, an I/O or protected-head error, or whatever `action` returns.
+    pub fn with_frozen_state<T, E>(
+        &self,
+        action: impl FnOnce(&WorkflowState) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<WorkflowError>,
+    {
+        let _append_lock = acquire_journal_append_lock(&self.path)?;
+        let file_len = fs::metadata(&self.path).map_err(WorkflowError::io)?.len();
+        let records = load_records(&self.path)?;
+        let protected_head = self
+            .protected_head_store
+            .load()
+            .map_err(WorkflowError::ProtectedHead)?;
+        if file_len != self.file_len
+            || records.len() != self.records.len()
+            || protected_head != self.protected_head
+        {
+            return Err(WorkflowError::ConcurrentModification.into());
+        }
+        action(&self.state)
+    }
+
     /// Reads the decision binding already durably committed to this
     /// journal, if any, without a lock or a caller-supplied binding to
     /// validate against.

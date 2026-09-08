@@ -5636,3 +5636,47 @@ fn bound_decision_identity_matches_the_runtime_view_of_the_same_decision() {
         LiveDecisionIdentity::of(&other)
     );
 }
+
+#[test]
+fn frozen_state_rejects_stale_instances_and_blocks_concurrent_appends() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("frozen.jsonl");
+    let binding = binding();
+    let first = reopen(&path, &binding);
+
+    // A fresh instance sees exactly what is on disk.
+    let stage = first
+        .with_frozen_state(|state| -> Result<_, WorkflowError> { Ok(state.stage()) })
+        .expect("fresh instance is not stale");
+    assert_eq!(stage, WorkflowStage::Decided);
+
+    // While one instance holds the frozen state, nobody else can append.
+    let mut second = reopen(&path, &binding);
+    first
+        .with_frozen_state(|_| -> Result<(), WorkflowError> {
+            assert!(matches!(
+                second.prepare_order(at(1)),
+                Err(WorkflowError::ConcurrentModification)
+            ));
+            Ok(())
+        })
+        .expect("holder runs");
+
+    // Once the other instance has appended, the first is stale and must
+    // fail closed before running the action.
+    ready(second.prepare_order(at(1)).expect("order prepared"));
+    let mut ran = false;
+    let result = first.with_frozen_state(|_| -> Result<(), WorkflowError> {
+        ran = true;
+        Ok(())
+    });
+    assert!(matches!(result, Err(WorkflowError::ConcurrentModification)));
+    assert!(!ran);
+    // The instance that did the append is current.
+    second
+        .with_frozen_state(|state| -> Result<(), WorkflowError> {
+            assert!(state.pending_action().is_some());
+            Ok(())
+        })
+        .expect("current instance");
+}
