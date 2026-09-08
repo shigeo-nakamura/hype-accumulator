@@ -2910,6 +2910,7 @@ fn live_cycles_bind_the_runtime_to_one_history_directory() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn journal_intent_is_recorded_before_the_journal_and_survives_reopen() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let start = at(2026, 7, 6, 8, 0);
@@ -2983,24 +2984,57 @@ fn journal_intent_is_recorded_before_the_journal_and_survives_reopen() {
         ),
         Err(RuntimeError::LiveHistoryDirectoryMismatch(_))
     ));
-    drop(runtime);
 
-    // Hash-chained: it is still there after a reopen, and the decision can
-    // still be settled from the fill afterwards; a settled decision can no
-    // longer take an intent.
-    let mut reopened = SignerFreeRuntime::open(runtime_config, limits()).expect("reopen runtime");
-    assert_eq!(
-        reopened.live_journal_intent(&decision.decision_id),
-        Some(journal)
-    );
-    reopened
+    // A later decision can never claim the same journal file.
+    runtime
         .settle_live_decision(
             &LiveDecisionIdentity::of(&decision),
             UsdcMicros::default(),
             UsdcMicros::default(),
             recorded_at + TimeDelta::minutes(1),
         )
-        .expect("settle after intent");
+        .expect("settle day one");
+    let next_decision_at = at(2026, 7, 7, 12, 0);
+    let next_signal = signal_for(next_decision_at, "2026-07-07");
+    let next_scan_start_ms = runtime.next_scan_start_ms();
+    let next = runtime
+        .apply_cycle(RuntimeCycleInput {
+            observed_at: next_decision_at,
+            scan_start_ms: next_scan_start_ms,
+            scan_end_ms: ms(next_decision_at),
+            movements: std::slice::from_ref(&movement),
+            approvals: &admission,
+            signal: Some(&next_signal),
+            accumulator: status(next_decision_at, 100.0),
+            capital_history_complete: true,
+            manual_pause: false,
+            api_errors: 0,
+            decision_mode: live_mode(),
+        })
+        .expect("next-day live cycle")
+        .decision()
+        .expect("next-day decision")
+        .clone();
+    assert_eq!(next.reason, DecisionReason::Planned);
+    assert!(matches!(
+        runtime.record_live_journal_intent(
+            &LiveDecisionIdentity::of(&next),
+            journal,
+            next_decision_at + TimeDelta::seconds(30)
+        ),
+        Err(RuntimeError::LiveHistoryDirectoryMismatch(_))
+    ));
+    assert_eq!(runtime.live_journal_intent(&next.decision_id), None);
+    drop(runtime);
+
+    // Hash-chained: still there after a reopen; a settled decision can no
+    // longer take an intent.
+    let reopened = SignerFreeRuntime::open(runtime_config, limits()).expect("reopen runtime");
+    assert_eq!(
+        reopened.live_journal_intent(&decision.decision_id),
+        Some(journal)
+    );
+    let mut reopened = reopened;
     assert!(reopened
         .record_live_journal_intent(&LiveDecisionIdentity::of(&decision), journal, recorded_at)
         .is_err());

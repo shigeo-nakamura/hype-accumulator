@@ -5701,19 +5701,32 @@ fn recorded_journal_intents_must_resolve_to_their_journals() {
     let today = temp.path().join("day-2.jsonl");
 
     // Present and bound as declared: intact.
-    verify_recorded_journal_intents(&intents, &today, identity_of).expect("intact history");
+    verify_recorded_journal_intents(&intents, "fixed-dca:today", &today, identity_of)
+        .expect("intact history");
 
     // The current cycle's own intent may not have a journal yet (retry after
     // a crash between the intent record and the journal write).
     let mut with_today = intents.clone();
     with_today.insert("fixed-dca:today".to_owned(), today.clone());
-    verify_recorded_journal_intents(&with_today, &today, identity_of).expect("own journal pending");
+    verify_recorded_journal_intents(&with_today, "fixed-dca:today", &today, identity_of)
+        .expect("own journal pending");
+    // ...but a *different* decision's intent at that same path is lost
+    // history, even though the file name is the one being prepared now.
+    let mut reused = intents.clone();
+    reused.insert("fixed-dca:earlier".to_owned(), today.clone());
+    assert!(matches!(
+        verify_recorded_journal_intents(&reused, "fixed-dca:today", &today, identity_of),
+        Err(LiveDecisionError::JournalIntentUnresolved {
+            reason: "is missing",
+            ..
+        })
+    ));
 
     // A different decision's journal missing = lost history.
     let mut lost = intents.clone();
     lost.insert("fixed-dca:lost".to_owned(), temp.path().join("gone.jsonl"));
     assert!(matches!(
-        verify_recorded_journal_intents(&lost, &today, identity_of),
+        verify_recorded_journal_intents(&lost, "fixed-dca:today", &today, identity_of),
         Err(LiveDecisionError::JournalIntentUnresolved {
             reason: "is missing",
             ..
@@ -5731,7 +5744,7 @@ fn recorded_journal_intents_must_resolve_to_their_journals() {
         })
     };
     assert!(matches!(
-        verify_recorded_journal_intents(&swapped, &today, other_identity),
+        verify_recorded_journal_intents(&swapped, "fixed-dca:today", &today, other_identity),
         Err(LiveDecisionError::JournalIntentUnresolved {
             reason: "is bound to a different decision",
             ..
@@ -5741,7 +5754,7 @@ fn recorded_journal_intents_must_resolve_to_their_journals() {
     // The declared journal deleted and recreated empty.
     fs::write(&path, b"").expect("truncate journal");
     assert!(matches!(
-        verify_recorded_journal_intents(&intents, &today, identity_of),
+        verify_recorded_journal_intents(&intents, "fixed-dca:today", &today, identity_of),
         Err(LiveDecisionError::JournalIntentUnresolved {
             reason: "has no committed binding",
             ..

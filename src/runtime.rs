@@ -941,6 +941,21 @@ impl SignerFreeRuntime {
             }
             None => {}
         }
+        // One journal file belongs to exactly one decision for the life of
+        // this runtime: reusing a filename a previous decision declared would
+        // let a new journal stand in for lost history.
+        if let Some((owner, _)) = self
+            .state
+            .live_journal_intents
+            .iter()
+            .find(|(_, recorded)| recorded.as_path() == journal_path)
+        {
+            return Err(RuntimeError::LiveHistoryDirectoryMismatch(format!(
+                "journal {} is already declared by decision {owner}; a journal path is never \
+                 reused across decisions",
+                journal_path.display()
+            )));
+        }
         if recorded_at < decision.decided_at {
             return Err(RuntimeError::InvalidCycle(
                 "journal intent predates its decision".to_owned(),
