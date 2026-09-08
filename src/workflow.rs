@@ -2628,9 +2628,25 @@ impl DurableWorkflow {
             .protected_head_store
             .load()
             .map_err(WorkflowError::ProtectedHead)?;
+        // Length/count/head equality alone would accept a journal swapped
+        // for a different internally valid chain of the same size: the
+        // on-disk records must replay to exactly this instance's state AND
+        // their computed terminal head must be the one the independent
+        // store protects.
+        let replayed = WorkflowState::replay(
+            &records
+                .iter()
+                .map(|record| record.event.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        let expected_head = records
+            .last()
+            .map(|last| protected_head_for(last, &replayed.workflow_id, file_len));
         if file_len != self.file_len
             || records.len() != self.records.len()
+            || replayed != self.state
             || protected_head != self.protected_head
+            || protected_head != expected_head
         {
             return Err(WorkflowError::ConcurrentModification.into());
         }

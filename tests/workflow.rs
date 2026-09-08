@@ -5761,3 +5761,37 @@ fn recorded_journal_intents_must_resolve_to_their_journals() {
         })
     ));
 }
+
+#[test]
+fn frozen_state_rejects_a_journal_swapped_for_another_valid_chain_of_the_same_size() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path_a = temp.path().join("a.jsonl");
+    let path_b = temp.path().join("b.jsonl");
+    let first = reopen(&path_a, &binding());
+    // Same shape, different content: only a same-length hash differs, so the
+    // other journal has the same byte length and record count.
+    let mut other = binding();
+    other.capital_snapshot_hash = "capital-snapshot-b".to_owned();
+    drop(reopen(&path_b, &other));
+    let bytes_a = fs::read(&path_a).expect("journal a");
+    let bytes_b = fs::read(&path_b).expect("journal b");
+    assert_eq!(bytes_a.len(), bytes_b.len());
+    assert_ne!(bytes_a, bytes_b);
+
+    // Swap the journal's storage under the loaded instance, leaving its
+    // protected head store untouched.
+    fs::write(&path_a, &bytes_b).expect("swap journal contents");
+    let mut ran = false;
+    let result = first.with_frozen_state(|_| -> Result<(), WorkflowError> {
+        ran = true;
+        Ok(())
+    });
+    assert!(matches!(result, Err(WorkflowError::ConcurrentModification)));
+    assert!(!ran);
+
+    // Restored, the instance is current again.
+    fs::write(&path_a, &bytes_a).expect("restore journal contents");
+    first
+        .with_frozen_state(|_| -> Result<(), WorkflowError> { Ok(()) })
+        .expect("restored journal matches the instance");
+}
