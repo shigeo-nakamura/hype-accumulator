@@ -878,6 +878,18 @@ fn settle_finalized_decision(
         println!("mode=settlement-deferred decision={decision_id} durable_finality=false");
         return Ok(());
     }
+    // A terminal result already on the journal is only settleable from a
+    // reconciliation that could see every fill row: with the venue's bounded
+    // recent-fill window aged out, `record_reconciliation` records nothing
+    // new (no contradictory evidence, no ManualReview) while the authoritative
+    // cumulative quantity may already exceed what the journal froze.
+    if !observation.fills_complete {
+        println!(
+            "mode=settlement-deferred decision={decision_id} fills_complete=false (rerun \
+             reconcile once the order's fill rows are fully visible)"
+        );
+        return Ok(());
+    }
     // Holds the journal's append lock through the runtime commit and first
     // re-verifies this instance is not stale: a concurrent `submit`/
     // `reconcile` that has meanwhile appended (a late fill, ManualReview)
@@ -892,6 +904,19 @@ fn settle_finalized_decision(
             return Err(format!(
                 "decision {decision_id}: workflow is in ManualReview (contradictory late venue \
                  evidence); refusing to settle contested totals — resolve the review first"
+            )
+            .into());
+        }
+        // The authoritative quantity this reconciliation observed must be the
+        // one the journal's terminal result was frozen from; anything else is
+        // late evidence the journal has not absorbed yet.
+        if observation.filled_hype != state.purchased_hype() {
+            return Err(format!(
+                "decision {decision_id}: venue reports {} HYPE atoms filled but the journal's \
+                 terminal result holds {}; refusing to settle stale totals — resolve as manual \
+                 review",
+                observation.filled_hype.as_atoms(),
+                state.purchased_hype().as_atoms()
             )
             .into());
         }
