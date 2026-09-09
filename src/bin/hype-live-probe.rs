@@ -718,6 +718,12 @@ fn bind_history_directory_for_prepare(
     Ok((journal_directory, live_history_directory, history_binding))
 }
 
+// Length is dominated by the 16-argument call to
+// `prepare_first_live_order_workflow` and the fail-closed ordering around it,
+// every step of which is commented with why it sits where it does. The two
+// pieces that could be lifted out without hiding that ordering already have
+// been (`bind_history_directory_for_prepare`, `print_prepared_order`).
+#[allow(clippy::too_many_lines)]
 async fn prepare(
     config_path: &str,
     security_policy_path: &str,
@@ -848,7 +854,7 @@ async fn prepare(
     // own mark (Codex review, hype-accumulator#54).
     let validated = Cell::new(0u64);
     let admissible = counting_journal_admissible(network_routing_admissible, &validated);
-    let workflow = prepare_first_live_order_workflow(
+    let prepared = prepare_first_live_order_workflow(
         &connector,
         &mut runtime,
         cycle_input,
@@ -868,8 +874,34 @@ async fn prepare(
     )
     .await?;
 
-    record_validated_history_journals(operational_params_path, &validated)?;
+    record_validated_history_journals(
+        operational_params_path,
+        &validated,
+        prepared.history_aggregated,
+    )?;
+    let workflow = prepared.workflow;
 
+    print_prepared_order(
+        &workflow,
+        config_path,
+        security_policy_path,
+        runtime_config_path,
+        operational_params_path,
+        journal_path,
+    )
+}
+
+/// Prints the prepared (but unsigned, unsent) order and the exact `submit`
+/// command that would send it — the operator's review step, and the only
+/// place a `submit` command line is ever produced.
+fn print_prepared_order(
+    workflow: &DurableWorkflow,
+    config_path: &str,
+    security_policy_path: &str,
+    runtime_config_path: &str,
+    operational_params_path: &str,
+    journal_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let action = workflow.pending_prepared_order()?;
     println!("mode=prepared journal={journal_path}");
     println!("{action:#?}");
@@ -1499,6 +1531,12 @@ fn historical_protected_head_store_for(
 /// Raises the durable journal high-water mark to what this run's verified
 /// scan actually validated, once that scan has succeeded.
 ///
+/// A no-op when no scan ran (`history_aggregated == false`): the
+/// existing-binding retry path reads no history, so `validated` is still
+/// zero there, and recording it would try to lower the mark — rejecting
+/// every retry once the mark is positive, on the very path that exists to
+/// make retries safe.
+///
 /// Only `prepare` records a mark. `release` deliberately does not: its own
 /// scan does not exclude the journal of the day being released, so a mark
 /// raised there would exceed what a later `prepare` — whose scan *does*
@@ -1507,7 +1545,11 @@ fn historical_protected_head_store_for(
 fn record_validated_history_journals(
     operational_params_path: &str,
     validated: &Cell<u64>,
+    history_aggregated: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if !history_aggregated {
+        return Ok(());
+    }
     HistoryDirectoryBinding::advance_journal_high_water_mark(
         operational_params_path,
         validated.get(),
@@ -1779,6 +1821,48 @@ mod tests {
         // the mark must never be raised as if it had been validated.
         assert!(counting(Path::new("/journals/foreign.jsonl")).is_err());
         assert_eq!(accepted.get(), 2);
+    }
+
+    #[test]
+    fn a_retry_that_read_no_history_records_no_mark() {
+        use super::record_validated_history_journals;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let operational_params_path = directory.path().join("operational.toml");
+        let operational_params_path = operational_params_path.to_str().expect("utf8 path");
+        let journals = directory.path().join("journals");
+        std::fs::create_dir(&journals).expect("create journals");
+        let journals_str = journals.to_str().expect("utf8 path");
+        HistoryDirectoryBinding::persist_first_ever(operational_params_path, journals_str)
+            .expect("persist binding");
+        HistoryDirectoryBinding::advance_journal_high_water_mark(operational_params_path, 3)
+            .expect("advance");
+
+        // The existing-binding retry path never scans history, so the
+        // counter is still zero. Recording it would try to lower the mark
+        // from 3 to 0, which is refused — and would therefore reject every
+        // retry, on the one path that exists to make retries safe.
+        let untouched = std::cell::Cell::new(0u64);
+        record_validated_history_journals(operational_params_path, &untouched, false)
+            .expect("a retry that read no history records nothing");
+        assert_eq!(
+            HistoryDirectoryBinding::check(operational_params_path, journals_str)
+                .expect("check binding")
+                .journal_high_water_mark,
+            3,
+            "the mark recorded by earlier runs must survive a retry untouched"
+        );
+
+        // A run that did scan history still records what it validated.
+        let scanned = std::cell::Cell::new(4u64);
+        record_validated_history_journals(operational_params_path, &scanned, true)
+            .expect("a scanned history is recorded");
+        assert_eq!(
+            HistoryDirectoryBinding::check(operational_params_path, journals_str)
+                .expect("check binding")
+                .journal_high_water_mark,
+            4
+        );
     }
 
     #[test]

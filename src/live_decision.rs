@@ -168,6 +168,21 @@ pub fn bound_decision_identity(binding: &DecisionBinding) -> LiveDecisionIdentit
     }
 }
 
+/// What [`prepare_first_live_order_workflow`] produced.
+pub struct PreparedLiveOrder {
+    pub workflow: DurableWorkflow,
+    /// Whether this call scanned `journal_directory` and aggregated the
+    /// history it holds.
+    ///
+    /// `false` on the existing-binding retry path, which deliberately reuses
+    /// the binding already on disk and skips every live read, history
+    /// included: there is no verified journal count to record a high-water
+    /// mark from, and nothing new was computed from history that a mark
+    /// would protect. (A retry is not unprotected: every recorded journal
+    /// intent is still resolved against the directory before this point.)
+    pub history_aggregated: bool,
+}
+
 /// Computes today's pacing decision (if one is due) and durably prepares its
 /// order envelope, ready for [`crate::live_probe::HyperliquidLiveProbe`].
 ///
@@ -217,7 +232,7 @@ pub async fn prepare_first_live_order_workflow(
     protected_head_store: Arc<dyn ProtectedWorkflowHeadStore>,
     exchange_order_owner_store: Arc<dyn ExchangeOrderOwnerStore>,
     now: DateTime<Utc>,
-) -> Result<DurableWorkflow, LiveDecisionError> {
+) -> Result<PreparedLiveOrder, LiveDecisionError> {
     let report = runtime.apply_cycle(cycle_input)?;
     let decision = report
         .decision()
@@ -240,6 +255,12 @@ pub async fn prepare_first_live_order_workflow(
     // `open_or_create`'s replay-match check. Reusing whatever binding is
     // already on disk — skipping every live read below — makes retry safe.
     let identity = LiveDecisionIdentity::of(&decision);
+    // Set only on the branch that actually scans `journal_directory`, so the
+    // caller can tell "history was verified and found to hold N journals"
+    // apart from "history was never read at all" — a zero counter means the
+    // latter on the retry path below, and recording from it would both lose
+    // whatever mark was already recorded and reject the retry outright.
+    let mut history_aggregated = false;
     let binding = if let Some(existing) = DurableWorkflow::peek_committed_binding(journal_path)? {
         // A journal already on disk must be *this* decision's retry, never a
         // reused path from another day: otherwise the intent below would
@@ -288,6 +309,7 @@ pub async fn prepare_first_live_order_workflow(
                 historical_journal_admissible,
                 minimum_history_journals,
             )?;
+        history_aggregated = true;
 
         let inventory_before = InventoryBaseline {
             execution_identity_hash: probe_binding.execution_identity_hash.clone(),
@@ -330,7 +352,10 @@ pub async fn prepare_first_live_order_workflow(
         exchange_order_owner_store,
     )?;
     workflow.prepare_order(now)?;
-    Ok(workflow)
+    Ok(PreparedLiveOrder {
+        workflow,
+        history_aggregated,
+    })
 }
 
 fn hype_atoms_from_decimal(value: Decimal) -> Result<HypeAtoms, LiveDecisionError> {
