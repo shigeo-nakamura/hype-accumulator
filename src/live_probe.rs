@@ -1906,6 +1906,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_journal_that_never_prepared_its_order_is_still_resolvable() {
+        // A crash between `open_or_create` and `prepare_order` leaves the
+        // journal in `Decided` with no pending action, and after the bound
+        // expiry no action can be staged any more. Absence must still
+        // resolve it, or the decision strands every later decision day.
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            unsigned_connector(format!("http://{}", listener.local_addr().unwrap()))
+                .execution_account_address()
+                .unwrap(),
+        );
+        drop(listener);
+        let binding = decision_binding(execution_identity_hash);
+        let mut workflow = open_test_workflow(temp.path(), &binding);
+        // Deliberately no `prepare_order` call.
+        assert!(workflow.pending_prepared_order().is_err());
+
+        let recorded = reconcile_unknown_order(
+            temp.path(),
+            &mut workflow,
+            fixture_at(35),
+            Some(serde_json::json!([])),
+            serde_json::json!([]),
+        )
+        .await
+        .unwrap();
+        assert!(recorded.absence_recorded);
+        assert!(recorded.durable_finality);
+        assert_eq!(workflow.state().stage(), WorkflowStage::OrderFinalized);
+    }
+
+    #[tokio::test]
     async fn a_client_order_id_present_in_venue_history_never_records_absence() {
         // `unknownOid` contradicted by the account's own history is an
         // anomaly to resolve, never an absence to record — recording it

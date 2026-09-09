@@ -1021,7 +1021,20 @@ impl WorkflowState {
                         "order absence contradicted an accepted order".into(),
                     ));
                 }
-                self.require_pending(ActionKind::SubmitOrder, action_id)?;
+                // Bound to the pending submission when there is one. A
+                // journal that never reached `ActionPrepared` — a crash
+                // between `open_or_create` and `prepare_order` — has no
+                // action to bind to, and none could have been submitted
+                // either: `submit` refuses without a pending prepared
+                // order, so nothing was ever signed or sent. Requiring a
+                // pending action there would leave that journal permanently
+                // unresolvable once its envelope expired, since
+                // `prepare_action` refuses to stage at or after the bound
+                // expiry. The venue-history evidence below is unchanged and
+                // still has to show the client order ID nowhere.
+                if self.pending_action.is_some() {
+                    self.require_pending(ActionKind::SubmitOrder, action_id)?;
+                }
                 if self.stage != WorkflowStage::Decided {
                     return Err(WorkflowError::InvalidTransition(
                         "absent order submission evidence is invalid for current state".into(),
