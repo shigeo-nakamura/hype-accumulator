@@ -99,7 +99,7 @@ pub enum OrderEnvelopeError {
 ///
 /// Never in practice: the internal `.min()` over `AuthorizationInputFreshness`
 /// runs over a fixed six-element array, which is never empty.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn assemble_order_envelope_binding(
     connector: &HyperliquidConnector,
     signer_identity_hash: String,
