@@ -35,8 +35,8 @@ use crate::{
     },
     workflow::{
         DecisionBinding, DurableWorkflow, EligibilityPolicyBinding, ExchangeOrderOwnerStore,
-        HypeAtoms, InventoryBaseline, JournalAdmissibilityCheck, ProtectedHeadStoreFactory,
-        ProtectedWorkflowHeadStore, WorkflowError,
+        HistoryScanRecorder, HypeAtoms, InventoryBaseline, JournalAdmissibilityCheck,
+        ProtectedHeadStoreFactory, ProtectedWorkflowHeadStore, WorkflowError,
     },
 };
 use chrono::{DateTime, Utc};
@@ -46,7 +46,7 @@ use dex_connector::{
 };
 use rust_decimal::Decimal;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -206,8 +206,17 @@ pub async fn prepare_first_live_order_workflow(
     configured_residual_hype_atoms: HypeAtoms,
     journal_path: &Path,
     journal_directory: &Path,
+    // Journals an earlier run durably recorded as present in
+    // `journal_directory` (bot-strategy#944). Every one of them must still
+    // be there or the aggregation below is refused as an incomplete
+    // history. Enforced inside the same scan the aggregation uses, so
+    // history cannot go missing between the check and the inventory it
+    // feeds, and compared by name so a newly created journal cannot
+    // silently stand in for a lost one.
+    recorded_history_journals: &BTreeSet<String>,
     historical_protected_head_store_for: &ProtectedHeadStoreFactory<'_>,
     historical_journal_admissible: &JournalAdmissibilityCheck<'_>,
+    record_history_scan: &HistoryScanRecorder<'_>,
     protected_head_store: Arc<dyn ProtectedWorkflowHeadStore>,
     exchange_order_owner_store: Arc<dyn ExchangeOrderOwnerStore>,
     now: DateTime<Utc>,
@@ -280,7 +289,14 @@ pub async fn prepare_first_live_order_workflow(
                 &probe_binding.execution_identity_hash,
                 historical_protected_head_store_for,
                 historical_journal_admissible,
+                recorded_history_journals,
             )?;
+        // Before the journal below exists: this is the only moment at which
+        // the scan's own result can be persisted and still be reproducible
+        // by a retry. Once this run's journal is on disk, a retry reuses its
+        // committed binding and never scans history again, so a write that
+        // failed here would never get a second chance.
+        record_history_scan()?;
 
         let inventory_before = InventoryBaseline {
             execution_identity_hash: probe_binding.execution_identity_hash.clone(),

@@ -143,6 +143,58 @@ A prepared-but-never-submitted order (journal exists, operator declined) is
 therefore *not* releasable today; do not run `prepare` unless you intend to
 submit, and treat that state as manual review until #929 lands.
 
+## A history directory that lost its journals
+
+`prepare` and `release` both refuse to read a `history_directory` that no
+longer holds a journal an earlier run recorded there:
+
+```text
+history directory lost journals: /opt/hype-accumulator/journals no longer
+holds 1 journal(s) an earlier run recorded there (2026-09-09.jsonl); journals
+are only ever added, so history has been lost (unmounted, deleted and
+recreated, or different underlying storage?). Restore it before running this
+command again.
+```
+
+The record lives in `<operational>.history-directory-binding.json`, next to
+the operational config and outside `history_directory`, so it survives that
+directory's loss. It catches what an existence check cannot: a journal
+filesystem unmounted while leaving its ordinary mount-point directory behind,
+or a directory deleted and recreated empty — both of which still pass
+`is_dir()`, aggregate to less than they should, and would otherwise read
+exactly like a smaller account (the live-balance bound only ever rejects a
+total that is too *large*). Unlike `live_journal_intents`, which protects the
+decision currently in flight, this protects every already-settled day's
+journal.
+
+Journals are recorded by name, not counted: with a count, each newly created
+journal would silently substitute for a lost older one and the loss would
+never surface. Each recorded journal is re-verified against its own protected
+head on every scan, so a name that is still present cannot have had its
+contents swapped.
+
+The comparison runs *inside* the verified scan it protects — the same scan
+that aggregates residual, or that `release` reads bindings from — so history
+cannot disappear between the check and its use. The record is written by that
+scan the moment it succeeds and before the run's own journal exists, so a
+failed write leaves no journal behind and the retry simply scans and records
+again. Only `prepare` records; `release` checks the record but never writes
+it.
+
+Recovery is to restore the journals — from the off-host ledger backup, or the
+host's own backup of `history_directory` — and rerun the command; the error
+names the journals that are missing, and a partial restore keeps failing until
+all of them are back. **Restore the newest backup**: each journal's protected
+head lives beside the journal itself, so an older journal and its own sidecar
+are self-consistent and this check cannot tell them from the current pair
+(bot-strategy#974). After any restore, `reconcile` each restored journal
+before running `prepare` again. Never "fix" this by deleting or editing the binding
+file: that discards the only evidence that the missing journals ever existed,
+and the next `prepare` would then treat still-unstaked HYPE from those
+journals as a fresh, staking-eligible fill. If history genuinely has to be
+abandoned (a decommissioned account), start a new operational config path
+instead, which binds a new directory and a new record.
+
 ## Settlement is final; late contradictory evidence is a manual review
 
 `submit`/`reconcile` settle the pacing decision once the workflow holds a
