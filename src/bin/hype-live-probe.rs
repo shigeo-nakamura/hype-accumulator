@@ -1306,8 +1306,9 @@ fn release(
             return Err(format!(
                 "decision {} declared workflow journal {} before it was created; refusing to \
                  release committed capital by absence. If that journal is present, run \
-                 `reconcile` on it; if it is missing, the history directory was lost — restore \
-                 it from backup (bot-strategy#944) before anything else.",
+                 `reconcile` on it — after the prepared order's expiry that records conclusive \
+                 absence and settles the decision at zero; if it is missing, the history \
+                 directory was lost — restore it from backup (bot-strategy#944) first.",
                 decision.decision_id,
                 intent.display()
             )
@@ -1316,8 +1317,10 @@ fn release(
         if let Some(journal_path) = bound.get(&decision.decision_id) {
             return Err(format!(
                 "decision {} is bound by workflow journal {}; refusing to release committed \
-                 capital while an order may exist at the venue. Run `reconcile` on that journal \
-                 to reach durable finality (conclusive absence evidence is bot-strategy#929).",
+                 capital while an order may exist at the venue. Run `reconcile` on that journal: \
+                 it reaches durable finality from a fill, or — once the prepared order has \
+                 expired and the venue's complete order and fill history contain its client \
+                 order ID nowhere — records conclusive absence and settles at zero.",
                 decision.decision_id,
                 journal_path.display()
             )

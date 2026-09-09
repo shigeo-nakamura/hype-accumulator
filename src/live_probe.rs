@@ -14,8 +14,9 @@ use crate::{
     hype_asset::HYPE_SPOT_MARKET,
     pacing::UsdcMicros,
     workflow::{
-        AuthenticatedOrderSubmission, DecisionBinding, DurableWorkflow, ExternalAction, HypeAtoms,
-        OrderFinality, WorkflowError, WorkflowState,
+        AuthenticatedOrderSubmission, ConclusiveAbsenceEvidence, DecisionBinding, DurableWorkflow,
+        ExternalAction, GapFreeHistoryWatermark, HistoryDomain, HypeAtoms, OrderFinality,
+        WorkflowError, WorkflowStage, WorkflowState,
     },
 };
 use chrono::{DateTime, Utc};
@@ -133,6 +134,11 @@ pub struct ProbeReconciliation {
     /// venue" (`exchange_order_id` is `None`), and `fills_complete == false`
     /// blocking finalization.
     pub durable_finality: bool,
+    /// True exactly when this call durably recorded conclusive absence for
+    /// an expired order the venue never accepted — the zero-fill terminal
+    /// outcome that releases a prepared intent (bot-strategy#982). `false`
+    /// on every other path.
+    pub absence_recorded: bool,
 }
 
 #[derive(Debug, Error)]
@@ -564,6 +570,17 @@ async fn record_reconciliation(
         }
     }
 
+    // The venue does not know this order. Before its expiry that is
+    // unresolved evidence and nothing may be recorded; after it, the order
+    // can never be accepted, and gap-free history showing the CLOID in
+    // neither orders nor fills makes absence conclusive.
+    let absence_recorded =
+        if evidence.order_id.is_none() && workflow.state().stage() == WorkflowStage::Decided {
+            record_conclusive_absence(connector, workflow, &binding, now).await?
+        } else {
+            false
+        };
+
     Ok(ProbeReconciliation {
         client_order_id: evidence.client_order_id,
         exchange_order_id: evidence.order_id,
@@ -575,7 +592,99 @@ async fn record_reconciliation(
         // *this* call reached `finalize_order` — an earlier call may already
         // have finalized it, and this one's fills could be incomplete.
         durable_finality: order_already_finalized(workflow.state().stage()),
+        absence_recorded,
     })
+}
+
+/// Durably records that an expired prepared order was never accepted by the
+/// venue, releasing its prepared intent as a zero-fill terminal outcome
+/// (bot-strategy#982). Returns `false` without recording anything whenever
+/// absence is not yet conclusive.
+///
+/// Every condition here is a fail-closed gate on evidence:
+///
+/// * before `effective_expiry_at` the order can still be accepted, so
+///   `unknownOid` proves nothing;
+/// * each history window must be *complete* — dex-connector rejects a
+///   response that reached the venue's row cap, since absence checked
+///   against a truncated window is not absence;
+/// * the fill history is queried from account inception through now, which
+///   spans the order's whole possible lifetime and is the only form the
+///   venue lets us prove untruncated;
+/// * the CLOID must appear in neither window, and its presence is an
+///   anomaly that fails closed rather than an absence to record.
+///
+/// The recorded watermarks claim gap-free coverage only from `decided_at`,
+/// never from the oldest row observed: a weaker claim that a complete
+/// window always supports.
+async fn record_conclusive_absence(
+    connector: &HyperliquidConnector,
+    workflow: &mut DurableWorkflow,
+    binding: &DecisionBinding,
+    now: DateTime<Utc>,
+) -> Result<bool, LiveProbeError> {
+    let effective_expiry_at = binding.order_envelope.effective_expiry_at;
+    if now <= effective_expiry_at {
+        return Ok(false);
+    }
+    let decided_at = binding.decided_at;
+    let orders = connector.historical_orders_window().await?;
+    // The whole retained fill history through the present, not the decision
+    // window: only a response the venue could not have truncated proves that
+    // an interval inside it is genuinely empty rather than aged out.
+    let fills = connector.retained_fills().await?;
+    // Read once, after both windows: the instant through which both are
+    // known to be gap-free.
+    let observed_through_at = truncate_to_millis(Utc::now());
+    if observed_through_at <= effective_expiry_at {
+        return Ok(false);
+    }
+    let client_order_id = workflow.state().client_order_id();
+    if orders.contains_client_order_id(&client_order_id)?
+        || fills.contains_client_order_id(&client_order_id)?
+    {
+        return Err(LiveProbeError::BindingMismatch(
+            "client order ID appears in venue history despite an unknown order status",
+        ));
+    }
+    // `recorded_at` must not precede the coverage it attests to.
+    let recorded_at = now.max(observed_through_at);
+    let watermark = |domain: HistoryDomain, label: &str, raw_body: &str| GapFreeHistoryWatermark {
+        domain,
+        watermark_id: content_hash(&[
+            "hype-accumulator/history-watermark/v1",
+            label,
+            &decided_at.timestamp_millis().to_string(),
+            &observed_through_at.timestamp_millis().to_string(),
+        ]),
+        // Strictly positive and meaningful: the venue-time cursor through
+        // which this window is gap-free.
+        cursor: u64::try_from(observed_through_at.timestamp_millis()).unwrap_or(u64::MAX),
+        gap_free_from_at: decided_at,
+        through_at: observed_through_at,
+        // Labelled per domain so two byte-identical bodies (an idle account
+        // returns `[]` for both) still yield independent evidence hashes.
+        evidence_hash: content_hash(&["hype-accumulator/history-evidence/v1", label, raw_body]),
+    };
+    let evidence = ConclusiveAbsenceEvidence {
+        observation_id: content_hash(&[
+            "hype-accumulator/order-absence-observation/v1",
+            &client_order_id,
+            orders.raw_body(),
+            fills.raw_body(),
+        ]),
+        execution_identity_hash: binding.inventory_before.execution_identity_hash.clone(),
+        client_order_id,
+        effective_expiry_at,
+        order_history: watermark(HistoryDomain::Order, "orders", orders.raw_body()),
+        fill_history: watermark(HistoryDomain::Fill, "fills", fills.raw_body()),
+    };
+    workflow.record_order_submission_absent(evidence, recorded_at)?;
+    Ok(true)
+}
+
+fn truncate_to_millis(at: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::from_timestamp_millis(at.timestamp_millis()).unwrap_or(at)
 }
 
 /// Builds and durably records [`AuthenticatedOrderSubmission`] exactly once
@@ -1636,6 +1745,217 @@ mod tests {
                 socket.write_all(response.as_bytes()).await.unwrap();
             }
         })
+    }
+
+    /// Answers one reconcile round for an order the venue never accepted:
+    /// `userFillsByTime` (the recent-fill window), `orderStatus`
+    /// (`unknownOid`), then — only when absence recording is expected —
+    /// `historicalOrders` and the decision-window `userFillsByTime`.
+    fn spawn_absence_responder(
+        listener: tokio::net::TcpListener,
+        historical_orders: Option<serde_json::Value>,
+        retained_fills: serde_json::Value,
+    ) -> tokio::task::JoinHandle<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::spawn(async move {
+            let mut request_types = vec!["userFillsByTime", "orderStatus"];
+            if historical_orders.is_some() {
+                request_types.push("historicalOrders");
+                request_types.push("userFillsByTime");
+            }
+            for (index, request_type) in request_types.iter().enumerate() {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut data = Vec::new();
+                let (header_end, length) = loop {
+                    let mut buffer = [0; 2048];
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    data.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = data.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&data[..end]);
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (key, value) = line.split_once(':')?;
+                                key.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse().unwrap())
+                            })
+                            .unwrap();
+                        break (end + 4, length);
+                    }
+                };
+                while data.len() < header_end + length {
+                    let mut buffer = [0; 2048];
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    data.extend_from_slice(&buffer[..count]);
+                }
+                let request: serde_json::Value =
+                    serde_json::from_slice(&data[header_end..header_end + length]).unwrap();
+                assert_eq!(&request["type"], request_type);
+                let body = match (*request_type, index) {
+                    ("orderStatus", _) => serde_json::json!({"status": "unknownOid"}).to_string(),
+                    ("historicalOrders", _) => historical_orders.clone().unwrap().to_string(),
+                    // The absence query must cover the retained history
+                    // from inception through the venue's own present: a
+                    // sub-range could sit past the retention horizon, and
+                    // any client-side upper bound could exclude fills that
+                    // have already evicted older rows.
+                    ("userFillsByTime", 3) => {
+                        assert_eq!(request["startTime"], 0);
+                        assert!(request.get("endTime").is_none());
+                        retained_fills.to_string()
+                    }
+                    _ => serde_json::json!([]).to_string(),
+                };
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        })
+    }
+
+    async fn reconcile_unknown_order(
+        temp: &Path,
+        workflow: &mut DurableWorkflow,
+        now: DateTime<Utc>,
+        historical_orders: Option<serde_json::Value>,
+        retained_fills: serde_json::Value,
+    ) -> Result<ProbeReconciliation, LiveProbeError> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connector = unsigned_connector(format!("http://{}", listener.local_addr().unwrap()));
+        let server = spawn_absence_responder(listener, historical_orders, retained_fills);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reconcile_prepared_order(&connector, workflow, &test_journal_path(temp), now),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn expired_order_the_venue_never_accepted_is_recorded_absent_exactly_once() {
+        // bot-strategy#982: a prepared order that was never submitted (the
+        // operator aborted, or the process died before `submit`) must be
+        // resolvable to a terminal zero-fill outcome from venue evidence,
+        // or its pacing decision strands every later decision day.
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            unsigned_connector(format!("http://{}", listener.local_addr().unwrap()))
+                .execution_account_address()
+                .unwrap(),
+        );
+        drop(listener);
+        let binding = decision_binding(execution_identity_hash);
+        let mut workflow = open_test_workflow(temp.path(), &binding);
+        workflow.prepare_order(fixture_at(2)).unwrap();
+
+        // Before the envelope expires, `unknownOid` proves nothing: the
+        // order can still be accepted, so nothing may be recorded and the
+        // history endpoints are not even consulted.
+        let early = reconcile_unknown_order(
+            temp.path(),
+            &mut workflow,
+            fixture_at(20),
+            None,
+            serde_json::json!([]),
+        )
+        .await
+        .unwrap();
+        assert!(!early.absence_recorded);
+        assert!(!early.durable_finality);
+        assert_eq!(workflow.state().stage(), WorkflowStage::Decided);
+
+        // After expiry, with complete order and fill history that does not
+        // contain this client order ID, absence is conclusive. Other
+        // accounts' orders in the window are irrelevant.
+        let other_order = serde_json::json!([
+            {"order": {"oid": 11, "cloid": "0x00000000000000000000000000000001"}, "status": "filled"}
+        ]);
+        let recorded = reconcile_unknown_order(
+            temp.path(),
+            &mut workflow,
+            fixture_at(35),
+            Some(other_order.clone()),
+            serde_json::json!([]),
+        )
+        .await
+        .unwrap();
+        assert!(recorded.absence_recorded);
+        assert!(recorded.durable_finality);
+        assert_eq!(recorded.filled_hype, HypeAtoms::from_atoms(0));
+        assert_eq!(workflow.state().stage(), WorkflowStage::OrderFinalized);
+        assert!(workflow.state().exchange_order_id().is_none());
+
+        // Idempotent: the workflow is no longer `Decided`, so a later
+        // reconcile neither re-records nor consults the history endpoints.
+        let again = reconcile_unknown_order(
+            temp.path(),
+            &mut workflow,
+            fixture_at(40),
+            None,
+            serde_json::json!([]),
+        )
+        .await
+        .unwrap();
+        assert!(!again.absence_recorded);
+        assert!(again.durable_finality);
+    }
+
+    #[tokio::test]
+    async fn a_client_order_id_present_in_venue_history_never_records_absence() {
+        // `unknownOid` contradicted by the account's own history is an
+        // anomaly to resolve, never an absence to record — recording it
+        // would release capital for an order that may have executed.
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            unsigned_connector(format!("http://{}", listener.local_addr().unwrap()))
+                .execution_account_address()
+                .unwrap(),
+        );
+        drop(listener);
+        let binding = decision_binding(execution_identity_hash);
+        let mut workflow = open_test_workflow(temp.path(), &binding);
+        workflow.prepare_order(fixture_at(2)).unwrap();
+        let cloid = workflow.state().client_order_id();
+
+        // Present among orders...
+        let mut fresh = open_test_workflow(temp.path(), &binding);
+        assert!(matches!(
+            reconcile_unknown_order(
+                temp.path(),
+                &mut fresh,
+                fixture_at(35),
+                Some(serde_json::json!([{"order": {"oid": 9, "cloid": cloid}, "status": "open"}])),
+                serde_json::json!([]),
+            )
+            .await,
+            Err(LiveProbeError::BindingMismatch(_))
+        ));
+        assert_eq!(fresh.state().stage(), WorkflowStage::Decided);
+
+        // ...and present among fills.
+        let mut fresh = open_test_workflow(temp.path(), &binding);
+        assert!(matches!(
+            reconcile_unknown_order(
+                temp.path(),
+                &mut fresh,
+                fixture_at(35),
+                Some(serde_json::json!([])),
+                serde_json::json!([{
+                    "coin": "@1", "px": "25", "sz": "1", "side": "B", "time": 1_000,
+                    "oid": 9, "tid": 3, "fee": "0.01", "feeToken": "USDC", "cloid": cloid
+                }]),
+            )
+            .await,
+            Err(LiveProbeError::BindingMismatch(_))
+        ));
+        assert_eq!(fresh.state().stage(), WorkflowStage::Decided);
     }
 
     #[tokio::test]
