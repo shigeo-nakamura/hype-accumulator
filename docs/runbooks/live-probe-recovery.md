@@ -143,6 +143,38 @@ A prepared-but-never-submitted order (journal exists, operator declined) is
 therefore *not* releasable today; do not run `prepare` unless you intend to
 submit, and treat that state as manual review until #929 lands.
 
+## A history directory that lost its journals
+
+`prepare` and `release` both refuse to read a `history_directory` that holds
+fewer `.jsonl` journals than the highest number an earlier run recorded for
+that operational config:
+
+```text
+history_directory /opt/hype-accumulator/journals holds 0 journal(s), but an
+earlier run for this operational_params_path recorded 3; journals are only
+ever added, so history has been lost ...
+```
+
+The mark lives in `<operational>.history-directory-binding.json`, next to
+the operational config and outside `history_directory`, so it survives that
+directory's loss. It catches what an existence check cannot: a journal
+filesystem unmounted while leaving its ordinary mount-point directory
+behind, or a directory deleted and recreated empty — both of which still
+pass `is_dir()`, aggregate to zero, and would otherwise read exactly like a
+clean account (the live-balance bound only ever rejects a total that is too
+*large*). Unlike `live_journal_intents`, which protects the decision
+currently in flight, this protects every already-settled day's journal.
+
+Recovery is to restore the journals — from the off-host ledger backup, or
+the host's own backup of `history_directory` — and rerun the command; the
+directory is content-verified, so a partial restore keeps failing until the
+count is whole again. Never "fix" this by deleting or editing the binding
+file: that discards the only evidence that the missing journals ever
+existed, and the next `prepare` would then treat still-unstaked HYPE from
+those journals as a fresh, staking-eligible fill. If history genuinely has
+to be abandoned (a decommissioned account), start a new operational config
+path instead, which binds a new directory and a new mark.
+
 ## Settlement is final; late contradictory evidence is a manual review
 
 `submit`/`reconcile` settle the pacing decision once the workflow holds a

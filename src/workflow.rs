@@ -2848,6 +2848,35 @@ impl DurableWorkflow {
         Ok(Some(journal_paths))
     }
 
+    /// Counts the `.jsonl` journals currently visible directly in
+    /// `journal_directory`, using the very same scan
+    /// [`Self::aggregate_terminal_residual_hype`] rediscovers history with
+    /// (symlinks and non-regular entries rejected, an orphaned
+    /// protected-head sidecar refused) so a caller's count can never drift
+    /// from what aggregation would actually see. Returns `Ok(0)` when the
+    /// directory does not exist yet — the caller decides whether that is a
+    /// genuinely first-ever run or a lost history, which this module has no
+    /// way to tell apart.
+    ///
+    /// Exists for the durable journal-count high-water mark
+    /// (bot-strategy#944): aggregation itself can only ever reject a total
+    /// that is too *large* (it is bounded by the live spot balance), so a
+    /// `journal_directory` that still exists but has silently lost its
+    /// journals — unmounted and leaving its mount point behind, or deleted
+    /// and recreated empty — would otherwise aggregate to zero and look
+    /// exactly like a clean account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `journal_directory` cannot be read, holds a
+    /// `.jsonl` entry that is a symlink or not a regular file, or leaves a
+    /// protected-head sidecar orphaned — the same states that fail
+    /// [`Self::aggregate_terminal_residual_hype`]'s own scan closed.
+    pub fn count_history_journals(journal_directory: &Path) -> Result<u64, WorkflowError> {
+        Ok(Self::scan_journal_paths(journal_directory, None)?
+            .map_or(0, |journal_paths| journal_paths.len() as u64))
+    }
+
     /// Sums the terminal residual HYPE left behind by every completed
     /// workflow journal in `journal_directory` that belongs to
     /// `execution_identity_hash`, then reconciles that sum — plus every

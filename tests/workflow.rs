@@ -4767,6 +4767,47 @@ fn aggregate_terminal_residual_hype_reconciles_against_residual_plus_unstaked_el
 }
 
 #[test]
+fn count_history_journals_counts_exactly_what_aggregation_would_rediscover() {
+    let temp = tempfile::tempdir().expect("temp directory");
+
+    // A directory that does not exist yet is a genuinely first-ever run,
+    // not a corrupt state: 0, not an error.
+    assert_eq!(
+        DurableWorkflow::count_history_journals(&temp.path().join("not-yet"))
+            .expect("missing directory counts as zero"),
+        0
+    );
+    assert_eq!(
+        DurableWorkflow::count_history_journals(temp.path()).expect("empty directory"),
+        0
+    );
+
+    complete_workflow_with_residual(&temp.path().join("day-1.jsonl"), 2);
+    complete_workflow_with_residual(&temp.path().join("day-2.jsonl"), 3);
+    // Sidecars this crate writes next to a journal are not journals, and
+    // must not inflate the count that guards against a lost history.
+    fs::write(temp.path().join("day-2.nonce-state.json"), b"{}").expect("write sidecar");
+    fs::write(temp.path().join("notes.txt"), b"").expect("write unrelated file");
+
+    assert_eq!(
+        DurableWorkflow::count_history_journals(temp.path()).expect("count journals"),
+        2
+    );
+
+    // The count fails closed on exactly what aggregation fails closed on,
+    // so the two can never disagree about what the directory holds.
+    fs::write(
+        temp.path().join("vanished.protected-head.json"),
+        b"{\"head\":\"orphan\"}",
+    )
+    .expect("write orphaned protected head");
+    assert!(matches!(
+        DurableWorkflow::count_history_journals(temp.path()),
+        Err(WorkflowError::CorruptJournal(_))
+    ));
+}
+
+#[test]
 fn aggregate_terminal_residual_hype_fails_closed_on_an_empty_historical_journal() {
     let temp = tempfile::tempdir().expect("temp directory");
     complete_workflow_with_residual(&temp.path().join("day-1.jsonl"), 2);
