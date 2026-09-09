@@ -1016,30 +1016,85 @@ fn expiry_binding_requires_exact_verified_clock_lag_gap() {
         "zero-lag",
         "overflow",
         "missing-evidence",
-        "future-evidence",
+        "evidence-before-decision",
+        "evidence-after-signed-expiry",
         "stale-horizon",
     ] {
         let valid = binding();
         let mut envelope = valid.order_envelope;
+        let mut decision = decision();
         match invalid {
             "wrong-gap" => envelope.max_venue_clock_lag_ms -= 1,
             "zero-lag" => envelope.max_venue_clock_lag_ms = 0,
             "overflow" => envelope.max_venue_clock_lag_ms = u64::MAX,
             "missing-evidence" => envelope.venue_clock_evidence_digest.clear(),
-            "future-evidence" => envelope.venue_clock_evidence_at = at(1),
+            // The decision is dated at its scheduled boundary; venue evidence
+            // observed BEFORE that boundary by more than the authorized clock
+            // lag cannot price the order it executes.
+            "evidence-before-decision" => decision.decided_at = at(2),
+            "evidence-after-signed-expiry" => {
+                envelope.venue_clock_evidence_at = envelope.signed_expiry_at;
+            }
             "stale-horizon" => envelope.venue_clock_evidence_valid_through_at = at(30),
             _ => unreachable!("complete fixture set"),
         }
-        assert!(matches!(
-            DecisionBinding::from_pacing_decision(
-                &decision(),
-                valid.inventory_before,
-                envelope,
-                valid.eligibility_policy,
+        assert!(
+            matches!(
+                DecisionBinding::from_pacing_decision(
+                    &decision,
+                    valid.inventory_before,
+                    envelope,
+                    valid.eligibility_policy,
+                ),
+                Err(WorkflowError::InvalidBinding(_))
             ),
-            Err(WorkflowError::InvalidBinding(_))
-        ));
+            "{invalid} must be rejected"
+        );
     }
+}
+
+#[test]
+fn expiry_binding_accepts_venue_evidence_observed_after_the_decision_boundary() {
+    // The runtime dates every decision at the scheduled 12:00 UTC boundary
+    // and the order envelope is assembled afterwards from a fresh book, so
+    // evidence strictly after `decided_at` is the normal live case
+    // (bot-strategy#845 blocker 7), not an error.
+    let valid = binding();
+    let mut envelope = valid.order_envelope;
+    envelope.venue_clock_evidence_at = at(5);
+    DecisionBinding::from_pacing_decision(
+        &decision(),
+        valid.inventory_before,
+        envelope,
+        valid.eligibility_policy,
+    )
+    .expect("evidence after the boundary is valid");
+
+    // A venue clock lagging the local clock by up to exactly the authorized
+    // `max_venue_clock_lag_ms` may put a book fetched right after the
+    // boundary slightly before `decided_at`; that is still authorized, one
+    // millisecond more is not.
+    let valid = binding();
+    let lag = i64::try_from(valid.order_envelope.max_venue_clock_lag_ms).unwrap();
+    let mut decision = decision();
+    decision.decided_at = at(0) + TimeDelta::milliseconds(lag);
+    DecisionBinding::from_pacing_decision(
+        &decision,
+        valid.inventory_before.clone(),
+        valid.order_envelope.clone(),
+        valid.eligibility_policy.clone(),
+    )
+    .expect("evidence exactly the authorized lag before the boundary is valid");
+    decision.decided_at = at(0) + TimeDelta::milliseconds(lag + 1);
+    assert!(matches!(
+        DecisionBinding::from_pacing_decision(
+            &decision,
+            valid.inventory_before,
+            valid.order_envelope,
+            valid.eligibility_policy,
+        ),
+        Err(WorkflowError::InvalidBinding(_))
+    ));
 }
 
 #[test]
