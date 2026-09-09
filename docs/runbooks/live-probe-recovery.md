@@ -56,9 +56,16 @@ account-wide recent-fill window. When `fills_complete` is `false`, this call
 could not durably record cumulative USDC and skipped fill/finality recording
 entirely rather than persisting an understated total — rerun `reconcile` once
 the order's fills are no longer competing with other account activity for that
-window. An `unknownOid` response is unresolved evidence, never permission to
-resubmit, and records nothing durably either (conclusive-absence recording is
-still unimplemented — see below).
+window. An `unknownOid` response is never permission to resubmit. Before the prepared
+order's `effective_expiry_at` it is unresolved evidence and nothing is
+recorded. After it, the order can no longer be accepted, and this command
+resolves it: it reads the account's complete order history and its complete
+retained fill history, and if the prepared client order ID appears in
+neither, durably records conclusive absence — the zero-fill terminal outcome
+that releases the prepared intent (`absence_recorded` in the JSON, and
+`durable_finality` then true), after which the same run settles the pacing
+decision at zero. Either history being truncated, or the client order ID
+appearing in one of them, fails closed and records nothing.
 
 `submit` now attempts this lookup after both a successful response and a
 submission error. If submission failed, it still exits unsuccessfully even when
@@ -82,9 +89,13 @@ requirements:
   command's next successful call — exercised by
   `reconciliation_survives_being_called_again_after_acceptance_is_recorded` in
   `src/live_probe.rs`, but not yet rehearsed end-to-end through a real signer.
-- Durably record conclusive absence for an `unknownOid` order
-  (`DurableWorkflow::record_order_submission_absent`) — needs gap-free order/
-  fill history watermark evidence this binary does not construct yet.
+- ~~Durably record conclusive absence for an `unknownOid` order~~ — done
+  (bot-strategy#982): `reconcile` builds the gap-free order/fill watermarks
+  from dex-connector's `historical_orders_window` /
+  `retained_fills_through` and records
+  `DurableWorkflow::record_order_submission_absent`. It fails closed once an
+  account's lifetime fills pass the venue's per-request row cap, which is
+  when this evidence needs a paginated format.
 - Settle the capital ledger once and carry attributable spot/residual/staking
   balances across daily workflows before enabling any scheduled purchase.
 - Rehearse backup/restore and halt with unresolved orders; a restore must not
@@ -139,9 +150,12 @@ gap-free conclusive-absence evidence, which this binary cannot construct yet
 scan closed. The exclusive runtime lock is held for the entire scan-and-
 release, so a concurrent `prepare` cannot slip a new journal in between.
 
-A prepared-but-never-submitted order (journal exists, operator declined) is
-therefore *not* releasable today; do not run `prepare` unless you intend to
-submit, and treat that state as manual review until #929 lands.
+A prepared-but-never-submitted order (journal exists, operator declined or
+the run was interrupted before `submit`) is not released by this command —
+it is resolved by `reconcile` once the prepared order has expired, as
+described above, which records conclusive absence and settles the decision
+at zero. `release` stays reserved for a decision that never got a journal at
+all.
 
 ## A history directory that lost its journals
 

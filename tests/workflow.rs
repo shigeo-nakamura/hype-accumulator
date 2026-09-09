@@ -5802,6 +5802,49 @@ fn bound_decision_ids_fails_closed_on_empty_orphaned_rolled_back_or_inadmissible
     assert_eq!(bound.len(), 1);
 }
 
+#[test]
+fn conclusive_absence_resolves_a_journal_that_never_prepared_its_order() {
+    // A crash between `open_or_create` and `prepare_order` leaves a journal
+    // in `Decided` with no pending action. Nothing can have been submitted
+    // from it — `submit` refuses without a pending prepared order — and
+    // after the bound expiry `prepare_action` will not stage one, so
+    // requiring a pending action here would strand the decision forever.
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("never-prepared.jsonl");
+    let binding = binding();
+    let mut workflow = reopen(&path, &binding);
+    assert!(workflow.pending_prepared_order().is_err());
+    assert!(matches!(
+        workflow.prepare_order(at(31)),
+        Err(WorkflowError::InvalidTransition(_))
+    ));
+
+    let evidence = absence_evidence(&workflow, "absent-never-prepared");
+    workflow
+        .record_order_submission_absent(evidence, at(32))
+        .expect("absence resolves a journal that never prepared its order");
+    assert_eq!(workflow.state().stage(), WorkflowStage::OrderFinalized);
+    assert!(workflow.state().exchange_order_id().is_none());
+    assert!(workflow.state().purchased_hype().is_zero());
+}
+
+#[test]
+fn conclusive_absence_still_requires_a_decided_stage() {
+    // Once an order was actually observed the workflow has left `Decided`,
+    // and absence must never overwrite that.
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("submitted.jsonl");
+    let binding = binding();
+    let mut workflow = reopen(&path, &binding);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
+    let evidence = absence_evidence(&workflow, "absent-after-submission");
+    assert!(matches!(
+        workflow.record_order_submission_absent(evidence, at(32)),
+        Err(WorkflowError::ContradictoryObservation(_) | WorkflowError::InvalidTransition(_))
+    ));
+}
+
 #[cfg(feature = "live-probe")]
 #[test]
 fn bound_decision_identity_matches_the_runtime_view_of_the_same_decision() {
