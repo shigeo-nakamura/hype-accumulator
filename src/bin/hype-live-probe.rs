@@ -407,6 +407,15 @@ impl HistoryDirectoryBinding {
         journals: &BTreeSet<String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let path = Self::path(operational_params_path);
+        // Held across the whole read-check-publish below. Two `prepare`s
+        // sharing this operational config are not otherwise serialized —
+        // their runtime locks are per state directory, and this file lives
+        // next to the operational config, not in either — so without it the
+        // slower writer's rename could replace a larger recorded set with
+        // its own stale, smaller one, and a journal only that larger set
+        // named would stop being missed when it was lost. Same lock-sibling
+        // posture as `FileProtectedWorkflowHeadStore`.
+        let _lock = Self::lock(&path)?;
         let existing: Self = serde_json::from_str(&fs::read_to_string(&path)?)?;
         let forgotten: Vec<&str> = existing
             .recorded_journals
@@ -436,6 +445,44 @@ impl HistoryDirectoryBinding {
         #[cfg(unix)]
         fs::File::open(&parent)?.sync_all()?;
         Ok(())
+    }
+
+    /// Opens and exclusively locks the `<binding>.lock` sibling, held for as
+    /// long as the returned handle lives. `O_NOFOLLOW` and the hard-link
+    /// check mirror this crate's posture for every other security-relevant
+    /// file open: a lock that can be aimed elsewhere, or that a second name
+    /// also points at, is not a lock.
+    fn lock(path: &Path) -> Result<fs::File, Box<dyn std::error::Error>> {
+        let mut lock_name = path
+            .file_name()
+            .ok_or("history-directory binding has no file name")?
+            .to_os_string();
+        lock_name.push(".lock");
+        let lock_path = path
+            .parent()
+            .ok_or("history-directory binding has no parent")?
+            .join(lock_name);
+        let mut options = fs::OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let lock = options.open(&lock_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if lock.metadata()?.nlink() != 1 {
+                return Err(format!(
+                    "history-directory binding lock {} has more than one name",
+                    lock_path.display()
+                )
+                .into());
+            }
+        }
+        fs2::FileExt::lock_exclusive(&lock)?;
+        Ok(lock)
     }
 
     /// Serializes `self` into a fsynced, 0600, `create_new` sibling of
@@ -1823,6 +1870,62 @@ mod tests {
         assert!(collecting(Path::new("/journals/foreign.jsonl")).is_err());
         assert_eq!(
             *accepted.borrow(),
+            BTreeSet::from(["day-1.jsonl".to_owned(), "day-2.jsonl".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_concurrent_record_waits_for_the_binding_lock() {
+        use super::record_validated_history_journals;
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let operational_params_path = directory.path().join("operational.toml");
+        let operational_params_path = operational_params_path.to_str().expect("utf8 path");
+        let journals = directory.path().join("journals");
+        std::fs::create_dir(&journals).expect("create journals");
+        let journals_str = journals.to_str().expect("utf8 path");
+        HistoryDirectoryBinding::persist_first_ever(operational_params_path, journals_str)
+            .expect("persist binding");
+        let recorded = RefCell::new(BTreeSet::from(["day-1.jsonl".to_owned()]));
+        record_validated_history_journals(operational_params_path, &recorded).expect("record");
+
+        // Stands in for a second `prepare` that is between reading this
+        // binding and publishing its own set: it holds the same lock.
+        let binding_path = HistoryDirectoryBinding::path(operational_params_path);
+        let held = HistoryDirectoryBinding::lock(&binding_path).expect("lock");
+
+        let owned_path = operational_params_path.to_owned();
+        let (finished, has_finished) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            let scanned = RefCell::new(BTreeSet::from([
+                "day-1.jsonl".to_owned(),
+                "day-2.jsonl".to_owned(),
+            ]));
+            let result = record_validated_history_journals(&owned_path, &scanned);
+            finished.send(()).expect("signal");
+            result
+        });
+
+        // The write it is about to make would succeed on its own, so if it
+        // completes while the lock is held, the read-check-publish is not
+        // serialized at all and a slower writer could publish a stale set
+        // over a larger one.
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            has_finished.try_recv().is_err(),
+            "a second writer must wait for the binding lock"
+        );
+
+        drop(held);
+        writer
+            .join()
+            .expect("join")
+            .expect("record after the lock is released");
+        assert_eq!(
+            HistoryDirectoryBinding::check(operational_params_path, journals_str)
+                .expect("check binding")
+                .recorded_journals,
             BTreeSet::from(["day-1.jsonl".to_owned(), "day-2.jsonl".to_owned()])
         );
     }
