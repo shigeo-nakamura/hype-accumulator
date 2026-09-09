@@ -4746,6 +4746,7 @@ fn aggregate_terminal_residual_hype_reconciles_against_residual_plus_unstaked_el
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
         &always_admissible,
+        0,
     );
     assert!(matches!(
         insufficient,
@@ -4761,50 +4762,89 @@ fn aggregate_terminal_residual_hype_reconciles_against_residual_plus_unstaked_el
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
         &always_admissible,
+        0,
     )
     .expect("live balance covers residual plus unstaked eligible HYPE");
     assert_eq!(aggregated, hype(10));
 }
 
 #[test]
-fn count_history_journals_counts_exactly_what_aggregation_would_rediscover() {
+fn aggregate_terminal_residual_hype_refuses_a_history_directory_that_lost_journals() {
     let temp = tempfile::tempdir().expect("temp directory");
-
-    // A directory that does not exist yet is a genuinely first-ever run,
-    // not a corrupt state: 0, not an error.
-    assert_eq!(
-        DurableWorkflow::count_history_journals(&temp.path().join("not-yet"))
-            .expect("missing directory counts as zero"),
-        0
-    );
-    assert_eq!(
-        DurableWorkflow::count_history_journals(temp.path()).expect("empty directory"),
-        0
-    );
-
     complete_workflow_with_residual(&temp.path().join("day-1.jsonl"), 2);
     complete_workflow_with_residual(&temp.path().join("day-2.jsonl"), 3);
-    // Sidecars this crate writes next to a journal are not journals, and
-    // must not inflate the count that guards against a lost history.
-    fs::write(temp.path().join("day-2.nonce-state.json"), b"{}").expect("write sidecar");
-    fs::write(temp.path().join("notes.txt"), b"").expect("write unrelated file");
 
+    let aggregate = |minimum: u64| {
+        DurableWorkflow::aggregate_terminal_residual_hype(
+            temp.path(),
+            None,
+            hype(100),
+            "signer-identity-hash-a",
+            &memory_protected_head_store_for,
+            &always_admissible,
+            minimum,
+        )
+    };
     assert_eq!(
-        DurableWorkflow::count_history_journals(temp.path()).expect("count journals"),
-        2
+        aggregate(2).expect("two journals satisfy a mark of two"),
+        hype(5)
     );
 
-    // The count fails closed on exactly what aggregation fails closed on,
-    // so the two can never disagree about what the directory holds.
-    fs::write(
-        temp.path().join("vanished.protected-head.json"),
-        b"{\"head\":\"orphan\"}",
-    )
-    .expect("write orphaned protected head");
+    // The journal filesystem is unmounted, or the directory is deleted and
+    // recreated: it still exists, and is empty. Aggregation would otherwise
+    // return zero here — its only sanity bound is the live spot balance,
+    // which rejects a total that is too large and never one that is too
+    // small — and a lost history would read exactly like a clean account.
+    fs::remove_dir_all(temp.path()).expect("remove journals");
+    fs::create_dir(temp.path()).expect("recreate journals");
+    assert!(temp.path().is_dir(), "the directory still exists");
     assert!(matches!(
-        DurableWorkflow::count_history_journals(temp.path()),
-        Err(WorkflowError::CorruptJournal(_))
+        aggregate(2),
+        Err(WorkflowError::HistoryRegressed(_))
     ));
+
+    // Total loss of the directory is refused for the same reason, rather
+    // than being read as "no history yet".
+    fs::remove_dir_all(temp.path()).expect("remove directory");
+    assert!(matches!(
+        aggregate(2),
+        Err(WorkflowError::HistoryRegressed(_))
+    ));
+    // Without a recorded mark there is nothing to contradict, and a missing
+    // directory is still a genuinely first-ever run.
+    assert_eq!(aggregate(0).expect("no mark, no history"), hype(0));
+}
+
+#[test]
+fn bound_decision_ids_refuses_a_history_directory_that_lost_journals() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    complete_workflow_with_residual(&temp.path().join("day-1.jsonl"), 2);
+
+    let bound = |minimum: u64| {
+        DurableWorkflow::bound_decision_ids(
+            temp.path(),
+            &memory_protected_head_store_for,
+            &always_admissible,
+            minimum,
+        )
+    };
+    assert_eq!(
+        bound(1)
+            .expect("one journal satisfies a mark of one")
+            .expect("directory exists")
+            .len(),
+        1
+    );
+
+    // `release` settles a decision at zero precisely when no journal binds
+    // it, so an emptied directory would make every bound decision look
+    // releasable — the sharpest form of this failure.
+    fs::remove_dir_all(temp.path()).expect("remove journals");
+    fs::create_dir(temp.path()).expect("recreate journals");
+    assert!(matches!(bound(1), Err(WorkflowError::HistoryRegressed(_))));
+    fs::remove_dir_all(temp.path()).expect("remove directory");
+    assert!(matches!(bound(1), Err(WorkflowError::HistoryRegressed(_))));
+    assert!(bound(0).expect("no mark, no history").is_none());
 }
 
 #[test]
@@ -4823,6 +4863,7 @@ fn aggregate_terminal_residual_hype_fails_closed_on_an_empty_historical_journal(
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
         &always_admissible,
+        0,
     );
     assert!(matches!(
         result,
@@ -4890,6 +4931,7 @@ fn aggregate_terminal_residual_hype_rejects_a_journal_rolled_back_since_its_prot
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
         &always_admissible,
+        0,
     );
     assert!(matches!(result, Err(WorkflowError::RollbackDetected(_))));
 }
@@ -4922,6 +4964,7 @@ fn aggregate_terminal_residual_hype_rejects_a_duplicate_workflow_id_across_two_f
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
         &always_admissible,
+        0,
     );
     assert!(matches!(result, Err(WorkflowError::CorruptJournal(_))));
 }
@@ -4972,6 +5015,7 @@ fn aggregate_terminal_residual_hype_rejects_a_journal_from_a_different_execution
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
         &always_admissible,
+        0,
     );
     assert!(matches!(result, Err(WorkflowError::CorruptJournal(_))));
 }
@@ -4997,6 +5041,7 @@ fn aggregate_terminal_residual_hype_rejects_a_journal_the_caller_marks_inadmissi
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
         &reject_everything,
+        0,
     );
     assert!(matches!(result, Err(WorkflowError::CorruptJournal(_))));
 }
@@ -5035,6 +5080,7 @@ fn aggregate_terminal_residual_hype_excludes_hype_already_delegated_to_staking()
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
         &always_admissible,
+        0,
     )
     .expect("delegated eligible HYPE is excluded from the spot reconciliation");
     assert_eq!(aggregated, hype(0));
@@ -5147,6 +5193,7 @@ fn aggregate_terminal_residual_hype_reconciles_using_movement_adjusted_residual(
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
         &always_admissible,
+        0,
     )
     .expect("aggregation uses the movement-adjusted residual, not the raw split");
     assert_eq!(aggregated, hype(6));
@@ -5234,6 +5281,7 @@ fn aggregate_terminal_residual_hype_fails_closed_when_a_journal_is_concurrently_
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
         &always_admissible,
+        0,
     );
     assert!(matches!(result, Err(WorkflowError::ConcurrentModification)));
 }
@@ -5249,6 +5297,7 @@ fn aggregate_terminal_residual_hype_returns_zero_for_a_directory_that_does_not_e
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
         &always_admissible,
+        0,
     )
     .expect("a directory that does not exist yet has no historical journals");
     assert_eq!(aggregated, hype(0));
@@ -5273,6 +5322,7 @@ fn aggregate_terminal_residual_hype_sums_across_the_directory_and_excludes_the_c
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
         &always_admissible,
+        0,
     )
     .expect("two terminal journals reconcile against the live balance");
     assert_eq!(aggregated, hype(12));
@@ -5312,6 +5362,7 @@ fn aggregate_terminal_residual_hype_ignores_non_journal_sidecar_files() {
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
         &always_admissible,
+        0,
     )
     .expect("sidecar files are never mistaken for journals");
     assert_eq!(aggregated, hype(3));
@@ -5340,6 +5391,7 @@ fn aggregate_terminal_residual_hype_fails_closed_on_a_corrupt_pending_append() {
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
         &always_admissible,
+        0,
     )
     .expect_err("a corrupt pending append must not be silently ignored");
     assert!(matches!(error, WorkflowError::RollbackDetected(_)));
@@ -5411,6 +5463,7 @@ fn aggregate_terminal_residual_hype_recovers_a_lost_completion_response() {
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
         &always_admissible,
+        0,
     )
     .expect("a lost completion response recovers instead of reading as a rollback");
     assert_eq!(aggregated, hype(3));
@@ -5437,6 +5490,7 @@ fn aggregate_terminal_residual_hype_rejects_an_orphaned_protected_head_file() {
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
         &always_admissible,
+        0,
     );
     assert!(matches!(result, Err(WorkflowError::CorruptJournal(_))));
 }
@@ -5464,6 +5518,7 @@ fn aggregate_terminal_residual_hype_does_not_flag_the_excluded_journals_own_prot
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
         &always_admissible,
+        0,
     )
     .expect("the excluded journal's own protected-head file is not orphaned");
     assert_eq!(aggregated, hype(3));
@@ -5489,6 +5544,7 @@ fn aggregate_terminal_residual_hype_rejects_a_symlinked_journal_instead_of_skipp
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
         &always_admissible,
+        0,
     );
     assert!(matches!(result, Err(WorkflowError::Io(_))));
 }
@@ -5516,6 +5572,7 @@ fn aggregate_terminal_residual_hype_fails_closed_on_a_non_terminal_historical_jo
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
         &always_admissible,
+        0,
     );
     assert!(matches!(
         result,
@@ -5535,6 +5592,7 @@ fn aggregate_terminal_residual_hype_fails_closed_on_a_reconciliation_gap() {
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
         &always_admissible,
+        0,
     );
     assert!(matches!(
         result,
@@ -5562,6 +5620,7 @@ fn bound_decision_ids_maps_every_verified_journal_including_in_flight_ones() {
         temp.path(),
         &memory_protected_head_store_for,
         &always_admissible,
+        0,
     )
     .expect("scan")
     .expect("directory exists");
@@ -5577,6 +5636,7 @@ fn bound_decision_ids_maps_every_verified_journal_including_in_flight_ones() {
             &temp.path().join("never-created"),
             &memory_protected_head_store_for,
             &always_admissible,
+            0,
         )
         .expect("missing directory is not an error"),
         None
@@ -5597,7 +5657,8 @@ fn bound_decision_ids_fails_closed_on_empty_orphaned_rolled_back_or_inadmissible
         DurableWorkflow::bound_decision_ids(
             temp.path(),
             &memory_protected_head_store_for,
-            &always_admissible
+            &always_admissible,
+            0,
         ),
         Err(WorkflowError::NonTerminalHistoricalJournal(_))
     ));
@@ -5609,7 +5670,8 @@ fn bound_decision_ids_fails_closed_on_empty_orphaned_rolled_back_or_inadmissible
         DurableWorkflow::bound_decision_ids(
             temp.path(),
             &memory_protected_head_store_for,
-            &always_admissible
+            &always_admissible,
+            0,
         ),
         Err(WorkflowError::CorruptJournal(_))
     ));
@@ -5626,7 +5688,8 @@ fn bound_decision_ids_fails_closed_on_empty_orphaned_rolled_back_or_inadmissible
         DurableWorkflow::bound_decision_ids(
             temp.path(),
             &memory_protected_head_store_for,
-            &always_admissible
+            &always_admissible,
+            0,
         ),
         Err(WorkflowError::RollbackDetected(_))
     ));
@@ -5643,7 +5706,8 @@ fn bound_decision_ids_fails_closed_on_empty_orphaned_rolled_back_or_inadmissible
         DurableWorkflow::bound_decision_ids(
             temp.path(),
             &memory_protected_head_store_for,
-            &inadmissible
+            &inadmissible,
+            0,
         ),
         Err(WorkflowError::CorruptJournal(_))
     ));
@@ -5653,6 +5717,7 @@ fn bound_decision_ids_fails_closed_on_empty_orphaned_rolled_back_or_inadmissible
         temp.path(),
         &memory_protected_head_store_for,
         &always_admissible,
+        0,
     )
     .expect("scan")
     .expect("directory exists");

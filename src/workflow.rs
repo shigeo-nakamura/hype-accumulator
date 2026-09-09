@@ -2848,33 +2848,39 @@ impl DurableWorkflow {
         Ok(Some(journal_paths))
     }
 
-    /// Counts the `.jsonl` journals currently visible directly in
-    /// `journal_directory`, using the very same scan
-    /// [`Self::aggregate_terminal_residual_hype`] rediscovers history with
-    /// (symlinks and non-regular entries rejected, an orphaned
-    /// protected-head sidecar refused) so a caller's count can never drift
-    /// from what aggregation would actually see. Returns `Ok(0)` when the
-    /// directory does not exist yet — the caller decides whether that is a
-    /// genuinely first-ever run or a lost history, which this module has no
-    /// way to tell apart.
+    /// Fails closed when a verified scan of `journal_directory` found fewer
+    /// journals than `minimum_journal_count`, the highest number an earlier
+    /// run recorded for this history (bot-strategy#944).
     ///
-    /// Exists for the durable journal-count high-water mark
-    /// (bot-strategy#944): aggregation itself can only ever reject a total
-    /// that is too *large* (it is bounded by the live spot balance), so a
-    /// `journal_directory` that still exists but has silently lost its
-    /// journals — unmounted and leaving its mount point behind, or deleted
-    /// and recreated empty — would otherwise aggregate to zero and look
-    /// exactly like a clean account.
+    /// Journals are only ever added to a history directory — nothing here
+    /// deletes one, and an orphaned protected-head sidecar fails the scan
+    /// closed — so the count is monotonically non-decreasing across runs and
+    /// any decrease means history was lost outside this program: the
+    /// directory unmounted (leaving its mount point behind), deleted and
+    /// recreated, or pointed at different underlying storage. None of that
+    /// is otherwise detectable here, because the only sanity bound on an
+    /// aggregate is the live spot balance, which rejects a total that is too
+    /// *large* and never one that is suspiciously small — a lost history
+    /// aggregates to zero and reads exactly like a clean account.
     ///
-    /// # Errors
-    ///
-    /// Returns an error when `journal_directory` cannot be read, holds a
-    /// `.jsonl` entry that is a symlink or not a regular file, or leaves a
-    /// protected-head sidecar orphaned — the same states that fail
-    /// [`Self::aggregate_terminal_residual_hype`]'s own scan closed.
-    pub fn count_history_journals(journal_directory: &Path) -> Result<u64, WorkflowError> {
-        Ok(Self::scan_journal_paths(journal_directory, None)?
-            .map_or(0, |journal_paths| journal_paths.len() as u64))
+    /// Deliberately takes the count from the caller's *own* scan rather than
+    /// rescanning: the condition being guarded must not be able to change
+    /// between the check and the use.
+    fn ensure_journal_count_not_regressed(
+        journal_directory: &Path,
+        found: usize,
+        minimum_journal_count: u64,
+    ) -> Result<(), WorkflowError> {
+        if (found as u64) < minimum_journal_count {
+            return Err(WorkflowError::HistoryRegressed(format!(
+                "{} holds {found} journal(s), but an earlier run recorded \
+                 {minimum_journal_count}; journals are only ever added, so history has been lost \
+                 (unmounted, deleted and recreated, or different underlying storage?). Restore it \
+                 before running this command again.",
+                journal_directory.display()
+            )));
+        }
+        Ok(())
     }
 
     /// Sums the terminal residual HYPE left behind by every completed
@@ -2951,13 +2957,22 @@ impl DurableWorkflow {
         execution_identity_hash: &str,
         protected_head_store_for: &ProtectedHeadStoreFactory<'_>,
         journal_admissible: &JournalAdmissibilityCheck<'_>,
+        minimum_journal_count: u64,
     ) -> Result<HypeAtoms, WorkflowError> {
         let Some(journal_paths) = Self::scan_journal_paths(journal_directory, exclude_path)? else {
             // No directory yet means no historical journals yet — this is
             // the normal state before this execution account's very first
-            // workflow, not a corrupt or unreadable one.
+            // workflow, not a corrupt or unreadable one. Unless an earlier
+            // run recorded journals here, in which case the directory did
+            // not "not exist yet", it disappeared.
+            Self::ensure_journal_count_not_regressed(journal_directory, 0, minimum_journal_count)?;
             return Ok(HypeAtoms::from_atoms(0));
         };
+        Self::ensure_journal_count_not_regressed(
+            journal_directory,
+            journal_paths.len(),
+            minimum_journal_count,
+        )?;
 
         let overflowed = |what: &str| {
             WorkflowError::CorruptJournal(format!(
@@ -3067,10 +3082,21 @@ impl DurableWorkflow {
         journal_directory: &Path,
         protected_head_store_for: &ProtectedHeadStoreFactory<'_>,
         journal_admissible: &JournalAdmissibilityCheck<'_>,
+        minimum_journal_count: u64,
     ) -> Result<Option<BTreeMap<String, PathBuf>>, WorkflowError> {
         let Some(journal_paths) = Self::scan_journal_paths(journal_directory, None)? else {
+            // A directory that never existed is `None` (the caller decides
+            // what that proves); one that *did* exist for an earlier run is
+            // a lost history, and is refused here rather than reported as
+            // "no journals bind anything".
+            Self::ensure_journal_count_not_regressed(journal_directory, 0, minimum_journal_count)?;
             return Ok(None);
         };
+        Self::ensure_journal_count_not_regressed(
+            journal_directory,
+            journal_paths.len(),
+            minimum_journal_count,
+        )?;
         let mut bound: BTreeMap<String, PathBuf> = BTreeMap::new();
         for path in journal_paths {
             journal_admissible(&path)?;
@@ -5080,6 +5106,8 @@ pub enum WorkflowError {
     NonTerminalHistoricalJournal(String),
     #[error("aggregated residual HYPE does not reconcile against the live spot balance: {0}")]
     ResidualReconciliationGap(String),
+    #[error("history directory lost journals: {0}")]
+    HistoryRegressed(String),
 }
 
 fn append_result_commit_status(

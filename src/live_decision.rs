@@ -206,6 +206,12 @@ pub async fn prepare_first_live_order_workflow(
     configured_residual_hype_atoms: HypeAtoms,
     journal_path: &Path,
     journal_directory: &Path,
+    // Fewest journals `journal_directory` may hold without the aggregation
+    // below being refused as an incomplete history (bot-strategy#944) — the
+    // count the caller's own durable high-water mark recorded. Enforced
+    // inside the same scan the aggregation uses, so history cannot go
+    // missing between the check and the inventory it feeds.
+    minimum_history_journals: u64,
     historical_protected_head_store_for: &ProtectedHeadStoreFactory<'_>,
     historical_journal_admissible: &JournalAdmissibilityCheck<'_>,
     protected_head_store: Arc<dyn ProtectedWorkflowHeadStore>,
@@ -280,6 +286,7 @@ pub async fn prepare_first_live_order_workflow(
                 &probe_binding.execution_identity_hash,
                 historical_protected_head_store_for,
                 historical_journal_admissible,
+                minimum_history_journals,
             )?;
 
         let inventory_before = InventoryBaseline {

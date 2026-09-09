@@ -44,6 +44,7 @@ use hype_accumulator::{
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::{
+    cell::Cell,
     env, fs,
     io::Write,
     path::{Path, PathBuf},
@@ -677,7 +678,7 @@ fn bind_history_directory_for_prepare(
     operational_params_path: &str,
     history_directory: &str,
     journal_path: &str,
-) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
+) -> Result<(PathBuf, PathBuf, HistoryBindingState), Box<dyn std::error::Error>> {
     // Durably binds history_directory to the first value ever read for this
     // operational_params_path, before trusting it for anything: an
     // operator later editing operational.toml's history_directory would
@@ -711,20 +712,10 @@ fn bind_history_directory_for_prepare(
     if history_binding.initialization == HistoryInitialization::FirstEver {
         HistoryDirectoryBinding::persist_first_ever(operational_params_path, history_directory)?;
     }
-    // The content half of the availability check above, run once the binding
-    // is guaranteed to exist (advancing the mark rewrites it) and before
-    // anything reads history: a `history_directory` that survived as an
-    // empty directory has to be refused here, not silently aggregated as
-    // zero.
-    ensure_history_journal_count_not_regressed(
-        operational_params_path,
-        &journal_directory,
-        history_binding.journal_high_water_mark,
-    )?;
     // Canonical so the runtime's hash-chained namespace binding cannot be
     // dodged with an alias of the same directory.
     let live_history_directory = fs::canonicalize(&journal_directory)?;
-    Ok((journal_directory, live_history_directory))
+    Ok((journal_directory, live_history_directory, history_binding))
 }
 
 async fn prepare(
@@ -746,11 +737,12 @@ async fn prepare(
         .history_directory
         .as_deref()
         .ok_or("operational.toml is missing history_directory, required by `prepare`")?;
-    let (journal_directory, live_history_directory) = bind_history_directory_for_prepare(
-        operational_params_path,
-        history_directory,
-        journal_path,
-    )?;
+    let (journal_directory, live_history_directory, history_binding) =
+        bind_history_directory_for_prepare(
+            operational_params_path,
+            history_directory,
+            journal_path,
+        )?;
     // Fixes the network this journal is bound to before anything else reads
     // `config`/`operational` for a network-dependent value: refuses to
     // silently re-bind an already-prepared journal to a different network on
@@ -846,6 +838,16 @@ async fn prepare(
     let signal_evidence_valid_through_at =
         now + chrono::TimeDelta::seconds(i64::try_from(effective.signal_stale_after_seconds)?);
     let network_routing_admissible = network_routing_admissible_for(&prepare_time_binding);
+    // The aggregation below calls this once per journal it accepts, and any
+    // journal that fails any later check aborts the whole scan — so a
+    // successful return means this counted exactly the journals the verified
+    // scan validated. That is the only count the durable high-water mark may
+    // be raised from: a malformed, foreign or half-restored `.jsonl` would
+    // otherwise raise the mark before the scan rejected it, and removing that
+    // file to repair the directory would then wedge every later run below its
+    // own mark (Codex review, hype-accumulator#54).
+    let validated = Cell::new(0u64);
+    let admissible = counting_journal_admissible(network_routing_admissible, &validated);
     let workflow = prepare_first_live_order_workflow(
         &connector,
         &mut runtime,
@@ -857,13 +859,16 @@ async fn prepare(
         configured_residual_hype_atoms,
         &journal,
         &journal_directory,
+        history_binding.journal_high_water_mark,
         &historical_protected_head_store_for,
-        &network_routing_admissible,
+        &admissible,
         protected_head_store,
         owner_store,
         now,
     )
     .await?;
+
+    record_validated_history_journals(operational_params_path, &validated)?;
 
     let action = workflow.pending_prepared_order()?;
     println!("mode=prepared journal={journal_path}");
@@ -1159,15 +1164,6 @@ fn release(
     }
     let journal_directory = PathBuf::from(history_directory);
     ensure_history_directory_available(history_binding.initialization, &journal_directory)?;
-    // Same content check `prepare` runs, and for a sharper reason here: the
-    // scan below releases a decision precisely when no journal in this
-    // directory binds it, so a directory that still exists but lost its
-    // journals would make every bound decision look releasable.
-    ensure_history_journal_count_not_regressed(
-        operational_params_path,
-        &journal_directory,
-        history_binding.journal_high_water_mark,
-    )?;
 
     // The exclusive runtime lock is taken BEFORE the journal scan and held
     // through settlement: `prepare` opens the runtime before it creates its
@@ -1215,6 +1211,7 @@ fn release(
         &journal_directory,
         &historical_protected_head_store_for,
         &network_routing_admissible,
+        history_binding.journal_high_water_mark,
     )?
     .ok_or_else(|| {
         format!(
@@ -1403,13 +1400,15 @@ fn build_prepare_policies(
 /// Existence alone is not enough, and never was (bot-strategy#944): an
 /// unmounted journal filesystem can leave an ordinary, empty mount-point
 /// directory behind, and a directory deleted then recreated empty passes
-/// `is_dir()` exactly the same way a genuinely-preserved one would.
-/// [`ensure_history_journal_count_not_regressed`] closes that half against
-/// the durable high-water mark in `HistoryDirectoryBinding` (which lives
-/// outside `journal_directory` and so survives its loss); the two run
-/// together in both callers, and are separate only because this one has to
-/// be answered *before* `prepare`'s `create_dir_all` makes the directory
-/// exist either way.
+/// `is_dir()` exactly the same way a genuinely-preserved one would. That
+/// half is closed by `minimum_journal_count`, the durable journal
+/// high-water mark from `HistoryDirectoryBinding` (which lives outside
+/// `journal_directory` and so survives its loss), enforced inside the
+/// verified scans themselves — `aggregate_terminal_residual_hype` and
+/// `bound_decision_ids` — so history cannot go missing between the check
+/// and the scan that depends on it. This check stays separate because it
+/// has to be answered *before* `prepare`'s `create_dir_all` makes the
+/// directory exist either way.
 fn ensure_history_directory_available(
     history_initialization: HistoryInitialization,
     journal_directory: &Path,
@@ -1424,60 +1423,6 @@ fn ensure_history_directory_available(
             journal_directory.display()
         )
         .into());
-    }
-    Ok(())
-}
-
-/// Fails closed when `journal_directory` holds fewer `.jsonl` journals than
-/// the highest count any earlier run for this `operational_params_path`
-/// recorded, and raises that mark when it holds more (bot-strategy#944).
-///
-/// This is the content half of [`ensure_history_directory_available`]'s
-/// existence check. Journals are only ever added to `history_directory` —
-/// nothing in this codebase deletes one, and every scan of the directory
-/// refuses to run at all if a completed journal's protected-head sidecar is
-/// left orphaned — so the visible count is monotonically non-decreasing
-/// across runs, and any decrease means history was lost outside this
-/// program: the directory unmounted (leaving its mount point behind),
-/// deleted and recreated, or pointed at different underlying storage.
-/// Aggregation itself cannot notice, because its only sanity bound is the
-/// live spot balance, which rejects a total that is too large and never one
-/// that is suspiciously small — a lost history aggregates to zero, reads
-/// exactly like a clean account, and the next fill is then misclassified as
-/// staking-eligible. `release` is if anything more exposed: an emptied
-/// directory makes every bound decision look unbound and therefore
-/// releasable.
-///
-/// The mark is raised from what is visible *now*, which in `prepare` is
-/// deliberately before its own journal exists (it is created further down),
-/// so a recorded mark only ever describes journals that were already
-/// durable when it was written — never one the recording run might yet fail
-/// to create. Concurrency needs no lock for the same reason the count is
-/// monotone: two runs observing the same directory write the same value in
-/// either order, and a run that observed fewer journals fails here instead
-/// of writing.
-fn ensure_history_journal_count_not_regressed(
-    operational_params_path: &str,
-    journal_directory: &Path,
-    recorded_high_water_mark: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let observed = DurableWorkflow::count_history_journals(journal_directory)?;
-    if observed < recorded_high_water_mark {
-        return Err(format!(
-            "history_directory {} holds {observed} journal(s), but an earlier run for this \
-             operational_params_path recorded {recorded_high_water_mark}; journals are only ever \
-             added, so history has been lost (unmounted, deleted and recreated, or different \
-             underlying storage?). Refusing to read an incomplete history — restore it before \
-             running this command again.",
-            journal_directory.display()
-        )
-        .into());
-    }
-    if observed > recorded_high_water_mark {
-        HistoryDirectoryBinding::advance_journal_high_water_mark(
-            operational_params_path,
-            observed,
-        )?;
     }
     Ok(())
 }
@@ -1551,6 +1496,47 @@ fn historical_protected_head_store_for(
 /// or building an independent protection mechanism for this sidecar —
 /// both out of scope for this aggregator-foundation PR. Tracked in
 /// bot-strategy#942.
+/// Raises the durable journal high-water mark to what this run's verified
+/// scan actually validated, once that scan has succeeded.
+///
+/// Only `prepare` records a mark. `release` deliberately does not: its own
+/// scan does not exclude the journal of the day being released, so a mark
+/// raised there would exceed what a later `prepare` — whose scan *does*
+/// exclude its own journal — could ever see again, wedging it below a mark
+/// it can never reach.
+fn record_validated_history_journals(
+    operational_params_path: &str,
+    validated: &Cell<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    HistoryDirectoryBinding::advance_journal_high_water_mark(
+        operational_params_path,
+        validated.get(),
+    )
+}
+
+/// Wraps a journal-admissibility check so a caller can learn how many
+/// journals a verified scan actually accepted, without rescanning the
+/// directory itself.
+///
+/// Both verified scans call this check once per journal, before every other
+/// per-journal check, and abort the whole scan on the first failure of any
+/// of them — so when a scan returns `Ok`, the counter holds exactly the
+/// number of journals that scan validated. That is the only count the
+/// durable journal high-water mark may be raised from: counting the
+/// directory separately would raise it from files a scan is about to
+/// reject, and the operator removing such a file to repair the directory
+/// would then wedge every later run below its own mark.
+fn counting_journal_admissible<'a>(
+    inner: impl Fn(&Path) -> Result<(), WorkflowError> + 'a,
+    accepted: &'a Cell<u64>,
+) -> impl Fn(&Path) -> Result<(), WorkflowError> + 'a {
+    move |path: &Path| {
+        inner(path)?;
+        accepted.set(accepted.get() + 1);
+        Ok(())
+    }
+}
+
 fn network_routing_admissible_for(
     current: &PrepareTimeBinding,
 ) -> impl Fn(&Path) -> Result<(), WorkflowError> + '_ {
@@ -1770,98 +1756,74 @@ mod tests {
     }
 
     #[test]
-    fn journal_high_water_mark_rejects_a_history_directory_recreated_empty() {
-        use super::{
-            ensure_history_directory_available, ensure_history_journal_count_not_regressed,
-        };
+    fn counting_journal_admissible_counts_only_accepted_journals() {
+        use super::counting_journal_admissible;
+        use hype_accumulator::workflow::WorkflowError;
 
-        let directory = tempfile::tempdir().expect("temp dir");
-        let operational_params_path = directory.path().join("operational.toml");
-        let operational_params_path = operational_params_path.to_str().expect("utf8 path");
-        let journals = directory.path().join("journals");
-        std::fs::create_dir(&journals).expect("create journals");
-        std::fs::write(journals.join("2026-09-08.jsonl"), b"").expect("journal a");
-        std::fs::write(journals.join("2026-09-09.jsonl"), b"").expect("journal b");
-        let journals_str = journals.to_str().expect("utf8 path");
-
-        // A first prepare records the two journals it can see.
-        HistoryDirectoryBinding::persist_first_ever(operational_params_path, journals_str)
-            .expect("persist binding");
-        ensure_history_journal_count_not_regressed(operational_params_path, &journals, 0)
-            .expect("first run advances the mark");
-        let recorded = HistoryDirectoryBinding::check(operational_params_path, journals_str)
-            .expect("check binding");
-        assert_eq!(recorded.journal_high_water_mark, 2);
-
-        // The journal filesystem is unmounted (or the directory deleted and
-        // recreated): the directory still exists and is empty.
-        std::fs::remove_dir_all(&journals).expect("remove journals");
-        std::fs::create_dir(&journals).expect("recreate journals");
-
-        // The existence check cannot see this — that is exactly the gap.
-        ensure_history_directory_available(HistoryInitialization::AlreadyInitialized, &journals)
-            .expect("an existing empty directory passes is_dir()");
-
-        let error = ensure_history_journal_count_not_regressed(
-            operational_params_path,
-            &journals,
-            recorded.journal_high_water_mark,
-        )
-        .expect_err("an emptied history directory must fail closed");
-        assert!(
-            error.to_string().contains("holds 0 journal(s)"),
-            "unexpected error: {error}"
+        let accepted = std::cell::Cell::new(0u64);
+        let counting = counting_journal_admissible(
+            |path: &Path| {
+                if path.ends_with("foreign.jsonl") {
+                    return Err(WorkflowError::CorruptJournal("foreign".into()));
+                }
+                Ok(())
+            },
+            &accepted,
         );
 
-        // The recorded mark survives the rejected run: a second attempt
-        // fails the same way instead of quietly accepting the loss.
-        let after = HistoryDirectoryBinding::check(operational_params_path, journals_str)
-            .expect("check binding");
-        assert_eq!(after.journal_high_water_mark, 2);
+        counting(Path::new("/journals/day-1.jsonl")).expect("admissible");
+        counting(Path::new("/journals/day-2.jsonl")).expect("admissible");
+        assert_eq!(accepted.get(), 2);
+
+        // A rejected journal must not be counted — the scan aborts here, so
+        // the mark must never be raised as if it had been validated.
+        assert!(counting(Path::new("/journals/foreign.jsonl")).is_err());
+        assert_eq!(accepted.get(), 2);
     }
 
     #[test]
     fn journal_high_water_mark_advances_only_upwards() {
-        use super::ensure_history_journal_count_not_regressed;
-
         let directory = tempfile::tempdir().expect("temp dir");
         let operational_params_path = directory.path().join("operational.toml");
         let operational_params_path = operational_params_path.to_str().expect("utf8 path");
         let journals = directory.path().join("journals");
         std::fs::create_dir(&journals).expect("create journals");
         let journals_str = journals.to_str().expect("utf8 path");
+
         HistoryDirectoryBinding::persist_first_ever(operational_params_path, journals_str)
             .expect("persist binding");
-
-        // An empty directory on a first-ever prepare records nothing.
-        ensure_history_journal_count_not_regressed(operational_params_path, &journals, 0)
-            .expect("empty history is fine when nothing was recorded");
         assert_eq!(
             HistoryDirectoryBinding::check(operational_params_path, journals_str)
                 .expect("check binding")
                 .journal_high_water_mark,
-            0
+            0,
+            "a first-ever prepare records no journals"
         );
 
-        std::fs::write(journals.join("2026-09-09.jsonl"), b"").expect("journal");
-        ensure_history_journal_count_not_regressed(operational_params_path, &journals, 0)
-            .expect("a grown history is accepted");
+        HistoryDirectoryBinding::advance_journal_high_water_mark(operational_params_path, 2)
+            .expect("advance");
         assert_eq!(
             HistoryDirectoryBinding::check(operational_params_path, journals_str)
                 .expect("check binding")
                 .journal_high_water_mark,
-            1
+            2
         );
 
-        // Lowering the mark is refused even when asked for directly, so no
-        // future caller can launder a lost history into a fresh baseline.
+        // Lowering the mark is refused, so a run that saw a *smaller*
+        // validated history — the very thing the mark exists to catch —
+        // can never launder it into a fresh baseline.
         assert!(HistoryDirectoryBinding::advance_journal_high_water_mark(
             operational_params_path,
-            0
+            1
         )
         .is_err());
+        // Rewriting at the same value is not a regression (two concurrent
+        // runs observing the same directory).
+        HistoryDirectoryBinding::advance_journal_high_water_mark(operational_params_path, 2)
+            .expect("idempotent advance");
 
-        // Advancing preserves the bound directory rather than rewriting it.
+        // Advancing preserves the bound directory rather than rewriting it:
+        // the write-once property protects `history_directory`, not the mark.
         HistoryDirectoryBinding::advance_journal_high_water_mark(operational_params_path, 7)
             .expect("advance");
         let persisted: HistoryDirectoryBinding = serde_json::from_str(
