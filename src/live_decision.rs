@@ -46,7 +46,7 @@ use dex_connector::{
 };
 use rust_decimal::Decimal;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -206,12 +206,14 @@ pub async fn prepare_first_live_order_workflow(
     configured_residual_hype_atoms: HypeAtoms,
     journal_path: &Path,
     journal_directory: &Path,
-    // Fewest journals `journal_directory` may hold without the aggregation
-    // below being refused as an incomplete history (bot-strategy#944) — the
-    // count the caller's own durable high-water mark recorded. Enforced
-    // inside the same scan the aggregation uses, so history cannot go
-    // missing between the check and the inventory it feeds.
-    minimum_history_journals: u64,
+    // Journals an earlier run durably recorded as present in
+    // `journal_directory` (bot-strategy#944). Every one of them must still
+    // be there or the aggregation below is refused as an incomplete
+    // history. Enforced inside the same scan the aggregation uses, so
+    // history cannot go missing between the check and the inventory it
+    // feeds, and compared by name so a newly created journal cannot
+    // silently stand in for a lost one.
+    recorded_history_journals: &BTreeSet<String>,
     historical_protected_head_store_for: &ProtectedHeadStoreFactory<'_>,
     historical_journal_admissible: &JournalAdmissibilityCheck<'_>,
     record_history_scan: &HistoryScanRecorder<'_>,
@@ -287,7 +289,7 @@ pub async fn prepare_first_live_order_workflow(
                 &probe_binding.execution_identity_hash,
                 historical_protected_head_store_for,
                 historical_journal_admissible,
-                minimum_history_journals,
+                recorded_history_journals,
             )?;
         // Before the journal below exists: this is the only moment at which
         // the scan's own result can be persisted and still be reproducible

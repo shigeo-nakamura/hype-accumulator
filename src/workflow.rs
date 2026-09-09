@@ -2054,7 +2054,7 @@ pub type JournalAdmissibilityCheck<'a> = dyn Fn(&Path) -> Result<(), WorkflowErr
 /// mistake for that scan's own history.
 ///
 /// This exists so a caller keeping durable evidence *about* the scan (the
-/// journal high-water mark of bot-strategy#944) can persist it at the only
+/// recorded journal manifest of bot-strategy#944) can persist it at the only
 /// point where the evidence is both known and not yet contradicted by the
 /// journal this run is about to create: recording it afterwards leaves a
 /// window where a failed write cannot be retried, because the next run
@@ -2860,36 +2860,53 @@ impl DurableWorkflow {
         Ok(Some(journal_paths))
     }
 
-    /// Fails closed when a verified scan of `journal_directory` found fewer
-    /// journals than `minimum_journal_count`, the highest number an earlier
-    /// run recorded for this history (bot-strategy#944).
+    /// Fails closed when a verified scan of `journal_directory` no longer
+    /// finds a journal an earlier run recorded there (bot-strategy#944).
     ///
     /// Journals are only ever added to a history directory — nothing here
     /// deletes one, and an orphaned protected-head sidecar fails the scan
-    /// closed — so the count is monotonically non-decreasing across runs and
-    /// any decrease means history was lost outside this program: the
-    /// directory unmounted (leaving its mount point behind), deleted and
-    /// recreated, or pointed at different underlying storage. None of that
-    /// is otherwise detectable here, because the only sanity bound on an
-    /// aggregate is the live spot balance, which rejects a total that is too
-    /// *large* and never one that is suspiciously small — a lost history
-    /// aggregates to zero and reads exactly like a clean account.
+    /// closed — so a recorded journal that is no longer present means
+    /// history was lost outside this program: the directory unmounted
+    /// (leaving its mount point behind), deleted and recreated, or pointed
+    /// at different underlying storage. None of that is otherwise
+    /// detectable here, because the only sanity bound on an aggregate is
+    /// the live spot balance, which rejects a total that is too *large* and
+    /// never one that is suspiciously small — a lost history aggregates to
+    /// less than it should and reads exactly like a smaller account.
     ///
-    /// Deliberately takes the count from the caller's *own* scan rather than
+    /// Compares journals by name, not merely by how many there are: a
+    /// cardinality check would let each newly created journal silently
+    /// substitute for a lost older one. Every journal named here was
+    /// validated by an earlier scan of this same directory, and each is
+    /// re-verified against its own protected head on every scan, so a name
+    /// that is still present cannot have had its contents swapped.
+    ///
+    /// Deliberately takes the scan result from its caller rather than
     /// rescanning: the condition being guarded must not be able to change
     /// between the check and the use.
-    fn ensure_journal_count_not_regressed(
+    fn ensure_recorded_journals_are_present(
         journal_directory: &Path,
-        found: usize,
-        minimum_journal_count: u64,
+        found: &[PathBuf],
+        recorded_journals: &BTreeSet<String>,
     ) -> Result<(), WorkflowError> {
-        if (found as u64) < minimum_journal_count {
+        let present: BTreeSet<&str> = found
+            .iter()
+            .filter_map(|path| path.file_name())
+            .filter_map(std::ffi::OsStr::to_str)
+            .collect();
+        let missing: Vec<&str> = recorded_journals
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !present.contains(name))
+            .collect();
+        if !missing.is_empty() {
             return Err(WorkflowError::HistoryRegressed(format!(
-                "{} holds {found} journal(s), but an earlier run recorded \
-                 {minimum_journal_count}; journals are only ever added, so history has been lost \
-                 (unmounted, deleted and recreated, or different underlying storage?). Restore it \
-                 before running this command again.",
-                journal_directory.display()
+                "{} no longer holds {} journal(s) an earlier run recorded there ({}); journals \
+                 are only ever added, so history has been lost (unmounted, deleted and recreated, \
+                 or different underlying storage?). Restore it before running this command again.",
+                journal_directory.display(),
+                missing.len(),
+                missing.join(", ")
             )));
         }
         Ok(())
@@ -2969,7 +2986,7 @@ impl DurableWorkflow {
         execution_identity_hash: &str,
         protected_head_store_for: &ProtectedHeadStoreFactory<'_>,
         journal_admissible: &JournalAdmissibilityCheck<'_>,
-        minimum_journal_count: u64,
+        recorded_journals: &BTreeSet<String>,
     ) -> Result<HypeAtoms, WorkflowError> {
         let Some(journal_paths) = Self::scan_journal_paths(journal_directory, exclude_path)? else {
             // No directory yet means no historical journals yet — this is
@@ -2977,13 +2994,13 @@ impl DurableWorkflow {
             // workflow, not a corrupt or unreadable one. Unless an earlier
             // run recorded journals here, in which case the directory did
             // not "not exist yet", it disappeared.
-            Self::ensure_journal_count_not_regressed(journal_directory, 0, minimum_journal_count)?;
+            Self::ensure_recorded_journals_are_present(journal_directory, &[], recorded_journals)?;
             return Ok(HypeAtoms::from_atoms(0));
         };
-        Self::ensure_journal_count_not_regressed(
+        Self::ensure_recorded_journals_are_present(
             journal_directory,
-            journal_paths.len(),
-            minimum_journal_count,
+            &journal_paths,
+            recorded_journals,
         )?;
 
         let overflowed = |what: &str| {
@@ -3094,20 +3111,20 @@ impl DurableWorkflow {
         journal_directory: &Path,
         protected_head_store_for: &ProtectedHeadStoreFactory<'_>,
         journal_admissible: &JournalAdmissibilityCheck<'_>,
-        minimum_journal_count: u64,
+        recorded_journals: &BTreeSet<String>,
     ) -> Result<Option<BTreeMap<String, PathBuf>>, WorkflowError> {
         let Some(journal_paths) = Self::scan_journal_paths(journal_directory, None)? else {
             // A directory that never existed is `None` (the caller decides
             // what that proves); one that *did* exist for an earlier run is
             // a lost history, and is refused here rather than reported as
             // "no journals bind anything".
-            Self::ensure_journal_count_not_regressed(journal_directory, 0, minimum_journal_count)?;
+            Self::ensure_recorded_journals_are_present(journal_directory, &[], recorded_journals)?;
             return Ok(None);
         };
-        Self::ensure_journal_count_not_regressed(
+        Self::ensure_recorded_journals_are_present(
             journal_directory,
-            journal_paths.len(),
-            minimum_journal_count,
+            &journal_paths,
+            recorded_journals,
         )?;
         let mut bound: BTreeMap<String, PathBuf> = BTreeMap::new();
         for path in journal_paths {
@@ -5120,8 +5137,8 @@ pub enum WorkflowError {
     ResidualReconciliationGap(String),
     #[error("history directory lost journals: {0}")]
     HistoryRegressed(String),
-    #[error("recording the verified journal count failed: {0}")]
-    HistoryMarkWrite(String),
+    #[error("recording the verified journal set failed: {0}")]
+    HistoryRecordWrite(String),
 }
 
 fn append_result_commit_status(
