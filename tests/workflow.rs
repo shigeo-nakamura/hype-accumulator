@@ -1070,20 +1070,31 @@ fn expiry_binding_accepts_venue_evidence_observed_after_the_decision_boundary() 
     )
     .expect("evidence after the boundary is valid");
 
-    // A venue clock lagging the local clock by up to the authorized
-    // `max_venue_clock_lag_ms` (+1 ms) may put a book fetched right after
-    // the boundary slightly before `decided_at`; that is still authorized.
+    // A venue clock lagging the local clock by up to exactly the authorized
+    // `max_venue_clock_lag_ms` may put a book fetched right after the
+    // boundary slightly before `decided_at`; that is still authorized, one
+    // millisecond more is not.
     let valid = binding();
-    let lag = valid.order_envelope.max_venue_clock_lag_ms;
+    let lag = i64::try_from(valid.order_envelope.max_venue_clock_lag_ms).unwrap();
     let mut decision = decision();
-    decision.decided_at = at(0) + TimeDelta::milliseconds(i64::try_from(lag).unwrap() + 1);
+    decision.decided_at = at(0) + TimeDelta::milliseconds(lag);
     DecisionBinding::from_pacing_decision(
         &decision,
-        valid.inventory_before,
-        valid.order_envelope,
-        valid.eligibility_policy,
+        valid.inventory_before.clone(),
+        valid.order_envelope.clone(),
+        valid.eligibility_policy.clone(),
     )
-    .expect("evidence within the authorized lag before the boundary is valid");
+    .expect("evidence exactly the authorized lag before the boundary is valid");
+    decision.decided_at = at(0) + TimeDelta::milliseconds(lag + 1);
+    assert!(matches!(
+        DecisionBinding::from_pacing_decision(
+            &decision,
+            valid.inventory_before,
+            valid.order_envelope,
+            valid.eligibility_policy,
+        ),
+        Err(WorkflowError::InvalidBinding(_))
+    ));
 }
 
 #[test]
