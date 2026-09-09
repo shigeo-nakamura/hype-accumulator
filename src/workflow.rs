@@ -2049,6 +2049,18 @@ pub type ProtectedHeadStoreFactory<'a> =
 /// silently worked around).
 pub type JournalAdmissibilityCheck<'a> = dyn Fn(&Path) -> Result<(), WorkflowError> + 'a;
 
+/// Called once, by the aggregation itself, the moment a verified history
+/// scan has succeeded and before anything is written that a later run would
+/// mistake for that scan's own history.
+///
+/// This exists so a caller keeping durable evidence *about* the scan (the
+/// journal high-water mark of bot-strategy#944) can persist it at the only
+/// point where the evidence is both known and not yet contradicted by the
+/// journal this run is about to create: recording it afterwards leaves a
+/// window where a failed write cannot be retried, because the next run
+/// takes the already-prepared-journal path and never scans history again.
+pub type HistoryScanRecorder<'a> = dyn Fn() -> Result<(), WorkflowError> + 'a;
+
 /// File-backed [`ProtectedWorkflowHeadStore`], one instance per stable
 /// decision identity (construct with a path derived from that identity, e.g.
 /// `<state_dir>/workflow-heads/<decision_id>.json`; never share one instance
@@ -5108,6 +5120,8 @@ pub enum WorkflowError {
     ResidualReconciliationGap(String),
     #[error("history directory lost journals: {0}")]
     HistoryRegressed(String),
+    #[error("recording the verified journal count failed: {0}")]
+    HistoryMarkWrite(String),
 }
 
 fn append_result_commit_status(

@@ -718,12 +718,6 @@ fn bind_history_directory_for_prepare(
     Ok((journal_directory, live_history_directory, history_binding))
 }
 
-// Length is dominated by the 16-argument call to
-// `prepare_first_live_order_workflow` and the fail-closed ordering around it,
-// every step of which is commented with why it sits where it does. The two
-// pieces that could be lifted out without hiding that ordering already have
-// been (`bind_history_directory_for_prepare`, `print_prepared_order`).
-#[allow(clippy::too_many_lines)]
 async fn prepare(
     config_path: &str,
     security_policy_path: &str,
@@ -854,7 +848,7 @@ async fn prepare(
     // own mark (Codex review, hype-accumulator#54).
     let validated = Cell::new(0u64);
     let admissible = counting_journal_admissible(network_routing_admissible, &validated);
-    let prepared = prepare_first_live_order_workflow(
+    let workflow = prepare_first_live_order_workflow(
         &connector,
         &mut runtime,
         cycle_input,
@@ -868,18 +862,12 @@ async fn prepare(
         history_binding.journal_high_water_mark,
         &historical_protected_head_store_for,
         &admissible,
+        &|| record_validated_history_journals(operational_params_path, &validated),
         protected_head_store,
         owner_store,
         now,
     )
     .await?;
-
-    record_validated_history_journals(
-        operational_params_path,
-        &validated,
-        prepared.history_aggregated,
-    )?;
-    let workflow = prepared.workflow;
 
     print_prepared_order(
         &workflow,
@@ -1528,14 +1516,16 @@ fn historical_protected_head_store_for(
 /// or building an independent protection mechanism for this sidecar —
 /// both out of scope for this aggregator-foundation PR. Tracked in
 /// bot-strategy#942.
-/// Raises the durable journal high-water mark to what this run's verified
-/// scan actually validated, once that scan has succeeded.
+/// Raises the durable journal high-water mark to what a verified history
+/// scan just validated.
 ///
-/// A no-op when no scan ran (`history_aggregated == false`): the
-/// existing-binding retry path reads no history, so `validated` is still
-/// zero there, and recording it would try to lower the mark — rejecting
-/// every retry once the mark is positive, on the very path that exists to
-/// make retries safe.
+/// Called by the aggregation itself, through [`HistoryScanRecorder`], the
+/// moment that scan succeeds and before this run's own journal exists — the
+/// only point where the count is known and a failed write can still be
+/// retried. The existing-binding retry path never scans history and so
+/// never reaches this: it reuses the binding already on disk, computes no
+/// inventory from history, and must leave whatever mark earlier runs
+/// recorded exactly as it is.
 ///
 /// Only `prepare` records a mark. `release` deliberately does not: its own
 /// scan does not exclude the journal of the day being released, so a mark
@@ -1545,15 +1535,12 @@ fn historical_protected_head_store_for(
 fn record_validated_history_journals(
     operational_params_path: &str,
     validated: &Cell<u64>,
-    history_aggregated: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if !history_aggregated {
-        return Ok(());
-    }
+) -> Result<(), WorkflowError> {
     HistoryDirectoryBinding::advance_journal_high_water_mark(
         operational_params_path,
         validated.get(),
     )
+    .map_err(|error| WorkflowError::HistoryMarkWrite(error.to_string()))
 }
 
 /// Wraps a journal-admissibility check so a caller can learn how many
@@ -1824,8 +1811,9 @@ mod tests {
     }
 
     #[test]
-    fn a_retry_that_read_no_history_records_no_mark() {
+    fn recording_a_count_below_the_mark_is_refused_rather_than_lowering_it() {
         use super::record_validated_history_journals;
+        use hype_accumulator::workflow::WorkflowError;
 
         let directory = tempfile::tempdir().expect("temp dir");
         let operational_params_path = directory.path().join("operational.toml");
@@ -1838,25 +1826,27 @@ mod tests {
         HistoryDirectoryBinding::advance_journal_high_water_mark(operational_params_path, 3)
             .expect("advance");
 
-        // The existing-binding retry path never scans history, so the
-        // counter is still zero. Recording it would try to lower the mark
-        // from 3 to 0, which is refused — and would therefore reject every
-        // retry, on the one path that exists to make retries safe.
-        let untouched = std::cell::Cell::new(0u64);
-        record_validated_history_journals(operational_params_path, &untouched, false)
-            .expect("a retry that read no history records nothing");
+        // A scan that validated fewer journals than an earlier one recorded
+        // must fail loudly here rather than quietly resetting the mark: the
+        // mark is the only surviving evidence that those journals existed.
+        let regressed = std::cell::Cell::new(1u64);
+        let error = record_validated_history_journals(operational_params_path, &regressed)
+            .expect_err("a lower count must not be recorded");
+        assert!(
+            matches!(error, WorkflowError::HistoryMarkWrite(_)),
+            "unexpected error: {error}"
+        );
         assert_eq!(
             HistoryDirectoryBinding::check(operational_params_path, journals_str)
                 .expect("check binding")
                 .journal_high_water_mark,
             3,
-            "the mark recorded by earlier runs must survive a retry untouched"
+            "the recorded mark must survive a refused write"
         );
 
-        // A run that did scan history still records what it validated.
         let scanned = std::cell::Cell::new(4u64);
-        record_validated_history_journals(operational_params_path, &scanned, true)
-            .expect("a scanned history is recorded");
+        record_validated_history_journals(operational_params_path, &scanned)
+            .expect("a larger verified count is recorded");
         assert_eq!(
             HistoryDirectoryBinding::check(operational_params_path, journals_str)
                 .expect("check binding")
