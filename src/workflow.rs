@@ -4305,9 +4305,13 @@ fn valid_expiry_binding(envelope: &OrderEnvelopeBinding, decided_at: DateTime<Ut
         && !envelope.venue_clock_evidence_digest.trim().is_empty()
         // The venue clock evidence prices the order, so it must postdate the
         // decision it executes (`decided_at` is the scheduled 12:00 UTC
-        // boundary, which envelope assembly always follows) and predate the
-        // signed expiry it bounds.
-        && envelope.venue_clock_evidence_at >= decided_at
+        // boundary, which envelope assembly always follows) — allowing for
+        // the venue clock lagging the local clock by the authorized
+        // `max_venue_clock_lag_ms` — and predate the signed expiry it bounds.
+        && envelope
+            .venue_clock_evidence_at
+            .checked_add_signed(offset)
+            .is_some_and(|latest_local_equivalent| latest_local_equivalent >= decided_at)
         && envelope.venue_clock_evidence_at < envelope.signed_expiry_at
         && envelope.venue_clock_evidence_valid_through_at > envelope.effective_expiry_at
         && envelope.effective_expiry_at <= envelope.input_freshness.earliest_deadline()

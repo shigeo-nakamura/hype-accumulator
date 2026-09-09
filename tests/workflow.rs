@@ -1029,9 +1029,9 @@ fn expiry_binding_requires_exact_verified_clock_lag_gap() {
             "overflow" => envelope.max_venue_clock_lag_ms = u64::MAX,
             "missing-evidence" => envelope.venue_clock_evidence_digest.clear(),
             // The decision is dated at its scheduled boundary; venue evidence
-            // observed BEFORE that boundary cannot price the order it
-            // executes.
-            "evidence-before-decision" => decision.decided_at = at(1),
+            // observed BEFORE that boundary by more than the authorized clock
+            // lag cannot price the order it executes.
+            "evidence-before-decision" => decision.decided_at = at(2),
             "evidence-after-signed-expiry" => {
                 envelope.venue_clock_evidence_at = envelope.signed_expiry_at;
             }
@@ -1069,6 +1069,21 @@ fn expiry_binding_accepts_venue_evidence_observed_after_the_decision_boundary() 
         valid.eligibility_policy,
     )
     .expect("evidence after the boundary is valid");
+
+    // A venue clock lagging the local clock by up to the authorized
+    // `max_venue_clock_lag_ms` (+1 ms) may put a book fetched right after
+    // the boundary slightly before `decided_at`; that is still authorized.
+    let valid = binding();
+    let lag = valid.order_envelope.max_venue_clock_lag_ms;
+    let mut decision = decision();
+    decision.decided_at = at(0) + TimeDelta::milliseconds(i64::try_from(lag).unwrap() + 1);
+    DecisionBinding::from_pacing_decision(
+        &decision,
+        valid.inventory_before,
+        valid.order_envelope,
+        valid.eligibility_policy,
+    )
+    .expect("evidence within the authorized lag before the boundary is valid");
 }
 
 #[test]
