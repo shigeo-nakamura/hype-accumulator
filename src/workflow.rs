@@ -2876,10 +2876,22 @@ impl DurableWorkflow {
     ///
     /// Compares journals by name, not merely by how many there are: a
     /// cardinality check would let each newly created journal silently
-    /// substitute for a lost older one. Every journal named here was
-    /// validated by an earlier scan of this same directory, and each is
-    /// re-verified against its own protected head on every scan, so a name
-    /// that is still present cannot have had its contents swapped.
+    /// substitute for a lost older one.
+    ///
+    /// Names, and not their contents: each journal is separately re-verified
+    /// against its own protected head on the same scan, which catches a
+    /// journal edited in place. What that does *not* catch — deliberately
+    /// out of scope, bot-strategy#974 — is a stale but internally consistent
+    /// restore. `FileProtectedWorkflowHeadStore` keeps each protected head
+    /// beside the journal it protects, so recovering `history_directory`
+    /// from an older backup brings back both halves together and every name
+    /// is present. Recording each journal's head digest here instead would
+    /// not be a narrow fix: a journal's terminal state may legitimately
+    /// advance afterwards (`Complete` to `ManualReview`), so the record
+    /// would have to permit forward progress and reject only rollback —
+    /// a second implementation of what the protected-head store already is.
+    /// The real fix is to stop colocating that store with the journals
+    /// (bot-strategy#942 / bot-strategy#943 are the same family).
     ///
     /// Deliberately takes the scan result from its caller rather than
     /// rescanning: the condition being guarded must not be able to change

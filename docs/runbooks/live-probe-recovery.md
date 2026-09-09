@@ -184,7 +184,11 @@ it.
 Recovery is to restore the journals — from the off-host ledger backup, or the
 host's own backup of `history_directory` — and rerun the command; the error
 names the journals that are missing, and a partial restore keeps failing until
-all of them are back. Never "fix" this by deleting or editing the binding
+all of them are back. **Restore the newest backup**: each journal's protected
+head lives beside the journal itself, so an older journal and its own sidecar
+are self-consistent and this check cannot tell them from the current pair
+(bot-strategy#974). After any restore, `reconcile` each restored journal
+before running `prepare` again. Never "fix" this by deleting or editing the binding
 file: that discards the only evidence that the missing journals ever existed,
 and the next `prepare` would then treat still-unstaked HYPE from those
 journals as a fresh, staking-eligible fill. If history genuinely has to be
