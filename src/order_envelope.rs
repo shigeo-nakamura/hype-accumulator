@@ -9,11 +9,12 @@
 //! # Caller obligations this module cannot enforce
 //!
 //! [`DurableWorkflow::open_or_create`](crate::workflow::DurableWorkflow::open_or_create)'s
-//! validation requires `venue_clock_evidence_at <= decided_at < signed_expiry_at`
-//! (see `workflow.rs::valid_expiry_binding`). This module has no `decided_at`
-//! to bind against — the caller must stamp its `DailyDecision.decided_at` at
-//! a moment between calling this function and using its result, not reuse an
-//! older decision. In practice: recompute today's pacing decision
+//! validation requires `decided_at <= venue_clock_evidence_at < signed_expiry_at`
+//! (see `workflow.rs::valid_expiry_binding`): the decision is dated at its
+//! scheduled boundary and the venue evidence that prices the order must be
+//! observed after it. This module has no `decided_at` to bind against — the
+//! caller must assemble the envelope after the decision boundary it
+//! executes, never from a book read before it. In practice: compute today's pacing decision
 //! immediately before calling this, not after.
 //!
 //! # Judgment calls made here (flagged for review, not settled elsewhere)
@@ -129,7 +130,13 @@ pub async fn assemble_order_envelope_binding(
     tokio::try_join!(connector.get_combined_balance(), connector.get_user_fees())?;
 
     let limit_price = worst_case_price_with_slippage(best_ask.price, policy.max_slippage_bps)?;
-    let original_quantity_hype = quantity_for_budget(planned_usdc, limit_price)?;
+    // The bound limit price is the micro-rounded one; the quantity must be
+    // derived from that same value so `atoms * limit_micros / atoms_per_hype`
+    // (which `workflow.rs::max_fill_notional_usdc` rounds UP) can never exceed
+    // `planned_usdc` by the micro the rounding may have added.
+    let limit_price_usdc_per_hype = decimal_to_usdc_micros(limit_price)?;
+    let original_quantity_hype =
+        quantity_for_budget(planned_usdc, limit_price_usdc_per_hype.as_decimal())?;
 
     let book_evidence_valid_through_at =
         now + seconds(policy.book_stale_after_seconds, "book_stale_after_seconds")?;
@@ -210,7 +217,7 @@ pub async fn assemble_order_envelope_binding(
         original_quantity_hype,
         hype_atoms_per_hype: HYPE_ATOMS_PER_HYPE,
         market_metadata_digest: hype_usdc_market_metadata_digest(),
-        limit_price_usdc_per_hype: decimal_to_usdc_micros(limit_price)?,
+        limit_price_usdc_per_hype,
         l1_nonce,
         signed_expiry_at,
         effective_expiry_at,
@@ -354,6 +361,43 @@ mod tests {
             quantity_for_budget(UsdcMicros::from_micros(1), Decimal::from(1_000_000_000)),
             Err(OrderEnvelopeError::ZeroQuantity)
         ));
+    }
+
+    #[test]
+    fn quantity_from_the_micro_rounded_limit_never_exceeds_the_budget_after_ceil() {
+        // The bound limit price is rounded to micros (nearest, so possibly
+        // UP). `workflow.rs::max_fill_notional_usdc` computes
+        // ceil(atoms * limit_micros / atoms_per_hype) and the binding rejects
+        // it above `planned_usdc`. Deriving the quantity from the unrounded
+        // price can overshoot by one micro; deriving it from the rounded
+        // price cannot. Sweep asks whose 20 bps markup has 7 decimals.
+        let planned = UsdcMicros::from_micros(25_000_000);
+        let scale = u128::from(HYPE_ATOMS_PER_HYPE);
+        let ceil_notional = |atoms: u64, limit_micros: u64| -> u128 {
+            (u128::from(atoms) * u128::from(limit_micros)).div_ceil(scale)
+        };
+        let mut unrounded_overshoots = 0;
+        for tenth in 0..1_000u32 {
+            // 80.0001 .. 80.1000 in 0.0001 steps: five significant digits,
+            // the venue's own tick granularity for this price band.
+            let best_ask = Decimal::from(800_001 + tenth) / Decimal::from(10_000);
+            let limit = worst_case_price_with_slippage(best_ask, 20).unwrap();
+            let limit_micros = decimal_to_usdc_micros(limit).unwrap();
+            let rounded_atoms = quantity_for_budget(planned, limit_micros.as_decimal()).unwrap();
+            assert!(
+                ceil_notional(rounded_atoms.as_atoms(), limit_micros.as_micros())
+                    <= u128::from(planned.as_micros()),
+                "ask {best_ask}: rounded-price quantity overshoots"
+            );
+            let unrounded_atoms = quantity_for_budget(planned, limit).unwrap();
+            if ceil_notional(unrounded_atoms.as_atoms(), limit_micros.as_micros())
+                > u128::from(planned.as_micros())
+            {
+                unrounded_overshoots += 1;
+            }
+        }
+        // The sweep must actually contain the failure mode being fixed.
+        assert!(unrounded_overshoots > 0);
     }
 
     #[test]
