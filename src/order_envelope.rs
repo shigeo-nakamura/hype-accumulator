@@ -117,7 +117,14 @@ pub async fn assemble_order_envelope_binding(
     let venue_book = connector
         .get_order_book_with_venue_time(HYPE_SPOT_MARKET, policy.order_book_depth)
         .await?;
+    // Local clock read AFTER the response: future venue evidence is rejected.
+    let fetched_at = Utc::now();
     let venue_clock_evidence_at = millis_to_datetime(venue_book.venue_time_ms)?;
+    if venue_clock_evidence_at > fetched_at {
+        return Err(OrderEnvelopeError::InvalidExpiryWindow(
+            "venue clock evidence is ahead of the local clock at fetch time",
+        ));
+    }
     let best_ask = venue_book
         .book
         .asks
@@ -130,10 +137,8 @@ pub async fn assemble_order_envelope_binding(
     tokio::try_join!(connector.get_combined_balance(), connector.get_user_fees())?;
 
     let limit_price = worst_case_price_with_slippage(best_ask.price, policy.max_slippage_bps)?;
-    // The bound limit price is the micro-rounded one; the quantity must be
-    // derived from that same value so `atoms * limit_micros / atoms_per_hype`
-    // (which `workflow.rs::max_fill_notional_usdc` rounds UP) can never exceed
-    // `planned_usdc` by the micro the rounding may have added.
+    // Quantity from the micro-rounded limit, so the (rounded-up) fill
+    // notional in `workflow.rs::max_fill_notional_usdc` never exceeds the plan.
     let limit_price_usdc_per_hype = decimal_to_usdc_micros(limit_price)?;
     let original_quantity_hype =
         quantity_for_budget(planned_usdc, limit_price_usdc_per_hype.as_decimal())?;
@@ -360,6 +365,81 @@ mod tests {
         assert!(matches!(
             quantity_for_budget(UsdcMicros::from_micros(1), Decimal::from(1_000_000_000)),
             Err(OrderEnvelopeError::ZeroQuantity)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_venue_clock_evidence_from_the_future() {
+        let spot_meta = serde_json::json!({
+            "universe": [{"name": "HYPE/USDC", "tokens": [1, 0], "index": 0, "isCanonical": true}],
+            "tokens": [
+                {"name": "USDC", "szDecimals": 2, "weiDecimals": 6, "index": 0},
+                {"name": "HYPE", "szDecimals": 2, "weiDecimals": 8, "index": 1},
+            ],
+        })
+        .to_string();
+        // Venue timestamp one minute ahead of this process's clock.
+        let future_ms =
+            u64::try_from((Utc::now() + TimeDelta::minutes(1)).timestamp_millis()).unwrap();
+        let l2_book = serde_json::json!({
+            "coin": "HYPE",
+            "time": future_ms,
+            "levels": [
+                [{"px": "24.9", "sz": "100", "n": 1}],
+                [{"px": "25.0", "sz": "100", "n": 1}],
+            ],
+        })
+        .to_string();
+        let responses = std::collections::HashMap::from([
+            ("spotMeta", spot_meta),
+            ("l2Book", l2_book),
+            (
+                "spotClearinghouseState",
+                serde_json::json!({"balances": []}).to_string(),
+            ),
+            ("allMids", serde_json::json!({}).to_string()),
+            ("userFees", serde_json::json!({}).to_string()),
+        ]);
+        // Assembly must stop right after the book: spotMeta + l2Book only.
+        let (address, server) = spawn_typed_mock_server(responses, 2).await;
+        let nonce_path = std::env::temp_dir().join(format!(
+            "hype-future-evidence-nonce-{}.json",
+            std::process::id()
+        ));
+        let connector = HyperliquidConnector::new(HyperliquidConnectorConfig {
+            base_url: format!("http://{address}"),
+            tracked_symbols: Vec::new(),
+        })
+        .unwrap()
+        .with_account(HyperliquidAccountConfig {
+            account_address: "0x0000000000000000000000000000000000000001".to_string(),
+            signer_private_key: Some(TEST_SIGNER_KEY.to_string()),
+            vault_address: None,
+            is_mainnet: false,
+            nonce_state_path: Some(nonce_path.clone()),
+            max_taker_notional: None,
+            max_taker_slippage_bps: None,
+            max_taker_book_age_ms: 600_000,
+        })
+        .unwrap();
+        let now = Utc::now();
+        let result = assemble_order_envelope_binding(
+            &connector,
+            "signer-identity-hash-a".to_string(),
+            UsdcMicros::from_micros(25_000_000),
+            now + TimeDelta::hours(1),
+            now + TimeDelta::hours(1),
+            &policy(),
+            now,
+        )
+        .await;
+        server.await.unwrap();
+        let _ = std::fs::remove_file(nonce_path);
+        assert!(matches!(
+            result,
+            Err(OrderEnvelopeError::InvalidExpiryWindow(
+                "venue clock evidence is ahead of the local clock at fetch time"
+            ))
         ));
     }
 
