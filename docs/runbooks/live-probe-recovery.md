@@ -164,6 +164,31 @@ requirements:
 - Complete the separately approved staking custody design and venue capability
   gates. The current policy still rejects automatic staking.
 
+### Completing a real purchase while staking is disabled (bot-strategy#993)
+
+Recording staking eligibility for an accepted order used to require
+signer-side `OrderBoundEligibilityEvidence`, which nothing produces while
+staking is disabled — so every real purchase stopped at `OrderFinalized`, and
+`aggregate_terminal_residual_hype` (which accepts only `Complete`) then failed
+every later `prepare` closed. Auto-staking is deliberately not implemented
+(owner decision, 2026-09-10: immaterial yield at this size, a master-key
+custody escalation since an API wallet cannot sign staking actions, and a
+7-day unbonding delay).
+
+Instead, `reconcile` and `submit` complete such a workflow under a
+**staking-disabled attestation**: the bound policy's canonical fingerprint
+(`effective_security_policy_digest`, which covers `staking.enabled` — and
+policy validation refuses `enabled = true`). The attestation is accepted only
+with no evidence, and only when it names exactly the policy version the
+decision was bound to; a journal carrying any other version fails closed on
+every open. The residual/eligible split is computed exactly as before. The
+digest requires an unexpired live acknowledgement: when it has expired,
+lookup, fill recording and settlement still run, but the workflow stays at
+`OrderFinalized` (the command prints a note) until the acknowledgement is
+renewed and `reconcile` is rerun. When staking is enabled later, the evidence
+producer is added then; workflows completed under the attestation remain
+distinguishable in the journal.
+
 No output of this command is a scheduled-live approval or a staking approval.
 
 ## Releasing a decision that never reached a signer

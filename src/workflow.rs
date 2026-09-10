@@ -535,6 +535,21 @@ pub struct StakingEligibility {
     pub eligible_hype: HypeAtoms,
 }
 
+/// Attests that the security policy the decision was bound to hard-disables
+/// staking, in place of signer-side [`OrderBoundEligibilityEvidence`]
+/// (bot-strategy#993). That evidence authorizes a custody movement of the
+/// eligible HYPE; while no such movement can exist, there is nothing for it
+/// to authorize, and requiring it left every real purchase stuck at
+/// `OrderFinalized`. `policy_version` must equal the decision binding's
+/// `eligibility_policy.policy_version`, which is the canonical fingerprint of
+/// the loaded policy *including* `staking.enabled` — and policy validation
+/// refuses `enabled = true` — so the attestation is tied to a policy that
+/// cannot stake. Never combined with evidence.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StakingDisabledAttestation {
+    pub policy_version: String,
+}
+
 /// One immutable fill included by the independent eligibility reconciler.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BoundFillEvidence {
@@ -734,6 +749,10 @@ pub enum WorkflowTransition {
         evidence: Option<Box<OrderBoundEligibilityEvidence>>,
         residual_hype: HypeAtoms,
         eligible_hype: HypeAtoms,
+        /// Skipped when absent so every event written before it existed
+        /// re-encodes byte-for-byte and its record hash still verifies.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        staking_disabled_by_policy: Option<StakingDisabledAttestation>,
     },
     StakingDepositObserved {
         action_id: String,
@@ -1195,6 +1214,7 @@ impl WorkflowState {
                 evidence,
                 residual_hype,
                 eligible_hype,
+                staking_disabled_by_policy,
             } => {
                 if self.stage != WorkflowStage::OrderFinalized {
                     return Err(WorkflowError::InvalidTransition(
@@ -1215,10 +1235,15 @@ impl WorkflowState {
                         "unsigned staking eligibility does not conserve purchased HYPE".into(),
                     ));
                 }
-                self.validate_eligibility_evidence(evidence.as_deref(), event.at)?;
+                self.validate_eligibility_basis(
+                    evidence.as_deref(),
+                    staking_disabled_by_policy.as_ref(),
+                    event.at,
+                )?;
                 let expected_workflow_id = eligibility_workflow_id_for(
                     &self.workflow_id,
                     evidence.as_deref(),
+                    staking_disabled_by_policy.as_ref(),
                     *residual_hype,
                     *eligible_hype,
                 )?;
@@ -1556,6 +1581,36 @@ impl WorkflowState {
             ));
         }
         Ok(())
+    }
+
+    /// Exactly one basis may justify an eligibility record for an accepted
+    /// order: signer-side order-bound evidence, or an attestation that the
+    /// bound policy hard-disables staking (bot-strategy#993). Both at once
+    /// is a contradiction; an attestation naming any other policy version
+    /// than the one the decision was bound to is too.
+    pub(crate) fn validate_eligibility_basis(
+        &self,
+        evidence: Option<&OrderBoundEligibilityEvidence>,
+        staking_disabled_by_policy: Option<&StakingDisabledAttestation>,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<(), WorkflowError> {
+        match (evidence, staking_disabled_by_policy) {
+            (Some(_), Some(_)) => Err(WorkflowError::ContradictoryObservation(
+                "eligibility carries both signer evidence and a staking-disabled attestation"
+                    .into(),
+            )),
+            (None, Some(attestation)) => {
+                if attestation.policy_version != self.binding.eligibility_policy.policy_version {
+                    return Err(WorkflowError::ContradictoryObservation(
+                        "staking-disabled attestation names a policy version the decision was \
+                         not bound to"
+                            .into(),
+                    ));
+                }
+                Ok(())
+            }
+            (evidence, None) => self.validate_eligibility_evidence(evidence, recorded_at),
+        }
     }
 
     fn validate_eligibility_evidence(
@@ -2079,15 +2134,21 @@ impl WorkflowState {
                     _ => None,
                 }
             }
-            WorkflowTransition::StakingEligibilityRecorded { evidence, .. }
-                if self.stage == WorkflowStage::OrderFinalized =>
-            {
+            WorkflowTransition::StakingEligibilityRecorded {
+                evidence,
+                staking_disabled_by_policy,
+                ..
+            } if self.stage == WorkflowStage::OrderFinalized => {
                 if at < self.last_transition_at {
                     return Some(
                         "eligibility evidence predates terminal order reconciliation".into(),
                     );
                 }
-                match self.validate_eligibility_evidence(evidence.as_deref(), at) {
+                match self.validate_eligibility_basis(
+                    evidence.as_deref(),
+                    staking_disabled_by_policy.as_ref(),
+                    at,
+                ) {
                     Err(WorkflowError::ContradictoryObservation(reason)) => Some(reason),
                     _ => None,
                 }
@@ -3760,6 +3821,88 @@ impl DurableWorkflow {
         )
     }
 
+    /// Records staking eligibility for a finalized order under an
+    /// attestation that the bound policy hard-disables staking, in place of
+    /// signer-side evidence (bot-strategy#993). The residual/eligible split
+    /// is computed exactly as [`Self::record_staking_eligibility`] computes
+    /// it; only the basis differs. Idempotent for the same attestation.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidTransition` when the order is not finalized or
+    /// `policy_version` is not the one the decision was bound to (an
+    /// operator running against the wrong policy, not venue evidence — so
+    /// this does not move the workflow to manual review), or a replay
+    /// conflict / write failure.
+    pub fn record_staking_eligibility_under_disabled_policy(
+        &mut self,
+        policy_version: &str,
+        at: DateTime<Utc>,
+    ) -> Result<StakingEligibility, WorkflowError> {
+        if policy_version != self.state.binding.eligibility_policy.policy_version {
+            return Err(WorkflowError::InvalidTransition(
+                "staking-disabled attestation names a policy version the decision was not \
+                 bound to"
+                    .into(),
+            ));
+        }
+        let attestation = StakingDisabledAttestation {
+            policy_version: policy_version.to_owned(),
+        };
+        let residual_hype = self
+            .state
+            .purchased_hype
+            .min(self.state.binding.inventory_before.residual_hype_deficit());
+        let eligible_hype = self
+            .state
+            .purchased_hype
+            .checked_sub(residual_hype)
+            .ok_or_else(|| WorkflowError::CorruptJournal("HYPE split underflowed".into()))?;
+        let eligibility_workflow_id = eligibility_workflow_id_for(
+            self.state.workflow_id(),
+            None,
+            Some(&attestation),
+            residual_hype,
+            eligible_hype,
+        )?;
+        if matches!(
+            self.state.stage,
+            WorkflowStage::StakingEligibilityRecorded | WorkflowStage::Complete
+        ) {
+            if self.state.eligibility_workflow_id() == Some(&eligibility_workflow_id) {
+                return Ok(self.state.staking_eligibility());
+            }
+            let reason =
+                "eligibility evidence changed after its content-addressed workflow was recorded";
+            self.mark_manual_review(reason, at.max(self.state.last_transition_at))?;
+            return Err(WorkflowError::ContradictoryObservation(reason.into()));
+        }
+        if self.state.stage != WorkflowStage::OrderFinalized {
+            return Err(WorkflowError::InvalidTransition(
+                "staking eligibility requires a terminal order".into(),
+            ));
+        }
+        let event_id = stable_id(
+            "event/staking_eligibility/v2",
+            &[self.state.workflow_id(), &eligibility_workflow_id],
+        );
+        self.append_observation(
+            event_id,
+            at,
+            WorkflowTransition::StakingEligibilityRecorded {
+                eligibility_workflow_id,
+                evidence: None,
+                residual_hype,
+                eligible_hype,
+                staking_disabled_by_policy: Some(attestation),
+            },
+        )?;
+        Ok(StakingEligibility {
+            residual_hype,
+            eligible_hype,
+        })
+    }
+
     /// Records the unsigned residual/eligible split without creating an action.
     ///
     /// Automatic staking remains unavailable under the current custody policy;
@@ -3794,6 +3937,7 @@ impl DurableWorkflow {
         let eligibility_workflow_id = eligibility_workflow_id_for(
             self.state.workflow_id(),
             evidence.as_ref(),
+            None,
             residual_hype,
             eligible_hype,
         )?;
@@ -3837,6 +3981,7 @@ impl DurableWorkflow {
             evidence: evidence.map(Box::new),
             residual_hype,
             eligible_hype,
+            staking_disabled_by_policy: None,
         };
         if let Some(owners) = owners {
             let owner_store = Arc::clone(&self.exchange_order_owner_store);
@@ -4657,6 +4802,10 @@ fn canonical_order_envelope_hash(state: &WorkflowState) -> Result<String, Workfl
 struct EligibilityWorkflowInput<'a> {
     execution_workflow_id: &'a str,
     evidence: Option<&'a OrderBoundEligibilityEvidence>,
+    /// Omitted when absent so IDs recorded before it existed still
+    /// recompute to the same value on replay.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    staking_disabled_by_policy: Option<&'a StakingDisabledAttestation>,
     residual_hype: HypeAtoms,
     eligible_hype: HypeAtoms,
 }
@@ -4664,12 +4813,14 @@ struct EligibilityWorkflowInput<'a> {
 fn eligibility_workflow_id_for(
     execution_workflow_id: &str,
     evidence: Option<&OrderBoundEligibilityEvidence>,
+    staking_disabled_by_policy: Option<&StakingDisabledAttestation>,
     residual_hype: HypeAtoms,
     eligible_hype: HypeAtoms,
 ) -> Result<String, WorkflowError> {
     let encoded = serde_json::to_vec(&EligibilityWorkflowInput {
         execution_workflow_id,
         evidence,
+        staking_disabled_by_policy,
         residual_hype,
         eligible_hype,
     })

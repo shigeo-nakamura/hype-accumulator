@@ -1026,8 +1026,23 @@ async fn submit(
     }
     // Even a transport error may follow venue acceptance. Recovery must run
     // after every attempt, without allowing a second economic request.
+    // Same attestation `reconcile` passes (bot-strategy#993): the bound
+    // policy's fingerprint covers `staking.enabled`, which validation
+    // refuses to be true, so a real fill can complete its workflow here.
+    // `submit` already required an unexpired acknowledgement above, so an
+    // error here would be a clock race; withholding the attestation then is
+    // the fail-closed choice (the next `reconcile` completes it).
+    let now = Utc::now();
+    let disabled_staking_policy_version = config
+        .effective_security_policy_digest(&ProcessEnvironment, now)
+        .ok();
     let reconciliation = probe
-        .reconcile(&mut workflow, Path::new(journal_path), Utc::now())
+        .reconcile(
+            &mut workflow,
+            Path::new(journal_path),
+            disabled_staking_policy_version.as_deref(),
+            now,
+        )
         .await;
     let settlement = if let Ok(observation) = &reconciliation {
         print_observation(observation)?;
@@ -1386,11 +1401,30 @@ async fn reconcile(
     // Deliberately do not validate live approval or load/decrypt the signer.
     // An expired approval and a revoked key must not prevent read-only recovery.
     let connector = build_read_only_connector(&config, &operational, &ProcessEnvironment)?;
+    let now = Utc::now();
+    // The bound policy's canonical fingerprint — which covers
+    // `staking.enabled`, and validation refuses `enabled = true` — attests
+    // that no staking custody movement is possible, so a real purchase can
+    // record eligibility and complete without signer-side evidence
+    // (bot-strategy#993). Read-only recovery must not depend on the live
+    // acknowledgement, so an expired one only withholds the attestation:
+    // lookup, fill recording and settlement still run, and the workflow
+    // stays at `OrderFinalized` until the acknowledgement is renewed.
+    let disabled_staking_policy_version = config
+        .effective_security_policy_digest(&ProcessEnvironment, now)
+        .ok();
+    if disabled_staking_policy_version.is_none() {
+        eprintln!(
+            "note: live acknowledgement expired; a real purchase cannot complete its workflow \
+             until it is renewed (bot-strategy#993)"
+        );
+    }
     let observation = reconcile_prepared_order(
         &connector,
         &mut workflow,
         Path::new(journal_path),
-        Utc::now(),
+        disabled_staking_policy_version.as_deref(),
+        now,
     )
     .await?;
     print_observation(&observation)?;

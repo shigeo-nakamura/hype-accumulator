@@ -320,6 +320,7 @@ impl HyperliquidLiveProbe {
         &self,
         workflow: &mut DurableWorkflow,
         journal_path: &Path,
+        disabled_staking_policy_version: Option<&str>,
         now: DateTime<Utc>,
     ) -> Result<ProbeReconciliation, LiveProbeError> {
         // Derived from the durable binding, not `pending_prepared_order()`:
@@ -348,7 +349,15 @@ impl HyperliquidLiveProbe {
         if evidence.client_order_id != client_order_id {
             return Err(LiveProbeError::BindingMismatch("client order ID"));
         }
-        record_reconciliation(&self.connector, workflow, journal_path, evidence, now).await
+        record_reconciliation(
+            &self.connector,
+            workflow,
+            journal_path,
+            evidence,
+            disabled_staking_policy_version,
+            now,
+        )
+        .await
     }
 }
 
@@ -370,10 +379,19 @@ pub async fn reconcile_prepared_order(
     connector: &HyperliquidConnector,
     workflow: &mut DurableWorkflow,
     journal_path: &Path,
+    disabled_staking_policy_version: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<ProbeReconciliation, LiveProbeError> {
     let evidence = lookup_read_only(connector, workflow.state()).await?;
-    record_reconciliation(connector, workflow, journal_path, evidence, now).await
+    record_reconciliation(
+        connector,
+        workflow,
+        journal_path,
+        evidence,
+        disabled_staking_policy_version,
+        now,
+    )
+    .await
 }
 
 /// Performs the unauthenticated exact-CLOID lookup itself: validates the
@@ -440,6 +458,10 @@ async fn record_reconciliation(
     workflow: &mut DurableWorkflow,
     journal_path: &Path,
     evidence: HyperliquidOrderReconciliation,
+    // The bound policy's version when that policy hard-disables staking and
+    // its acknowledgement is unexpired; `None` leaves a real purchase at
+    // `OrderFinalized` rather than attesting anything (bot-strategy#993).
+    disabled_staking_policy_version: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<ProbeReconciliation, LiveProbeError> {
     // Never rejected for being "before" the venue's own reported acceptance
@@ -617,18 +639,40 @@ async fn record_reconciliation(
     // `StakingEligibilityRecorded`, which is just as non-terminal for
     // aggregation, so a later reconcile has to finish the job rather than
     // skip it.
-    let workflow_completed = if workflow.state().exchange_order_id().is_none()
-        && workflow.state().purchased_hype().is_zero()
-        && matches!(
-            workflow.state().stage(),
-            WorkflowStage::OrderFinalized | WorkflowStage::StakingEligibilityRecorded
-        ) {
+    // A real purchase completes the same way under an attestation that the
+    // bound policy hard-disables staking (bot-strategy#993): with no custody
+    // movement possible there is nothing for signer-side eligibility
+    // evidence to authorize, and requiring it left every real purchase at
+    // `OrderFinalized` — which blocks every later prepare exactly like the
+    // zero-purchase case. Without the attestation (policy acknowledgement
+    // expired) the order stays finalized-but-incomplete until it is renewed.
+    let zero_purchase = workflow.state().exchange_order_id().is_none()
+        && workflow.state().purchased_hype().is_zero();
+    let can_record_eligibility = zero_purchase || disabled_staking_policy_version.is_some();
+    let workflow_completed = if matches!(
+        workflow.state().stage(),
+        WorkflowStage::OrderFinalized | WorkflowStage::StakingEligibilityRecorded
+    ) && (workflow.state().stage()
+        == WorkflowStage::StakingEligibilityRecorded
+        || can_record_eligibility)
+    {
         // Never earlier than the transition it follows: absence recording
         // just above clamps its own timestamp forward past the venue
         // evidence it attests to, so a bare `now` can regress behind it.
         let completion_at = now.max(workflow.state().last_transition_at());
         if workflow.state().stage() == WorkflowStage::OrderFinalized {
-            workflow.record_staking_eligibility(None, completion_at)?;
+            match (zero_purchase, disabled_staking_policy_version) {
+                (true, _) => {
+                    workflow.record_staking_eligibility(None, completion_at)?;
+                }
+                (false, Some(policy_version)) => {
+                    workflow.record_staking_eligibility_under_disabled_policy(
+                        policy_version,
+                        completion_at,
+                    )?;
+                }
+                (false, None) => unreachable!("guarded by can_record_eligibility"),
+            }
         }
         workflow.complete(completion_at)?;
         true
@@ -2067,7 +2111,13 @@ mod tests {
         let server = spawn_absence_responder(listener, historical_orders, retained_fills);
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            reconcile_prepared_order(&connector, workflow, &test_journal_path(temp), now),
+            reconcile_prepared_order(
+                &connector,
+                workflow,
+                &test_journal_path(temp),
+                Some("custody-policy-v1"),
+                now,
+            ),
         )
         .await
         .unwrap();
@@ -2361,6 +2411,7 @@ mod tests {
                 &connector,
                 &mut workflow,
                 &test_journal_path(temp.path()),
+                Some("custody-policy-v1"),
                 fixture_at(20),
             ),
         )
@@ -2405,6 +2456,7 @@ mod tests {
                 &connector,
                 &mut workflow,
                 &test_journal_path(temp.path()),
+                Some("custody-policy-v1"),
                 fixture_at(25),
             ),
         )
@@ -2452,6 +2504,7 @@ mod tests {
                 &connector,
                 &mut workflow,
                 &test_journal_path(temp.path()),
+                Some("custody-policy-v1"),
                 fixture_at(20),
             ),
         )
@@ -2507,6 +2560,7 @@ mod tests {
                 &connector,
                 &mut workflow,
                 &test_journal_path(temp.path()),
+                Some("custody-policy-v1"),
                 fixture_at(20),
             ),
         )
@@ -2564,6 +2618,7 @@ mod tests {
                 &connector,
                 &mut workflow,
                 &test_journal_path(temp.path()),
+                Some("custody-policy-v1"),
                 fixture_at(20),
             ),
         )
@@ -2620,6 +2675,7 @@ mod tests {
                 &connector,
                 &mut workflow,
                 &test_journal_path(temp.path()),
+                Some("custody-policy-v1"),
                 fixture_at(20),
             ),
         )
@@ -2670,6 +2726,7 @@ mod tests {
                 &connector,
                 &mut workflow,
                 &test_journal_path(temp.path()),
+                Some("custody-policy-v1"),
                 fixture_at(20),
             ),
         )
@@ -2701,6 +2758,7 @@ mod tests {
                 &connector,
                 &mut workflow,
                 &test_journal_path(temp.path()),
+                Some("custody-policy-v1"),
                 fixture_at(25),
             ),
         )
@@ -2830,6 +2888,7 @@ mod tests {
                 &connector,
                 &mut workflow,
                 &test_journal_path(temp.path()),
+                Some("custody-policy-v1"),
                 fixture_at(20),
             ),
         )
@@ -2881,6 +2940,7 @@ mod tests {
                 &connector,
                 &mut workflow,
                 &test_journal_path(temp.path()),
+                Some("custody-policy-v1"),
                 fixture_at(20),
             ),
         )
@@ -2929,6 +2989,7 @@ mod tests {
                 &connector,
                 &mut workflow,
                 &test_journal_path(temp.path()),
+                Some("custody-policy-v1"),
                 fixture_at(20),
             ),
         )
@@ -2980,6 +3041,7 @@ mod tests {
                 &connector,
                 &mut workflow,
                 &test_journal_path(temp.path()),
+                Some("custody-policy-v1"),
                 fixture_at(20),
             ),
         )
@@ -3083,6 +3145,7 @@ mod tests {
                 &connector,
                 &mut workflow,
                 &test_journal_path(temp.path()),
+                Some("custody-policy-v1"),
                 fixture_at(20),
             ),
         )
@@ -3118,6 +3181,7 @@ mod tests {
                 &connector,
                 &mut workflow,
                 &test_journal_path(temp.path()),
+                Some("custody-policy-v1"),
                 fixture_at(25),
             ),
         )
@@ -3207,6 +3271,7 @@ mod tests {
                 &connector,
                 &mut workflow,
                 &test_journal_path(temp.path()),
+                Some("custody-policy-v1"),
                 fixture_at(20),
             ),
         )
@@ -3263,6 +3328,7 @@ mod tests {
                 &connector,
                 &mut workflow,
                 &test_journal_path(temp.path()),
+                Some("custody-policy-v1"),
                 fixture_at(5),
             ),
         )
@@ -3316,6 +3382,7 @@ mod tests {
                 &connector,
                 &mut workflow,
                 &test_journal_path(temp.path()),
+                Some("custody-policy-v1"),
                 fixture_at(5),
             ),
         )
@@ -3366,6 +3433,7 @@ mod tests {
                 &connector,
                 &mut workflow,
                 &test_journal_path(temp.path()),
+                Some("custody-policy-v1"),
                 fixture_at(20),
             ),
         )
@@ -3416,6 +3484,7 @@ mod tests {
                 &connector,
                 &mut workflow,
                 &test_journal_path(temp.path()),
+                Some("custody-policy-v1"),
                 fixture_at(20),
             ),
         )
@@ -3860,6 +3929,7 @@ mod tests {
                 &connector,
                 &mut workflow,
                 &test_journal_path(temp.path()),
+                Some("custody-policy-v1"),
                 fixture_at(20),
             ),
         )
@@ -3876,12 +3946,199 @@ mod tests {
             observed.credited_hype,
             Some(HypeAtoms::from_atoms(29_979_000))
         );
+        // And, under the staking-disabled attestation, it completes in the
+        // same call (bot-strategy#993) — the split conserving what the
+        // account holds, so a later prepare's residual aggregation is
+        // satisfiable against the live balance.
+        assert!(observed.workflow_completed);
         let state = workflow.state();
-        assert_eq!(state.stage(), WorkflowStage::OrderFinalized);
+        assert_eq!(state.stage(), WorkflowStage::Complete);
         assert_eq!(state.matched_hype(), HypeAtoms::from_atoms(30_000_000));
         assert_eq!(state.purchased_hype(), HypeAtoms::from_atoms(29_979_000));
         assert_eq!(state.filled_usdc(), UsdcMicros::from_micros(7_500_000));
         assert_eq!(state.debited_usdc(), UsdcMicros::from_micros(7_500_000));
+        let eligibility = state.terminal_staking_eligibility().unwrap();
+        assert_eq!(
+            eligibility.residual_hype.as_atoms() + eligibility.eligible_hype.as_atoms(),
+            29_979_000
+        );
+        // Replays from disk to the same terminal state.
+        let reopened = open_test_workflow(temp.path(), &binding);
+        assert_eq!(reopened.state().stage(), WorkflowStage::Complete);
+        assert_eq!(
+            reopened.state().terminal_staking_eligibility(),
+            Some(eligibility)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_real_purchase_stays_finalized_without_the_staking_disabled_attestation() {
+        // No attestation (expired acknowledgement): fill and finality are
+        // still recorded and settle-able, but nothing attests that staking
+        // is disabled, so the workflow stops at OrderFinalized rather than
+        // recording eligibility on no basis at all.
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connector = unsigned_connector(format!("http://{}", listener.local_addr().unwrap()));
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let mut workflow = open_test_workflow(temp.path(), &binding);
+        workflow.prepare_order(fixture_at(2)).unwrap();
+        let accepted_at_ms = fixture_at(5).timestamp_millis();
+        let filled = serde_json::json!({
+            "status": "order",
+            "order": {
+                "order": {"oid": 7, "origSz": "0.3", "sz": "0.0", "side": "B", "tif": "Ioc", "cloid": workflow.state().client_order_id(), "limitPx": "25.0", "timestamp": accepted_at_ms},
+                "status": "filled",
+                "statusTimestamp": accepted_at_ms
+            }
+        });
+        let fill = serde_json::json!([{
+            "coin": "@107", "px": "25", "sz": "0.3", "side": "B", "time": 1_000,
+            "oid": 7, "tid": 1, "fee": "0.0075", "feeToken": "USDC"
+        }]);
+        let server = spawn_reconcile_responder(listener, filled, fill, true);
+        let observed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reconcile_prepared_order(
+                &connector,
+                &mut workflow,
+                &test_journal_path(temp.path()),
+                None,
+                fixture_at(20),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+        assert!(observed.durable_finality);
+        assert!(!observed.workflow_completed);
+        assert_eq!(workflow.state().stage(), WorkflowStage::OrderFinalized);
+    }
+
+    #[tokio::test]
+    async fn the_attestation_must_name_the_policy_the_decision_was_bound_to() {
+        let temp = tempfile::tempdir().unwrap();
+        let connector = unsigned_connector("http://127.0.0.1:1".to_owned());
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let mut workflow = open_test_workflow(temp.path(), &binding);
+        workflow.prepare_order(fixture_at(2)).unwrap();
+        let submission = test_submission_evidence(&workflow, &binding, fixture_at(5));
+        workflow
+            .observe_order_submission(&submission, fixture_at(5))
+            .unwrap();
+        let matched = HypeAtoms::from_atoms(50_000_000);
+        let usdc = UsdcMicros::from_micros(12_500_000);
+        workflow
+            .observe_order_fill("fill", matched, matched, usdc, usdc, false, fixture_at(6))
+            .unwrap();
+        workflow
+            .finalize_order(
+                matched,
+                matched,
+                usdc,
+                usdc,
+                crate::workflow::OrderFinality::Canceled,
+                fixture_at(7),
+            )
+            .unwrap();
+
+        // Wrong policy version: refused, and NOT a manual review (operator
+        // error, not venue evidence).
+        assert!(matches!(
+            workflow
+                .record_staking_eligibility_under_disabled_policy("other-policy", fixture_at(8)),
+            Err(WorkflowError::InvalidTransition(_))
+        ));
+        assert_eq!(workflow.state().stage(), WorkflowStage::OrderFinalized);
+
+        // The bound version: recorded, idempotent, completes.
+        let first = workflow
+            .record_staking_eligibility_under_disabled_policy("custody-policy-v1", fixture_at(8))
+            .unwrap();
+        let again = workflow
+            .record_staking_eligibility_under_disabled_policy("custody-policy-v1", fixture_at(9))
+            .unwrap();
+        assert_eq!(first, again);
+        assert_eq!(
+            workflow.state().stage(),
+            WorkflowStage::StakingEligibilityRecorded
+        );
+        workflow.complete(fixture_at(9)).unwrap();
+        assert_eq!(workflow.state().stage(), WorkflowStage::Complete);
+    }
+
+    #[tokio::test]
+    async fn replay_refuses_an_attestation_naming_another_policy_or_paired_with_evidence() {
+        // The replay-side check (`validate_eligibility_basis`) is what makes
+        // a hand-crafted or foreign-policy attestation in a journal fail
+        // closed on every open; the record-time check alone would not.
+        let temp = tempfile::tempdir().unwrap();
+        let connector = unsigned_connector("http://127.0.0.1:1".to_owned());
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let workflow = open_test_workflow(temp.path(), &binding);
+        let state = workflow.state();
+        let bound = crate::workflow::StakingDisabledAttestation {
+            policy_version: "custody-policy-v1".to_owned(),
+        };
+        let foreign = crate::workflow::StakingDisabledAttestation {
+            policy_version: "other-policy".to_owned(),
+        };
+        assert!(state
+            .validate_eligibility_basis(None, Some(&bound), fixture_at(8))
+            .is_ok());
+        assert!(matches!(
+            state.validate_eligibility_basis(None, Some(&foreign), fixture_at(8)),
+            Err(WorkflowError::ContradictoryObservation(_))
+        ));
+        // No basis at all for an order that exists is still refused, as
+        // before this attestation existed.
+        let submission = test_submission_evidence(&workflow, &binding, fixture_at(5));
+        let mut workflow = workflow;
+        workflow.prepare_order(fixture_at(2)).unwrap();
+        workflow
+            .observe_order_submission(&submission, fixture_at(5))
+            .unwrap();
+        assert!(workflow
+            .state()
+            .validate_eligibility_basis(None, None, fixture_at(8))
+            .is_err());
+    }
+
+    #[test]
+    fn a_legacy_eligibility_event_without_the_attestation_re_encodes_unchanged() {
+        // 2026-09-09's journal holds such an event (zero-purchase absence,
+        // `evidence: null`); its record hash must keep verifying, and its
+        // eligibility workflow ID must recompute to the same value.
+        let legacy = serde_json::json!({
+            "type": "staking_eligibility_recorded",
+            "eligibility_workflow_id": "eligibility_wf_abc",
+            "evidence": null,
+            "residual_hype": 0,
+            "eligible_hype": 0
+        });
+        let decoded: crate::workflow::WorkflowTransition =
+            serde_json::from_value(legacy.clone()).unwrap();
+        match &decoded {
+            crate::workflow::WorkflowTransition::StakingEligibilityRecorded {
+                staking_disabled_by_policy,
+                ..
+            } => assert_eq!(*staking_disabled_by_policy, None),
+            other => panic!("unexpected transition {other:?}"),
+        }
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), legacy);
     }
 
     #[tokio::test]
