@@ -112,6 +112,7 @@ pub struct ProbeSubmission {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ProbeReconciliation {
     pub client_order_id: String,
     pub exchange_order_id: Option<String>,
@@ -139,6 +140,11 @@ pub struct ProbeReconciliation {
     /// outcome that releases a prepared intent (bot-strategy#982). `false`
     /// on every other path.
     pub absence_recorded: bool,
+    /// True exactly when this call drove a zero-purchase workflow to
+    /// `Complete`. Only a workflow that bought no HYPE is completed here;
+    /// anything holding HYPE needs the separately approved staking custody
+    /// design to classify residual versus eligible.
+    pub workflow_completed: bool,
 }
 
 #[derive(Debug, Error)]
@@ -424,6 +430,7 @@ async fn lookup_read_only(
 /// Propagates invalid quantities/timestamps and any error the workflow
 /// raises validating the observed evidence (contradiction, replay conflict,
 /// or journal I/O failure).
+#[allow(clippy::too_many_lines)]
 async fn record_reconciliation(
     connector: &HyperliquidConnector,
     workflow: &mut DurableWorkflow,
@@ -581,6 +588,38 @@ async fn record_reconciliation(
             false
         };
 
+    // A journal that bought nothing still has to reach `Complete`:
+    // `DurableWorkflow::aggregate_terminal_residual_hype` treats anything
+    // short of that as fail-closed, so a workflow left at `OrderFinalized`
+    // blocks every later `prepare` for this account — the decision cannot
+    // even be computed, let alone settled (bot-strategy#845 blocker 9).
+    // There is nothing to classify or stake at zero HYPE, and
+    // `validate_eligibility_evidence` already allows exactly this shape
+    // (no exchange order, no evidence, nothing purchased).
+    // Both stages are resumable: a crash between the eligibility append and
+    // the completion append leaves the journal at
+    // `StakingEligibilityRecorded`, which is just as non-terminal for
+    // aggregation, so a later reconcile has to finish the job rather than
+    // skip it.
+    let workflow_completed = if workflow.state().exchange_order_id().is_none()
+        && workflow.state().purchased_hype().is_zero()
+        && matches!(
+            workflow.state().stage(),
+            WorkflowStage::OrderFinalized | WorkflowStage::StakingEligibilityRecorded
+        ) {
+        // Never earlier than the transition it follows: absence recording
+        // just above clamps its own timestamp forward past the venue
+        // evidence it attests to, so a bare `now` can regress behind it.
+        let completion_at = now.max(workflow.state().last_transition_at());
+        if workflow.state().stage() == WorkflowStage::OrderFinalized {
+            workflow.record_staking_eligibility(None, completion_at)?;
+        }
+        workflow.complete(completion_at)?;
+        true
+    } else {
+        false
+    };
+
     Ok(ProbeReconciliation {
         client_order_id: evidence.client_order_id,
         exchange_order_id: evidence.order_id,
@@ -593,6 +632,7 @@ async fn record_reconciliation(
         // have finalized it, and this one's fills could be incomplete.
         durable_finality: order_already_finalized(workflow.state().stage()),
         absence_recorded,
+        workflow_completed,
     })
 }
 
@@ -1887,7 +1927,12 @@ mod tests {
         assert!(recorded.absence_recorded);
         assert!(recorded.durable_finality);
         assert_eq!(recorded.filled_hype, HypeAtoms::from_atoms(0));
-        assert_eq!(workflow.state().stage(), WorkflowStage::OrderFinalized);
+        // Driven all the way to `Complete`: a journal left at
+        // `OrderFinalized` is not terminal for
+        // `aggregate_terminal_residual_hype` and would block every later
+        // `prepare` for this account.
+        assert!(recorded.workflow_completed);
+        assert_eq!(workflow.state().stage(), WorkflowStage::Complete);
         assert!(workflow.state().exchange_order_id().is_none());
 
         // Idempotent: the workflow is no longer `Decided`, so a later
@@ -1903,6 +1948,82 @@ mod tests {
         .unwrap();
         assert!(!again.absence_recorded);
         assert!(again.durable_finality);
+        // Already `Complete`, so nothing is appended a second time.
+        assert!(!again.workflow_completed);
+        assert_eq!(workflow.state().stage(), WorkflowStage::Complete);
+    }
+
+    /// The absence evidence `record_conclusive_absence` builds, rebuilt here
+    /// so a test can drive a workflow into the mid-completion state a crash
+    /// would leave behind.
+    fn test_absence_evidence(
+        workflow: &DurableWorkflow,
+        observed_through_at: DateTime<Utc>,
+    ) -> ConclusiveAbsenceEvidence {
+        let binding = workflow.state().binding().clone();
+        let decided_at = binding.decided_at;
+        let watermark = |domain: HistoryDomain, label: &str| GapFreeHistoryWatermark {
+            domain,
+            watermark_id: content_hash(&["test/watermark", label]),
+            cursor: u64::try_from(observed_through_at.timestamp_millis()).unwrap(),
+            gap_free_from_at: decided_at,
+            through_at: observed_through_at,
+            evidence_hash: content_hash(&["test/evidence", label]),
+        };
+        ConclusiveAbsenceEvidence {
+            observation_id: content_hash(&["test/absence", &workflow.state().client_order_id()]),
+            execution_identity_hash: binding.inventory_before.execution_identity_hash.clone(),
+            client_order_id: workflow.state().client_order_id(),
+            effective_expiry_at: binding.order_envelope.effective_expiry_at,
+            order_history: watermark(HistoryDomain::Order, "orders"),
+            fill_history: watermark(HistoryDomain::Fill, "fills"),
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_resumes_after_a_crash_between_eligibility_and_complete() {
+        // A process that exits between the eligibility append and the
+        // completion append leaves the journal at
+        // `StakingEligibilityRecorded`, which aggregation rejects exactly
+        // like `OrderFinalized`. A later reconcile must finish it.
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            unsigned_connector(format!("http://{}", listener.local_addr().unwrap()))
+                .execution_account_address()
+                .unwrap(),
+        );
+        drop(listener);
+        let binding = decision_binding(execution_identity_hash);
+        let mut workflow = open_test_workflow(temp.path(), &binding);
+        workflow.prepare_order(fixture_at(2)).unwrap();
+        let through = fixture_at(34);
+        workflow
+            .record_order_submission_absent(test_absence_evidence(&workflow, through), through)
+            .expect("absence recorded");
+        workflow
+            .record_staking_eligibility(None, through)
+            .expect("eligibility recorded");
+        // The crash: `complete` never ran.
+        assert_eq!(
+            workflow.state().stage(),
+            WorkflowStage::StakingEligibilityRecorded
+        );
+
+        let resumed = reconcile_unknown_order(
+            temp.path(),
+            &mut workflow,
+            fixture_at(35),
+            None,
+            serde_json::json!([]),
+        )
+        .await
+        .unwrap();
+        // No absence to record a second time, but the completion resumes.
+        assert!(!resumed.absence_recorded);
+        assert!(resumed.workflow_completed);
+        assert_eq!(workflow.state().stage(), WorkflowStage::Complete);
     }
 
     #[tokio::test]
@@ -1936,7 +2057,8 @@ mod tests {
         .unwrap();
         assert!(recorded.absence_recorded);
         assert!(recorded.durable_finality);
-        assert_eq!(workflow.state().stage(), WorkflowStage::OrderFinalized);
+        assert!(recorded.workflow_completed);
+        assert_eq!(workflow.state().stage(), WorkflowStage::Complete);
     }
 
     #[tokio::test]
