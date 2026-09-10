@@ -546,8 +546,12 @@ pub struct BoundFillEvidence {
     pub order_id: String,
     /// Quantity the venue matched for this fill (gross). The executed
     /// notional is `matched × price`, so this — not `purchased_hype` — is
-    /// what the quantity-at-limit notional cap is taken from.
-    pub matched_hype: HypeAtoms,
+    /// what the quantity-at-limit notional cap is taken from. Absent only
+    /// in evidence written before this field existed, where `purchased_hype`
+    /// *was* the matched quantity; skipped when serializing so such a
+    /// record re-encodes byte-for-byte and its hash still verifies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_hype: Option<HypeAtoms>,
     /// Quantity credited to the account by this fill: matched less any fee
     /// the venue charged in HYPE (bot-strategy#998). Sums to the workflow's
     /// `purchased_hype`.
@@ -1666,8 +1670,9 @@ impl WorkflowState {
             // charged in HYPE reduces what was credited, not what traded,
             // so capping on `purchased_hype` would reject every honest fill
             // near the limit price (Codex review of PR #60).
+            let fill_matched_hype = fill.matched_hype.unwrap_or(fill.purchased_hype);
             let fill_notional_cap =
-                max_fill_notional_usdc(fill.matched_hype, &self.binding.order_envelope)
+                max_fill_notional_usdc(fill_matched_hype, &self.binding.order_envelope)
                     .ok_or_else(|| {
                         WorkflowError::ContradictoryObservation(
                             "fill quantity-at-limit notional overflowed".into(),
@@ -1694,9 +1699,9 @@ impl WorkflowState {
                 || fill.execution_identity_hash != evidence.execution_identity_hash
                 || fill.client_order_id != evidence.client_order_id
                 || fill.order_id != evidence.order_id
-                || fill.matched_hype.is_zero()
+                || fill_matched_hype.is_zero()
                 || fill.purchased_hype.is_zero()
-                || fill.purchased_hype > fill.matched_hype
+                || fill.purchased_hype > fill_matched_hype
                 || fill.executed_notional_usdc.is_zero()
                 || fill.executed_notional_usdc > fill_notional_cap
                 || !fill_ids.insert(fill.fill_id.as_str())
@@ -4493,7 +4498,7 @@ fn checked_fill_totals(
     fill: &BoundFillEvidence,
 ) -> Result<(u64, u64, u64), WorkflowError> {
     let matched = matched
-        .checked_add(fill.matched_hype.as_atoms())
+        .checked_add(fill.matched_hype.unwrap_or(fill.purchased_hype).as_atoms())
         .ok_or_else(|| {
             WorkflowError::ContradictoryObservation("authorized fill quantity overflowed".into())
         })?;

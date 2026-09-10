@@ -585,10 +585,53 @@ fn eligibility_caps_a_fill_notional_on_the_matched_quantity_not_the_credited_one
 
     // Evidence built for the credited 249, executing the full 50 USDC.
     let mut evidence = bound_evidence(&workflow, &[("fill-a", 249, 3)], at(5));
-    evidence.fills[0].matched_hype = hype(250);
+    evidence.fills[0].matched_hype = Some(hype(250));
     workflow
         .record_staking_eligibility(Some(evidence.clone()), at(5))
         .expect("eligibility recorded for a fee-in-HYPE fill");
+
+    // Evidence written before `matched_hype` existed carries no such key and
+    // means "matched == purchased"; it must decode, re-encode unchanged, and
+    // validate under that meaning.
+    let mut legacy = serde_json::to_value(&evidence.fills[0]).expect("fill serializes");
+    legacy
+        .as_object_mut()
+        .expect("object")
+        .remove("matched_hype");
+    let decoded: BoundFillEvidence =
+        serde_json::from_value(legacy.clone()).expect("legacy decodes");
+    assert_eq!(decoded.matched_hype, None);
+    assert_eq!(serde_json::to_value(&decoded).expect("re-encodes"), legacy);
+    // A legacy-shaped fill (no HYPE fee, so purchased *is* matched) must
+    // still validate at its full quantity-at-limit notional.
+    let temp = tempfile::tempdir().expect("temp directory");
+    let mut workflow = accepted_workflow(&temp.path().join("legacy-shape.jsonl"));
+    workflow
+        .observe_order_fill(
+            "fill-observation",
+            hype(250),
+            hype(250),
+            usdc(50_000_000),
+            usdc(50_000_000),
+            true,
+            at(3),
+        )
+        .expect("fill observed");
+    workflow
+        .finalize_order(
+            hype(250),
+            hype(250),
+            usdc(50_000_000),
+            usdc(50_000_000),
+            OrderFinality::Filled,
+            at(4),
+        )
+        .expect("order finalized");
+    let mut legacy_evidence = bound_evidence(&workflow, &[("fill-a", 250, 3)], at(5));
+    legacy_evidence.fills[0].matched_hype = None;
+    workflow
+        .record_staking_eligibility(Some(legacy_evidence), at(5))
+        .expect("legacy-shaped evidence validates with matched == purchased");
 
     // Claiming more credited than matched is a contradiction.
     let temp = tempfile::tempdir().expect("temp directory");
@@ -615,7 +658,7 @@ fn eligibility_caps_a_fill_notional_on_the_matched_quantity_not_the_credited_one
         )
         .expect("order finalized");
     let mut evidence = bound_evidence(&workflow, &[("fill-a", 249, 3)], at(5));
-    evidence.fills[0].matched_hype = hype(248);
+    evidence.fills[0].matched_hype = Some(hype(248));
     assert!(workflow
         .record_staking_eligibility(Some(evidence), at(5))
         .is_err());
@@ -712,7 +755,7 @@ fn bound_evidence(
                         .exchange_order_id()
                         .expect("accepted order identity")
                         .to_owned(),
-                    matched_hype: hype(*atoms),
+                    matched_hype: Some(hype(*atoms)),
                     purchased_hype: hype(*atoms),
                     executed_notional_usdc: usdc(executed_notional),
                     executed_at: at(*minute),

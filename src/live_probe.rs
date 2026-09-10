@@ -595,6 +595,14 @@ async fn record_reconciliation(
         } else {
             false
         };
+    if evidence.order_id.is_none() {
+        // The venue has no such order, so nothing was credited: a known
+        // zero, exactly like `filled_hype` above. Settlement compares this
+        // against the journal's `purchased_hype`, which a conclusive-absence
+        // (or crash-resumed zero-purchase) workflow holds as zero; `None`
+        // here would refuse that settlement and strand the decision.
+        credited_hype = Some(HypeAtoms::default());
+    }
 
     // A journal that bought nothing still has to reach `Complete`:
     // `DurableWorkflow::aggregate_terminal_residual_hype` treats anything
@@ -1358,6 +1366,12 @@ fn cumulative_credited_hype_from_fills(
         let net = size
             .checked_sub(base_fee)
             .ok_or(LiveProbeError::InvalidDecimal("credited fill size"))?;
+        // Per row, not only in aggregate: a fee that consumes or exceeds
+        // its own fill is malformed evidence, and another honest row must
+        // not be allowed to hide it inside a still-positive total.
+        if net <= Decimal::ZERO {
+            return Err(LiveProbeError::InvalidDecimal("credited fill size"));
+        }
         credited = credited
             .checked_add(net)
             .ok_or(LiveProbeError::InvalidDecimal("cumulative credited size"))?;
@@ -2210,6 +2224,9 @@ mod tests {
         // No absence to record a second time, but the completion resumes.
         assert!(!resumed.absence_recorded);
         assert!(resumed.workflow_completed);
+        // Nothing was credited, and settlement needs that as a known zero
+        // rather than "unknown" (Codex review of PR #60).
+        assert_eq!(resumed.credited_hype, Some(HypeAtoms::default()));
         assert_eq!(workflow.state().stage(), WorkflowStage::Complete);
     }
 
@@ -3720,6 +3737,19 @@ mod tests {
         fills.insert(
             "1".to_string(),
             accumulated_with_base_fee("0.3", "7.5", "7.5", "0.4"),
+        );
+        assert!(cumulative_credited_hype_from_fills(&fills, 100_000_000).is_err());
+
+        // ...and so is one that consumes its fill exactly, even when another
+        // row keeps the aggregate positive (Codex review of PR #60).
+        let mut fills = BTreeMap::new();
+        fills.insert(
+            "1".to_string(),
+            accumulated_with_base_fee("0.3", "7.5", "7.5", "0.3"),
+        );
+        fills.insert(
+            "2".to_string(),
+            accumulated_with_base_fee("0.3", "7.5", "0.00525", "0.00021"),
         );
         assert!(cumulative_credited_hype_from_fills(&fills, 100_000_000).is_err());
     }
