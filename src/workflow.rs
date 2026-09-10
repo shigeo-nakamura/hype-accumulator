@@ -651,7 +651,14 @@ pub struct AuthenticatedOrderSubmission {
     /// rounds a request *down* onto its size lot (`szDecimals`), so this
     /// is at or below `original_quantity_hype` and is what "completely
     /// filled" means for this order (bot-strategy#845).
-    pub venue_accepted_quantity_hype: HypeAtoms,
+    ///
+    /// Absent only in an event written before this field existed. The code
+    /// that wrote those required the venue's quantity to *equal*
+    /// `original_quantity_hype`, so absence means exactly that, and replay
+    /// resolves it there. It is skipped when serializing so a legacy event
+    /// re-encodes byte-for-byte and its record hash still verifies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub venue_accepted_quantity_hype: Option<HypeAtoms>,
     pub hype_atoms_per_hype: u64,
     pub market_metadata_digest: String,
     pub limit_price_usdc_per_hype: UsdcMicros,
@@ -1017,7 +1024,11 @@ impl WorkflowState {
                 }
                 self.validate_order_submission_evidence(evidence, event.at)?;
                 self.exchange_order_id = Some(evidence.exchange_order_id.clone());
-                self.venue_accepted_quantity_hype = Some(evidence.venue_accepted_quantity_hype);
+                self.venue_accepted_quantity_hype = Some(
+                    evidence
+                        .venue_accepted_quantity_hype
+                        .unwrap_or(self.binding.order_envelope.original_quantity_hype),
+                );
                 self.order_accepted_at = Some(evidence.accepted_at);
                 self.pending_action = None;
                 self.stage = WorkflowStage::OrderSubmitted;
@@ -1755,6 +1766,11 @@ impl WorkflowState {
     /// that needs it means the journal is missing that observation, so
     /// this fails closed rather than falling back to the authorized
     /// quantity (which the venue may have rounded down — bot-strategy#845).
+    #[must_use]
+    pub fn venue_accepted_quantity_hype(&self) -> Option<HypeAtoms> {
+        self.venue_accepted_quantity_hype
+    }
+
     fn venue_accepted_quantity(&self) -> Result<HypeAtoms, WorkflowError> {
         self.venue_accepted_quantity_hype.ok_or_else(|| {
             WorkflowError::CorruptJournal("venue-accepted order quantity is missing".into())
@@ -1787,8 +1803,12 @@ impl WorkflowState {
             // The venue may only round the authorized size DOWN onto its
             // own size lot; a larger accepted size, or none at all, is a
             // contradiction and must never become the full-fill target.
-            || evidence.venue_accepted_quantity_hype.is_zero()
-            || evidence.venue_accepted_quantity_hype > envelope.original_quantity_hype
+            // (Absent = a legacy event; see the field's own note.)
+            || evidence
+                .venue_accepted_quantity_hype
+                .is_some_and(|accepted| {
+                    accepted.is_zero() || accepted > envelope.original_quantity_hype
+                })
             || evidence.hype_atoms_per_hype != envelope.hype_atoms_per_hype
             || evidence.market_metadata_digest != envelope.market_metadata_digest
             || evidence.limit_price_usdc_per_hype != envelope.limit_price_usdc_per_hype
