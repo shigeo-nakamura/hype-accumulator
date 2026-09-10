@@ -1921,6 +1921,34 @@ impl WorkflowState {
     /// Cumulative quantity the venue matched for this order — the
     /// order-level figure that "completely filled" is judged against.
     /// Differs from [`Self::purchased_hype`] by any fee charged in HYPE.
+    /// The attestation `proof` can justify for this decision's binding, or
+    /// `None` when it cannot (bot-strategy#993): the basis is fixed by the
+    /// binding — a digest-bearing binding only ever accepts its staking
+    /// digest, an older one only its whole-policy version. Callers use this
+    /// to *withhold* a proof that cannot match rather than attempt it: an
+    /// attempt fails, and a failure after finalization would abort the
+    /// reconciliation before settlement.
+    #[must_use]
+    pub fn disabled_staking_attestation_for(
+        &self,
+        proof: &DisabledStakingProof,
+    ) -> Option<StakingDisabledAttestation> {
+        let policy = &self.binding.eligibility_policy;
+        match policy.staking_policy_digest.as_deref() {
+            Some(bound_digest) if bound_digest == proof.staking_policy_digest => {
+                Some(StakingDisabledAttestation::StakingPolicyDigest {
+                    staking_policy_digest: proof.staking_policy_digest.clone(),
+                })
+            }
+            None if proof.validated_policy_version == policy.policy_version => {
+                Some(StakingDisabledAttestation::BoundPolicyVersion {
+                    policy_version: proof.validated_policy_version.clone(),
+                })
+            }
+            _ => None,
+        }
+    }
+
     #[must_use]
     pub fn matched_hype(&self) -> HypeAtoms {
         self.matched_hype
@@ -3886,25 +3914,10 @@ impl DurableWorkflow {
         proof: &DisabledStakingProof,
         at: DateTime<Utc>,
     ) -> Result<StakingEligibility, WorkflowError> {
-        let policy = &self.state.binding.eligibility_policy;
-        let attestation = match policy.staking_policy_digest.as_deref() {
-            Some(bound_digest) if bound_digest == proof.staking_policy_digest => {
-                StakingDisabledAttestation::StakingPolicyDigest {
-                    staking_policy_digest: proof.staking_policy_digest.clone(),
-                }
-            }
-            None if proof.validated_policy_version == policy.policy_version => {
-                StakingDisabledAttestation::BoundPolicyVersion {
-                    policy_version: proof.validated_policy_version.clone(),
-                }
-            }
-            _ => {
-                return Err(WorkflowError::InvalidTransition(
-                    "staking-disabled proof does not match the policy the decision was bound \
-                     to"
-                    .into(),
-                ))
-            }
+        let Some(attestation) = self.state.disabled_staking_attestation_for(proof) else {
+            return Err(WorkflowError::InvalidTransition(
+                "staking-disabled proof does not match the policy the decision was bound to".into(),
+            ));
         };
         let residual_hype = self
             .state

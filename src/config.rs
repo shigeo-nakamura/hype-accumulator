@@ -1291,9 +1291,17 @@ impl SecurityPolicy {
 
     fn staking_policy_digest(&self) -> Result<String, SecurityPolicyError> {
         let staking = &self.wire.staking;
+        // The same normalized, sorted, de-duplicated form `live_context`
+        // hashes into the whole-policy acknowledgement: reordering the
+        // allowlist or reformatting an address must not change the digest,
+        // or a digest-bound workflow could never complete after an
+        // otherwise-identical policy was re-acknowledged (Codex review of
+        // PR #61).
+        let validator_allowlist =
+            normalized_addresses(&staking.validator_allowlist, "validator allowlist", true)?;
         let canonical = CanonicalStakingPolicy {
             enabled: staking.enabled,
-            validator_allowlist: &staking.validator_allowlist,
+            validator_allowlist: &validator_allowlist,
             residual_hype_wei: staking.residual_hype_wei,
             lot_consumption_policy: "oldest_authoritative_fill_first",
             fill_registration_deadline_seconds: staking.fill_registration_deadline_seconds,

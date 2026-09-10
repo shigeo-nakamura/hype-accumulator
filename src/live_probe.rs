@@ -648,6 +648,17 @@ async fn record_reconciliation(
     // expired) the order stays finalized-but-incomplete until it is renewed.
     let zero_purchase = workflow.state().exchange_order_id().is_none()
         && workflow.state().purchased_hype().is_zero();
+    // A proof that cannot satisfy this binding (the staking section changed
+    // under a later, live-valid policy) is withheld rather than attempted:
+    // the attempt would fail after finalization and abort the reconciliation
+    // before settlement, leaving the decision unsettled on every retry
+    // (Codex review of PR #61). The order then stays finalized-but-incomplete.
+    let disabled_staking = disabled_staking.filter(|proof| {
+        workflow
+            .state()
+            .disabled_staking_attestation_for(proof)
+            .is_some()
+    });
     let can_record_eligibility = zero_purchase || disabled_staking.is_some();
     let workflow_completed = if matches!(
         workflow.state().stage(),
@@ -4021,6 +4032,60 @@ mod tests {
                 &mut workflow,
                 &test_journal_path(temp.path()),
                 None,
+                fixture_at(20),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+        assert!(observed.durable_finality);
+        assert!(!observed.workflow_completed);
+        assert_eq!(workflow.state().stage(), WorkflowStage::OrderFinalized);
+    }
+
+    #[tokio::test]
+    async fn a_proof_that_cannot_match_the_binding_is_withheld_not_attempted() {
+        // Codex review of PR #61: the staking section changed under a later
+        // live-valid policy. Attempting the mismatched proof would fail
+        // after finalization and abort before settlement; instead the fill
+        // is recorded and finalized, the order stays at OrderFinalized, and
+        // the call succeeds so settlement can run.
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connector = unsigned_connector(format!("http://{}", listener.local_addr().unwrap()));
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let mut workflow = open_test_workflow(temp.path(), &binding);
+        workflow.prepare_order(fixture_at(2)).unwrap();
+        let accepted_at_ms = fixture_at(5).timestamp_millis();
+        let filled = serde_json::json!({
+            "status": "order",
+            "order": {
+                "order": {"oid": 7, "origSz": "0.3", "sz": "0.0", "side": "B", "tif": "Ioc", "cloid": workflow.state().client_order_id(), "limitPx": "25.0", "timestamp": accepted_at_ms},
+                "status": "filled",
+                "statusTimestamp": accepted_at_ms
+            }
+        });
+        let fill = serde_json::json!([{
+            "coin": "@107", "px": "25", "sz": "0.3", "side": "B", "time": 1_000,
+            "oid": 7, "tid": 1, "fee": "0.0075", "feeToken": "USDC"
+        }]);
+        let server = spawn_reconcile_responder(listener, filled, fill, true);
+        let changed_staking_section = DisabledStakingProof {
+            staking_policy_digest: "some-other-staking-policy".to_owned(),
+            ..test_disabled_staking_proof()
+        };
+        let observed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reconcile_prepared_order(
+                &connector,
+                &mut workflow,
+                &test_journal_path(temp.path()),
+                Some(&changed_staking_section),
                 fixture_at(20),
             ),
         )
