@@ -463,16 +463,7 @@ async fn record_reconciliation(
         // could pass every later cumulative-cap check by construction,
         // since those checks are bounded by the authorized quantity, not
         // verified against what the venue actually reported.
-        let observed_original_quantity = decimal_to_atoms(
-            evidence
-                .filled_size
-                .checked_add(evidence.remaining_size)
-                .ok_or(LiveProbeError::InvalidDecimal("observed original quantity"))?,
-            hype_atoms_per_hype,
-        )?;
-        if observed_original_quantity != binding.order_envelope.original_quantity_hype {
-            return Err(LiveProbeError::QuantityMismatch);
-        }
+        let observed_original_quantity = verify_observed_quantity(&evidence, &binding)?;
         // CLOID, side, time-in-force, and limit price, read directly from
         // the raw venue envelope (no market-metadata resolution needed for
         // these — unlike `coin`, which is venue-internal and not
@@ -531,7 +522,7 @@ async fn record_reconciliation(
             &binding,
             &exchange_order_id,
             &evidence.raw_order_status,
-            hype_atoms_per_hype,
+            observed_original_quantity,
             now,
         )
         .await?;
@@ -547,7 +538,14 @@ async fn record_reconciliation(
             // (when terminal) rather than recording a fill observation that
             // would always be rejected.
             if !cumulative_hype.is_zero() {
-                let fully_filled = cumulative_hype == binding.order_envelope.original_quantity_hype;
+                // "Completely filled" means the venue filled everything it
+                // accepted, which is the authorized quantity rounded down
+                // onto the venue's size lot, not the authorized quantity
+                // itself (bot-strategy#845). Comparing against the latter
+                // would leave every real full fill looking partial, and
+                // `OrderFinality::Filled` would then be rejected as
+                // contradictory.
+                let fully_filled = cumulative_hype == observed_original_quantity;
                 let fill_observation_id = content_hash(&[
                     "hype-accumulator/order-fill-observation/v1",
                     &exchange_order_id,
@@ -739,16 +737,54 @@ fn truncate_to_millis(at: DateTime<Utc>) -> DateTime<Utc> {
 /// # Errors
 ///
 /// Propagates connector, timestamp-parsing, and workflow-validation errors.
+/// The venue's own quantity for this order, independently reconstructed
+/// from its `orderStatus` envelope (`filled + remaining` = `origSz`) and
+/// checked against the authorized envelope.
+///
+/// The venue may only round the requested size **down** onto its own size
+/// lot: HYPE spot trades on a `szDecimals` grid while the envelope
+/// authorizes at wei precision, so an authorized 0.30798790 comes back as
+/// 0.3 and equality can never hold (bot-strategy#845 blocker 10, hit on a
+/// real fill). A size *larger* than authorized is a genuine contradiction
+/// and fails closed, which is the property this check exists for: every
+/// later cumulative cap is bounded by this quantity, so the venue must
+/// never be able to enlarge it. Zero does not describe a submitted order.
+/// Spend stays bounded independently by the envelope's `max_debit_usdc`,
+/// and recorded fill totals come from the fills themselves.
+fn verify_observed_quantity(
+    evidence: &HyperliquidOrderReconciliation,
+    binding: &DecisionBinding,
+) -> Result<HypeAtoms, LiveProbeError> {
+    let observed = decimal_to_atoms(
+        evidence
+            .filled_size
+            .checked_add(evidence.remaining_size)
+            .ok_or(LiveProbeError::InvalidDecimal("observed original quantity"))?,
+        binding.order_envelope.hype_atoms_per_hype,
+    )?;
+    if observed.is_zero() || observed > binding.order_envelope.original_quantity_hype {
+        return Err(LiveProbeError::QuantityMismatch);
+    }
+    Ok(observed)
+}
+
 async fn record_order_submission_if_new(
     connector: &HyperliquidConnector,
     workflow: &mut DurableWorkflow,
     binding: &DecisionBinding,
     exchange_order_id: &str,
     raw_order_status: &str,
-    hype_atoms_per_hype: u64,
+    venue_accepted_quantity_hype: HypeAtoms,
     now: DateTime<Utc>,
 ) -> Result<DateTime<Utc>, LiveProbeError> {
     if let Some(recorded) = workflow.state().exchange_order_id() {
+        // The accepted quantity is the full-fill target and the cumulative
+        // fill cap, so once recorded it is immutable: a later lookup
+        // reporting a different `origSz` for the same order is a
+        // contradiction, and letting it pass would silently move both.
+        if workflow.state().venue_accepted_quantity_hype() != Some(venue_accepted_quantity_hype) {
+            return Err(LiveProbeError::QuantityMismatch);
+        }
         // Never silently treated as "already observed, nothing to do": a
         // later lookup returning a *different* exchange order ID than the
         // one already durably recorded would otherwise let the caller
@@ -804,7 +840,8 @@ async fn record_order_submission_if_new(
         planned_usdc: binding.planned_usdc,
         max_debit_usdc: binding.committed_usdc,
         original_quantity_hype: binding.order_envelope.original_quantity_hype,
-        hype_atoms_per_hype,
+        venue_accepted_quantity_hype: Some(venue_accepted_quantity_hype),
+        hype_atoms_per_hype: binding.order_envelope.hype_atoms_per_hype,
         market_metadata_digest: binding.order_envelope.market_metadata_digest.clone(),
         limit_price_usdc_per_hype: binding.order_envelope.limit_price_usdc_per_hype,
         l1_nonce: binding.order_envelope.l1_nonce,
@@ -1733,6 +1770,41 @@ mod tests {
     /// going in) — that's the only case `record_reconciliation` fetches
     /// `spotClearinghouseState`. A later round reconciling an
     /// already-recorded order does not repeat that lookup.
+    fn test_submission_evidence(
+        workflow: &DurableWorkflow,
+        binding: &DecisionBinding,
+        accepted_at: DateTime<Utc>,
+    ) -> AuthenticatedOrderSubmission {
+        AuthenticatedOrderSubmission {
+            observation_id: "obs-a".to_string(),
+            account_scope_evidence_hash: "hash-a".to_string(),
+            order_envelope_evidence_hash: "hash-b".to_string(),
+            execution_identity_hash: binding.inventory_before.execution_identity_hash.clone(),
+            signer_identity_hash: binding.order_envelope.signer_identity_hash.clone(),
+            decision_id: binding.decision_id.clone(),
+            client_order_id: workflow.state().client_order_id(),
+            exchange_order_id: "7".to_string(),
+            canonical_order_envelope_hash: workflow
+                .state()
+                .canonical_order_envelope_hash()
+                .unwrap(),
+            planned_usdc: binding.planned_usdc,
+            max_debit_usdc: binding.committed_usdc,
+            original_quantity_hype: binding.order_envelope.original_quantity_hype,
+            venue_accepted_quantity_hype: Some(binding.order_envelope.original_quantity_hype),
+            hype_atoms_per_hype: binding.order_envelope.hype_atoms_per_hype,
+            market_metadata_digest: binding.order_envelope.market_metadata_digest.clone(),
+            limit_price_usdc_per_hype: binding.order_envelope.limit_price_usdc_per_hype,
+            l1_nonce: binding.order_envelope.l1_nonce,
+            signed_expiry_at: binding.order_envelope.signed_expiry_at,
+            effective_expiry_at: binding.order_envelope.effective_expiry_at,
+            market: HYPE_SPOT_MARKET.to_string(),
+            side: "buy".to_string(),
+            time_in_force: "IOC".to_string(),
+            accepted_at,
+        }
+    }
+
     fn spawn_reconcile_responder(
         listener: tokio::net::TcpListener,
         order_status: serde_json::Value,
@@ -2315,6 +2387,328 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepts_a_venue_quantity_rounded_down_onto_the_venue_size_lot() {
+        // Regression test for bot-strategy#845 blocker 10, hit on the first
+        // real fill: the envelope authorizes a quantity at wei precision
+        // (0.30798790 HYPE for a $25 budget) but HYPE spot trades on a 0.01
+        // size lot, so the venue reported `origSz` 0.3 and the old equality
+        // check made the fill permanently unrecordable. A quantity the
+        // venue rounded *down* onto its own lot is accepted; every later
+        // cumulative cap stays bounded by the larger authorized quantity,
+        // and spend stays bounded independently by `max_debit_usdc`.
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connector = unsigned_connector(format!("http://{}", listener.local_addr().unwrap()));
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let mut workflow = open_test_workflow(temp.path(), &binding);
+        workflow.prepare_order(fixture_at(2)).unwrap();
+
+        // Authorized envelope is 1.0 HYPE; the venue accepted 0.9 and
+        // filled all of it. "Completely filled" therefore has to mean the
+        // accepted 0.9, not the authorized 1.0 — otherwise the fill looks
+        // partial, `OrderFinality::Filled` is rejected as contradictory,
+        // and the journal is driven to ManualReview instead of settling.
+        let accepted_at_ms = fixture_at(5).timestamp_millis();
+        let rounded_down_and_filled = serde_json::json!({
+            "status": "order",
+            "order": {
+                "order": {"oid": 7, "origSz": "0.9", "sz": "0", "side": "B", "tif": "Ioc", "cloid": workflow.state().client_order_id(), "limitPx": "25.0", "timestamp": accepted_at_ms},
+                "status": "filled",
+                "statusTimestamp": accepted_at_ms
+            }
+        });
+        let one_fill = serde_json::json!([{
+            "coin": "@1", "px": "25", "sz": "0.9", "side": "B", "time": 1_000,
+            "oid": 7, "tid": 1, "fee": "0.01", "feeToken": "USDC"
+        }]);
+        let server = spawn_reconcile_responder(listener, rounded_down_and_filled, one_fill, true);
+        let observed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reconcile_prepared_order(
+                &connector,
+                &mut workflow,
+                &test_journal_path(temp.path()),
+                fixture_at(20),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(observed.status, "filled");
+        assert_eq!(observed.filled_hype, HypeAtoms::from_atoms(90_000_000));
+        assert!(observed.fills_complete);
+        assert!(observed.durable_finality);
+        assert!(workflow.state().manual_review_reason().is_none());
+        assert_eq!(workflow.state().exchange_order_id(), Some("7"));
+    }
+
+    #[tokio::test]
+    async fn a_rounded_down_order_filled_to_its_accepted_size_reaches_the_filled_stage() {
+        // The `fully_filled` flag drives the workflow stage
+        // (Filled vs PartiallyFilled), so it must also be judged against
+        // the accepted quantity rather than the authorized one. Observed
+        // here on an order the venue still reports as `open`, so nothing
+        // finalizes and the stage after the fill observation is what the
+        // flag decided.
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connector = unsigned_connector(format!("http://{}", listener.local_addr().unwrap()));
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let mut workflow = open_test_workflow(temp.path(), &binding);
+        workflow.prepare_order(fixture_at(2)).unwrap();
+
+        // Authorized 1.0 HYPE, accepted 0.9, all 0.9 filled, still open.
+        let accepted_at_ms = fixture_at(5).timestamp_millis();
+        let filled_but_open = serde_json::json!({
+            "status": "order",
+            "order": {
+                "order": {"oid": 7, "origSz": "0.9", "sz": "0", "side": "B", "tif": "Ioc", "cloid": workflow.state().client_order_id(), "limitPx": "25.0", "timestamp": accepted_at_ms},
+                "status": "open",
+                "statusTimestamp": accepted_at_ms
+            }
+        });
+        let one_fill = serde_json::json!([{
+            "coin": "@1", "px": "25", "sz": "0.9", "side": "B", "time": 1_000,
+            "oid": 7, "tid": 1, "fee": "0.01", "feeToken": "USDC"
+        }]);
+        let server = spawn_reconcile_responder(listener, filled_but_open, one_fill, true);
+        let observed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reconcile_prepared_order(
+                &connector,
+                &mut workflow,
+                &test_journal_path(temp.path()),
+                fixture_at(20),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+
+        assert!(!observed.durable_finality);
+        assert_eq!(workflow.state().stage(), WorkflowStage::Filled);
+    }
+
+    #[tokio::test]
+    async fn a_later_lookup_may_not_change_the_recorded_accepted_quantity() {
+        // Reported by Codex on PR #58. Once recorded, the accepted quantity
+        // is both the full-fill target and the cumulative fill cap, so a
+        // later `orderStatus` reporting a different `origSz` for the same
+        // order must fail closed rather than silently move either bound.
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connector = unsigned_connector(format!("http://{}", listener.local_addr().unwrap()));
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let mut workflow = open_test_workflow(temp.path(), &binding);
+        workflow.prepare_order(fixture_at(2)).unwrap();
+
+        // Authorized 1.0, accepted 0.9, half of it filled and still open.
+        let accepted_at_ms = fixture_at(5).timestamp_millis();
+        let accepted_at_nine = serde_json::json!({
+            "status": "order",
+            "order": {
+                "order": {"oid": 7, "origSz": "0.9", "sz": "0.4", "side": "B", "tif": "Ioc", "cloid": workflow.state().client_order_id(), "limitPx": "25.0", "timestamp": accepted_at_ms},
+                "status": "open",
+                "statusTimestamp": accepted_at_ms
+            }
+        });
+        let one_fill = serde_json::json!([{
+            "coin": "@1", "px": "25", "sz": "0.5", "side": "B", "time": 1_000,
+            "oid": 7, "tid": 1, "fee": "0.01", "feeToken": "USDC"
+        }]);
+        let server = spawn_reconcile_responder(listener, accepted_at_nine, one_fill.clone(), true);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reconcile_prepared_order(
+                &connector,
+                &mut workflow,
+                &test_journal_path(temp.path()),
+                fixture_at(20),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            workflow.state().venue_accepted_quantity_hype(),
+            Some(HypeAtoms::from_atoms(90_000_000))
+        );
+
+        // The same order, now claiming it was accepted at the full 1.0 --
+        // within the authorization, so only the recorded value catches it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connector = unsigned_connector(format!("http://{}", listener.local_addr().unwrap()));
+        let accepted_at_one = serde_json::json!({
+            "status": "order",
+            "order": {
+                "order": {"oid": 7, "origSz": "1", "sz": "0.5", "side": "B", "tif": "Ioc", "cloid": workflow.state().client_order_id(), "limitPx": "25.0", "timestamp": accepted_at_ms},
+                "status": "open",
+                "statusTimestamp": accepted_at_ms
+            }
+        });
+        let server = spawn_reconcile_responder(listener, accepted_at_one, one_fill, false);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reconcile_prepared_order(
+                &connector,
+                &mut workflow,
+                &test_journal_path(temp.path()),
+                fixture_at(25),
+            ),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert!(matches!(result, Err(LiveProbeError::QuantityMismatch)));
+        assert_eq!(
+            workflow.state().venue_accepted_quantity_hype(),
+            Some(HypeAtoms::from_atoms(90_000_000))
+        );
+    }
+
+    #[test]
+    fn a_legacy_submission_event_re_encodes_unchanged_and_replays_at_the_authorized_quantity() {
+        // The journal's record hash is recomputed by *re-serializing* the
+        // decoded event, so a field that materializes on decode would
+        // change that encoding and make every already-written record fail
+        // verification. An event from before this field existed therefore
+        // has to decode to `None` and re-encode without the key. It also
+        // has to replay to a usable full-fill target: the code that wrote
+        // such events required the venue quantity to equal the authorized
+        // quantity, so that is exactly what absence means.
+        let temp = tempfile::tempdir().unwrap();
+        let connector = unsigned_connector("http://127.0.0.1:1".to_owned());
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let mut workflow = open_test_workflow(temp.path(), &binding);
+        workflow.prepare_order(fixture_at(2)).unwrap();
+
+        let mut legacy = test_submission_evidence(&workflow, &binding, fixture_at(5));
+        legacy.venue_accepted_quantity_hype = None;
+        let encoded = serde_json::to_string(&legacy).unwrap();
+        assert!(!encoded.contains("venue_accepted_quantity_hype"));
+        let decoded: AuthenticatedOrderSubmission = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.venue_accepted_quantity_hype, None);
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
+
+        workflow
+            .observe_order_submission(&legacy, fixture_at(5))
+            .unwrap();
+        assert_eq!(
+            workflow.state().venue_accepted_quantity_hype(),
+            Some(binding.order_envelope.original_quantity_hype)
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_submission_evidence_claiming_more_than_the_authorized_quantity() {
+        // The accepted quantity recorded from the venue becomes the
+        // full-fill target and the cumulative fill cap, so it must itself
+        // be bounded by the authorized envelope: evidence claiming the
+        // venue accepted *more* than was authorized cannot be allowed to
+        // raise either bound.
+        // A rejected observation durably records a contradiction, so each
+        // case needs its own workflow.
+        let temp = tempfile::tempdir().unwrap();
+        let connector = unsigned_connector("http://127.0.0.1:1".to_owned());
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let authorized = binding.order_envelope.original_quantity_hype;
+
+        let case = |directory: &str, accepted: Option<HypeAtoms>| {
+            let root = temp.path().join(directory);
+            std::fs::create_dir_all(&root).unwrap();
+            let mut workflow = open_test_workflow(&root, &binding);
+            workflow.prepare_order(fixture_at(2)).unwrap();
+            let mut submission = test_submission_evidence(&workflow, &binding, fixture_at(5));
+            submission.venue_accepted_quantity_hype = accepted;
+            workflow.observe_order_submission(&submission, fixture_at(5))
+        };
+
+        assert!(case(
+            "larger",
+            Some(HypeAtoms::from_atoms(authorized.as_atoms() + 1))
+        )
+        .is_err());
+        assert!(case("zero", Some(HypeAtoms::default())).is_err());
+        // The same evidence at the authorized quantity is accepted, so the
+        // rejections above are attributable to the accepted quantity alone.
+        case("authorized", Some(authorized)).unwrap();
+        // And so is anything the venue rounded down to.
+        case(
+            "rounded-down",
+            Some(HypeAtoms::from_atoms(authorized.as_atoms() - 1)),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_a_zero_venue_reported_quantity() {
+        // A venue response whose order carries no quantity at all is not
+        // "our order rounded down" — it is evidence that does not describe
+        // a submitted order, and accepting it would let a nonsense response
+        // advance the workflow past submission.
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connector = unsigned_connector(format!("http://{}", listener.local_addr().unwrap()));
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let mut workflow = open_test_workflow(temp.path(), &binding);
+        workflow.prepare_order(fixture_at(2)).unwrap();
+
+        let accepted_at_ms = fixture_at(5).timestamp_millis();
+        let zero_quantity = serde_json::json!({
+            "status": "order",
+            "order": {
+                "order": {"oid": 7, "origSz": "0", "sz": "0", "side": "B", "tif": "Ioc", "cloid": workflow.state().client_order_id(), "limitPx": "25.0", "timestamp": accepted_at_ms},
+                "status": "canceled",
+                "statusTimestamp": accepted_at_ms
+            }
+        });
+        let no_fills = serde_json::json!([]);
+        let server = spawn_reconcile_responder(listener, zero_quantity, no_fills, false);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reconcile_prepared_order(
+                &connector,
+                &mut workflow,
+                &test_journal_path(temp.path()),
+                fixture_at(20),
+            ),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert!(matches!(result, Err(LiveProbeError::QuantityMismatch)));
+        assert!(workflow.state().exchange_order_id().is_none());
+    }
+
+    #[tokio::test]
     async fn rejects_a_venue_reported_cloid_that_does_not_match_the_requested_one() {
         // Regression test for a real Codex review finding: dex-connector's
         // reconcile_order_by_client_id currently echoes the requested
@@ -2868,33 +3262,7 @@ mod tests {
         let mut workflow = open_test_workflow(temp.path(), &binding);
         workflow.prepare_order(fixture_at(2)).unwrap();
 
-        let submission = AuthenticatedOrderSubmission {
-            observation_id: "obs-a".to_string(),
-            account_scope_evidence_hash: "hash-a".to_string(),
-            order_envelope_evidence_hash: "hash-b".to_string(),
-            execution_identity_hash: binding.inventory_before.execution_identity_hash.clone(),
-            signer_identity_hash: binding.order_envelope.signer_identity_hash.clone(),
-            decision_id: binding.decision_id.clone(),
-            client_order_id: workflow.state().client_order_id(),
-            exchange_order_id: "7".to_string(),
-            canonical_order_envelope_hash: workflow
-                .state()
-                .canonical_order_envelope_hash()
-                .unwrap(),
-            planned_usdc: binding.planned_usdc,
-            max_debit_usdc: binding.committed_usdc,
-            original_quantity_hype: binding.order_envelope.original_quantity_hype,
-            hype_atoms_per_hype: binding.order_envelope.hype_atoms_per_hype,
-            market_metadata_digest: binding.order_envelope.market_metadata_digest.clone(),
-            limit_price_usdc_per_hype: binding.order_envelope.limit_price_usdc_per_hype,
-            l1_nonce: binding.order_envelope.l1_nonce,
-            signed_expiry_at: binding.order_envelope.signed_expiry_at,
-            effective_expiry_at: binding.order_envelope.effective_expiry_at,
-            market: HYPE_SPOT_MARKET.to_string(),
-            side: "buy".to_string(),
-            time_in_force: "IOC".to_string(),
-            accepted_at: fixture_at(20),
-        };
+        let submission = test_submission_evidence(&workflow, &binding, fixture_at(20));
         // Simulates an earlier call's positive clock-lag clamp having
         // pushed the recorded transition time forward to fixture_at(20).
         workflow
@@ -2909,7 +3277,7 @@ mod tests {
             &binding,
             "7",
             "{}",
-            binding.order_envelope.hype_atoms_per_hype,
+            binding.order_envelope.original_quantity_hype,
             fixture_at(15),
         )
         .await

@@ -646,6 +646,19 @@ pub struct AuthenticatedOrderSubmission {
     pub planned_usdc: UsdcMicros,
     pub max_debit_usdc: UsdcMicros,
     pub original_quantity_hype: HypeAtoms,
+    /// The quantity the venue actually accepted for this order, read from
+    /// its own `orderStatus` envelope (`filled + remaining`). The venue
+    /// rounds a request *down* onto its size lot (`szDecimals`), so this
+    /// is at or below `original_quantity_hype` and is what "completely
+    /// filled" means for this order (bot-strategy#845).
+    ///
+    /// Absent only in an event written before this field existed. The code
+    /// that wrote those required the venue's quantity to *equal*
+    /// `original_quantity_hype`, so absence means exactly that, and replay
+    /// resolves it there. It is skipped when serializing so a legacy event
+    /// re-encodes byte-for-byte and its record hash still verifies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub venue_accepted_quantity_hype: Option<HypeAtoms>,
     pub hype_atoms_per_hype: u64,
     pub market_metadata_digest: String,
     pub limit_price_usdc_per_hype: UsdcMicros,
@@ -731,6 +744,8 @@ pub struct WorkflowState {
     pending_action: Option<ExternalAction>,
     order_prepared_at: Option<DateTime<Utc>>,
     exchange_order_id: Option<String>,
+    #[serde(default)]
+    venue_accepted_quantity_hype: Option<HypeAtoms>,
     order_accepted_at: Option<DateTime<Utc>>,
     purchased_hype: HypeAtoms,
     filled_usdc: UsdcMicros,
@@ -925,6 +940,7 @@ impl WorkflowState {
             pending_action: None,
             order_prepared_at: None,
             exchange_order_id: None,
+            venue_accepted_quantity_hype: None,
             order_accepted_at: None,
             purchased_hype: HypeAtoms::default(),
             filled_usdc: UsdcMicros::from_micros(0),
@@ -1008,6 +1024,11 @@ impl WorkflowState {
                 }
                 self.validate_order_submission_evidence(evidence, event.at)?;
                 self.exchange_order_id = Some(evidence.exchange_order_id.clone());
+                self.venue_accepted_quantity_hype = Some(
+                    evidence
+                        .venue_accepted_quantity_hype
+                        .unwrap_or(self.binding.order_envelope.original_quantity_hype),
+                );
                 self.order_accepted_at = Some(evidence.accepted_at);
                 self.pending_action = None;
                 self.stage = WorkflowStage::OrderSubmitted;
@@ -1731,12 +1752,29 @@ impl WorkflowState {
             cumulative_debited_usdc,
             false,
         )?;
-        if fully_filled && cumulative_hype != self.binding.order_envelope.original_quantity_hype {
+        if fully_filled && cumulative_hype != self.venue_accepted_quantity()? {
             return Err(WorkflowError::ContradictoryObservation(
-                "fully-filled observation did not reconcile the full signed quantity".into(),
+                "fully-filled observation did not reconcile the accepted quantity".into(),
             ));
         }
         Ok(())
+    }
+
+    /// The quantity the venue accepted for this order, which is what a
+    /// complete fill has to reconcile to. Recorded from the venue's own
+    /// order envelope when submission is observed; its absence at a point
+    /// that needs it means the journal is missing that observation, so
+    /// this fails closed rather than falling back to the authorized
+    /// quantity (which the venue may have rounded down — bot-strategy#845).
+    #[must_use]
+    pub fn venue_accepted_quantity_hype(&self) -> Option<HypeAtoms> {
+        self.venue_accepted_quantity_hype
+    }
+
+    fn venue_accepted_quantity(&self) -> Result<HypeAtoms, WorkflowError> {
+        self.venue_accepted_quantity_hype.ok_or_else(|| {
+            WorkflowError::CorruptJournal("venue-accepted order quantity is missing".into())
+        })
     }
 
     fn validate_order_submission_evidence(
@@ -1762,6 +1800,15 @@ impl WorkflowState {
             || evidence.planned_usdc != self.binding.planned_usdc
             || evidence.max_debit_usdc != self.binding.committed_usdc
             || evidence.original_quantity_hype != envelope.original_quantity_hype
+            // The venue may only round the authorized size DOWN onto its
+            // own size lot; a larger accepted size, or none at all, is a
+            // contradiction and must never become the full-fill target.
+            // (Absent = a legacy event; see the field's own note.)
+            || evidence
+                .venue_accepted_quantity_hype
+                .is_some_and(|accepted| {
+                    accepted.is_zero() || accepted > envelope.original_quantity_hype
+                })
             || evidence.hype_atoms_per_hype != envelope.hype_atoms_per_hype
             || evidence.market_metadata_digest != envelope.market_metadata_digest
             || evidence.limit_price_usdc_per_hype != envelope.limit_price_usdc_per_hype
@@ -1795,11 +1842,9 @@ impl WorkflowState {
             cumulative_debited_usdc,
             matches!(finality, OrderFinality::Canceled | OrderFinality::Expired),
         )?;
-        if finality == OrderFinality::Filled
-            && cumulative_hype != self.binding.order_envelope.original_quantity_hype
-        {
+        if finality == OrderFinality::Filled && cumulative_hype != self.venue_accepted_quantity()? {
             return Err(WorkflowError::ContradictoryObservation(
-                "filled finality did not reconcile the full signed quantity".into(),
+                "filled finality did not reconcile the accepted quantity".into(),
             ));
         }
         Ok(())
@@ -1829,7 +1874,10 @@ impl WorkflowState {
             || cumulative_filled_usdc > self.binding.planned_usdc
             || cumulative_filled_usdc > proportional_fill_cap
             || cumulative_debited_usdc > self.binding.committed_usdc
-            || cumulative_hype > self.binding.order_envelope.original_quantity_hype
+            || cumulative_hype
+                > self
+                    .venue_accepted_quantity_hype
+                    .unwrap_or(self.binding.order_envelope.original_quantity_hype)
         {
             return Err(WorkflowError::ContradictoryObservation(
                 "cumulative fill/debit regressed, violated its cap, or had zero HYPE".into(),
