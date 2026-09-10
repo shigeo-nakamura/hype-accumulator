@@ -112,6 +112,7 @@ pub struct ProbeSubmission {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ProbeReconciliation {
     pub client_order_id: String,
     pub exchange_order_id: Option<String>,
@@ -139,6 +140,11 @@ pub struct ProbeReconciliation {
     /// outcome that releases a prepared intent (bot-strategy#982). `false`
     /// on every other path.
     pub absence_recorded: bool,
+    /// True exactly when this call drove a zero-purchase workflow to
+    /// `Complete`. Only a workflow that bought no HYPE is completed here;
+    /// anything holding HYPE needs the separately approved staking custody
+    /// design to classify residual versus eligible.
+    pub workflow_completed: bool,
 }
 
 #[derive(Debug, Error)]
@@ -424,6 +430,7 @@ async fn lookup_read_only(
 /// Propagates invalid quantities/timestamps and any error the workflow
 /// raises validating the observed evidence (contradiction, replay conflict,
 /// or journal I/O failure).
+#[allow(clippy::too_many_lines)]
 async fn record_reconciliation(
     connector: &HyperliquidConnector,
     workflow: &mut DurableWorkflow,
@@ -581,6 +588,29 @@ async fn record_reconciliation(
             false
         };
 
+    // A journal that bought nothing still has to reach `Complete`:
+    // `DurableWorkflow::aggregate_terminal_residual_hype` treats anything
+    // short of that as fail-closed, so a workflow left at `OrderFinalized`
+    // blocks every later `prepare` for this account — the decision cannot
+    // even be computed, let alone settled (bot-strategy#845 blocker 9).
+    // There is nothing to classify or stake at zero HYPE, and
+    // `validate_eligibility_evidence` already allows exactly this shape
+    // (no exchange order, no evidence, nothing purchased).
+    let workflow_completed = if workflow.state().exchange_order_id().is_none()
+        && workflow.state().purchased_hype().is_zero()
+        && workflow.state().stage() == WorkflowStage::OrderFinalized
+    {
+        // Never earlier than the transition it follows: absence recording
+        // just above clamps its own timestamp forward past the venue
+        // evidence it attests to, so a bare `now` can regress behind it.
+        let completion_at = now.max(workflow.state().last_transition_at());
+        workflow.record_staking_eligibility(None, completion_at)?;
+        workflow.complete(completion_at)?;
+        true
+    } else {
+        false
+    };
+
     Ok(ProbeReconciliation {
         client_order_id: evidence.client_order_id,
         exchange_order_id: evidence.order_id,
@@ -593,6 +623,7 @@ async fn record_reconciliation(
         // have finalized it, and this one's fills could be incomplete.
         durable_finality: order_already_finalized(workflow.state().stage()),
         absence_recorded,
+        workflow_completed,
     })
 }
 
@@ -1887,7 +1918,12 @@ mod tests {
         assert!(recorded.absence_recorded);
         assert!(recorded.durable_finality);
         assert_eq!(recorded.filled_hype, HypeAtoms::from_atoms(0));
-        assert_eq!(workflow.state().stage(), WorkflowStage::OrderFinalized);
+        // Driven all the way to `Complete`: a journal left at
+        // `OrderFinalized` is not terminal for
+        // `aggregate_terminal_residual_hype` and would block every later
+        // `prepare` for this account.
+        assert!(recorded.workflow_completed);
+        assert_eq!(workflow.state().stage(), WorkflowStage::Complete);
         assert!(workflow.state().exchange_order_id().is_none());
 
         // Idempotent: the workflow is no longer `Decided`, so a later
@@ -1903,6 +1939,9 @@ mod tests {
         .unwrap();
         assert!(!again.absence_recorded);
         assert!(again.durable_finality);
+        // Already `Complete`, so nothing is appended a second time.
+        assert!(!again.workflow_completed);
+        assert_eq!(workflow.state().stage(), WorkflowStage::Complete);
     }
 
     #[tokio::test]
@@ -1936,7 +1975,8 @@ mod tests {
         .unwrap();
         assert!(recorded.absence_recorded);
         assert!(recorded.durable_finality);
-        assert_eq!(workflow.state().stage(), WorkflowStage::OrderFinalized);
+        assert!(recorded.workflow_completed);
+        assert_eq!(workflow.state().stage(), WorkflowStage::Complete);
     }
 
     #[tokio::test]

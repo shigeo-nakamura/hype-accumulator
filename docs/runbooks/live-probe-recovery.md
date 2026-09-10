@@ -64,7 +64,13 @@ retained fill history, and if the prepared client order ID appears in
 neither, durably records conclusive absence — the zero-fill terminal outcome
 that releases the prepared intent (`absence_recorded` in the JSON, and
 `durable_finality` then true), after which the same run settles the pacing
-decision at zero. Either history being truncated, or the client order ID
+decision at zero. A workflow that bought no HYPE is also driven all the way
+to `Complete` (`workflow_completed`): `aggregate_terminal_residual_hype`
+treats anything short of that as fail-closed, so a journal left at
+`OrderFinalized` would block every later `prepare` for this account. Only a
+zero-purchase workflow is completed this way — one holding HYPE needs the
+separately approved staking custody design to classify residual versus
+eligible. Either history being truncated, or the client order ID
 appearing in one of them, fails closed and records nothing.
 
 `submit` now attempts this lookup after both a successful response and a
