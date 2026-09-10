@@ -118,6 +118,10 @@ pub struct ProbeReconciliation {
     pub exchange_order_id: Option<String>,
     pub status: String,
     pub filled_hype: HypeAtoms,
+    /// HYPE actually credited to the account: `filled_hype` less any fee
+    /// the venue charged in HYPE (bot-strategy#998). `None` until the
+    /// fills are gap-free, since it can only be computed from fill rows.
+    pub credited_hype: Option<HypeAtoms>,
     pub remaining_hype: HypeAtoms,
     /// Whether `fills` (the detailed rows this lookup returned) fully
     /// accounts for `filled_hype` (the authoritative cumulative quantity
@@ -453,6 +457,7 @@ async fn record_reconciliation(
     // Vacuously complete when the order itself is not (yet) known to the
     // venue — nothing to reconcile, not evidence of incompleteness.
     let mut fills_complete = true;
+    let mut credited_hype = None;
 
     if let Some(exchange_order_id) = evidence.order_id.clone() {
         // The venue evidence's own quantity, independently reconstructed
@@ -530,6 +535,9 @@ async fn record_reconciliation(
         if fills_complete {
             let (cumulative_filled_usdc, cumulative_debited_usdc) =
                 cumulative_usdc_from_fills(&accumulated_fills.fills)?;
+            let cumulative_credited_hype =
+                cumulative_credited_hype_from_fills(&accumulated_fills.fills, hype_atoms_per_hype)?;
+            credited_hype = Some(cumulative_credited_hype);
             // `observe_order_fill` never accepts a zero-HYPE observation
             // (`validate_cumulative_fill` allows zero only for a Canceled/
             // Expired *finalization*, not a bare fill observation) — a
@@ -556,6 +564,7 @@ async fn record_reconciliation(
                 workflow.observe_order_fill(
                     fill_observation_id,
                     cumulative_hype,
+                    cumulative_credited_hype,
                     cumulative_filled_usdc,
                     cumulative_debited_usdc,
                     fully_filled,
@@ -566,6 +575,7 @@ async fn record_reconciliation(
             if let Some(finality) = finality_from_status(&evidence.status) {
                 workflow.finalize_order(
                     cumulative_hype,
+                    cumulative_credited_hype,
                     cumulative_filled_usdc,
                     cumulative_debited_usdc,
                     finality,
@@ -585,6 +595,14 @@ async fn record_reconciliation(
         } else {
             false
         };
+    if evidence.order_id.is_none() {
+        // The venue has no such order, so nothing was credited: a known
+        // zero, exactly like `filled_hype` above. Settlement compares this
+        // against the journal's `purchased_hype`, which a conclusive-absence
+        // (or crash-resumed zero-purchase) workflow holds as zero; `None`
+        // here would refuse that settlement and strand the decision.
+        credited_hype = Some(HypeAtoms::default());
+    }
 
     // A journal that bought nothing still has to reach `Complete`:
     // `DurableWorkflow::aggregate_terminal_residual_hype` treats anything
@@ -623,6 +641,7 @@ async fn record_reconciliation(
         exchange_order_id: evidence.order_id,
         status: evidence.status,
         filled_hype: cumulative_hype,
+        credited_hype,
         remaining_hype,
         fills_complete,
         // Reflects the workflow's actual durable state, not just whether
@@ -993,7 +1012,7 @@ fn verify_observed_order_envelope(
     Ok(())
 }
 
-const OBSERVED_FILLS_SCHEMA_VERSION: u8 = 1;
+const OBSERVED_FILLS_SCHEMA_VERSION: u8 = 2;
 
 /// One fill's economically relevant fields, durably persisted as exact
 /// decimal strings (never re-derived from a float, never silently
@@ -1003,7 +1022,13 @@ const OBSERVED_FILLS_SCHEMA_VERSION: u8 = 1;
 struct AccumulatedFill {
     size: String,
     notional: String,
+    /// Quote-equivalent total fee, as dex-connector reports it.
     fee: String,
+    /// The part of `fee` the venue charged in the base asset, in HYPE
+    /// (bot-strategy#998). `size - base_fee` is what the account was
+    /// credited. Schema version 2 added this; a version-1 file cannot be
+    /// upgraded (its rows never captured the fee token) and is rejected.
+    base_fee: String,
 }
 
 /// Durable, append-only-in-spirit record of every fill row this journal's
@@ -1158,6 +1183,8 @@ fn observed_fills_content_hash(
         hasher.update(fill.notional.as_bytes());
         hasher.update([0]);
         hasher.update(fill.fee.as_bytes());
+        hasher.update([0]);
+        hasher.update(fill.base_fee.as_bytes());
     }
     format!("{:x}", hasher.finalize())
 }
@@ -1177,6 +1204,27 @@ fn load_observed_fills(
 ) -> Result<ObservedFillsAccumulator, LiveProbeError> {
     match fs::read_to_string(path) {
         Ok(contents) => {
+            // Version first, on its own: a version-1 row has no `base_fee`,
+            // so the full parse below would fail on that field with a
+            // message that hides the actual cause.
+            #[derive(serde::Deserialize)]
+            struct Header {
+                #[serde(default)]
+                schema_version: u8,
+            }
+            let header: Header = serde_json::from_str(&contents)
+                .map_err(|error| LiveProbeError::ObservedFillsAccumulator(error.to_string()))?;
+            if header.schema_version != OBSERVED_FILLS_SCHEMA_VERSION {
+                return Err(LiveProbeError::ObservedFillsAccumulator(format!(
+                    "observed-fills record is schema version {} but this binary writes {}; \
+                     a version-1 record never captured which asset each fee was charged in, so \
+                     it cannot be upgraded. If the journal holds no fill observation yet, \
+                     remove the record and reconcile rebuilds it from the venue; if it does, \
+                     that observation was recorded under the old fee semantics — see \
+                     docs/runbooks/live-probe-recovery.md before touching anything",
+                    header.schema_version, OBSERVED_FILLS_SCHEMA_VERSION
+                )));
+            }
             let accumulator: ObservedFillsAccumulator = serde_json::from_str(&contents)
                 .map_err(|error| LiveProbeError::ObservedFillsAccumulator(error.to_string()))?;
             if accumulator.workflow_id != workflow_id {
@@ -1239,6 +1287,14 @@ fn merge_observed_fills(
                 .filled_fee
                 .ok_or(LiveProbeError::InvalidDecimal("fill fee"))?
                 .to_string(),
+            // `None` means the venue adapter does not say which asset the
+            // fee was charged in. Hyperliquid always says; anything else
+            // reaching this path is an unexpected connector and must not be
+            // recorded as though nothing was taken from the base asset.
+            base_fee: fill
+                .filled_base_fee
+                .ok_or(LiveProbeError::InvalidDecimal("fill base fee"))?
+                .to_string(),
         };
         match accumulated.get(&fill.trade_id) {
             Some(existing) if *existing != entry => {
@@ -1279,12 +1335,61 @@ fn fills_cover_authoritative_quantity(
     Ok(total == authoritative_filled_size)
 }
 
-/// Sums each accumulated fill's notional and fee (both already
-/// quote-denominated by `dex-connector`, regardless of which token the fee
-/// was actually charged in) into cumulative filled and debited USDC,
-/// matching the same notional-plus-fee-markup semantics
-/// `PreparedIocOrder::from_action`'s pre-submission worst-case-debit check
-/// already uses.
+/// The HYPE actually credited to the account by the accumulated fills:
+/// each fill's matched size less the part of its fee the venue charged in
+/// HYPE (bot-strategy#998). The real 2026-09-10 fill matched 0.3 and
+/// charged 0.00021 HYPE, so 0.29979 arrived; recording 0.3 would claim
+/// HYPE the account does not hold and fail every later residual
+/// reconciliation closed. Only meaningful once the fills are gap-free.
+///
+/// `size - base_fee` is the *buy* movement; a sell's would be
+/// `-size - base_fee`. Every fill reaching this path is a buy:
+/// `verify_observed_order_envelope` has already rejected any order whose
+/// venue side is not `B`, and the fills are looked up by that order's ID.
+///
+/// # Errors
+///
+/// Corrupt stored values, overflow, a negative result (a fee larger than
+/// its own fill), or a total not representable at `hype_atoms_per_hype`.
+fn cumulative_credited_hype_from_fills(
+    fills: &BTreeMap<String, AccumulatedFill>,
+    hype_atoms_per_hype: u64,
+) -> Result<HypeAtoms, LiveProbeError> {
+    let mut credited = Decimal::ZERO;
+    for entry in fills.values() {
+        let size = entry.size.parse::<Decimal>().map_err(|_| {
+            LiveProbeError::ObservedFillsAccumulator("corrupt stored fill size".into())
+        })?;
+        let base_fee = entry.base_fee.parse::<Decimal>().map_err(|_| {
+            LiveProbeError::ObservedFillsAccumulator("corrupt stored fill base fee".into())
+        })?;
+        let net = size
+            .checked_sub(base_fee)
+            .ok_or(LiveProbeError::InvalidDecimal("credited fill size"))?;
+        // Per row, not only in aggregate: a fee that consumes or exceeds
+        // its own fill is malformed evidence, and another honest row must
+        // not be allowed to hide it inside a still-positive total.
+        if net <= Decimal::ZERO {
+            return Err(LiveProbeError::InvalidDecimal("credited fill size"));
+        }
+        credited = credited
+            .checked_add(net)
+            .ok_or(LiveProbeError::InvalidDecimal("cumulative credited size"))?;
+    }
+    decimal_to_atoms(credited, hype_atoms_per_hype)
+}
+
+/// Sums each accumulated fill's notional, plus the fee **when it was
+/// charged in USDC**, into cumulative filled and debited USDC.
+///
+/// A fee the venue charged in HYPE is not a USDC debit: the account paid
+/// exactly the notional in USDC and received `size - base_fee` HYPE. That
+/// fee is accounted for once, as fewer HYPE credited
+/// ([`cumulative_credited_hype_from_fills`]); adding its quote-equivalent
+/// here as well would count it twice and record a USDC spend the account
+/// never made (bot-strategy#998). Hyperliquid charges each fill's fee in
+/// exactly one asset, so a non-zero `base_fee` means the whole `fee` is
+/// that amount converted, and none of it left the USDC balance.
 fn cumulative_usdc_from_fills(
     fills: &BTreeMap<String, AccumulatedFill>,
 ) -> Result<(UsdcMicros, UsdcMicros), LiveProbeError> {
@@ -1297,11 +1402,19 @@ fn cumulative_usdc_from_fills(
         let entry_fee = entry.fee.parse::<Decimal>().map_err(|_| {
             LiveProbeError::ObservedFillsAccumulator("corrupt stored fill fee".into())
         })?;
+        let base_fee = entry.base_fee.parse::<Decimal>().map_err(|_| {
+            LiveProbeError::ObservedFillsAccumulator("corrupt stored fill base fee".into())
+        })?;
+        let usdc_fee = if base_fee.is_zero() {
+            entry_fee
+        } else {
+            Decimal::ZERO
+        };
         filled = filled
             .checked_add(value)
             .ok_or(LiveProbeError::InvalidDecimal("cumulative fill notional"))?;
         fee = fee
-            .checked_add(entry_fee)
+            .checked_add(usdc_fee)
             .ok_or(LiveProbeError::InvalidDecimal("cumulative fill fee"))?;
     }
     let debited = filled
@@ -2111,6 +2224,9 @@ mod tests {
         // No absence to record a second time, but the completion resumes.
         assert!(!resumed.absence_recorded);
         assert!(resumed.workflow_completed);
+        // Nothing was credited, and settlement needs that as a known zero
+        // rather than "unknown" (Codex review of PR #60).
+        assert_eq!(resumed.credited_hype, Some(HypeAtoms::default()));
         assert_eq!(workflow.state().stage(), WorkflowStage::Complete);
     }
 
@@ -3549,17 +3665,292 @@ mod tests {
             filled_size: Some(Decimal::from_str(size).unwrap()),
             filled_value: Some(Decimal::from_str(value).unwrap()),
             filled_fee: Some(Decimal::from_str(fee).unwrap()),
+            filled_base_fee: Some(Decimal::ZERO),
             filled_ts_ms: None,
             tx_hash: None,
         }
     }
 
     fn accumulated(size: &str, value: &str, fee: &str) -> AccumulatedFill {
+        accumulated_with_base_fee(size, value, fee, "0")
+    }
+
+    fn accumulated_with_base_fee(
+        size: &str,
+        value: &str,
+        fee: &str,
+        base_fee: &str,
+    ) -> AccumulatedFill {
         AccumulatedFill {
             size: size.to_string(),
             notional: value.to_string(),
             fee: fee.to_string(),
+            base_fee: base_fee.to_string(),
         }
+    }
+
+    #[test]
+    fn a_fee_charged_in_hype_is_fewer_hype_credited_not_a_usdc_debit() {
+        // bot-strategy#998, with the real 2026-09-10 fill's shape: 0.3 HYPE
+        // matched, 0.00021 HYPE fee. dex-connector reports the fee's quote
+        // value (0.00021 × px) as `fee` and the raw 0.00021 as `base_fee`.
+        // The account paid exactly the notional in USDC and received
+        // 0.29979 HYPE — the fee must be counted once, on the HYPE side.
+        let mut fills = BTreeMap::new();
+        fills.insert(
+            "1".to_string(),
+            accumulated_with_base_fee("0.3", "7.5", "0.00525", "0.00021"),
+        );
+        assert_eq!(
+            cumulative_usdc_from_fills(&fills).unwrap(),
+            (
+                UsdcMicros::from_micros(7_500_000),
+                UsdcMicros::from_micros(7_500_000)
+            )
+        );
+        assert_eq!(
+            cumulative_credited_hype_from_fills(&fills, 100_000_000).unwrap(),
+            HypeAtoms::from_atoms(29_979_000)
+        );
+
+        // A fee charged in USDC is the opposite: a USDC debit, full HYPE.
+        let mut fills = BTreeMap::new();
+        fills.insert(
+            "1".to_string(),
+            accumulated_with_base_fee("0.3", "7.5", "0.0075", "0"),
+        );
+        assert_eq!(
+            cumulative_usdc_from_fills(&fills).unwrap(),
+            (
+                UsdcMicros::from_micros(7_500_000),
+                UsdcMicros::from_micros(7_507_500)
+            )
+        );
+        assert_eq!(
+            cumulative_credited_hype_from_fills(&fills, 100_000_000).unwrap(),
+            HypeAtoms::from_atoms(30_000_000)
+        );
+
+        // A base fee larger than its own fill is corrupt, never a negative
+        // credit.
+        let mut fills = BTreeMap::new();
+        fills.insert(
+            "1".to_string(),
+            accumulated_with_base_fee("0.3", "7.5", "7.5", "0.4"),
+        );
+        assert!(cumulative_credited_hype_from_fills(&fills, 100_000_000).is_err());
+
+        // ...and so is one that consumes its fill exactly, even when another
+        // row keeps the aggregate positive (Codex review of PR #60).
+        let mut fills = BTreeMap::new();
+        fills.insert(
+            "1".to_string(),
+            accumulated_with_base_fee("0.3", "7.5", "7.5", "0.3"),
+        );
+        fills.insert(
+            "2".to_string(),
+            accumulated_with_base_fee("0.3", "7.5", "0.00525", "0.00021"),
+        );
+        assert!(cumulative_credited_hype_from_fills(&fills, 100_000_000).is_err());
+    }
+
+    #[test]
+    fn a_fill_whose_fee_asset_is_unknown_is_not_recorded_as_fee_free() {
+        // `filled_base_fee: None` means the adapter does not say which asset
+        // the fee left; recording it as zero base fee would silently claim
+        // HYPE the account may not hold.
+        let mut fill = raw_fill("1", "0.3", "7.5", "0.0075");
+        fill.filled_base_fee = None;
+        let mut accumulated = BTreeMap::new();
+        assert!(matches!(
+            merge_observed_fills(&mut accumulated, &[fill]),
+            Err(LiveProbeError::InvalidDecimal("fill base fee"))
+        ));
+        assert!(accumulated.is_empty());
+    }
+
+    #[test]
+    fn a_version_one_fill_accumulator_is_refused_not_upgraded() {
+        // Its rows never captured which asset each fee was charged in, so
+        // there is no correct way to fill in `base_fee`.
+        let temp = tempfile::tempdir().unwrap();
+        let journal = test_journal_path(temp.path());
+        let legacy = serde_json::json!({
+            "schema_version": 1,
+            "workflow_id": "wf_legacy",
+            "exchange_order_id": "7",
+            "fills": {"1": {"size": "0.3", "notional": "7.5", "fee": "0.0075"}},
+            "content_hash": ""
+        });
+        let path = observed_fills_path(&journal);
+        std::fs::write(&path, legacy.to_string()).unwrap();
+        let error = load_observed_fills(&path, "wf_legacy").unwrap_err();
+        assert!(
+            error.to_string().contains("schema version 1"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_legacy_fill_event_without_credited_hype_re_encodes_unchanged() {
+        // Record hashes re-serialize the decoded event, so an event written
+        // before `cumulative_credited_hype` existed must decode to `None`
+        // and re-encode byte-for-byte; replay then treats credited as equal
+        // to matched, which is what that code recorded.
+        let legacy = serde_json::json!({
+            "type": "order_fill_observed",
+            "observation_id": "obs",
+            "cumulative_hype": 30_000_000,
+            "cumulative_filled_usdc": 7_500_000,
+            "cumulative_debited_usdc": 7_507_500,
+            "fully_filled": true
+        });
+        let encoded = legacy.to_string();
+        let decoded: crate::workflow::WorkflowTransition = serde_json::from_str(&encoded).unwrap();
+        match &decoded {
+            crate::workflow::WorkflowTransition::OrderFillObserved {
+                cumulative_credited_hype,
+                ..
+            } => assert_eq!(*cumulative_credited_hype, None),
+            other => panic!("unexpected transition {other:?}"),
+        }
+        assert_eq!(
+            serde_json::to_value(&decoded).unwrap(),
+            legacy,
+            "re-encoding a legacy event must not add the new field"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_real_fill_with_its_fee_charged_in_hype_records_what_the_account_holds() {
+        // End-to-end shape of the 2026-09-10 order (bot-strategy#998), at
+        // the fixture's 25.0 limit: the venue matched 0.3 HYPE in full and
+        // charged 0.00021 HYPE. The journal must end with purchased HYPE =
+        // 0.29979 (what the account holds), matched = 0.3 (what "filled"
+        // means for the order), and a USDC debit equal to the notional —
+        // through both the fill observation and the finalization.
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connector = unsigned_connector(format!("http://{}", listener.local_addr().unwrap()));
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let mut workflow = open_test_workflow(temp.path(), &binding);
+        workflow.prepare_order(fixture_at(2)).unwrap();
+
+        let accepted_at_ms = fixture_at(5).timestamp_millis();
+        let filled = serde_json::json!({
+            "status": "order",
+            "order": {
+                "order": {"oid": 7, "origSz": "0.3", "sz": "0.0", "side": "B", "tif": "Ioc", "cloid": workflow.state().client_order_id(), "limitPx": "25.0", "timestamp": accepted_at_ms},
+                "status": "filled",
+                "statusTimestamp": accepted_at_ms
+            }
+        });
+        let hype_fee_fill = serde_json::json!([{
+            "coin": "@107", "px": "25", "sz": "0.3", "side": "B", "time": 1_000,
+            "oid": 7, "tid": 1, "fee": "0.00021", "feeToken": "HYPE"
+        }]);
+        let server = spawn_reconcile_responder(listener, filled, hype_fee_fill, true);
+        let observed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reconcile_prepared_order(
+                &connector,
+                &mut workflow,
+                &test_journal_path(temp.path()),
+                fixture_at(20),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(observed.status, "filled");
+        assert!(observed.fills_complete);
+        assert!(observed.durable_finality);
+        assert_eq!(observed.filled_hype, HypeAtoms::from_atoms(30_000_000));
+        assert_eq!(
+            observed.credited_hype,
+            Some(HypeAtoms::from_atoms(29_979_000))
+        );
+        let state = workflow.state();
+        assert_eq!(state.stage(), WorkflowStage::OrderFinalized);
+        assert_eq!(state.matched_hype(), HypeAtoms::from_atoms(30_000_000));
+        assert_eq!(state.purchased_hype(), HypeAtoms::from_atoms(29_979_000));
+        assert_eq!(state.filled_usdc(), UsdcMicros::from_micros(7_500_000));
+        assert_eq!(state.debited_usdc(), UsdcMicros::from_micros(7_500_000));
+    }
+
+    #[tokio::test]
+    async fn a_fill_with_no_hype_fee_writes_the_same_event_body_as_the_previous_release() {
+        // Reconciling an order again after this upgrade must be an
+        // idempotent replay, not a conflicting one: with no fee charged in
+        // HYPE, the event body (and so the stable event ID's content) must
+        // be exactly what the previous release wrote — no new key. Only a
+        // fee in HYPE, which changes the totals, adds the field.
+        let temp = tempfile::tempdir().unwrap();
+        let connector = unsigned_connector("http://127.0.0.1:1".to_owned());
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let usdc = UsdcMicros::from_micros(12_500_000);
+        let last_event = |directory: &str, matched: HypeAtoms, credited: HypeAtoms| {
+            let root = temp.path().join(directory);
+            std::fs::create_dir_all(&root).unwrap();
+            let mut workflow = open_test_workflow(&root, &binding);
+            workflow.prepare_order(fixture_at(2)).unwrap();
+            let submission = test_submission_evidence(&workflow, &binding, fixture_at(5));
+            workflow
+                .observe_order_submission(&submission, fixture_at(5))
+                .unwrap();
+            workflow
+                .observe_order_fill("fill", matched, credited, usdc, usdc, false, fixture_at(6))
+                .unwrap();
+            let journal = std::fs::read_to_string(test_journal_path(&root)).unwrap();
+            journal.lines().last().unwrap().to_owned()
+        };
+
+        let matched = HypeAtoms::from_atoms(50_000_000);
+        assert!(!last_event("no-hype-fee", matched, matched).contains("cumulative_credited_hype"));
+        assert!(
+            last_event("hype-fee", matched, HypeAtoms::from_atoms(49_965_000))
+                .contains("\"cumulative_credited_hype\":49965000")
+        );
+    }
+
+    #[tokio::test]
+    async fn credited_hype_may_never_exceed_or_vanish_from_the_matched_quantity() {
+        let temp = tempfile::tempdir().unwrap();
+        let connector = unsigned_connector("http://127.0.0.1:1".to_owned());
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let matched = HypeAtoms::from_atoms(50_000_000);
+        let usdc = UsdcMicros::from_micros(12_500_000);
+
+        let case = |directory: &str, credited: HypeAtoms| {
+            let root = temp.path().join(directory);
+            std::fs::create_dir_all(&root).unwrap();
+            let mut workflow = open_test_workflow(&root, &binding);
+            workflow.prepare_order(fixture_at(2)).unwrap();
+            let submission = test_submission_evidence(&workflow, &binding, fixture_at(5));
+            workflow
+                .observe_order_submission(&submission, fixture_at(5))
+                .unwrap();
+            workflow.observe_order_fill("fill", matched, credited, usdc, usdc, false, fixture_at(6))
+        };
+
+        assert!(case("more-than-matched", HypeAtoms::from_atoms(50_000_001)).is_err());
+        assert!(case("vanished", HypeAtoms::default()).is_err());
+        case("net-of-fee", HypeAtoms::from_atoms(49_965_000)).unwrap();
+        case("no-base-fee", matched).unwrap();
     }
 
     fn fills_map(entries: &[(&str, &str, &str, &str)]) -> BTreeMap<String, AccumulatedFill> {

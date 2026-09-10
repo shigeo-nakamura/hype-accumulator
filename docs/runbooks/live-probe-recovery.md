@@ -94,6 +94,33 @@ it, or a non-positive one. Order identity comes from the client order ID, not
 from the price. Deriving the price on the venue's grid up front is part of
 bot-strategy#991.
 
+Hyperliquid spot charges a **buy's** taker fee in the token being bought: the
+2026-09-10 fill matched 0.3 HYPE and carried `fee: 0.00021, feeToken: HYPE`,
+so the account was credited 0.29979 HYPE and paid exactly the 24.3063 USDC
+notional. The journal keeps the two quantities apart (bot-strategy#998):
+`matched_hype` (0.3) is the order-level figure — what "completely filled"
+means, and what the fill cap bounds — while `purchased_hype` (0.29979) is
+what the account actually holds and is what residual/eligibility inventory
+is built from. Recording the matched size as purchased would claim HYPE the
+account does not hold, and `aggregate_terminal_residual_hype`'s live-balance
+bound would then fail every later `prepare` closed, permanently. The fee is
+counted once, on the HYPE side: `debited_usdc` includes only a fee the venue
+charged in USDC, never the quote-equivalent of one charged in HYPE. The
+per-fill accumulator next to the journal is schema version 2 for this; a
+version-1 file (which never captured the fee asset) is refused rather than
+upgraded. What to do depends on the journal it belongs to. If the journal
+holds no fill observation yet (the earlier run merged fills but failed before
+`observe_order_fill`), remove the file and `reconcile` rebuilds it from the
+venue. If the journal already holds a fill observation, that observation was
+recorded under the old fee semantics: with a fee charged in USDC its totals
+are unchanged and a rebuilt reconcile replays it identically (the new field
+is written only when a HYPE fee makes credited differ from matched); with a
+fee charged in HYPE its totals were wrong, the rebuilt evidence contradicts
+them, and the workflow moves to `ManualReview` — treat it as the
+settlement-correction case above, never by editing the journal. No such
+journal exists on the production host: no fill was ever recorded by a
+version-1 binary.
+
 That accepted quantity is durably recorded with the order-submission evidence,
 and it — not the authorized quantity — is what a *complete* fill has to
 reconcile to. Without that, a venue-rounded order that fills entirely still

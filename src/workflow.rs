@@ -544,6 +544,17 @@ pub struct BoundFillEvidence {
     pub execution_identity_hash: String,
     pub client_order_id: String,
     pub order_id: String,
+    /// Quantity the venue matched for this fill (gross). The executed
+    /// notional is `matched × price`, so this — not `purchased_hype` — is
+    /// what the quantity-at-limit notional cap is taken from. Absent only
+    /// in evidence written before this field existed, where `purchased_hype`
+    /// *was* the matched quantity; skipped when serializing so such a
+    /// record re-encodes byte-for-byte and its hash still verifies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_hype: Option<HypeAtoms>,
+    /// Quantity credited to the account by this fill: matched less any fee
+    /// the venue charged in HYPE (bot-strategy#998). Sums to the workflow's
+    /// `purchased_hype`.
     pub purchased_hype: HypeAtoms,
     pub executed_notional_usdc: UsdcMicros,
     pub executed_at: DateTime<Utc>,
@@ -691,14 +702,29 @@ pub enum WorkflowTransition {
     },
     OrderFillObserved {
         observation_id: String,
+        /// Cumulative quantity the venue *matched* for this order
+        /// (`orderStatus`'s origSz−sz). This is the order-level figure:
+        /// what "completely filled" means, and what the fill cap bounds.
         cumulative_hype: HypeAtoms,
+        /// Cumulative quantity actually *credited* to the account, i.e.
+        /// matched minus any fee the venue charged in the base asset
+        /// (bot-strategy#998). Becomes `purchased_hype`. Absent only in
+        /// an event written before this field existed, where it equals
+        /// `cumulative_hype`; skipped when serializing so such an event
+        /// re-encodes byte-for-byte and its record hash still verifies.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cumulative_credited_hype: Option<HypeAtoms>,
         cumulative_filled_usdc: UsdcMicros,
         cumulative_debited_usdc: UsdcMicros,
         fully_filled: bool,
     },
     OrderFinalized {
         action_id: String,
+        /// See [`Self::OrderFillObserved::cumulative_hype`].
         cumulative_hype: HypeAtoms,
+        /// See [`Self::OrderFillObserved::cumulative_credited_hype`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cumulative_credited_hype: Option<HypeAtoms>,
         cumulative_filled_usdc: UsdcMicros,
         cumulative_debited_usdc: UsdcMicros,
         finality: OrderFinality,
@@ -747,6 +773,11 @@ pub struct WorkflowState {
     #[serde(default)]
     venue_accepted_quantity_hype: Option<HypeAtoms>,
     order_accepted_at: Option<DateTime<Utc>>,
+    /// Cumulative quantity the venue matched (order-level). `purchased_hype`
+    /// is what was actually credited after any base-asset fee, and is what
+    /// every downstream inventory figure is built from (bot-strategy#998).
+    #[serde(default)]
+    matched_hype: HypeAtoms,
     purchased_hype: HypeAtoms,
     filled_usdc: UsdcMicros,
     debited_usdc: UsdcMicros,
@@ -942,6 +973,7 @@ impl WorkflowState {
             exchange_order_id: None,
             venue_accepted_quantity_hype: None,
             order_accepted_at: None,
+            matched_hype: HypeAtoms::default(),
             purchased_hype: HypeAtoms::default(),
             filled_usdc: UsdcMicros::from_micros(0),
             debited_usdc: UsdcMicros::from_micros(0),
@@ -1068,10 +1100,12 @@ impl WorkflowState {
             WorkflowTransition::OrderFillObserved {
                 observation_id,
                 cumulative_hype,
+                cumulative_credited_hype,
                 cumulative_filled_usdc,
                 cumulative_debited_usdc,
                 fully_filled,
             } => {
+                let cumulative_credited_hype = cumulative_credited_hype.unwrap_or(*cumulative_hype);
                 if observation_id.trim().is_empty() {
                     return Err(WorkflowError::InvalidTransition(
                         "fill observation ID is empty".into(),
@@ -1094,6 +1128,7 @@ impl WorkflowState {
                 }
                 self.validate_observed_fill(
                     *cumulative_hype,
+                    cumulative_credited_hype,
                     *cumulative_filled_usdc,
                     *cumulative_debited_usdc,
                     *fully_filled,
@@ -1103,8 +1138,9 @@ impl WorkflowState {
                         "a fully filled order regressed to partial".into(),
                     ));
                 }
-                let new_fill_observed = *cumulative_hype > self.purchased_hype;
-                self.purchased_hype = *cumulative_hype;
+                let new_fill_observed = *cumulative_hype > self.matched_hype;
+                self.matched_hype = *cumulative_hype;
+                self.purchased_hype = cumulative_credited_hype;
                 self.filled_usdc = *cumulative_filled_usdc;
                 self.debited_usdc = *cumulative_debited_usdc;
                 if new_fill_observed {
@@ -1119,10 +1155,12 @@ impl WorkflowState {
             WorkflowTransition::OrderFinalized {
                 action_id,
                 cumulative_hype,
+                cumulative_credited_hype,
                 cumulative_filled_usdc,
                 cumulative_debited_usdc,
                 finality,
             } => {
+                let cumulative_credited_hype = cumulative_credited_hype.unwrap_or(*cumulative_hype);
                 if action_id != &action_id_for(&self.workflow_id, ActionKind::SubmitOrder)
                     || !matches!(
                         self.stage,
@@ -1135,14 +1173,16 @@ impl WorkflowState {
                         "order finalization is invalid for current state".into(),
                     ));
                 }
-                let new_fill_observed = *cumulative_hype > self.purchased_hype;
+                let new_fill_observed = *cumulative_hype > self.matched_hype;
                 self.validate_order_finalization(
                     *cumulative_hype,
+                    cumulative_credited_hype,
                     *cumulative_filled_usdc,
                     *cumulative_debited_usdc,
                     *finality,
                 )?;
-                self.purchased_hype = *cumulative_hype;
+                self.matched_hype = *cumulative_hype;
+                self.purchased_hype = cumulative_credited_hype;
                 self.filled_usdc = *cumulative_filled_usdc;
                 self.debited_usdc = *cumulative_debited_usdc;
                 if new_fill_observed {
@@ -1610,6 +1650,7 @@ impl WorkflowState {
         let mut fill_ids = BTreeSet::new();
         let mut registration_record_ids = BTreeSet::new();
         let mut registration_cursors = BTreeSet::new();
+        let mut matched = 0_u64;
         let mut purchased = 0_u64;
         let mut executed_notional = 0_u64;
         let mut residual_remaining = evidence.residual_reservation_hype.as_atoms();
@@ -1625,8 +1666,13 @@ impl WorkflowState {
                     )
                 })?;
             let residual_for_fill = residual_remaining.min(fill.purchased_hype.as_atoms());
+            // The notional was executed on the *matched* quantity; a fee
+            // charged in HYPE reduces what was credited, not what traded,
+            // so capping on `purchased_hype` would reject every honest fill
+            // near the limit price (Codex review of PR #60).
+            let fill_matched_hype = fill.matched_hype.unwrap_or(fill.purchased_hype);
             let fill_notional_cap =
-                max_fill_notional_usdc(fill.purchased_hype, &self.binding.order_envelope)
+                max_fill_notional_usdc(fill_matched_hype, &self.binding.order_envelope)
                     .ok_or_else(|| {
                         WorkflowError::ContradictoryObservation(
                             "fill quantity-at-limit notional overflowed".into(),
@@ -1653,7 +1699,9 @@ impl WorkflowState {
                 || fill.execution_identity_hash != evidence.execution_identity_hash
                 || fill.client_order_id != evidence.client_order_id
                 || fill.order_id != evidence.order_id
+                || fill_matched_hype.is_zero()
                 || fill.purchased_hype.is_zero()
+                || fill.purchased_hype > fill_matched_hype
                 || fill.executed_notional_usdc.is_zero()
                 || fill.executed_notional_usdc > fill_notional_cap
                 || !fill_ids.insert(fill.fill_id.as_str())
@@ -1680,12 +1728,13 @@ impl WorkflowState {
                         .into(),
                 ));
             }
-            (purchased, executed_notional) =
-                checked_fill_totals(purchased, executed_notional, fill)?;
+            (matched, purchased, executed_notional) =
+                checked_fill_totals(matched, purchased, executed_notional, fill)?;
             residual_remaining = residual_remaining.saturating_sub(fill.purchased_hype.as_atoms());
             previous = Some(key);
         }
-        if purchased != self.purchased_hype.as_atoms()
+        if matched != self.matched_hype.as_atoms()
+            || purchased != self.purchased_hype.as_atoms()
             || executed_notional != self.filled_usdc.as_micros()
         {
             return Err(WorkflowError::ContradictoryObservation(
@@ -1742,12 +1791,14 @@ impl WorkflowState {
     fn validate_observed_fill(
         &self,
         cumulative_hype: HypeAtoms,
+        cumulative_credited_hype: HypeAtoms,
         cumulative_filled_usdc: UsdcMicros,
         cumulative_debited_usdc: UsdcMicros,
         fully_filled: bool,
     ) -> Result<(), WorkflowError> {
         self.validate_cumulative_fill(
             cumulative_hype,
+            cumulative_credited_hype,
             cumulative_filled_usdc,
             cumulative_debited_usdc,
             false,
@@ -1766,6 +1817,14 @@ impl WorkflowState {
     /// that needs it means the journal is missing that observation, so
     /// this fails closed rather than falling back to the authorized
     /// quantity (which the venue may have rounded down — bot-strategy#845).
+    /// Cumulative quantity the venue matched for this order — the
+    /// order-level figure that "completely filled" is judged against.
+    /// Differs from [`Self::purchased_hype`] by any fee charged in HYPE.
+    #[must_use]
+    pub fn matched_hype(&self) -> HypeAtoms {
+        self.matched_hype
+    }
+
     #[must_use]
     pub fn venue_accepted_quantity_hype(&self) -> Option<HypeAtoms> {
         self.venue_accepted_quantity_hype
@@ -1832,12 +1891,14 @@ impl WorkflowState {
     fn validate_order_finalization(
         &self,
         cumulative_hype: HypeAtoms,
+        cumulative_credited_hype: HypeAtoms,
         cumulative_filled_usdc: UsdcMicros,
         cumulative_debited_usdc: UsdcMicros,
         finality: OrderFinality,
     ) -> Result<(), WorkflowError> {
         self.validate_cumulative_fill(
             cumulative_hype,
+            cumulative_credited_hype,
             cumulative_filled_usdc,
             cumulative_debited_usdc,
             matches!(finality, OrderFinality::Canceled | OrderFinality::Expired),
@@ -1853,10 +1914,25 @@ impl WorkflowState {
     fn validate_cumulative_fill(
         &self,
         cumulative_hype: HypeAtoms,
+        cumulative_credited_hype: HypeAtoms,
         cumulative_filled_usdc: UsdcMicros,
         cumulative_debited_usdc: UsdcMicros,
         allow_zero: bool,
     ) -> Result<(), WorkflowError> {
+        // The credited quantity is the matched quantity less any fee the
+        // venue charged in the base asset (bot-strategy#998). It can never
+        // exceed what was matched: a base-asset *rebate* on a taker IOC is
+        // not something this venue does, and treating one as real would
+        // credit HYPE the account does not hold, so it fails closed. A fee
+        // cannot consume an entire fill either.
+        if cumulative_credited_hype > cumulative_hype
+            || cumulative_credited_hype.is_zero() != cumulative_hype.is_zero()
+            || cumulative_credited_hype < self.purchased_hype
+        {
+            return Err(WorkflowError::ContradictoryObservation(
+                "credited HYPE exceeded the matched quantity, vanished, or regressed".into(),
+            ));
+        }
         let proportional_fill_cap =
             max_fill_notional_usdc(cumulative_hype, &self.binding.order_envelope).ok_or_else(
                 || {
@@ -1867,7 +1943,7 @@ impl WorkflowState {
             )?;
         if (cumulative_hype.is_zero() && !allow_zero)
             || cumulative_hype.is_zero() != cumulative_filled_usdc.is_zero()
-            || cumulative_hype < self.purchased_hype
+            || cumulative_hype < self.matched_hype
             || cumulative_filled_usdc < self.filled_usdc
             || cumulative_debited_usdc < self.debited_usdc
             || cumulative_debited_usdc < cumulative_filled_usdc
@@ -1908,6 +1984,7 @@ impl WorkflowState {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     fn invalid_transition_contradiction_reason(
         &self,
         transition: &WorkflowTransition,
@@ -1951,6 +2028,7 @@ impl WorkflowState {
             }
             WorkflowTransition::OrderFillObserved {
                 cumulative_hype,
+                cumulative_credited_hype,
                 cumulative_filled_usdc,
                 cumulative_debited_usdc,
                 fully_filled,
@@ -1965,6 +2043,7 @@ impl WorkflowState {
                 if let Err(WorkflowError::ContradictoryObservation(reason)) = self
                     .validate_observed_fill(
                         *cumulative_hype,
+                        cumulative_credited_hype.unwrap_or(*cumulative_hype),
                         *cumulative_filled_usdc,
                         *cumulative_debited_usdc,
                         *fully_filled,
@@ -1977,6 +2056,7 @@ impl WorkflowState {
             }
             WorkflowTransition::OrderFinalized {
                 cumulative_hype,
+                cumulative_credited_hype,
                 cumulative_filled_usdc,
                 cumulative_debited_usdc,
                 finality,
@@ -1990,6 +2070,7 @@ impl WorkflowState {
             {
                 match self.validate_order_finalization(
                     *cumulative_hype,
+                    cumulative_credited_hype.unwrap_or(*cumulative_hype),
                     *cumulative_filled_usdc,
                     *cumulative_debited_usdc,
                     *finality,
@@ -3601,10 +3682,12 @@ impl DurableWorkflow {
     ///
     /// Returns an error when cumulative values regress, exceed their immutable
     /// caps, conflict with replay, or cannot be persisted.
+    #[allow(clippy::too_many_arguments)]
     pub fn observe_order_fill(
         &mut self,
         observation_id: impl Into<String>,
         cumulative_hype: HypeAtoms,
+        cumulative_credited_hype: HypeAtoms,
         cumulative_filled_usdc: UsdcMicros,
         cumulative_debited_usdc: UsdcMicros,
         fully_filled: bool,
@@ -3625,6 +3708,13 @@ impl DurableWorkflow {
             WorkflowTransition::OrderFillObserved {
                 observation_id,
                 cumulative_hype,
+                // Written only when it carries information. A fill with no
+                // HYPE-denominated fee then produces exactly the event body
+                // (and event ID) the previous release wrote, so reconciling
+                // such an order again after the upgrade is an idempotent
+                // replay rather than a conflicting one.
+                cumulative_credited_hype: (cumulative_credited_hype != cumulative_hype)
+                    .then_some(cumulative_credited_hype),
                 cumulative_filled_usdc,
                 cumulative_debited_usdc,
                 fully_filled,
@@ -3640,6 +3730,7 @@ impl DurableWorkflow {
     pub fn finalize_order(
         &mut self,
         cumulative_hype: HypeAtoms,
+        cumulative_credited_hype: HypeAtoms,
         cumulative_filled_usdc: UsdcMicros,
         cumulative_debited_usdc: UsdcMicros,
         finality: OrderFinality,
@@ -3655,6 +3746,13 @@ impl DurableWorkflow {
             WorkflowTransition::OrderFinalized {
                 action_id,
                 cumulative_hype,
+                // Written only when it carries information. A fill with no
+                // HYPE-denominated fee then produces exactly the event body
+                // (and event ID) the previous release wrote, so reconciling
+                // such an order again after the upgrade is an idempotent
+                // replay rather than a conflicting one.
+                cumulative_credited_hype: (cumulative_credited_hype != cumulative_hype)
+                    .then_some(cumulative_credited_hype),
                 cumulative_filled_usdc,
                 cumulative_debited_usdc,
                 finality,
@@ -4394,10 +4492,16 @@ fn eligibility_policy_windows(
 }
 
 fn checked_fill_totals(
+    matched: u64,
     purchased: u64,
     executed_notional: u64,
     fill: &BoundFillEvidence,
-) -> Result<(u64, u64), WorkflowError> {
+) -> Result<(u64, u64, u64), WorkflowError> {
+    let matched = matched
+        .checked_add(fill.matched_hype.unwrap_or(fill.purchased_hype).as_atoms())
+        .ok_or_else(|| {
+            WorkflowError::ContradictoryObservation("authorized fill quantity overflowed".into())
+        })?;
     let purchased = purchased
         .checked_add(fill.purchased_hype.as_atoms())
         .ok_or_else(|| {
@@ -4408,7 +4512,7 @@ fn checked_fill_totals(
         .ok_or_else(|| {
             WorkflowError::ContradictoryObservation("authorized fill notional overflowed".into())
         })?;
-    Ok((purchased, executed_notional))
+    Ok((matched, purchased, executed_notional))
 }
 
 fn residual_hype_available_before(
