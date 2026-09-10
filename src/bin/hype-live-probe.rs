@@ -20,7 +20,7 @@
 //! (see `live_decision.rs`'s module doc for why). It is feature-gated
 //! behind `live-probe` and is not built by default.
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use dex_connector::{HyperliquidAccountConfig, HyperliquidConnector, HyperliquidConnectorConfig};
 use hype_accumulator::{
     config::{Config, EffectiveLiveOrderPolicy, ProcessEnvironment},
@@ -36,7 +36,7 @@ use hype_accumulator::{
     signal::SignalSnapshot,
     signer::resolve_signer_private_key,
     workflow::{
-        DurableWorkflow, EligibilityPolicyBinding, ExchangeOrderOwnerStore,
+        DisabledStakingProof, DurableWorkflow, EligibilityPolicyBinding, ExchangeOrderOwnerStore,
         FileExchangeOrderOwnerStore, FileProtectedWorkflowHeadStore, HypeAtoms,
         ProtectedWorkflowHeadStore, WorkflowError, WorkflowStage,
     },
@@ -775,6 +775,7 @@ fn bind_history_directory_for_prepare(
     Ok((journal_directory, live_history_directory, history_binding))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn prepare(
     config_path: &str,
     security_policy_path: &str,
@@ -845,8 +846,12 @@ async fn prepare(
     let now = Utc::now();
     let effective = config.effective_live_order_policy(&ProcessEnvironment, now)?;
     let policy_version = config.effective_security_policy_digest(&ProcessEnvironment, now)?;
-    let (envelope_policy, eligibility_policy) =
-        build_prepare_policies(&effective, &operational, policy_version);
+    let (envelope_policy, eligibility_policy) = build_prepare_policies(
+        &effective,
+        &operational,
+        policy_version,
+        config.staking_policy_digest()?,
+    );
     let configured_residual_hype_atoms = HypeAtoms::from_atoms(effective.residual_hype_wei);
 
     let runtime_config = RuntimeConfig::from_toml(&fs::read_to_string(runtime_config_path)?)?
@@ -1026,8 +1031,19 @@ async fn submit(
     }
     // Even a transport error may follow venue acceptance. Recovery must run
     // after every attempt, without allowing a second economic request.
+    // Same proof `reconcile` passes (bot-strategy#993). `submit` already
+    // required a valid acknowledgement above, so a failure here would be a
+    // clock race; withholding the proof then is the fail-closed choice (the
+    // next `reconcile` completes the workflow).
+    let now = Utc::now();
+    let disabled_staking = disabled_staking_proof(&config, now);
     let reconciliation = probe
-        .reconcile(&mut workflow, Path::new(journal_path), Utc::now())
+        .reconcile(
+            &mut workflow,
+            Path::new(journal_path),
+            disabled_staking.as_ref(),
+            now,
+        )
         .await;
     let settlement = if let Ok(observation) = &reconciliation {
         print_observation(observation)?;
@@ -1386,11 +1402,14 @@ async fn reconcile(
     // Deliberately do not validate live approval or load/decrypt the signer.
     // An expired approval and a revoked key must not prevent read-only recovery.
     let connector = build_read_only_connector(&config, &operational, &ProcessEnvironment)?;
+    let now = Utc::now();
+    let disabled_staking = disabled_staking_proof(&config, now);
     let observation = reconcile_prepared_order(
         &connector,
         &mut workflow,
         Path::new(journal_path),
-        Utc::now(),
+        disabled_staking.as_ref(),
+        now,
     )
     .await?;
     print_observation(&observation)?;
@@ -1422,6 +1441,41 @@ fn build_read_only_connector<E: hype_accumulator::config::Environment>(
         max_taker_book_age_ms: operational.max_taker_book_age_ms,
     })
     .map_err(box_error)
+}
+
+/// Proof, for the workflow, that the policy in force disables staking
+/// (bot-strategy#993) — or `None`, which leaves a real purchase at
+/// `OrderFinalized` rather than attesting anything.
+///
+/// Gated on the **full** live-contract validation (`effective_live_order_
+/// policy`): validation refuses `staking.enabled = true`, and it also checks
+/// the configured acknowledgement against the policy's expected digest, so a
+/// cleared or mismatched acknowledgement withholds the proof even while its
+/// expiry lies in the future. Read-only recovery must not depend on any of
+/// this, so a failure only withholds the proof: lookup, fill recording and
+/// settlement still run. The staking-section digest survives an
+/// acknowledgement renewal; the whole-policy version does not, and only
+/// matters for decisions bound before the digest existed.
+fn disabled_staking_proof(config: &Config, now: DateTime<Utc>) -> Option<DisabledStakingProof> {
+    let validated = config
+        .effective_live_order_policy(&ProcessEnvironment, now)
+        .and_then(|_| config.effective_security_policy_digest(&ProcessEnvironment, now))
+        .and_then(|validated_policy_version| {
+            Ok(DisabledStakingProof {
+                staking_policy_digest: config.staking_policy_digest()?,
+                validated_policy_version,
+            })
+        });
+    match validated {
+        Ok(proof) => Some(proof),
+        Err(error) => {
+            eprintln!(
+                "note: security policy is not live-valid ({error}); a real purchase cannot \
+                 complete its workflow until it is (bot-strategy#993)"
+            );
+            None
+        }
+    }
 }
 
 fn load_config(
@@ -1459,6 +1513,7 @@ fn build_prepare_policies(
     effective: &EffectiveLiveOrderPolicy,
     operational: &OperationalParams,
     policy_version: String,
+    staking_policy_digest: String,
 ) -> (OrderEnvelopeFreshnessPolicy, EligibilityPolicyBinding) {
     let envelope_policy = OrderEnvelopeFreshnessPolicy {
         max_venue_clock_lag_ms: effective.max_venue_clock_lag_ms,
@@ -1476,6 +1531,7 @@ fn build_prepare_policies(
         policy_version,
         fill_registration_deadline_seconds: effective.fill_registration_deadline_seconds,
         lot_eligibility_max_age_seconds: effective.lot_eligibility_max_age_seconds,
+        staking_policy_digest: Some(staking_policy_digest),
     };
     (envelope_policy, eligibility_policy)
 }

@@ -618,6 +618,48 @@ fn resolved_parent_identity_is_digest_bound_when_inheritance_is_enabled() {
 }
 
 #[test]
+fn staking_policy_digest_is_normalized_and_independent_of_the_acknowledgement() {
+    // bot-strategy#993 (Codex review of PR #61): the staking-section digest
+    // binds an eligibility attestation across acknowledgement renewals, so
+    // it must hash the same normalized allowlist the whole-policy digest
+    // hashes -- reordering or reformatting the same validators, or renewing
+    // the acknowledgement expiry, must not change it -- while a real change
+    // to the staking section must.
+    let single = format!("validator_allowlist = [\"{VALIDATOR}\"]");
+    let runtime = live_runtime_toml().replace(
+        &single,
+        &format!("validator_allowlist = [\"{OTHER_VALIDATOR}\", \"{VALIDATOR}\"]"),
+    );
+    let first = live_policy_template().replace(
+        &single,
+        &format!("validator_allowlist = [\"{VALIDATOR}\", \"{OTHER_VALIDATOR}\"]"),
+    );
+    let reversed_and_uppercased = first.replace(
+        &format!("validator_allowlist = [\"{VALIDATOR}\", \"{OTHER_VALIDATOR}\"]"),
+        &format!(
+            "validator_allowlist = [\"{}\", \"{VALIDATOR}\"]",
+            OTHER_VALIDATOR.to_uppercase().replace("0X", "0x")
+        ),
+    );
+    let renewed = first.replace(
+        &format!("live_acknowledgement_expires_at = \"{EXPIRY}\""),
+        "live_acknowledgement_expires_at = \"2027-01-01T00:00:00Z\"",
+    );
+    let residual_changed = first.replace("residual_hype_wei = 1000", "residual_hype_wei = 2000");
+    let digest = |policy: &str| {
+        Config::from_toml_with_security_policy(&runtime, policy)
+            .expect("policy documents")
+            .staking_policy_digest()
+            .expect("staking digest")
+    };
+    let baseline = digest(&first);
+    assert_eq!(baseline.len(), 64);
+    assert_eq!(digest(&reversed_and_uppercased), baseline);
+    assert_eq!(digest(&renewed), baseline);
+    assert_ne!(digest(&residual_changed), baseline);
+}
+
+#[test]
 fn multiple_validators_are_normalized_as_a_digest_bound_set() {
     let env = live_environment();
     let single = format!("validator_allowlist = [\"{VALIDATOR}\"]");

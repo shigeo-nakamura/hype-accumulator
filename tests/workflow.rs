@@ -9,12 +9,13 @@ use hype_accumulator::{
     workflow::{
         ActionKind, AppendOutcome, AuthenticatedOrderSubmission, AuthorizationInputFreshness,
         BoundFillEvidence, BoundMovementEvidence, ConclusiveAbsenceEvidence, DecisionBinding,
-        DurableWorkflow, EligibilityPolicyBinding, ExchangeFillOwner, ExchangeOrderOwner,
-        ExchangeOrderOwnerStore, ExternalAction, ExternalReceipt, FileExchangeOrderOwnerStore,
-        FileProtectedWorkflowHeadStore, GapFreeHistoryWatermark, HistoryDomain, HypeAtoms,
-        InventoryBaseline, JournalCommitStatus, OrderBoundEligibilityEvidence,
-        OrderEnvelopeBinding, OrderFinality, OwnershipCommitOutcome, PrepareOutcome,
-        ProtectedWorkflowHead, ProtectedWorkflowHeadStore, WorkflowError, WorkflowStage,
+        DisabledStakingProof, DurableWorkflow, EligibilityPolicyBinding, ExchangeFillOwner,
+        ExchangeOrderOwner, ExchangeOrderOwnerStore, ExternalAction, ExternalReceipt,
+        FileExchangeOrderOwnerStore, FileProtectedWorkflowHeadStore, GapFreeHistoryWatermark,
+        HistoryDomain, HypeAtoms, InventoryBaseline, JournalCommitStatus,
+        OrderBoundEligibilityEvidence, OrderEnvelopeBinding, OrderFinality, OwnershipCommitOutcome,
+        PrepareOutcome, ProtectedWorkflowHead, ProtectedWorkflowHeadStore, WorkflowError,
+        WorkflowStage,
     },
 };
 use std::{
@@ -400,6 +401,7 @@ fn decision() -> DailyDecision {
 
 fn eligibility_policy() -> EligibilityPolicyBinding {
     EligibilityPolicyBinding {
+        staking_policy_digest: Some("staking-policy-digest-a".to_owned()),
         policy_version: "custody-policy-v1".to_owned(),
         fill_registration_deadline_seconds: 60,
         lot_eligibility_max_age_seconds: 3_600,
@@ -2191,6 +2193,148 @@ fn every_transition_survives_a_restart_without_double_counting() {
         workflow.state().binding().inventory_before.spot_hype_atoms,
         hype(10_000)
     );
+}
+
+#[test]
+fn completion_may_resume_from_recorded_eligibility_only_where_the_gate_allows_it() {
+    // bot-strategy#993: a reconciliation resumes completion from
+    // `StakingEligibilityRecorded` only when the `Completed` transition would
+    // accept it. Without an offline staking capability it always would.
+    let temp = tempfile::tempdir().expect("temp directory");
+    let mut workflow = accepted_workflow(&temp.path().join("resume.jsonl"));
+    workflow
+        .observe_order_fill(
+            "fill-observation",
+            hype(250),
+            hype(250),
+            usdc(50_000_000),
+            usdc(50_000_000),
+            true,
+            at(3),
+        )
+        .expect("fill observed");
+    workflow
+        .finalize_order(
+            hype(250),
+            hype(250),
+            usdc(50_000_000),
+            usdc(50_000_000),
+            OrderFinality::Filled,
+            at(4),
+        )
+        .expect("order finalized");
+    assert!(!workflow.state().can_complete_from_recorded_eligibility());
+    workflow
+        .record_staking_eligibility_under_disabled_policy(
+            &DisabledStakingProof {
+                staking_policy_digest: "staking-policy-digest-a".to_owned(),
+                validated_policy_version: "custody-policy-v1".to_owned(),
+            },
+            at(5),
+        )
+        .expect("eligibility recorded under the disabled policy");
+    assert!(workflow.state().can_complete_from_recorded_eligibility());
+    workflow.complete(at(6)).expect("completes");
+    assert!(!workflow.state().can_complete_from_recorded_eligibility());
+}
+
+#[cfg(feature = "offline-staking-simulation")]
+#[test]
+fn a_staking_capable_binding_never_records_eligibility_on_an_attestation() {
+    // Codex review of PR #61: the simulated staking actions that follow
+    // eligibility are exactly what order-bound evidence authorizes, so a
+    // binding carrying the offline capability must refuse the attestation
+    // basis outright -- at record time and on replay.
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("offline-attestation.jsonl");
+    let binding = offline_staking_binding();
+    let mut workflow = reopen(&path, &binding);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission reconciled");
+    workflow
+        .observe_order_fill(
+            "fill-1",
+            hype(250),
+            hype(250),
+            usdc(50_000_000),
+            usdc(50_500_000),
+            true,
+            at(3),
+        )
+        .expect("fill reconciled");
+    workflow
+        .finalize_order(
+            hype(250),
+            hype(250),
+            usdc(50_000_000),
+            usdc(50_500_000),
+            OrderFinality::Filled,
+            at(4),
+        )
+        .expect("order finalized");
+    let proof = DisabledStakingProof {
+        staking_policy_digest: "staking-policy-digest-a".to_owned(),
+        validated_policy_version: "custody-policy-v1".to_owned(),
+    };
+    assert!(workflow
+        .state()
+        .disabled_staking_attestation_for(&proof)
+        .is_none());
+    assert!(matches!(
+        workflow.record_staking_eligibility_under_disabled_policy(&proof, at(5)),
+        Err(WorkflowError::InvalidTransition(_))
+    ));
+    assert_eq!(workflow.state().stage(), WorkflowStage::OrderFinalized);
+}
+
+#[cfg(feature = "offline-staking-simulation")]
+#[test]
+fn completion_does_not_resume_for_a_simulated_staking_workflow_awaiting_delegation() {
+    // Codex review of PR #61: with the simulation feature, a workflow with
+    // eligible HYPE legitimately waits at `StakingEligibilityRecorded` for
+    // deposit and delegation. The predicate must say so, and it must agree
+    // with what `complete` would actually do.
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("offline-resume.jsonl");
+    let binding = offline_staking_binding();
+    let mut workflow = reopen(&path, &binding);
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission reconciled");
+    workflow
+        .observe_order_fill(
+            "fill-1",
+            hype(250),
+            hype(250),
+            usdc(50_000_000),
+            usdc(50_500_000),
+            true,
+            at(3),
+        )
+        .expect("fill reconciled");
+    workflow
+        .finalize_order(
+            hype(250),
+            hype(250),
+            usdc(50_000_000),
+            usdc(50_500_000),
+            OrderFinality::Filled,
+            at(4),
+        )
+        .expect("order finalized");
+    let eligibility_evidence = bound_evidence(&workflow, &[("fill-1", 250, 3)], at(5));
+    let eligibility = workflow
+        .record_staking_eligibility(Some(eligibility_evidence), at(5))
+        .expect("eligibility recorded");
+    assert!(!eligibility.eligible_hype.is_zero());
+    assert_eq!(
+        workflow.state().stage(),
+        WorkflowStage::StakingEligibilityRecorded
+    );
+    assert!(!workflow.state().can_complete_from_recorded_eligibility());
+    assert!(matches!(
+        workflow.complete(at(6)),
+        Err(WorkflowError::InvalidTransition(_))
+    ));
 }
 
 #[cfg(feature = "offline-staking-simulation")]
