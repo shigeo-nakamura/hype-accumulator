@@ -660,12 +660,13 @@ async fn record_reconciliation(
             .is_some()
     });
     let can_record_eligibility = zero_purchase || disabled_staking.is_some();
-    let workflow_completed = if matches!(
-        workflow.state().stage(),
-        WorkflowStage::OrderFinalized | WorkflowStage::StakingEligibilityRecorded
-    ) && (workflow.state().stage()
-        == WorkflowStage::StakingEligibilityRecorded
-        || can_record_eligibility)
+    // Resuming from `StakingEligibilityRecorded` only where the workflow can
+    // actually complete there (see `can_complete_from_recorded_eligibility`);
+    // a simulated-staking workflow with eligible HYPE waits at that stage
+    // for deposit and delegation (Codex review of PR #61).
+    let workflow_completed = if (workflow.state().stage() == WorkflowStage::OrderFinalized
+        && can_record_eligibility)
+        || workflow.state().can_complete_from_recorded_eligibility()
     {
         // Never earlier than the transition it follows: absence recording
         // just above clamps its own timestamp forward past the venue

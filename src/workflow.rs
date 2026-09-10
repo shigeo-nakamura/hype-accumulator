@@ -1949,6 +1949,20 @@ impl WorkflowState {
         }
     }
 
+    /// Whether a workflow sitting at `StakingEligibilityRecorded` may be
+    /// completed there — the same gate the `Completed` transition applies:
+    /// no offline staking capability, or nothing eligible to stake. A
+    /// simulated-staking workflow with eligible HYPE legitimately waits at
+    /// this stage for deposit and delegation, so a caller resuming
+    /// completion (bot-strategy#993) must ask this first rather than turn a
+    /// read-only reconciliation into a rejected transition.
+    #[must_use]
+    pub fn can_complete_from_recorded_eligibility(&self) -> bool {
+        self.stage == WorkflowStage::StakingEligibilityRecorded
+            && (self.binding.offline_staking_capability.is_none()
+                || self.staking_eligible_hype.is_zero())
+    }
+
     #[must_use]
     pub fn matched_hype(&self) -> HypeAtoms {
         self.matched_hype
