@@ -85,6 +85,15 @@ practical effect is that a probe can under-spend its budget by up to one lot's
 notional; deriving the quantity on the venue's lot grid up front is
 bot-strategy#991.
 
+The venue also normalizes the order's *price* onto its own grid (at most five
+significant figures for spot), so an authorized 81.172020 USDC per HYPE comes
+back as 81.172. The order is a buy, so the authorized price is a ceiling:
+reconciliation accepts a venue price at or below it — strictly within the
+authorization, and it can only lower the maximum spend — and rejects one above
+it, or a non-positive one. Order identity comes from the client order ID, not
+from the price. Deriving the price on the venue's grid up front is part of
+bot-strategy#991.
+
 That accepted quantity is durably recorded with the order-submission evidence,
 and it — not the authorized quantity — is what a *complete* fill has to
 reconcile to. Without that, a venue-rounded order that fills entirely still

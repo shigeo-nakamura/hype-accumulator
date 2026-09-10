@@ -971,8 +971,24 @@ fn verify_observed_order_envelope(
     if tif != Some("Ioc") {
         return Err(LiveProbeError::BindingMismatch("order time in force"));
     }
-    if limit_price != Some(expected_limit_price_usdc_per_hype) {
-        return Err(LiveProbeError::BindingMismatch("order limit price"));
+    // Hyperliquid normalizes an order's price onto its own grid (at most
+    // five significant figures for spot), while the envelope authorizes at
+    // micro-USDC precision: an authorized 81.172020 comes back as 81.172,
+    // and equality can never hold (bot-strategy#845 blocker 12, hit on the
+    // first real fill — same shape as the size lot in blocker 10).
+    //
+    // This is a *buy*, so the authorized limit price is a ceiling on what
+    // may be paid per HYPE. A venue price at or below it is therefore
+    // strictly within the authorization and can only lower the maximum
+    // spend; a price *above* it would let the order pay more than was
+    // authorized and still fails closed, which is the property this check
+    // exists for. A non-positive price does not describe a real order.
+    // Order identity itself comes from the CLOID check above, not from the
+    // price. Deriving the price on the venue's grid up front, so intent
+    // matches what the venue accepts, is bot-strategy#991.
+    match limit_price {
+        Some(price) if price > Decimal::ZERO && price <= expected_limit_price_usdc_per_hype => {}
+        _ => return Err(LiveProbeError::BindingMismatch("order limit price")),
     }
     Ok(())
 }
@@ -2859,6 +2875,57 @@ mod tests {
             Err(LiveProbeError::BindingMismatch("order limit price"))
         ));
         assert!(workflow.state().exchange_order_id().is_none());
+    }
+
+    #[tokio::test]
+    async fn accepts_a_venue_price_normalized_onto_the_venue_grid_but_not_one_above_it() {
+        // Regression test for bot-strategy#845 blocker 12, hit on the first
+        // real fill: Hyperliquid normalizes an order's price onto its own
+        // grid (five significant figures for spot), so an authorized
+        // 81.172020 came back as 81.172 and the old equality check made the
+        // fill permanently unrecordable. The order is a buy, so the
+        // authorized price is a ceiling: at or below it is within the
+        // authorization, above it is not.
+        let temp = tempfile::tempdir().unwrap();
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            unsigned_connector("http://127.0.0.1:1".to_owned())
+                .execution_account_address()
+                .unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let workflow = open_test_workflow(temp.path(), &binding);
+        let cloid = workflow.state().client_order_id();
+        // decision_binding authorizes 25.0 USDC per HYPE.
+        let authorized = binding
+            .order_envelope
+            .limit_price_usdc_per_hype
+            .as_decimal();
+        let envelope = |limit_px: &str| {
+            serde_json::json!({
+                "order": {"order": {"side": "B", "tif": "Ioc", "cloid": cloid, "limitPx": limit_px}}
+            })
+            .to_string()
+        };
+
+        // Normalized down onto the venue grid: within the ceiling.
+        verify_observed_order_envelope(&envelope("24.999"), &cloid, authorized).unwrap();
+        // Exactly the authorized price still passes.
+        verify_observed_order_envelope(&envelope("25.0"), &cloid, authorized).unwrap();
+        // Above the ceiling: the venue would be paying more than authorized.
+        assert!(matches!(
+            verify_observed_order_envelope(&envelope("25.001"), &cloid, authorized),
+            Err(LiveProbeError::BindingMismatch("order limit price"))
+        ));
+        // Non-positive does not describe a real order.
+        assert!(matches!(
+            verify_observed_order_envelope(&envelope("0"), &cloid, authorized),
+            Err(LiveProbeError::BindingMismatch("order limit price"))
+        ));
+        assert!(matches!(
+            verify_observed_order_envelope(&envelope("-1"), &cloid, authorized),
+            Err(LiveProbeError::BindingMismatch("order limit price"))
+        ));
     }
 
     #[tokio::test]
