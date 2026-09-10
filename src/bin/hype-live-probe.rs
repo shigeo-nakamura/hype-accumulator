@@ -1111,12 +1111,25 @@ fn settle_finalized_decision(
         // The authoritative quantity this reconciliation observed must be the
         // one the journal's terminal result was frozen from; anything else is
         // late evidence the journal has not absorbed yet.
-        if observation.filled_hype != state.purchased_hype() {
+        if observation.filled_hype != state.matched_hype() {
             return Err(format!(
-                "decision {decision_id}: venue reports {} HYPE atoms filled but the journal's \
+                "decision {decision_id}: venue reports {} HYPE atoms matched but the journal's \
                  terminal result holds {}; refusing to settle stale totals — resolve as manual \
                  review",
                 observation.filled_hype.as_atoms(),
+                state.matched_hype().as_atoms()
+            )
+            .into());
+        }
+        // And the credited quantity — what the account actually holds after
+        // any fee charged in HYPE (bot-strategy#998) — must be the one the
+        // journal's terminal result was frozen from, for the same reason.
+        if observation.credited_hype != Some(state.purchased_hype()) {
+            return Err(format!(
+                "decision {decision_id}: venue fills credit {:?} HYPE atoms but the journal's \
+                 terminal result holds {}; refusing to settle stale totals — resolve as manual \
+                 review",
+                observation.credited_hype.map(HypeAtoms::as_atoms),
                 state.purchased_hype().as_atoms()
             )
             .into());

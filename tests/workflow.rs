@@ -712,6 +712,7 @@ fn offline_staking_submitted_with_receipt(
         .observe_order_fill(
             "fill-negative",
             hype(250),
+            hype(250),
             usdc(50_000_000),
             usdc(50_500_000),
             true,
@@ -720,6 +721,7 @@ fn offline_staking_submitted_with_receipt(
         .expect("fill reconciled");
     workflow
         .finalize_order(
+            hype(250),
             hype(250),
             usdc(50_000_000),
             usdc(50_500_000),
@@ -1420,6 +1422,7 @@ fn losing_journal_commit_does_not_retain_fill_claims() {
         .observe_order_fill(
             "fill-observation",
             hype(250),
+            hype(250),
             usdc(50_000_000),
             usdc(50_500_000),
             true,
@@ -1428,6 +1431,7 @@ fn losing_journal_commit_does_not_retain_fill_claims() {
         .expect("fill observed");
     initializer
         .finalize_order(
+            hype(250),
             hype(250),
             usdc(50_000_000),
             usdc(50_500_000),
@@ -1478,6 +1482,7 @@ fn fill_owner_intent_survives_an_ambiguous_journal_commit() {
         .observe_order_fill(
             "fill-observation",
             hype(250),
+            hype(250),
             usdc(50_000_000),
             usdc(50_500_000),
             true,
@@ -1486,6 +1491,7 @@ fn fill_owner_intent_survives_an_ambiguous_journal_commit() {
         .expect("fill observed");
     workflow
         .finalize_order(
+            hype(250),
             hype(250),
             usdc(50_000_000),
             usdc(50_500_000),
@@ -1633,6 +1639,7 @@ fn one_exchange_fill_cannot_be_owned_by_two_decision_workflows() {
             .observe_order_fill(
                 "fill-observation",
                 hype(250),
+                hype(250),
                 usdc(50_000_000),
                 usdc(50_500_000),
                 true,
@@ -1641,6 +1648,7 @@ fn one_exchange_fill_cannot_be_owned_by_two_decision_workflows() {
             .expect("fill observed");
         workflow
             .finalize_order(
+                hype(250),
                 hype(250),
                 usdc(50_000_000),
                 usdc(50_500_000),
@@ -1829,6 +1837,7 @@ fn a_lower_configured_target_reserves_no_new_residual_when_history_already_excee
         .observe_order_fill(
             "fill",
             hype(6),
+            hype(6),
             usdc(1_200_000),
             usdc(1_210_000),
             false,
@@ -1837,6 +1846,7 @@ fn a_lower_configured_target_reserves_no_new_residual_when_history_already_excee
         .expect("fill observed");
     workflow
         .finalize_order(
+            hype(6),
             hype(6),
             usdc(1_200_000),
             usdc(1_210_000),
@@ -1987,6 +1997,7 @@ fn every_transition_survives_a_restart_without_double_counting() {
         .observe_order_fill(
             "fill-1",
             hype(100),
+            hype(100),
             usdc(20_000_000),
             usdc(20_200_000),
             false,
@@ -2002,6 +2013,7 @@ fn every_transition_survives_a_restart_without_double_counting() {
         .observe_order_fill(
             "fill-2",
             hype(250),
+            hype(250),
             usdc(50_000_000),
             usdc(50_500_000),
             true,
@@ -2015,6 +2027,7 @@ fn every_transition_survives_a_restart_without_double_counting() {
 
     workflow
         .finalize_order(
+            hype(250),
             hype(250),
             usdc(50_000_000),
             usdc(50_500_000),
@@ -2072,6 +2085,7 @@ fn offline_staking_every_transition_survives_restart_and_ambiguity() {
         .observe_order_fill(
             "fill-1",
             hype(250),
+            hype(250),
             usdc(50_000_000),
             usdc(50_500_000),
             true,
@@ -2082,6 +2096,7 @@ fn offline_staking_every_transition_survives_restart_and_ambiguity() {
     workflow = reopen(&path, &binding);
     workflow
         .finalize_order(
+            hype(250),
             hype(250),
             usdc(50_000_000),
             usdc(50_500_000),
@@ -2282,6 +2297,7 @@ fn offline_staking_uses_recorded_residual_split_and_cannot_complete_early() {
         .observe_order_fill(
             "fill-residual",
             hype(250),
+            hype(250),
             usdc(50_000_000),
             usdc(50_500_000),
             true,
@@ -2290,6 +2306,7 @@ fn offline_staking_uses_recorded_residual_split_and_cannot_complete_early() {
         .expect("fill reconciled");
     workflow
         .finalize_order(
+            hype(250),
             hype(250),
             usdc(50_000_000),
             usdc(50_500_000),
@@ -2491,6 +2508,7 @@ fn duplicate_responses_are_idempotent_even_when_redelivered_later() {
             .observe_order_fill(
                 "fill-1",
                 hype(250),
+                hype(250),
                 usdc(50_000_000),
                 usdc(50_500_000),
                 true,
@@ -2504,6 +2522,7 @@ fn duplicate_responses_are_idempotent_even_when_redelivered_later() {
         workflow
             .observe_order_fill(
                 "fill-1",
+                hype(250),
                 hype(250),
                 usdc(50_000_000),
                 usdc(50_500_000),
@@ -2534,6 +2553,7 @@ fn blank_fill_observation_ids_never_advance_the_journal() {
             workflow.observe_order_fill(
                 observation_id,
                 hype(100),
+                hype(100),
                 usdc(20_000_000),
                 usdc(20_200_000),
                 false,
@@ -2548,6 +2568,7 @@ fn blank_fill_observation_ids_never_advance_the_journal() {
     workflow
         .observe_order_fill(
             "  stable-fill-id  ",
+            hype(100),
             hype(100),
             usdc(20_000_000),
             usdc(20_200_000),
@@ -2698,6 +2719,7 @@ fn fully_filled_observation_requires_the_full_signed_quantity() {
         workflow.observe_order_fill(
             "partial-fill",
             hype(100),
+            hype(100),
             usdc(20_000_000),
             usdc(20_200_000),
             true,
@@ -2725,6 +2747,7 @@ fn filled_finality_requires_the_full_signed_quantity() {
         .observe_order_fill(
             "partial-fill",
             hype(100),
+            hype(100),
             usdc(20_000_000),
             usdc(20_200_000),
             false,
@@ -2734,6 +2757,7 @@ fn filled_finality_requires_the_full_signed_quantity() {
 
     assert!(matches!(
         workflow.finalize_order(
+            hype(100),
             hype(100),
             usdc(20_000_000),
             usdc(20_200_000),
@@ -2762,6 +2786,7 @@ fn partial_fill_cancel_race_uses_one_final_cumulative_fill_and_never_rebuys() {
         .observe_order_fill(
             "partial-before-cancel",
             hype(100),
+            hype(100),
             usdc(20_000_000),
             usdc(20_200_000),
             false,
@@ -2772,6 +2797,7 @@ fn partial_fill_cancel_race_uses_one_final_cumulative_fill_and_never_rebuys() {
     workflow
         .observe_order_fill(
             "unchanged-after-cancel",
+            hype(100),
             hype(100),
             usdc(20_000_000),
             usdc(20_200_000),
@@ -2787,6 +2813,7 @@ fn partial_fill_cancel_race_uses_one_final_cumulative_fill_and_never_rebuys() {
 
     workflow
         .finalize_order(
+            hype(150),
             hype(150),
             usdc(30_000_000),
             usdc(30_300_000),
@@ -2827,6 +2854,7 @@ fn timely_fill_evidence_can_reconcile_after_effective_expiry() {
         .observe_order_fill(
             "timely-fill",
             hype(250),
+            hype(250),
             usdc(50_000_000),
             usdc(50_500_000),
             true,
@@ -2835,6 +2863,7 @@ fn timely_fill_evidence_can_reconcile_after_effective_expiry() {
         .expect("fill observed before expiry");
     workflow
         .finalize_order(
+            hype(250),
             hype(250),
             usdc(50_000_000),
             usdc(50_500_000),
@@ -2863,7 +2892,7 @@ fn zero_fill_terminal_orders_complete_without_staking_intent() {
         ready(workflow.prepare_order(at(1)).expect("order prepared"));
         observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
         workflow
-            .finalize_order(hype(0), usdc(0), usdc(0), finality, at(3))
+            .finalize_order(hype(0), hype(0), usdc(0), usdc(0), finality, at(3))
             .expect("zero-fill terminal order finalized");
         let evidence = bound_evidence(&workflow, &[], at(4));
         let eligibility = workflow
@@ -2896,6 +2925,7 @@ fn residual_only_fill_records_zero_eligibility_and_completes() {
         .observe_order_fill(
             "residual-fill",
             hype(5),
+            hype(5),
             usdc(1_000_000),
             usdc(1_010_000),
             false,
@@ -2904,6 +2934,7 @@ fn residual_only_fill_records_zero_eligibility_and_completes() {
         .expect("residual fill observed");
     workflow
         .finalize_order(
+            hype(5),
             hype(5),
             usdc(1_000_000),
             usdc(1_010_000),
@@ -2937,6 +2968,7 @@ fn consumed_residual_inventory_is_replenished_before_eligible_spot() {
         .observe_order_fill(
             "mixed-fill",
             hype(20),
+            hype(20),
             usdc(4_000_000),
             usdc(4_040_000),
             false,
@@ -2945,6 +2977,7 @@ fn consumed_residual_inventory_is_replenished_before_eligible_spot() {
         .expect("mixed fill observed");
     workflow
         .finalize_order(
+            hype(20),
             hype(20),
             usdc(4_000_000),
             usdc(4_040_000),
@@ -2997,6 +3030,7 @@ fn late_event_collision_persists_manual_review_at_a_monotonic_time() {
         .observe_order_fill(
             "fill-1",
             hype(100),
+            hype(100),
             usdc(20_000_000),
             usdc(20_200_000),
             false,
@@ -3006,6 +3040,7 @@ fn late_event_collision_persists_manual_review_at_a_monotonic_time() {
     workflow
         .observe_order_fill(
             "fill-2",
+            hype(150),
             hype(150),
             usdc(30_000_000),
             usdc(30_300_000),
@@ -3017,6 +3052,7 @@ fn late_event_collision_persists_manual_review_at_a_monotonic_time() {
     assert!(matches!(
         workflow.observe_order_fill(
             "fill-1",
+            hype(101),
             hype(101),
             usdc(20_100_000),
             usdc(20_301_000),
@@ -3042,7 +3078,14 @@ fn event_collision_after_completion_durably_invalidates_the_result() {
     ready(workflow.prepare_order(at(1)).expect("order prepared"));
     observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
     workflow
-        .finalize_order(hype(0), usdc(0), usdc(0), OrderFinality::Expired, at(3))
+        .finalize_order(
+            hype(0),
+            hype(0),
+            usdc(0),
+            usdc(0),
+            OrderFinality::Expired,
+            at(3),
+        )
         .expect("order finalized");
     workflow
         .record_staking_eligibility(Some(bound_evidence(&workflow, &[], at(4))), at(4))
@@ -3093,7 +3136,14 @@ fn fresh_late_order_evidence_durably_invalidates_terminal_results() {
     ready(completed.prepare_order(at(1)).expect("order prepared"));
     observe_submission(&mut completed, "exchange-order-1", at(2)).expect("submission observed");
     completed
-        .finalize_order(hype(0), usdc(0), usdc(0), OrderFinality::Expired, at(3))
+        .finalize_order(
+            hype(0),
+            hype(0),
+            usdc(0),
+            usdc(0),
+            OrderFinality::Expired,
+            at(3),
+        )
         .expect("order finalized");
     completed
         .record_staking_eligibility(Some(bound_evidence(&completed, &[], at(4))), at(4))
@@ -3102,6 +3152,7 @@ fn fresh_late_order_evidence_durably_invalidates_terminal_results() {
     assert!(matches!(
         completed.observe_order_fill(
             "fresh-late-fill",
+            hype(1),
             hype(1),
             usdc(100_000),
             usdc(101_000),
@@ -3130,6 +3181,7 @@ fn stale_contradictory_cumulative_evidence_durably_halts_before_completion() {
     fill.observe_order_fill(
         "partial-fill",
         hype(100),
+        hype(100),
         usdc(20_000_000),
         usdc(20_200_000),
         false,
@@ -3139,6 +3191,7 @@ fn stale_contradictory_cumulative_evidence_durably_halts_before_completion() {
     assert!(matches!(
         fill.observe_order_fill(
             "fresh-but-stale-contradiction",
+            hype(150),
             hype(150),
             usdc(30_000_000),
             usdc(51_000_001),
@@ -3162,6 +3215,7 @@ fn stale_contradictory_cumulative_evidence_durably_halts_before_completion() {
         .observe_order_fill(
             "partial-fill",
             hype(100),
+            hype(100),
             usdc(20_000_000),
             usdc(20_200_000),
             false,
@@ -3170,6 +3224,7 @@ fn stale_contradictory_cumulative_evidence_durably_halts_before_completion() {
         .expect("partial fill observed");
     assert!(matches!(
         finalization.finalize_order(
+            hype(150),
             hype(150),
             usdc(30_000_000),
             usdc(51_000_001),
@@ -3201,6 +3256,7 @@ fn contradictory_authoritative_debits_fail_closed() {
         assert!(matches!(
             workflow.observe_order_fill(
                 "contradictory-fill",
+                hype(100),
                 hype(100),
                 usdc(filled),
                 usdc(debited),
@@ -3277,6 +3333,7 @@ fn staking_and_delegation_actions_remain_hard_disabled() {
         .observe_order_fill(
             "fill-1",
             hype(250),
+            hype(250),
             usdc(50_000_000),
             usdc(50_500_000),
             true,
@@ -3285,6 +3342,7 @@ fn staking_and_delegation_actions_remain_hard_disabled() {
         .expect("fill observed");
     workflow
         .finalize_order(
+            hype(250),
             hype(250),
             usdc(50_000_000),
             usdc(50_500_000),
@@ -3452,6 +3510,7 @@ fn late_terminal_finalization_after_absence_durably_halts() {
     assert!(matches!(
         workflow.finalize_order(
             hype(1),
+            hype(1),
             usdc(100_000),
             usdc(101_000),
             OrderFinality::Filled,
@@ -3495,6 +3554,7 @@ fn eligibility_requires_durable_timely_fill_registration() {
             .observe_order_fill(
                 "fill-1",
                 hype(250),
+                hype(250),
                 usdc(50_000_000),
                 usdc(50_500_000),
                 true,
@@ -3503,6 +3563,7 @@ fn eligibility_requires_durable_timely_fill_registration() {
             .expect("fill observed");
         workflow
             .finalize_order(
+                hype(250),
                 hype(250),
                 usdc(50_000_000),
                 usdc(50_500_000),
@@ -3563,6 +3624,7 @@ fn order_binding_at_effective_expiry_halts_before_claiming_fills() {
         .observe_order_fill(
             "fill-1",
             hype(250),
+            hype(250),
             usdc(50_000_000),
             usdc(50_500_000),
             true,
@@ -3571,6 +3633,7 @@ fn order_binding_at_effective_expiry_halts_before_claiming_fills() {
         .expect("fill observed");
     workflow
         .finalize_order(
+            hype(250),
             hype(250),
             usdc(50_000_000),
             usdc(50_500_000),
@@ -3610,6 +3673,7 @@ fn eligibility_expires_at_configured_max_age_boundary() {
             .observe_order_fill(
                 "fill-1",
                 hype(250),
+                hype(250),
                 usdc(50_000_000),
                 usdc(50_500_000),
                 true,
@@ -3618,6 +3682,7 @@ fn eligibility_expires_at_configured_max_age_boundary() {
             .expect("fill observed");
         workflow
             .finalize_order(
+                hype(250),
                 hype(250),
                 usdc(50_000_000),
                 usdc(50_500_000),
@@ -3673,6 +3738,7 @@ fn movements_preserve_eligibility_only_within_the_residual_carve_out() {
             .observe_order_fill(
                 "mixed-fill",
                 hype(20),
+                hype(20),
                 usdc(4_000_000),
                 usdc(4_040_000),
                 false,
@@ -3681,6 +3747,7 @@ fn movements_preserve_eligibility_only_within_the_residual_carve_out() {
             .expect("mixed fill observed");
         workflow
             .finalize_order(
+                hype(20),
                 hype(20),
                 usdc(4_000_000),
                 usdc(4_040_000),
@@ -3747,6 +3814,7 @@ fn eligibility_requires_fresh_gap_free_movement_coverage() {
             .observe_order_fill(
                 "fill-1",
                 hype(250),
+                hype(250),
                 usdc(50_000_000),
                 usdc(50_500_000),
                 true,
@@ -3755,6 +3823,7 @@ fn eligibility_requires_fresh_gap_free_movement_coverage() {
             .expect("fill observed");
         workflow
             .finalize_order(
+                hype(250),
                 hype(250),
                 usdc(50_000_000),
                 usdc(50_500_000),
@@ -3813,6 +3882,7 @@ fn accepted_order_without_bound_authorization_is_permanently_ineligible() {
         .observe_order_fill(
             "fill-1",
             hype(250),
+            hype(250),
             usdc(50_000_000),
             usdc(50_500_000),
             true,
@@ -3821,6 +3891,7 @@ fn accepted_order_without_bound_authorization_is_permanently_ineligible() {
         .expect("fill observed");
     workflow
         .finalize_order(
+            hype(250),
             hype(250),
             usdc(50_000_000),
             usdc(50_500_000),
@@ -3865,7 +3936,14 @@ fn every_signed_order_field_must_match_for_eligibility() {
         ready(workflow.prepare_order(at(1)).expect("order prepared"));
         observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
         workflow
-            .finalize_order(hype(0), usdc(0), usdc(0), OrderFinality::Expired, at(3))
+            .finalize_order(
+                hype(0),
+                hype(0),
+                usdc(0),
+                usdc(0),
+                OrderFinality::Expired,
+                at(3),
+            )
             .expect("order finalized");
         let mut evidence = bound_evidence(&workflow, &[], at(4));
         match mismatch {
@@ -3902,7 +3980,14 @@ fn stale_invalid_eligibility_evidence_cannot_be_replaced() {
     ready(workflow.prepare_order(at(1)).expect("order prepared"));
     observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
     workflow
-        .finalize_order(hype(0), usdc(0), usdc(0), OrderFinality::Expired, at(4))
+        .finalize_order(
+            hype(0),
+            hype(0),
+            usdc(0),
+            usdc(0),
+            OrderFinality::Expired,
+            at(4),
+        )
         .expect("order finalized");
     let valid_evidence = bound_evidence(&workflow, &[], at(5));
 
@@ -3936,6 +4021,7 @@ fn cumulative_fill_notional_cannot_exceed_quantity_at_limit() {
         workflow.observe_order_fill(
             "fill-above-limit",
             hype(1),
+            hype(1),
             usdc(49_000_000),
             usdc(49_000_000),
             false,
@@ -3967,6 +4053,7 @@ fn individual_fill_notional_cannot_hide_above_limit_execution() {
         .observe_order_fill(
             "aggregate-fill-observation",
             hype(250),
+            hype(250),
             usdc(50_000_000),
             usdc(50_500_000),
             true,
@@ -3975,6 +4062,7 @@ fn individual_fill_notional_cannot_hide_above_limit_execution() {
         .expect("aggregate fill observed");
     workflow
         .finalize_order(
+            hype(250),
             hype(250),
             usdc(50_000_000),
             usdc(50_500_000),
@@ -4025,6 +4113,7 @@ fn expired_residual_fill_does_not_invalidate_fresh_eligible_allocation() {
         .observe_order_fill(
             "residual-fill",
             hype(10),
+            hype(10),
             usdc(2_000_000),
             usdc(2_000_000),
             false,
@@ -4035,6 +4124,7 @@ fn expired_residual_fill_does_not_invalidate_fresh_eligible_allocation() {
         .observe_order_fill(
             "eligible-fill",
             hype(20),
+            hype(20),
             usdc(4_000_000),
             usdc(4_000_000),
             false,
@@ -4043,6 +4133,7 @@ fn expired_residual_fill_does_not_invalidate_fresh_eligible_allocation() {
         .expect("eligible fill observed");
     workflow
         .finalize_order(
+            hype(20),
             hype(20),
             usdc(4_000_000),
             usdc(4_000_000),
@@ -4705,6 +4796,7 @@ fn complete_workflow_with_residual(path: &Path, residual_atoms: u64) -> Decision
             .observe_order_fill(
                 "residual-fill",
                 hype(residual_atoms),
+                hype(residual_atoms),
                 usdc(filled_usdc_micros),
                 usdc(debited_usdc_micros),
                 false,
@@ -4722,6 +4814,7 @@ fn complete_workflow_with_residual(path: &Path, residual_atoms: u64) -> Decision
     };
     workflow
         .finalize_order(
+            hype(residual_atoms),
             hype(residual_atoms),
             filled_usdc,
             debited_usdc,
@@ -4759,6 +4852,7 @@ fn complete_workflow_with_residual_and_eligible(
         .observe_order_fill(
             "fill",
             hype(purchased_atoms),
+            hype(purchased_atoms),
             usdc(filled_usdc_micros),
             usdc(debited_usdc_micros),
             false,
@@ -4767,6 +4861,7 @@ fn complete_workflow_with_residual_and_eligible(
         .expect("fill observed");
     workflow
         .finalize_order(
+            hype(purchased_atoms),
             hype(purchased_atoms),
             usdc(filled_usdc_micros),
             usdc(debited_usdc_micros),
@@ -4973,6 +5068,7 @@ fn aggregate_terminal_residual_hype_rejects_a_journal_rolled_back_since_its_prot
         .observe_order_fill(
             "fill",
             hype(5),
+            hype(5),
             usdc(1_000_000),
             usdc(1_010_000),
             false,
@@ -4981,6 +5077,7 @@ fn aggregate_terminal_residual_hype_rejects_a_journal_rolled_back_since_its_prot
         .expect("fill observed");
     workflow
         .finalize_order(
+            hype(5),
             hype(5),
             usdc(1_000_000),
             usdc(1_010_000),
@@ -5065,6 +5162,7 @@ fn aggregate_terminal_residual_hype_rejects_a_journal_from_a_different_execution
         .observe_order_fill(
             "fill",
             hype(5),
+            hype(5),
             usdc(1_000_000),
             usdc(1_010_000),
             false,
@@ -5073,6 +5171,7 @@ fn aggregate_terminal_residual_hype_rejects_a_journal_from_a_different_execution
         .expect("fill observed");
     workflow
         .finalize_order(
+            hype(5),
             hype(5),
             usdc(1_000_000),
             usdc(1_010_000),
@@ -5181,6 +5280,7 @@ fn terminal_staking_eligibility_subtracts_residual_consumed_by_recorded_movement
         .observe_order_fill(
             "fill",
             hype(10),
+            hype(10),
             usdc(2_000_000),
             usdc(2_010_000),
             false,
@@ -5189,6 +5289,7 @@ fn terminal_staking_eligibility_subtracts_residual_consumed_by_recorded_movement
         .expect("fill observed");
     workflow
         .finalize_order(
+            hype(10),
             hype(10),
             usdc(2_000_000),
             usdc(2_010_000),
@@ -5236,6 +5337,7 @@ fn aggregate_terminal_residual_hype_reconciles_using_movement_adjusted_residual(
         .observe_order_fill(
             "fill",
             hype(10),
+            hype(10),
             usdc(2_000_000),
             usdc(2_010_000),
             false,
@@ -5244,6 +5346,7 @@ fn aggregate_terminal_residual_hype_reconciles_using_movement_adjusted_residual(
         .expect("fill observed");
     workflow
         .finalize_order(
+            hype(10),
             hype(10),
             usdc(2_000_000),
             usdc(2_010_000),
@@ -5292,6 +5395,7 @@ fn terminal_staking_eligibility_is_none_before_complete_and_some_after() {
         .observe_order_fill(
             "residual-fill",
             hype(5),
+            hype(5),
             usdc(1_000_000),
             usdc(1_010_000),
             false,
@@ -5300,6 +5404,7 @@ fn terminal_staking_eligibility_is_none_before_complete_and_some_after() {
         .expect("residual fill observed");
     workflow
         .finalize_order(
+            hype(5),
             hype(5),
             usdc(1_000_000),
             usdc(1_010_000),
@@ -5499,6 +5604,7 @@ fn aggregate_terminal_residual_hype_recovers_a_lost_completion_response() {
         .observe_order_fill(
             "residual-fill",
             hype(3),
+            hype(3),
             usdc(600_000),
             usdc(610_000),
             false,
@@ -5507,6 +5613,7 @@ fn aggregate_terminal_residual_hype_recovers_a_lost_completion_response() {
         .expect("residual fill observed");
     workflow
         .finalize_order(
+            hype(3),
             hype(3),
             usdc(600_000),
             usdc(610_000),
