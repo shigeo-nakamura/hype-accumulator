@@ -108,7 +108,18 @@ counted once, on the HYPE side: `debited_usdc` includes only a fee the venue
 charged in USDC, never the quote-equivalent of one charged in HYPE. The
 per-fill accumulator next to the journal is schema version 2 for this; a
 version-1 file (which never captured the fee asset) is refused rather than
-upgraded — remove it and let `reconcile` rebuild it from the venue.
+upgraded. What to do depends on the journal it belongs to. If the journal
+holds no fill observation yet (the earlier run merged fills but failed before
+`observe_order_fill`), remove the file and `reconcile` rebuilds it from the
+venue. If the journal already holds a fill observation, that observation was
+recorded under the old fee semantics: with a fee charged in USDC its totals
+are unchanged and a rebuilt reconcile replays it identically (the new field
+is written only when a HYPE fee makes credited differ from matched); with a
+fee charged in HYPE its totals were wrong, the rebuilt evidence contradicts
+them, and the workflow moves to `ManualReview` — treat it as the
+settlement-correction case above, never by editing the journal. No such
+journal exists on the production host: no fill was ever recorded by a
+version-1 binary.
 
 That accepted quantity is durably recorded with the order-submission evidence,
 and it — not the authorized quantity — is what a *complete* fill has to

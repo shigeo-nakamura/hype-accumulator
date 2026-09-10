@@ -1210,7 +1210,10 @@ fn load_observed_fills(
                 return Err(LiveProbeError::ObservedFillsAccumulator(format!(
                     "observed-fills record is schema version {} but this binary writes {}; \
                      a version-1 record never captured which asset each fee was charged in, so \
-                     it cannot be upgraded — rebuild it from the venue by removing it",
+                     it cannot be upgraded. If the journal holds no fill observation yet, \
+                     remove the record and reconcile rebuilds it from the venue; if it does, \
+                     that observation was recorded under the old fee semantics — see \
+                     docs/runbooks/live-probe-recovery.md before touching anything",
                     header.schema_version, OBSERVED_FILLS_SCHEMA_VERSION
                 )));
             }
@@ -3849,6 +3852,45 @@ mod tests {
         assert_eq!(state.purchased_hype(), HypeAtoms::from_atoms(29_979_000));
         assert_eq!(state.filled_usdc(), UsdcMicros::from_micros(7_500_000));
         assert_eq!(state.debited_usdc(), UsdcMicros::from_micros(7_500_000));
+    }
+
+    #[tokio::test]
+    async fn a_fill_with_no_hype_fee_writes_the_same_event_body_as_the_previous_release() {
+        // Reconciling an order again after this upgrade must be an
+        // idempotent replay, not a conflicting one: with no fee charged in
+        // HYPE, the event body (and so the stable event ID's content) must
+        // be exactly what the previous release wrote — no new key. Only a
+        // fee in HYPE, which changes the totals, adds the field.
+        let temp = tempfile::tempdir().unwrap();
+        let connector = unsigned_connector("http://127.0.0.1:1".to_owned());
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let usdc = UsdcMicros::from_micros(12_500_000);
+        let last_event = |directory: &str, matched: HypeAtoms, credited: HypeAtoms| {
+            let root = temp.path().join(directory);
+            std::fs::create_dir_all(&root).unwrap();
+            let mut workflow = open_test_workflow(&root, &binding);
+            workflow.prepare_order(fixture_at(2)).unwrap();
+            let submission = test_submission_evidence(&workflow, &binding, fixture_at(5));
+            workflow
+                .observe_order_submission(&submission, fixture_at(5))
+                .unwrap();
+            workflow
+                .observe_order_fill("fill", matched, credited, usdc, usdc, false, fixture_at(6))
+                .unwrap();
+            let journal = std::fs::read_to_string(test_journal_path(&root)).unwrap();
+            journal.lines().last().unwrap().to_owned()
+        };
+
+        let matched = HypeAtoms::from_atoms(50_000_000);
+        assert!(!last_event("no-hype-fee", matched, matched).contains("cumulative_credited_hype"));
+        assert!(
+            last_event("hype-fee", matched, HypeAtoms::from_atoms(49_965_000))
+                .contains("\"cumulative_credited_hype\":49965000")
+        );
     }
 
     #[tokio::test]

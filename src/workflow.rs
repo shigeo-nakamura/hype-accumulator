@@ -544,6 +544,13 @@ pub struct BoundFillEvidence {
     pub execution_identity_hash: String,
     pub client_order_id: String,
     pub order_id: String,
+    /// Quantity the venue matched for this fill (gross). The executed
+    /// notional is `matched × price`, so this — not `purchased_hype` — is
+    /// what the quantity-at-limit notional cap is taken from.
+    pub matched_hype: HypeAtoms,
+    /// Quantity credited to the account by this fill: matched less any fee
+    /// the venue charged in HYPE (bot-strategy#998). Sums to the workflow's
+    /// `purchased_hype`.
     pub purchased_hype: HypeAtoms,
     pub executed_notional_usdc: UsdcMicros,
     pub executed_at: DateTime<Utc>,
@@ -1639,6 +1646,7 @@ impl WorkflowState {
         let mut fill_ids = BTreeSet::new();
         let mut registration_record_ids = BTreeSet::new();
         let mut registration_cursors = BTreeSet::new();
+        let mut matched = 0_u64;
         let mut purchased = 0_u64;
         let mut executed_notional = 0_u64;
         let mut residual_remaining = evidence.residual_reservation_hype.as_atoms();
@@ -1654,8 +1662,12 @@ impl WorkflowState {
                     )
                 })?;
             let residual_for_fill = residual_remaining.min(fill.purchased_hype.as_atoms());
+            // The notional was executed on the *matched* quantity; a fee
+            // charged in HYPE reduces what was credited, not what traded,
+            // so capping on `purchased_hype` would reject every honest fill
+            // near the limit price (Codex review of PR #60).
             let fill_notional_cap =
-                max_fill_notional_usdc(fill.purchased_hype, &self.binding.order_envelope)
+                max_fill_notional_usdc(fill.matched_hype, &self.binding.order_envelope)
                     .ok_or_else(|| {
                         WorkflowError::ContradictoryObservation(
                             "fill quantity-at-limit notional overflowed".into(),
@@ -1682,7 +1694,9 @@ impl WorkflowState {
                 || fill.execution_identity_hash != evidence.execution_identity_hash
                 || fill.client_order_id != evidence.client_order_id
                 || fill.order_id != evidence.order_id
+                || fill.matched_hype.is_zero()
                 || fill.purchased_hype.is_zero()
+                || fill.purchased_hype > fill.matched_hype
                 || fill.executed_notional_usdc.is_zero()
                 || fill.executed_notional_usdc > fill_notional_cap
                 || !fill_ids.insert(fill.fill_id.as_str())
@@ -1709,12 +1723,13 @@ impl WorkflowState {
                         .into(),
                 ));
             }
-            (purchased, executed_notional) =
-                checked_fill_totals(purchased, executed_notional, fill)?;
+            (matched, purchased, executed_notional) =
+                checked_fill_totals(matched, purchased, executed_notional, fill)?;
             residual_remaining = residual_remaining.saturating_sub(fill.purchased_hype.as_atoms());
             previous = Some(key);
         }
-        if purchased != self.purchased_hype.as_atoms()
+        if matched != self.matched_hype.as_atoms()
+            || purchased != self.purchased_hype.as_atoms()
             || executed_notional != self.filled_usdc.as_micros()
         {
             return Err(WorkflowError::ContradictoryObservation(
@@ -3688,7 +3703,13 @@ impl DurableWorkflow {
             WorkflowTransition::OrderFillObserved {
                 observation_id,
                 cumulative_hype,
-                cumulative_credited_hype: Some(cumulative_credited_hype),
+                // Written only when it carries information. A fill with no
+                // HYPE-denominated fee then produces exactly the event body
+                // (and event ID) the previous release wrote, so reconciling
+                // such an order again after the upgrade is an idempotent
+                // replay rather than a conflicting one.
+                cumulative_credited_hype: (cumulative_credited_hype != cumulative_hype)
+                    .then_some(cumulative_credited_hype),
                 cumulative_filled_usdc,
                 cumulative_debited_usdc,
                 fully_filled,
@@ -3720,7 +3741,13 @@ impl DurableWorkflow {
             WorkflowTransition::OrderFinalized {
                 action_id,
                 cumulative_hype,
-                cumulative_credited_hype: Some(cumulative_credited_hype),
+                // Written only when it carries information. A fill with no
+                // HYPE-denominated fee then produces exactly the event body
+                // (and event ID) the previous release wrote, so reconciling
+                // such an order again after the upgrade is an idempotent
+                // replay rather than a conflicting one.
+                cumulative_credited_hype: (cumulative_credited_hype != cumulative_hype)
+                    .then_some(cumulative_credited_hype),
                 cumulative_filled_usdc,
                 cumulative_debited_usdc,
                 finality,
@@ -4460,10 +4487,16 @@ fn eligibility_policy_windows(
 }
 
 fn checked_fill_totals(
+    matched: u64,
     purchased: u64,
     executed_notional: u64,
     fill: &BoundFillEvidence,
-) -> Result<(u64, u64), WorkflowError> {
+) -> Result<(u64, u64, u64), WorkflowError> {
+    let matched = matched
+        .checked_add(fill.matched_hype.as_atoms())
+        .ok_or_else(|| {
+            WorkflowError::ContradictoryObservation("authorized fill quantity overflowed".into())
+        })?;
     let purchased = purchased
         .checked_add(fill.purchased_hype.as_atoms())
         .ok_or_else(|| {
@@ -4474,7 +4507,7 @@ fn checked_fill_totals(
         .ok_or_else(|| {
             WorkflowError::ContradictoryObservation("authorized fill notional overflowed".into())
         })?;
-    Ok((purchased, executed_notional))
+    Ok((matched, purchased, executed_notional))
 }
 
 fn residual_hype_available_before(

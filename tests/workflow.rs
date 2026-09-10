@@ -538,6 +538,89 @@ fn allocate_fill_notional(
     notional
 }
 
+fn accepted_workflow(path: &Path) -> DurableWorkflow {
+    let binding = binding();
+    let mut workflow = DurableWorkflow::open_or_create(
+        path,
+        &binding,
+        Arc::new(MemoryProtectedHeadStore::default()),
+        Arc::new(MemoryExchangeOrderOwnerStore::default()),
+    )
+    .expect("workflow initializes");
+    ready(workflow.prepare_order(at(1)).expect("order prepared"));
+    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
+    workflow
+}
+
+#[test]
+fn eligibility_caps_a_fill_notional_on_the_matched_quantity_not_the_credited_one() {
+    // bot-strategy#998: a buy filled at the limit price with its fee charged
+    // in HYPE executes `matched × limit` of notional but credits less than
+    // `matched`. Capping the notional on the credited quantity rejects every
+    // such honest fill (Codex review of PR #60); the cap is on `matched`,
+    // and the credited total is checked separately.
+    let temp = tempfile::tempdir().expect("temp directory");
+    let mut workflow = accepted_workflow(&temp.path().join("fee-in-hype.jsonl"));
+    workflow
+        .observe_order_fill(
+            "fill-observation",
+            hype(250),
+            hype(249),
+            usdc(50_000_000),
+            usdc(50_000_000),
+            true,
+            at(3),
+        )
+        .expect("fill observed");
+    workflow
+        .finalize_order(
+            hype(250),
+            hype(249),
+            usdc(50_000_000),
+            usdc(50_000_000),
+            OrderFinality::Filled,
+            at(4),
+        )
+        .expect("order finalized");
+
+    // Evidence built for the credited 249, executing the full 50 USDC.
+    let mut evidence = bound_evidence(&workflow, &[("fill-a", 249, 3)], at(5));
+    evidence.fills[0].matched_hype = hype(250);
+    workflow
+        .record_staking_eligibility(Some(evidence.clone()), at(5))
+        .expect("eligibility recorded for a fee-in-HYPE fill");
+
+    // Claiming more credited than matched is a contradiction.
+    let temp = tempfile::tempdir().expect("temp directory");
+    let mut workflow = accepted_workflow(&temp.path().join("fee-in-hype.jsonl"));
+    workflow
+        .observe_order_fill(
+            "fill-observation",
+            hype(250),
+            hype(249),
+            usdc(50_000_000),
+            usdc(50_000_000),
+            true,
+            at(3),
+        )
+        .expect("fill observed");
+    workflow
+        .finalize_order(
+            hype(250),
+            hype(249),
+            usdc(50_000_000),
+            usdc(50_000_000),
+            OrderFinality::Filled,
+            at(4),
+        )
+        .expect("order finalized");
+    let mut evidence = bound_evidence(&workflow, &[("fill-a", 249, 3)], at(5));
+    evidence.fills[0].matched_hype = hype(248);
+    assert!(workflow
+        .record_staking_eligibility(Some(evidence), at(5))
+        .is_err());
+}
+
 fn bound_evidence(
     workflow: &DurableWorkflow,
     fills: &[(&str, u64, u32)],
@@ -629,6 +712,7 @@ fn bound_evidence(
                         .exchange_order_id()
                         .expect("accepted order identity")
                         .to_owned(),
+                    matched_hype: hype(*atoms),
                     purchased_hype: hype(*atoms),
                     executed_notional_usdc: usdc(executed_notional),
                     executed_at: at(*minute),
