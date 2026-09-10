@@ -73,6 +73,18 @@ separately approved staking custody design to classify residual versus
 eligible. Either history being truncated, or the client order ID
 appearing in one of them, fails closed and records nothing.
 
+The order the venue reports may carry a slightly *smaller* quantity than the
+envelope authorized: HYPE spot trades on a venue size lot (`szDecimals`) while
+the envelope is derived at wei precision, so an authorized 0.30798790 HYPE is
+accepted as 0.3. Reconciliation accepts a quantity that is at or below the
+authorized one and rejects anything larger (or zero), because every later
+cumulative cap is bounded by the authorized quantity and the venue must never
+be able to enlarge it. Spend is bounded independently by the envelope's
+`max_debit_usdc`, and recorded USDC totals come from the fills themselves. The
+practical effect is that a probe can under-spend its budget by up to one lot's
+notional; deriving the quantity on the venue's lot grid up front is
+bot-strategy#991.
+
 `submit` now attempts this lookup after both a successful response and a
 submission error. If submission failed, it still exits unsuccessfully even when
 a subsequent lookup succeeds. If both calls fail, retain the journal and use

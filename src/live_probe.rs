@@ -470,7 +470,21 @@ async fn record_reconciliation(
                 .ok_or(LiveProbeError::InvalidDecimal("observed original quantity"))?,
             hype_atoms_per_hype,
         )?;
-        if observed_original_quantity != binding.order_envelope.original_quantity_hype {
+        // The venue may only round our requested size DOWN onto its own
+        // size lot — HYPE spot trades on a 0.01 grid (`szDecimals = 2`)
+        // while the envelope authorizes at wei precision, so an authorized
+        // 0.30798790 is accepted by the venue as 0.3 and equality can never
+        // hold (bot-strategy#845 blocker 10, hit on a real fill). A size
+        // *larger* than authorized is a genuine contradiction and still
+        // fails closed, which is the property this check exists for: every
+        // later cumulative cap is bounded by the authorized quantity, so
+        // the venue must never be able to enlarge it. Spend stays bounded
+        // independently by the envelope's `max_debit_usdc`, and the
+        // recorded fill totals come from the fills themselves, never from
+        // this figure.
+        if observed_original_quantity.is_zero()
+            || observed_original_quantity > binding.order_envelope.original_quantity_hype
+        {
             return Err(LiveProbeError::QuantityMismatch);
         }
         // CLOID, side, time-in-force, and limit price, read directly from
@@ -2311,6 +2325,102 @@ mod tests {
         server.await.unwrap();
         assert!(matches!(result, Err(LiveProbeError::QuantityMismatch)));
         // Nothing was durably recorded from the mismatched evidence.
+        assert!(workflow.state().exchange_order_id().is_none());
+    }
+
+    #[tokio::test]
+    async fn accepts_a_venue_quantity_rounded_down_onto_the_venue_size_lot() {
+        // Regression test for bot-strategy#845 blocker 10, hit on the first
+        // real fill: the envelope authorizes a quantity at wei precision
+        // (0.30798790 HYPE for a $25 budget) but HYPE spot trades on a 0.01
+        // size lot, so the venue reported `origSz` 0.3 and the old equality
+        // check made the fill permanently unrecordable. A quantity the
+        // venue rounded *down* onto its own lot is accepted; every later
+        // cumulative cap stays bounded by the larger authorized quantity,
+        // and spend stays bounded independently by `max_debit_usdc`.
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connector = unsigned_connector(format!("http://{}", listener.local_addr().unwrap()));
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let mut workflow = open_test_workflow(temp.path(), &binding);
+        workflow.prepare_order(fixture_at(2)).unwrap();
+
+        // Authorized envelope is 1.0 HYPE; the venue accepted 0.9.
+        let accepted_at_ms = fixture_at(5).timestamp_millis();
+        let rounded_down = serde_json::json!({
+            "status": "order",
+            "order": {
+                "order": {"oid": 7, "origSz": "0.9", "sz": "0.9", "side": "B", "tif": "Ioc", "cloid": workflow.state().client_order_id(), "limitPx": "25.0", "timestamp": accepted_at_ms},
+                "status": "canceled",
+                "statusTimestamp": accepted_at_ms
+            }
+        });
+        let no_fills = serde_json::json!([]);
+        let server = spawn_reconcile_responder(listener, rounded_down, no_fills, true);
+        let observed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reconcile_prepared_order(
+                &connector,
+                &mut workflow,
+                &test_journal_path(temp.path()),
+                fixture_at(20),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(observed.status, "canceled");
+        assert!(observed.durable_finality);
+        assert_eq!(workflow.state().exchange_order_id(), Some("7"));
+    }
+
+    #[tokio::test]
+    async fn rejects_a_zero_venue_reported_quantity() {
+        // A venue response whose order carries no quantity at all is not
+        // "our order rounded down" — it is evidence that does not describe
+        // a submitted order, and accepting it would let a nonsense response
+        // advance the workflow past submission.
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connector = unsigned_connector(format!("http://{}", listener.local_addr().unwrap()));
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            connector.execution_account_address().unwrap(),
+        );
+        let binding = decision_binding(execution_identity_hash);
+        let mut workflow = open_test_workflow(temp.path(), &binding);
+        workflow.prepare_order(fixture_at(2)).unwrap();
+
+        let accepted_at_ms = fixture_at(5).timestamp_millis();
+        let zero_quantity = serde_json::json!({
+            "status": "order",
+            "order": {
+                "order": {"oid": 7, "origSz": "0", "sz": "0", "side": "B", "tif": "Ioc", "cloid": workflow.state().client_order_id(), "limitPx": "25.0", "timestamp": accepted_at_ms},
+                "status": "canceled",
+                "statusTimestamp": accepted_at_ms
+            }
+        });
+        let no_fills = serde_json::json!([]);
+        let server = spawn_reconcile_responder(listener, zero_quantity, no_fills, false);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reconcile_prepared_order(
+                &connector,
+                &mut workflow,
+                &test_journal_path(temp.path()),
+                fixture_at(20),
+            ),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert!(matches!(result, Err(LiveProbeError::QuantityMismatch)));
         assert!(workflow.state().exchange_order_id().is_none());
     }
 
