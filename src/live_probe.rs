@@ -596,15 +596,24 @@ async fn record_reconciliation(
     // There is nothing to classify or stake at zero HYPE, and
     // `validate_eligibility_evidence` already allows exactly this shape
     // (no exchange order, no evidence, nothing purchased).
+    // Both stages are resumable: a crash between the eligibility append and
+    // the completion append leaves the journal at
+    // `StakingEligibilityRecorded`, which is just as non-terminal for
+    // aggregation, so a later reconcile has to finish the job rather than
+    // skip it.
     let workflow_completed = if workflow.state().exchange_order_id().is_none()
         && workflow.state().purchased_hype().is_zero()
-        && workflow.state().stage() == WorkflowStage::OrderFinalized
-    {
+        && matches!(
+            workflow.state().stage(),
+            WorkflowStage::OrderFinalized | WorkflowStage::StakingEligibilityRecorded
+        ) {
         // Never earlier than the transition it follows: absence recording
         // just above clamps its own timestamp forward past the venue
         // evidence it attests to, so a bare `now` can regress behind it.
         let completion_at = now.max(workflow.state().last_transition_at());
-        workflow.record_staking_eligibility(None, completion_at)?;
+        if workflow.state().stage() == WorkflowStage::OrderFinalized {
+            workflow.record_staking_eligibility(None, completion_at)?;
+        }
         workflow.complete(completion_at)?;
         true
     } else {
@@ -1941,6 +1950,79 @@ mod tests {
         assert!(again.durable_finality);
         // Already `Complete`, so nothing is appended a second time.
         assert!(!again.workflow_completed);
+        assert_eq!(workflow.state().stage(), WorkflowStage::Complete);
+    }
+
+    /// The absence evidence `record_conclusive_absence` builds, rebuilt here
+    /// so a test can drive a workflow into the mid-completion state a crash
+    /// would leave behind.
+    fn test_absence_evidence(
+        workflow: &DurableWorkflow,
+        observed_through_at: DateTime<Utc>,
+    ) -> ConclusiveAbsenceEvidence {
+        let binding = workflow.state().binding().clone();
+        let decided_at = binding.decided_at;
+        let watermark = |domain: HistoryDomain, label: &str| GapFreeHistoryWatermark {
+            domain,
+            watermark_id: content_hash(&["test/watermark", label]),
+            cursor: u64::try_from(observed_through_at.timestamp_millis()).unwrap(),
+            gap_free_from_at: decided_at,
+            through_at: observed_through_at,
+            evidence_hash: content_hash(&["test/evidence", label]),
+        };
+        ConclusiveAbsenceEvidence {
+            observation_id: content_hash(&["test/absence", &workflow.state().client_order_id()]),
+            execution_identity_hash: binding.inventory_before.execution_identity_hash.clone(),
+            client_order_id: workflow.state().client_order_id(),
+            effective_expiry_at: binding.order_envelope.effective_expiry_at,
+            order_history: watermark(HistoryDomain::Order, "orders"),
+            fill_history: watermark(HistoryDomain::Fill, "fills"),
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_resumes_after_a_crash_between_eligibility_and_complete() {
+        // A process that exits between the eligibility append and the
+        // completion append leaves the journal at
+        // `StakingEligibilityRecorded`, which aggregation rejects exactly
+        // like `OrderFinalized`. A later reconcile must finish it.
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let execution_identity_hash = identity_hash(
+            EXECUTION_IDENTITY_DOMAIN,
+            unsigned_connector(format!("http://{}", listener.local_addr().unwrap()))
+                .execution_account_address()
+                .unwrap(),
+        );
+        drop(listener);
+        let binding = decision_binding(execution_identity_hash);
+        let mut workflow = open_test_workflow(temp.path(), &binding);
+        workflow.prepare_order(fixture_at(2)).unwrap();
+        let through = fixture_at(34);
+        workflow
+            .record_order_submission_absent(test_absence_evidence(&workflow, through), through)
+            .expect("absence recorded");
+        workflow
+            .record_staking_eligibility(None, through)
+            .expect("eligibility recorded");
+        // The crash: `complete` never ran.
+        assert_eq!(
+            workflow.state().stage(),
+            WorkflowStage::StakingEligibilityRecorded
+        );
+
+        let resumed = reconcile_unknown_order(
+            temp.path(),
+            &mut workflow,
+            fixture_at(35),
+            None,
+            serde_json::json!([]),
+        )
+        .await
+        .unwrap();
+        // No absence to record a second time, but the completion resumes.
+        assert!(!resumed.absence_recorded);
+        assert!(resumed.workflow_completed);
         assert_eq!(workflow.state().stage(), WorkflowStage::Complete);
     }
 
