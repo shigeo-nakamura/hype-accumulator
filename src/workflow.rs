@@ -1632,6 +1632,12 @@ impl WorkflowState {
                 "eligibility carries both signer evidence and a staking-disabled attestation"
                     .into(),
             )),
+            (None, Some(_)) if self.binding.offline_staking_capability.is_some() => {
+                Err(WorkflowError::ContradictoryObservation(
+                    "staking-disabled attestation on a binding that carries a staking capability"
+                        .into(),
+                ))
+            }
             (None, Some(attestation)) => {
                 let policy = &self.binding.eligibility_policy;
                 let accepted = match (attestation, policy.staking_policy_digest.as_deref()) {
@@ -1933,6 +1939,13 @@ impl WorkflowState {
         &self,
         proof: &DisabledStakingProof,
     ) -> Option<StakingDisabledAttestation> {
+        // A binding that can stake (the offline simulation capability) must
+        // never record eligibility on an attestation: the staking actions
+        // that follow are exactly what order-bound evidence authorizes
+        // (Codex review of PR #61).
+        if self.binding.offline_staking_capability.is_some() {
+            return None;
+        }
         let policy = &self.binding.eligibility_policy;
         match policy.staking_policy_digest.as_deref() {
             Some(bound_digest) if bound_digest == proof.staking_policy_digest => {
