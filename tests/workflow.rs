@@ -480,6 +480,7 @@ fn submission_evidence(
         planned_usdc: binding.planned_usdc,
         max_debit_usdc: binding.committed_usdc,
         original_quantity_hype: binding.order_envelope.original_quantity_hype,
+        venue_accepted_quantity_hype: binding.order_envelope.original_quantity_hype,
         hype_atoms_per_hype: binding.order_envelope.hype_atoms_per_hype,
         market_metadata_digest: binding.order_envelope.market_metadata_digest.clone(),
         limit_price_usdc_per_hype: binding.order_envelope.limit_price_usdc_per_hype,

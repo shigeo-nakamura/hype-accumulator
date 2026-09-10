@@ -85,6 +85,13 @@ practical effect is that a probe can under-spend its budget by up to one lot's
 notional; deriving the quantity on the venue's lot grid up front is
 bot-strategy#991.
 
+That accepted quantity is durably recorded with the order-submission evidence,
+and it — not the authorized quantity — is what a *complete* fill has to
+reconcile to. Without that, a venue-rounded order that fills entirely still
+looks partial, `filled` finality is rejected as contradictory, and the journal
+lands in `ManualReview` instead of settling. It is recorded once, bounded above
+by the authorized quantity, and also caps cumulative fills from then on.
+
 `submit` now attempts this lookup after both a successful response and a
 submission error. If submission failed, it still exits unsuccessfully even when
 a subsequent lookup succeeds. If both calls fail, retain the journal and use
