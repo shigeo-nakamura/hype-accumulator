@@ -400,6 +400,7 @@ fn decision() -> DailyDecision {
 
 fn eligibility_policy() -> EligibilityPolicyBinding {
     EligibilityPolicyBinding {
+        staking_policy_digest: Some("staking-policy-digest-a".to_owned()),
         policy_version: "custody-policy-v1".to_owned(),
         fill_registration_deadline_seconds: 60,
         lot_eligibility_max_age_seconds: 3_600,

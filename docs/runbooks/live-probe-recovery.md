@@ -176,18 +176,31 @@ custody escalation since an API wallet cannot sign staking actions, and a
 7-day unbonding delay).
 
 Instead, `reconcile` and `submit` complete such a workflow under a
-**staking-disabled attestation**: the bound policy's canonical fingerprint
-(`effective_security_policy_digest`, which covers `staking.enabled` — and
-policy validation refuses `enabled = true`). The attestation is accepted only
-with no evidence, and only when it names exactly the policy version the
-decision was bound to; a journal carrying any other version fails closed on
-every open. The residual/eligible split is computed exactly as before. The
-digest requires an unexpired live acknowledgement: when it has expired,
-lookup, fill recording and settlement still run, but the workflow stays at
-`OrderFinalized` (the command prints a note) until the acknowledgement is
-renewed and `reconcile` is rerun. When staking is enabled later, the evidence
-producer is added then; workflows completed under the attestation remain
-distinguishable in the journal.
+**staking-disabled attestation**, produced only from a policy that passed the
+full live-contract validation (`effective_live_order_policy`, which refuses
+`staking.enabled = true` and checks the configured acknowledgement against the
+policy's expected digest — a cleared or mismatched acknowledgement withholds
+it even while its expiry lies in the future). Which basis a journal accepts is
+fixed by its decision binding, never chosen by the operator:
+
+- A binding that carries `eligibility_policy.staking_policy_digest` (every
+  decision prepared from this release on) accepts only that digest — the
+  fingerprint of the policy's staking section alone, which survives a live
+  acknowledgement renewal. Such a decision can be completed under any later
+  valid acknowledgement.
+- A binding written before that field existed (2026-09-10) accepts only the
+  whole-policy `policy_version` it was bound under. That fingerprint covers
+  the acknowledgement expiry, so **complete such a decision before renewing
+  the acknowledgement**; after a renewal it stays at `OrderFinalized` with no
+  attestation that can match it, and needs the settlement-correction path.
+
+An attestation naming any other digest or version fails closed on every open.
+The residual/eligible split is computed exactly as before. When the policy is
+not live-valid, lookup, fill recording and settlement still run (read-only
+recovery must not depend on it), the command prints a note, and the workflow
+stays at `OrderFinalized` until it is and `reconcile` is rerun. When staking
+is enabled later, the evidence producer is added then; workflows completed
+under an attestation remain distinguishable in the journal.
 
 No output of this command is a scheduled-live approval or a staking approval.
 

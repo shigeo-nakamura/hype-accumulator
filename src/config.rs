@@ -542,6 +542,26 @@ impl Config {
             .requires_vault_address_routing())
     }
 
+    /// Canonical fingerprint of the **staking section only** of the loaded
+    /// policy — `enabled`, the validator allowlist, and the residual/lot
+    /// parameters — independent of the live acknowledgement and its expiry.
+    /// Unlike [`Self::effective_security_policy_digest`] it therefore
+    /// survives an acknowledgement renewal, which is what lets a decision
+    /// bound under one acknowledgement complete under a later one
+    /// (bot-strategy#993). Validation refuses `staking.enabled = true`, so
+    /// any digest this returns is of a policy that cannot stake.
+    ///
+    /// # Errors
+    ///
+    /// No security policy is loaded, or the section fails to serialize.
+    pub fn staking_policy_digest(&self) -> Result<String, ConfigError> {
+        self.security_policy
+            .as_ref()
+            .ok_or(ConfigError::MissingSecurityPolicy)?
+            .staking_policy_digest()
+            .map_err(ConfigError::from)
+    }
+
     /// Computes the lowercase SHA-256 digest of the canonical effective policy.
     ///
     /// The digest excludes the acknowledgement field itself and includes the
@@ -1267,6 +1287,31 @@ impl SecurityPolicy {
                 .map_err(|error| SecurityPolicyError::Invalid(error.to_string()))?;
         }
         Ok(format!("{LIVE_ACKNOWLEDGEMENT_PREFIX}{hex}"))
+    }
+
+    fn staking_policy_digest(&self) -> Result<String, SecurityPolicyError> {
+        let staking = &self.wire.staking;
+        let canonical = CanonicalStakingPolicy {
+            enabled: staking.enabled,
+            validator_allowlist: &staking.validator_allowlist,
+            residual_hype_wei: staking.residual_hype_wei,
+            lot_consumption_policy: "oldest_authoritative_fill_first",
+            fill_registration_deadline_seconds: staking.fill_registration_deadline_seconds,
+            lot_eligibility_max_age_seconds: staking.lot_eligibility_max_age_seconds,
+            no_eligible_validator_policy: "hold_in_spot",
+        };
+        let encoded = serde_json::to_vec(&canonical)
+            .map_err(|error| SecurityPolicyError::Invalid(error.to_string()))?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"hype-accumulator/staking-policy-digest/v1");
+        hasher.update([0]);
+        hasher.update(&encoded);
+        let mut hex = String::with_capacity(64);
+        for byte in hasher.finalize() {
+            write!(&mut hex, "{byte:02x}")
+                .map_err(|error| SecurityPolicyError::Invalid(error.to_string()))?;
+        }
+        Ok(hex)
     }
 
     fn validate_designated_parent_mode(&self) -> Result<(), SecurityPolicyError> {

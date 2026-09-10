@@ -125,6 +125,14 @@ pub struct EligibilityPolicyBinding {
     pub policy_version: String,
     pub fill_registration_deadline_seconds: u64,
     pub lot_eligibility_max_age_seconds: u64,
+    /// Fingerprint of the policy's staking section alone
+    /// (`Config::staking_policy_digest`), independent of the live
+    /// acknowledgement, so a staking-disabled attestation can be matched
+    /// after that acknowledgement is renewed (bot-strategy#993). Absent in
+    /// bindings written before it existed; skipped when serializing so
+    /// those re-encode byte-for-byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staking_policy_digest: Option<String>,
 }
 
 /// Immutable, signer-free capability used only by the offline staking
@@ -540,14 +548,39 @@ pub struct StakingEligibility {
 /// (bot-strategy#993). That evidence authorizes a custody movement of the
 /// eligible HYPE; while no such movement can exist, there is nothing for it
 /// to authorize, and requiring it left every real purchase stuck at
-/// `OrderFinalized`. `policy_version` must equal the decision binding's
-/// `eligibility_policy.policy_version`, which is the canonical fingerprint of
-/// the loaded policy *including* `staking.enabled` — and policy validation
-/// refuses `enabled = true` — so the attestation is tied to a policy that
-/// cannot stake. Never combined with evidence.
+/// `OrderFinalized`. Never combined with evidence. Which basis applies is
+/// fixed by the decision binding, not chosen by the caller:
+///
+/// * a binding that carries `eligibility_policy.staking_policy_digest`
+///   accepts only [`Self::StakingPolicyDigest`] naming exactly that digest —
+///   the staking section's own fingerprint, which policy validation only
+///   ever produces for `enabled = false`, and which survives a live
+///   acknowledgement renewal;
+/// * a binding written before that field existed accepts only
+///   [`Self::BoundPolicyVersion`] naming exactly its `policy_version` (the
+///   whole-policy fingerprint, which also covers `staking.enabled`). That
+///   fingerprint changes when the acknowledgement is renewed, so such a
+///   decision has to be completed under the acknowledgement it was made
+///   under.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct StakingDisabledAttestation {
-    pub policy_version: String,
+#[serde(tag = "basis", rename_all = "snake_case")]
+pub enum StakingDisabledAttestation {
+    StakingPolicyDigest { staking_policy_digest: String },
+    BoundPolicyVersion { policy_version: String },
+}
+
+/// What a caller that has just loaded **and validated** the security policy
+/// (validation refuses `staking.enabled = true` and checks the configured
+/// live acknowledgement) proves to
+/// [`DurableWorkflow::record_staking_eligibility_under_disabled_policy`].
+/// The workflow derives the attestation from it; the caller never picks the
+/// basis.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisabledStakingProof {
+    /// `Config::staking_policy_digest` of the validated policy.
+    pub staking_policy_digest: String,
+    /// `Config::effective_security_policy_digest` of the validated policy.
+    pub validated_policy_version: String,
 }
 
 /// One immutable fill included by the independent eligibility reconciler.
@@ -1600,10 +1633,23 @@ impl WorkflowState {
                     .into(),
             )),
             (None, Some(attestation)) => {
-                if attestation.policy_version != self.binding.eligibility_policy.policy_version {
+                let policy = &self.binding.eligibility_policy;
+                let accepted = match (attestation, policy.staking_policy_digest.as_deref()) {
+                    (
+                        StakingDisabledAttestation::StakingPolicyDigest {
+                            staking_policy_digest,
+                        },
+                        Some(bound_digest),
+                    ) => staking_policy_digest == bound_digest,
+                    (StakingDisabledAttestation::BoundPolicyVersion { policy_version }, None) => {
+                        *policy_version == policy.policy_version
+                    }
+                    _ => false,
+                };
+                if !accepted {
                     return Err(WorkflowError::ContradictoryObservation(
-                        "staking-disabled attestation names a policy version the decision was \
-                         not bound to"
+                        "staking-disabled attestation does not match the policy the decision \
+                         was bound to"
                             .into(),
                     ));
                 }
@@ -3825,29 +3871,40 @@ impl DurableWorkflow {
     /// attestation that the bound policy hard-disables staking, in place of
     /// signer-side evidence (bot-strategy#993). The residual/eligible split
     /// is computed exactly as [`Self::record_staking_eligibility`] computes
-    /// it; only the basis differs. Idempotent for the same attestation.
+    /// it; only the basis differs. The attestation is derived from `proof`
+    /// according to the binding (see [`StakingDisabledAttestation`]).
+    /// Idempotent for the same attestation.
     ///
     /// # Errors
     ///
-    /// `InvalidTransition` when the order is not finalized or
-    /// `policy_version` is not the one the decision was bound to (an
-    /// operator running against the wrong policy, not venue evidence — so
-    /// this does not move the workflow to manual review), or a replay
-    /// conflict / write failure.
+    /// `InvalidTransition` when the order is not finalized or the proof does
+    /// not match the policy the decision was bound to (an operator running
+    /// against the wrong policy, not venue evidence — so this does not move
+    /// the workflow to manual review), or a replay conflict / write failure.
     pub fn record_staking_eligibility_under_disabled_policy(
         &mut self,
-        policy_version: &str,
+        proof: &DisabledStakingProof,
         at: DateTime<Utc>,
     ) -> Result<StakingEligibility, WorkflowError> {
-        if policy_version != self.state.binding.eligibility_policy.policy_version {
-            return Err(WorkflowError::InvalidTransition(
-                "staking-disabled attestation names a policy version the decision was not \
-                 bound to"
+        let policy = &self.state.binding.eligibility_policy;
+        let attestation = match policy.staking_policy_digest.as_deref() {
+            Some(bound_digest) if bound_digest == proof.staking_policy_digest => {
+                StakingDisabledAttestation::StakingPolicyDigest {
+                    staking_policy_digest: proof.staking_policy_digest.clone(),
+                }
+            }
+            None if proof.validated_policy_version == policy.policy_version => {
+                StakingDisabledAttestation::BoundPolicyVersion {
+                    policy_version: proof.validated_policy_version.clone(),
+                }
+            }
+            _ => {
+                return Err(WorkflowError::InvalidTransition(
+                    "staking-disabled proof does not match the policy the decision was bound \
+                     to"
                     .into(),
-            ));
-        }
-        let attestation = StakingDisabledAttestation {
-            policy_version: policy_version.to_owned(),
+                ))
+            }
         };
         let residual_hype = self
             .state
