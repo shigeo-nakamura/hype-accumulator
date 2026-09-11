@@ -295,8 +295,16 @@ impl HyperliquidLiveProbe {
         // *current* grid right before signing, so the connector's own
         // normalization is a no-op and the venue accepts exactly what was
         // authorized — never a silently re-rounded quantity or price
-        // (bot-strategy#991).
-        let grid = self.connector.spot_order_grid(&prepared.symbol).await?;
+        // (bot-strategy#991). The refreshing accessor, deliberately: the
+        // plain one serves the connector's cached `spotMeta`, which on a
+        // connector reused from `prepare` would just hand back the grid the
+        // order was derived on and could never detect a change. The refresh
+        // also replaces that cache, so the order path below normalizes
+        // against the same grid this check passed.
+        let grid = self
+            .connector
+            .refresh_spot_order_grid(&prepared.symbol)
+            .await?;
         verify_hype_usdc_order_grid(&grid)?;
         verify_prepared_order_on_grid(&prepared, &grid)?;
         let response = self
@@ -839,10 +847,12 @@ fn truncate_to_millis(at: DateTime<Utc>) -> DateTime<Utc> {
 /// and recorded fill totals come from the fills themselves.
 ///
 /// Since bot-strategy#991 the envelope derives its quantity on the venue
-/// lot and `submit` refuses to sign anything off-grid, so for a new
-/// binding the venue's `origSz` equals the authorized quantity; the
-/// "rounded down" tolerance stays as defence in depth (and for bindings
-/// prepared before that change), never as the mechanism a fill relies on.
+/// lot and `submit` refuses to sign anything off-grid, so the venue's
+/// `origSz` equals the authorized quantity for every binding this build
+/// can reconcile (older, v1-digest bindings are rejected upstream by the
+/// market-metadata check); the "rounded down" tolerance stays as defence
+/// in depth against a venue re-rounding an order that passed the
+/// pre-signing check, never as the mechanism a fill relies on.
 fn verify_observed_quantity(
     evidence: &HyperliquidOrderReconciliation,
     binding: &DecisionBinding,
@@ -1077,9 +1087,10 @@ fn verify_observed_order_envelope(
     // exists for. A non-positive price does not describe a real order.
     // Order identity itself comes from the CLOID check above, not from the
     // price. Since bot-strategy#991 the envelope derives the price on the
-    // venue's grid up front and `submit` refuses an off-grid price, so a
-    // new binding's venue price equals the authorized one; the ceiling
-    // tolerance stays as defence in depth, not as the mechanism relied on.
+    // venue's grid up front and `submit` refuses an off-grid price, so the
+    // venue price equals the authorized one for every binding this build
+    // can reconcile; the ceiling tolerance stays as defence in depth, not
+    // as the mechanism relied on.
     match limit_price {
         Some(price) if price > Decimal::ZERO && price <= expected_limit_price_usdc_per_hype => {}
         _ => return Err(LiveProbeError::BindingMismatch("order limit price")),
