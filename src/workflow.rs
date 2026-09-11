@@ -3025,6 +3025,27 @@ impl DurableWorkflow {
     /// immutable history (see [`Self::aggregate_terminal_residual_hype`]),
     /// never as a substitute for [`Self::open_or_create`] before appending
     /// to a journal.
+    /// Replays one journal and returns the state it is durably in, verified
+    /// against its independently protected head (rollback, truncation and
+    /// replacement all fail closed). `Ok(None)` means the journal is empty —
+    /// a crash before its first durable append, or a truncation — and a
+    /// caller must treat that as fail-closed, never as "nothing happened".
+    ///
+    /// Public so evidence *about* a past workflow can be read without
+    /// reopening it for writing (bot-strategy#929's attribution backfill).
+    /// Reading it does not make the journal appendable and takes no lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkflowError`] for an unreadable or corrupt journal, or a
+    /// state that disagrees with its protected head.
+    pub fn read_verified_state(
+        path: &Path,
+        protected_head_store: &dyn ProtectedWorkflowHeadStore,
+    ) -> Result<Option<WorkflowState>, WorkflowError> {
+        Self::peek_verified_terminal_state(path, protected_head_store)
+    }
+
     fn peek_verified_terminal_state(
         path: &Path,
         protected_head_store: &dyn ProtectedWorkflowHeadStore,

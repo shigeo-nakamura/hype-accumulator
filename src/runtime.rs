@@ -1046,6 +1046,30 @@ impl SignerFreeRuntime {
         aggregate
     }
 
+    /// Every settled purchase whose HYPE acquisition was never recorded.
+    ///
+    /// These are the decisions [`Self::attributed_hype`] counts as missing
+    /// evidence — settled by a build older than bot-strategy#929 — and the
+    /// exact set a backfill must supply before attribution can be reported
+    /// at all.
+    #[must_use]
+    pub fn settled_purchases_without_acquisition(&self) -> Vec<DailyDecision> {
+        self.state
+            .pacing
+            .decisions()
+            .values()
+            .filter(|decision| {
+                decision.settled
+                    && !decision.filled_usdc.is_zero()
+                    && !self
+                        .state
+                        .hype_acquisitions
+                        .contains_key(&decision.decision_id)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// The runtime's own identity view of `decision_id`, if it exists.
     #[must_use]
     pub fn decision_identity(&self, decision_id: &str) -> Option<LiveDecisionIdentity> {
@@ -1158,6 +1182,109 @@ impl SignerFreeRuntime {
             .filter(|decision| !decision.settled && !decision.planned_usdc.is_zero())
             .cloned()
             .collect()
+    }
+
+    /// Records the HYPE acquisition of a decision that was already settled
+    /// without one (bot-strategy#929).
+    ///
+    /// Exists because settlements committed before this runtime recorded
+    /// inventory left their purchases unevidenced, and attribution is
+    /// withheld entirely while any such purchase remains — see
+    /// [`Self::attributed_hype`]. It changes no capital: the decision is
+    /// already settled and its cash figures are untouched.
+    ///
+    /// Idempotent by content. Re-running it with the same evidence writes
+    /// nothing; different evidence for the same decision fails closed rather
+    /// than replacing a record the caller cannot prove is wrong.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::LiveDecisionMismatch`] when `identity` is not
+    /// this runtime's view of the decision, [`RuntimeError::InvalidCycle`]
+    /// when the decision is not a settled purchase (nothing unsettled, and
+    /// nothing that never bought anything, has inventory to backfill),
+    /// [`RuntimeError::InvalidHypeAcquisition`] when the evidence does not
+    /// match the journal this runtime bound the decision to,
+    /// [`RuntimeError::HypeAcquisitionConflict`] when a different record
+    /// already exists, and the usual persistence errors.
+    pub fn backfill_hype_acquisition(
+        &mut self,
+        identity: &LiveDecisionIdentity,
+        acquisition: &LiveHypeAcquisition,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<LiveSettlementOutcome, RuntimeError> {
+        self.ensure_runtime_lock_current()?;
+        let decision_id = identity.decision_id.as_str();
+        let decision = self
+            .state
+            .pacing
+            .decisions()
+            .values()
+            .find(|decision| decision.decision_id == decision_id)
+            .cloned()
+            .ok_or(PacingError::UnknownDecision)?;
+        if let Some(field) = identity.mismatch_against(&decision) {
+            return Err(RuntimeError::LiveDecisionMismatch(field));
+        }
+        if !decision.settled {
+            return Err(RuntimeError::InvalidCycle(format!(
+                "decision {decision_id} is not settled; its inventory is recorded by the \
+                 settlement itself, not backfilled"
+            )));
+        }
+        if decision.filled_usdc.is_zero() {
+            return Err(RuntimeError::InvalidCycle(format!(
+                "decision {decision_id} settled without filling any USDC, so it bought no HYPE \
+                 to backfill"
+            )));
+        }
+        // The same checks a live settlement's evidence passes: the quoted
+        // journal must be the one this decision was bound to, and the cash
+        // and inventory sides must agree.
+        let Some(row) = self.validated_acquisition_row(
+            decision_id,
+            decision.filled_usdc,
+            acquisition,
+            recorded_at,
+        )?
+        else {
+            return Err(RuntimeError::InvalidHypeAcquisition(format!(
+                "decision {decision_id} settled a purchase, so it cannot be backfilled as \
+                 though no workflow ever existed"
+            )));
+        };
+        if let Some(existing) = self.state.hype_acquisitions.get(decision_id) {
+            if same_acquisition(existing, &row) {
+                return Ok(LiveSettlementOutcome::AlreadySettled);
+            }
+            return Err(RuntimeError::HypeAcquisitionConflict(format!(
+                "decision {decision_id} already records {} HYPE atoms from workflow {} ({}) \
+                 but the backfill offers {} from workflow {} ({})",
+                existing.credited_hype_atoms,
+                existing.workflow_id,
+                existing.journal.display(),
+                row.credited_hype_atoms,
+                row.workflow_id,
+                row.journal.display()
+            )));
+        }
+        let mut next_state = self.state.clone();
+        next_state
+            .hype_acquisitions
+            .insert(decision_id.to_owned(), row);
+        let pending = PendingRuntimeCycle::new(recorded_at, next_state, Vec::new())?;
+        let replayed = self
+            .ledger
+            .validate_append_batch(&pending_cycle_ledger_events(&pending))?;
+        ensure_capital_totals_match(&pending.body.state.pacing, &replayed)?;
+        self.ensure_runtime_lock_current()?;
+        write_private_json_atomic(
+            self.config.state_directory.join(PENDING_CYCLE_FILE_NAME),
+            &pending,
+        )?;
+        self.ensure_runtime_lock_current()?;
+        self.state = commit_pending_cycle(&self.config, &self.limits, &mut self.ledger, &pending)?;
+        Ok(LiveSettlementOutcome::Settled)
     }
 
     /// Validates the HYPE side of a settlement and shapes it into the row
