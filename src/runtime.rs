@@ -573,15 +573,24 @@ struct RuntimeState {
 /// `credited_hype_atoms` is what the account was actually credited — net of
 /// any fee the venue charged in HYPE (bot-strategy#998) — never the quantity
 /// the venue matched.
+///
+/// Deliberately records only the acquisition, never a later outflow. HYPE
+/// leaving the account again is a separate, later event: a workflow's own
+/// `residual_consumed_by_movements_hype` is only fixed at
+/// `StakingEligibilityRecorded`, which can follow the settlement that wrote
+/// this row, and a sale after the workflow completed is not attributable to
+/// it at all. Snapshotting it here would either go stale or turn an honest
+/// later reconcile into a permanent replay conflict. Netting outflows needs
+/// the movement ledger keyed by `movement_id` in bot-strategy#929's
+/// remaining scope; until it exists an unexplained shortfall surfaces as the
+/// divergence health failure and halts the cycle, which is the fail-closed
+/// answer rather than a silently wrong number.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RuntimeHypeAcquisition {
     workflow_id: String,
     journal: PathBuf,
     credited_hype_atoms: u64,
-    /// HYPE the same workflow records as having left the account again.
-    #[serde(default)]
-    consumed_hype_atoms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_fill_at: Option<DateTime<Utc>>,
     recorded_at: DateTime<Utc>,
@@ -680,12 +689,6 @@ pub enum LiveHypeAcquisition {
         /// HYPE atoms credited to the account, net of a HYPE-denominated fee
         /// (bot-strategy#998). Never the matched quantity.
         credited_hype_atoms: u64,
-        /// HYPE atoms the same workflow records as having left the account
-        /// again (a sale or transfer consuming part of its residual
-        /// allocation). Subtracted from the credited amount when inventory
-        /// is attributed, so a recorded outflow cannot leave attribution
-        /// claiming HYPE the account no longer holds.
-        consumed_hype_atoms: u64,
         /// When the last fill backing those atoms executed, if any fill did.
         last_fill_at: Option<DateTime<Utc>>,
     },
@@ -1023,13 +1026,9 @@ impl SignerFreeRuntime {
                 // An unrepresentable total is unusable evidence, not a
                 // capped one: counting it as missing withholds the whole
                 // attribution instead of publishing a saturated number.
-                // Net of what the same workflow recorded as having left the
-                // account: attribution reports HYPE the bot still owns, not
-                // everything it ever bought.
-                Some(row) => match row
+                Some(row) => match aggregate
                     .credited_hype_atoms
-                    .checked_sub(row.consumed_hype_atoms)
-                    .and_then(|owned| aggregate.credited_hype_atoms.checked_add(owned))
+                    .checked_add(row.credited_hype_atoms)
                 {
                     Some(total) => {
                         aggregate.settled_purchases_with_evidence += 1;
@@ -1116,7 +1115,7 @@ impl SignerFreeRuntime {
             .state
             .live_journal_intents
             .iter()
-            .find(|(_, recorded)| recorded.as_path() == journal_path)
+            .find(|(_, recorded)| same_journal_path(recorded, journal_path))
         {
             return Err(RuntimeError::LiveHistoryDirectoryMismatch(format!(
                 "journal {} is already declared by decision {owner}; a journal path is never \
@@ -1186,7 +1185,6 @@ impl SignerFreeRuntime {
             workflow_id,
             journal,
             credited_hype_atoms,
-            consumed_hype_atoms,
             last_fill_at,
         } = acquisition
         else {
@@ -1237,18 +1235,10 @@ impl SignerFreeRuntime {
                 credited_hype_atoms
             )));
         }
-        if consumed_hype_atoms > credited_hype_atoms {
-            return Err(RuntimeError::InvalidHypeAcquisition(format!(
-                "decision {decision_id} records {consumed_hype_atoms} HYPE atoms leaving the \
-                 account against {credited_hype_atoms} credited; a workflow cannot give up more \
-                 than it was credited"
-            )));
-        }
         Ok(Some(RuntimeHypeAcquisition {
             workflow_id: workflow_id.to_owned(),
             journal: journal.clone(),
             credited_hype_atoms: *credited_hype_atoms,
-            consumed_hype_atoms: *consumed_hype_atoms,
             last_fill_at: *last_fill_at,
             recorded_at: settled_at,
         }))
@@ -1385,6 +1375,55 @@ impl SignerFreeRuntime {
         // the pre-settlement commitment until some later scheduled cycle.
         self.publish_metrics(settled_at)?;
         Ok(LiveSettlementOutcome::Settled)
+    }
+
+    /// Publishes the status and metrics documents for an observation that is
+    /// not allowed to become a cycle.
+    ///
+    /// Writes exactly what [`Self::apply_cycle`] would publish — including
+    /// the operations block a dashboard needs to show committed capital and
+    /// stuck detection — but commits no state, appends no ledger event, and
+    /// makes no decision. Used when an observation is itself the reason to
+    /// stop (bot-strategy#929: attributed HYPE above what the account holds),
+    /// so the dashboard keeps being updated while the economic path fails
+    /// closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError`] when the metrics snapshot cannot be derived
+    /// or either document cannot be written.
+    pub fn publish_halted_status(
+        &self,
+        accumulator: AccumulatorStatus,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), RuntimeError> {
+        let signal = match fs::read_to_string(self.config.signal_snapshot_path()) {
+            Ok(payload) => SignalSnapshot::from_json(&payload).ok(),
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let metrics = MetricsSnapshot::from_runtime(
+            observed_at,
+            &self.state.pacing,
+            &self.limits,
+            self.ledger.state(),
+            &[],
+            signal.as_ref(),
+            self.state.api_errors_total,
+            self.state.stale_signal_events_total,
+            self.state.dry_run_actions_total,
+            self.config.stuck_after_seconds,
+        )?;
+        let status = DashboardStatus::new(
+            observed_at,
+            self.process_started_at.min(observed_at),
+            true,
+            accumulator,
+        )
+        .with_operations(metrics.clone())?;
+        write_metrics_atomic(&self.config.metrics_path, &metrics)?;
+        write_status_atomic(&self.config.status_path, &status)?;
+        Ok(())
     }
 
     /// Returns the inclusive start of the next overlapping movement query.
@@ -2845,9 +2884,8 @@ fn same_journal_path(left: &Path, right: &Path) -> bool {
 /// from the same terminal journal but observes a later clock.
 fn same_acquisition(left: &RuntimeHypeAcquisition, right: &RuntimeHypeAcquisition) -> bool {
     left.workflow_id == right.workflow_id
-        && left.journal == right.journal
+        && same_journal_path(&left.journal, &right.journal)
         && left.credited_hype_atoms == right.credited_hype_atoms
-        && left.consumed_hype_atoms == right.consumed_hype_atoms
         && left.last_fill_at == right.last_fill_at
 }
 

@@ -26,7 +26,7 @@ use hype_accumulator::{
     config::{Config, EffectiveLiveOrderPolicy, ProcessEnvironment},
     live_decision::{bound_decision_identity, prepare_first_live_order_workflow},
     live_probe::{reconcile_prepared_order, HyperliquidLiveProbe, LiveProbeBinding},
-    monitor::{trade_cadence_label, HyperliquidObserver},
+    monitor::{trade_cadence_label, HyperliquidObserver, ATTRIBUTION_EXCEEDS_HOLDINGS},
     order_envelope::OrderEnvelopeFreshnessPolicy,
     pacing::{PacingLimits, UsdcMicros},
     runtime::{
@@ -842,6 +842,20 @@ async fn prepare(
     let accumulator = observer
         .observe(&attribution, trade_cadence_label(&config.schedule))
         .await?;
+    // The recurring cycle halts on this (see `main.rs`), and this path — the
+    // only one that commits real capital — must halt harder: refuse before a
+    // decision is committed or an order is printed, while HYPE the ledger
+    // says the bot owns is unaccounted for (bot-strategy#929).
+    if accumulator
+        .health_reason()
+        .is_some_and(|reason| reason.contains(ATTRIBUTION_EXCEEDS_HOLDINGS))
+    {
+        return Err(format!(
+            "refusing to prepare an order: {ATTRIBUTION_EXCEEDS_HOLDINGS}. Reconcile the \
+             account's HYPE against the workflow journals first."
+        )
+        .into());
+    }
 
     // Re-reads the clock here, after the KMS-backed signer decrypt and the
     // account observation above (network round trips whose latency is
@@ -1166,7 +1180,6 @@ fn settle_finalized_decision(
             workflow_id: state.workflow_id().to_owned(),
             journal: workflow.journal_path().to_path_buf(),
             credited_hype_atoms: state.purchased_hype().as_atoms(),
-            consumed_hype_atoms: state.residual_consumed_by_movements_hype().as_atoms(),
             last_fill_at: state.last_fill_at(),
         };
         let outcome = runtime.settle_live_decision(

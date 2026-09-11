@@ -14,8 +14,7 @@ use hype_accumulator::{
         build_snapshot, core_health_label, plan_snapshot, publish_snapshot,
         HyperliquidCoreSignalSource, PublishOutcome,
     },
-    status::DashboardStatus,
-    status_io::{mirror_status_to_s3, write_status_atomic},
+    status_io::mirror_status_to_s3,
 };
 use std::{
     env, fs,
@@ -258,7 +257,6 @@ async fn run_dry_run_cycle(
     security_policy_path: &Path,
     runtime_config_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let process_started_at = Utc::now();
     let config = load_config(config_path, Some(security_policy_path))?;
     config.validate_signer_free_runtime(&ProcessEnvironment)?;
     let limits = PacingLimits::from_config(&config)?;
@@ -306,9 +304,15 @@ async fn run_dry_run_cycle(
         .health_reason()
         .is_some_and(|reason| reason.contains(ATTRIBUTION_EXCEEDS_HOLDINGS))
     {
-        let published =
-            DashboardStatus::new(Utc::now(), process_started_at, config.dry_run, accumulator);
-        write_status_atomic(&status_path, &published)?;
+        // Publishes the same documents a cycle would — operations block
+        // included, so the dashboard keeps showing committed capital and
+        // stuck detection through the incident — without committing one.
+        runtime.publish_halted_status(accumulator, Utc::now())?;
+        // Releases the exclusive state lock before the mirror's network call,
+        // for the reason spelled out at the end of the normal path: an
+        // unresponsive S3 endpoint would otherwise hold the lock an operator
+        // needs in order to run the very reconcile this error asks for.
+        drop(runtime);
         if let Ok(body) = fs::read_to_string(&status_path) {
             mirror_status_to_s3(&status_path, body).await;
         }

@@ -2548,7 +2548,6 @@ fn bound_acquisition(
         workflow_id: format!("workflow:{}", decision.decision_id),
         journal: journal.to_path_buf(),
         credited_hype_atoms,
-        consumed_hype_atoms: 0,
         last_fill_at: (credited_hype_atoms > 0).then_some(recorded_at),
     }
 }
@@ -2775,7 +2774,6 @@ fn live_settlement_records_the_hype_it_bought_and_attributes_it() {
         workflow_id: "workflow-a".to_owned(),
         journal: journal.to_path_buf(),
         credited_hype_atoms: credited,
-        consumed_hype_atoms: 0,
         last_fill_at: Some(fill_at),
     };
 
@@ -2790,7 +2788,6 @@ fn live_settlement_records_the_hype_it_bought_and_attributes_it() {
                 workflow_id: "workflow-a".to_owned(),
                 journal: PathBuf::from("/elsewhere/2026-07-06.jsonl"),
                 credited_hype_atoms: credited,
-                consumed_hype_atoms: 0,
                 last_fill_at: Some(fill_at),
             },
             decision_at + TimeDelta::minutes(1),
@@ -2806,7 +2803,6 @@ fn live_settlement_records_the_hype_it_bought_and_attributes_it() {
                 workflow_id: "workflow-a".to_owned(),
                 journal: journal.to_path_buf(),
                 credited_hype_atoms: 0,
-                consumed_hype_atoms: 0,
                 last_fill_at: None,
             },
             decision_at + TimeDelta::minutes(1),
@@ -2882,7 +2878,6 @@ fn live_settlement_records_the_hype_it_bought_and_attributes_it() {
                 workflow_id: "workflow-a".to_owned(),
                 journal: journal.to_path_buf(),
                 credited_hype_atoms: credited + 1,
-                consumed_hype_atoms: 0,
                 last_fill_at: Some(fill_at),
             },
             settled_at,
@@ -2900,11 +2895,22 @@ fn live_settlement_records_the_hype_it_bought_and_attributes_it() {
 }
 
 #[test]
-fn recorded_outflow_is_netted_out_of_attributed_hype() {
-    // A workflow whose own eligibility evidence records HYPE leaving the
-    // account again must not keep claiming it: attribution reports what the
-    // bot still owns (bot-strategy#929).
+fn a_settlement_may_spell_its_journal_differently_than_the_intent_did() {
+    // `prepare` and `reconcile` can be invoked with different spellings of
+    // the same file (a symlinked parent, a relative path). A byte comparison
+    // would refuse to settle a real fill and leave committed capital
+    // permanently unsettleable, failing every later decision day closed
+    // (bot-strategy#929 review).
     let directory = tempfile::tempdir().expect("temporary directory");
+    let journals = directory.path().join("journals");
+    std::fs::create_dir_all(&journals).expect("journal directory");
+    let journal = journals.join("2026-07-06.jsonl");
+    std::fs::write(&journal, b"").expect("journal file");
+    let linked_parent = directory.path().join("by-link");
+    std::os::unix::fs::symlink(&journals, &linked_parent).expect("symlink");
+    let same_journal_other_spelling = linked_parent.join("2026-07-06.jsonl");
+    assert_ne!(journal, same_journal_other_spelling);
+
     let start = at(2026, 7, 6, 8, 0);
     let deposit_at = start + TimeDelta::hours(1);
     let decision_at = at(2026, 7, 6, 12, 0);
@@ -2912,7 +2918,6 @@ fn recorded_outflow_is_netted_out_of_attributed_hype() {
     let movement = deposit("deposit-approved", deposit_at, 100);
     let admission = approvals("deposit-approved", deposit_at, deposit_at);
     let signal = signal(decision_at);
-    let journal = Path::new("/var/lib/hype-accumulator/journals/2026-07-06.jsonl");
 
     let mut runtime = SignerFreeRuntime::open(runtime_config, limits()).expect("open runtime");
     let decision = live_planned_decision(
@@ -2927,44 +2932,97 @@ fn recorded_outflow_is_netted_out_of_attributed_hype() {
     .expect("planned decision")
     .clone();
     let filled = UsdcMicros::from_micros(decision.planned_usdc.as_micros() - 1_000);
-    bound_acquisition(&mut runtime, &decision, journal, decision_at, 30_000_000);
+    bound_acquisition(&mut runtime, &decision, &journal, decision_at, 30_000_000);
 
-    // Giving up more than was ever credited is incoherent evidence.
-    assert!(matches!(
-        runtime.settle_live_decision(
-            &LiveDecisionIdentity::of(&decision),
-            filled,
-            filled,
-            &LiveHypeAcquisition::Workflow {
-                workflow_id: "workflow-a".to_owned(),
-                journal: journal.to_path_buf(),
-                credited_hype_atoms: 30_000_000,
-                consumed_hype_atoms: 30_000_001,
-                last_fill_at: None,
-            },
-            decision_at + TimeDelta::minutes(1),
-        ),
-        Err(RuntimeError::InvalidHypeAcquisition(_))
-    ));
+    let quoting_the_link = LiveHypeAcquisition::Workflow {
+        workflow_id: "workflow-a".to_owned(),
+        journal: same_journal_other_spelling,
+        credited_hype_atoms: 30_000_000,
+        last_fill_at: None,
+    };
+    assert_eq!(
+        runtime
+            .settle_live_decision(
+                &LiveDecisionIdentity::of(&decision),
+                filled,
+                filled,
+                &quoting_the_link,
+                decision_at + TimeDelta::minutes(2),
+            )
+            .expect("the same journal by another spelling settles"),
+        LiveSettlementOutcome::Settled
+    );
+    // And the replay of that same settlement stays idempotent rather than
+    // becoming a conflict because the two spellings differ byte-for-byte.
+    assert_eq!(
+        runtime
+            .settle_live_decision(
+                &LiveDecisionIdentity::of(&decision),
+                filled,
+                filled,
+                &quoting_the_link,
+                decision_at + TimeDelta::minutes(3),
+            )
+            .expect("idempotent replay through the link"),
+        LiveSettlementOutcome::AlreadySettled
+    );
+    assert_eq!(runtime.attributed_hype().credited_hype_atoms, 30_000_000);
+}
 
+#[test]
+fn a_halted_observation_publishes_the_full_status_without_committing_a_cycle() {
+    // The divergence halt must not cost the dashboard the operations block it
+    // needs during an incident, and must not become a cycle
+    // (bot-strategy#929).
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = start + TimeDelta::hours(1);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-approved", deposit_at, 100);
+    let admission = approvals("deposit-approved", deposit_at, deposit_at);
+    let signal = signal(decision_at);
+
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
+    live_planned_decision(
+        &mut runtime,
+        start,
+        decision_at,
+        &movement,
+        &admission,
+        &signal,
+    );
+    let head_before = runtime.state.last_committed_cycle_hash.clone();
+    let ledger_before = runtime.ledger.state().committed_usdc();
+
+    let observed_at = decision_at + TimeDelta::minutes(5);
+    let degraded = AccumulatorStatus::new(
+        100.0,
+        0.5,
+        10.0,
+        observed_at,
+        None,
+        "daily",
+        Some(crate::monitor::ATTRIBUTION_EXCEEDS_HOLDINGS.to_owned()),
+    )
+    .expect("degraded status");
     runtime
-        .settle_live_decision(
-            &LiveDecisionIdentity::of(&decision),
-            filled,
-            filled,
-            &LiveHypeAcquisition::Workflow {
-                workflow_id: "workflow-a".to_owned(),
-                journal: journal.to_path_buf(),
-                credited_hype_atoms: 30_000_000,
-                consumed_hype_atoms: 10_000_000,
-                last_fill_at: None,
-            },
-            decision_at + TimeDelta::minutes(2),
-        )
-        .expect("settle with a recorded outflow");
-    let attributed = runtime.attributed_hype();
-    assert_eq!(attributed.credited_hype_atoms, 20_000_000);
-    assert!(attributed.is_complete());
+        .publish_halted_status(degraded, observed_at)
+        .expect("publish without committing");
+
+    let published = std::fs::read_to_string(&runtime_config.status_path).expect("status written");
+    assert!(published.contains(crate::monitor::ATTRIBUTION_EXCEEDS_HOLDINGS));
+    assert!(
+        published.contains("operations"),
+        "the halted status keeps the operations block: {published}"
+    );
+    assert!(std::fs::read_to_string(&runtime_config.metrics_path)
+        .expect("metrics written")
+        .contains("hype_accumulator_committed_usdc"));
+    // Nothing was committed: no new cycle head, no capital movement.
+    assert_eq!(runtime.state.last_committed_cycle_hash, head_before);
+    assert_eq!(runtime.ledger.state().committed_usdc(), ledger_before);
 }
 
 #[test]
@@ -3333,7 +3391,6 @@ fn journal_intent_is_recorded_before_the_journal_and_survives_reopen() {
                 workflow_id: format!("workflow:{}", decision.decision_id),
                 journal: journal.to_path_buf(),
                 credited_hype_atoms: 0,
-                consumed_hype_atoms: 0,
                 last_fill_at: None,
             },
             recorded_at + TimeDelta::minutes(1),
