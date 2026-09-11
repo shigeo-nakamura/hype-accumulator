@@ -137,8 +137,14 @@ fn unattributed_hype_is_excluded_and_visible_as_degraded() {
 }
 
 #[test]
-fn attribution_cannot_exceed_observed_hype() {
-    let error = reconcile_status(
+fn attribution_above_observed_hype_is_degraded_not_a_dropped_observation() {
+    // The ledger says 6.0 HYPE is bot-owned but the account only holds 5.75:
+    // bot-owned HYPE has left the account. The dashboard must still be
+    // published — refusing to produce a document here would hide exactly the
+    // situation that needs attention — reporting what the account
+    // demonstrably holds, which is the tightest true upper bound on the
+    // bot-owned part (bot-strategy#929).
+    let status = reconcile_status(
         &BalanceObservation {
             spot_usdc: 25.0,
             spot_hype: 2.0,
@@ -152,17 +158,51 @@ fn attribution_cannot_exceed_observed_hype() {
         },
         &HypeAttribution::Reconciled {
             hype: 6.0,
+            last_trade_at: Some(at(10)),
+        },
+        at(12),
+        "daily",
+    )
+    .unwrap();
+
+    assert!((status.hype_balance() - 5.75).abs() < f64::EPSILON);
+    assert!(!status.is_healthy());
+    assert_eq!(
+        status.health_reason(),
+        Some(
+            "attributed HYPE exceeds observed account holdings; bot-owned HYPE has left the \
+             account"
+        )
+    );
+    assert_eq!(status.last_trade_at(), Some(&at(10)));
+}
+
+#[test]
+fn attribution_within_tolerance_of_observed_hype_stays_healthy() {
+    // Float arithmetic on the observed side must not turn an exactly-matching
+    // ledger into a divergence report.
+    let status = reconcile_status(
+        &BalanceObservation {
+            spot_usdc: 25.0,
+            spot_hype: 2.0,
+            hype_price_usdc: 40.0,
+        },
+        &StakingObservation {
+            delegated_hype: 3.0,
+            undelegated_hype: 0.5,
+            pending_withdrawal_hype: 0.25,
+            delegation_rows_hype: 3.0,
+        },
+        &HypeAttribution::Reconciled {
+            hype: 5.75 + 1e-12,
             last_trade_at: None,
         },
         at(12),
         "daily",
     )
-    .unwrap_err();
+    .unwrap();
 
-    assert_eq!(
-        error.to_string(),
-        "invalid Hyperliquid response: attributed HYPE exceeds observed account holdings"
-    );
+    assert!(status.is_healthy());
 }
 
 #[test]

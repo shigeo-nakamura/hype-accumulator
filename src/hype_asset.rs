@@ -33,7 +33,9 @@ pub(crate) const HYPE_WEI_DECIMALS: u32 = 8;
 /// prepare and submit time so a venue change fails closed instead of
 /// silently re-rounding an authorized quantity (bot-strategy#991).
 pub(crate) const HYPE_SIZE_DECIMALS: u32 = 2;
-#[cfg(feature = "live-probe")]
+/// HYPE atoms per whole HYPE (`10^HYPE_WEI_DECIMALS`). Every durable HYPE
+/// figure is an integer count of these; only the dashboard boundary
+/// ([`atoms_to_hype_f64`]) leaves atom precision.
 pub(crate) const HYPE_ATOMS_PER_HYPE: u64 = 100_000_000;
 /// v2: adds the size lot (`HYPE_SIZE_DECIMALS`) to the digest. A v1 binding
 /// (prepared before bot-strategy#991) no longer matches; every v1 journal
@@ -54,6 +56,18 @@ const MARKET_METADATA_DOMAIN: &[u8] = b"hype-accumulator/hyperliquid-hype-usdc-s
 /// `live_probe` are only compiled with the `live-probe` feature, and a
 /// default-build `cargo doc` cannot resolve a link into a module it did not
 /// compile.
+/// Converts HYPE atoms to the fractional HYPE the dashboard reports.
+///
+/// Exact for every balance this account can plausibly hold: `f64` represents
+/// integers exactly up to 2^53, i.e. ~90 million HYPE in atoms, and the
+/// divisor is a power of ten times a power of two. Amounts beyond that would
+/// round, which is why every durable figure stays in atoms and only this
+/// presentation boundary converts.
+#[allow(clippy::cast_precision_loss)]
+pub(crate) fn atoms_to_hype_f64(atoms: u64) -> f64 {
+    atoms as f64 / HYPE_ATOMS_PER_HYPE as f64
+}
+
 #[must_use]
 pub fn hype_usdc_market_metadata_digest() -> String {
     let mut hasher = Sha256::new();

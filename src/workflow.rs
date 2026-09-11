@@ -2914,6 +2914,16 @@ pub struct DurableWorkflow {
 }
 
 impl DurableWorkflow {
+    /// The journal file this workflow is durably recorded in.
+    ///
+    /// The authoritative answer to "which journal is this?", so a caller
+    /// evidencing a settlement (bot-strategy#929) quotes the workflow's own
+    /// path rather than one it carried separately and could pass wrongly.
+    #[must_use]
+    pub fn journal_path(&self) -> &Path {
+        &self.path
+    }
+
     /// Runs `action` against this instance's state while holding the
     /// journal's exclusive append lock, after verifying under that lock that
     /// the on-disk journal still matches what this instance loaded (same

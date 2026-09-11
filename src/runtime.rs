@@ -13,6 +13,7 @@ use crate::{
         ProtectedHeadAnchor,
     },
     metrics::{MetricsError, MetricsSnapshot},
+    monitor::HypeAttribution,
     pacing::{
         CapitalEvent, DailyDecision, DecisionInput, DecisionResult, DepositEvent, PacingError,
         PacingLimits, PacingState, UsdcMicros, WithdrawalEvent,
@@ -552,6 +553,35 @@ struct RuntimeState {
     /// one, so absence from the directory can never release it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     live_journal_intents: BTreeMap<String, PathBuf>,
+    /// Decision ID → the HYPE that decision's authenticated workflow proves
+    /// this account was credited (bot-strategy#929). Append-only and
+    /// hash-chained with the settlement that produced it: this is the
+    /// cross-workflow ownership record that distinguishes HYPE this bot
+    /// acquired from HYPE the account holds for any other reason, and it is
+    /// the only thing the read-only observer is allowed to attribute.
+    ///
+    /// Written by the same commit as the USDC settlement it belongs to, so
+    /// inventory can never drift from capital: there is no second write to
+    /// forget, and a conflicting replay fails closed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    hype_acquisitions: BTreeMap<String, RuntimeHypeAcquisition>,
+}
+
+/// One settled decision's HYPE acquisition, as durably recorded beside the
+/// capital settlement that produced it.
+///
+/// `credited_hype_atoms` is what the account was actually credited — net of
+/// any fee the venue charged in HYPE (bot-strategy#998) — never the quantity
+/// the venue matched.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeHypeAcquisition {
+    workflow_id: String,
+    journal: PathBuf,
+    credited_hype_atoms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_fill_at: Option<DateTime<Utc>>,
+    recorded_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -619,6 +649,88 @@ impl RuntimeState {
             parent_funding_route: None,
             live_history_directory: None,
             live_journal_intents: BTreeMap::new(),
+            hype_acquisitions: BTreeMap::new(),
+        }
+    }
+}
+
+/// The HYPE side of a live settlement: what, if anything, this account was
+/// credited by the decision being settled.
+///
+/// Passed to [`SignerFreeRuntime::settle_live_decision`] rather than recorded
+/// by a separate call, so a settlement can never move capital without also
+/// accounting for the inventory it bought (bot-strategy#929). The two
+/// variants are the two ways a live decision can reach settlement, and the
+/// runtime checks each against its own record rather than trusting the
+/// caller's choice.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LiveHypeAcquisition {
+    /// Settled from an authenticated workflow journal.
+    Workflow {
+        /// The workflow whose terminal, protected-head-verified state these
+        /// figures were read from.
+        workflow_id: String,
+        /// The journal that workflow lives in. Must be the journal this
+        /// runtime itself recorded as this decision's intent — a settlement
+        /// quoting any other journal is refused.
+        journal: PathBuf,
+        /// HYPE atoms credited to the account, net of a HYPE-denominated fee
+        /// (bot-strategy#998). Never the matched quantity.
+        credited_hype_atoms: u64,
+        /// When the last fill backing those atoms executed, if any fill did.
+        last_fill_at: Option<DateTime<Utc>>,
+    },
+    /// Released capital for a decision this runtime never bound a journal to:
+    /// no order can exist, so no HYPE can have been acquired. Refused unless
+    /// the runtime agrees there is no journal intent and the settlement moves
+    /// no cash.
+    NoWorkflow,
+}
+
+/// HYPE this runtime's own settled history proves the workflow acquired,
+/// plus how much of that history is still missing its evidence.
+///
+/// A consumer must treat a nonzero `settled_purchases_without_evidence` as
+/// "attribution incomplete" and exclude account holdings entirely, never as
+/// "the rest is zero": a purchase settled by a build older than
+/// bot-strategy#929 has no acquisition row until it is backfilled, and
+/// reporting the partial sum as if it were the whole would understate
+/// bot-owned inventory without saying so.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AttributedHype {
+    pub credited_hype_atoms: u64,
+    pub last_fill_at: Option<DateTime<Utc>>,
+    pub settled_purchases_with_evidence: usize,
+    pub settled_purchases_without_evidence: usize,
+}
+
+impl AttributedHype {
+    /// Whether every settled purchase has its acquisition evidence.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.settled_purchases_without_evidence == 0
+    }
+
+    /// The credited HYPE as the fractional quantity a dashboard reports.
+    #[must_use]
+    pub fn credited_hype(&self) -> f64 {
+        crate::hype_asset::atoms_to_hype_f64(self.credited_hype_atoms)
+    }
+
+    /// The attribution an observer may report for this account.
+    ///
+    /// The single place the "incomplete evidence excludes holdings" rule
+    /// lives, so no observer can accidentally publish a partial sum as if it
+    /// were the whole (bot-strategy#929).
+    #[must_use]
+    pub fn to_attribution(&self) -> HypeAttribution {
+        if self.is_complete() {
+            HypeAttribution::Reconciled {
+                hype: self.credited_hype(),
+                last_trade_at: self.last_fill_at,
+            }
+        } else {
+            HypeAttribution::Unavailable
         }
     }
 }
@@ -879,6 +991,49 @@ impl SignerFreeRuntime {
         &self.state.live_journal_intents
     }
 
+    /// HYPE this runtime's own settled decisions prove the workflow
+    /// acquired, together with how many settled purchases are still missing
+    /// their acquisition evidence (bot-strategy#929).
+    ///
+    /// Read-only and signer-free: this is what the observer attributes to the
+    /// bot, and the only figure allowed to be reported as bot-owned HYPE. A
+    /// nonzero `settled_purchases_without_evidence` means the record is
+    /// incomplete and the caller must exclude account holdings rather than
+    /// report the partial sum.
+    #[must_use]
+    pub fn attributed_hype(&self) -> AttributedHype {
+        let mut aggregate = AttributedHype::default();
+        for decision in self.state.pacing.decisions().values() {
+            // Only a settled decision that actually spent cash can own HYPE.
+            // A dry-run cycle settles a planned decision at zero fill, and a
+            // skip never had an order at all; neither has an inventory side.
+            if !decision.settled || decision.filled_usdc.is_zero() {
+                continue;
+            }
+            match self.state.hype_acquisitions.get(&decision.decision_id) {
+                // An unrepresentable total is unusable evidence, not a
+                // capped one: counting it as missing withholds the whole
+                // attribution instead of publishing a saturated number.
+                Some(row) => match aggregate
+                    .credited_hype_atoms
+                    .checked_add(row.credited_hype_atoms)
+                {
+                    Some(total) => {
+                        aggregate.settled_purchases_with_evidence += 1;
+                        aggregate.credited_hype_atoms = total;
+                        aggregate.last_fill_at = match (aggregate.last_fill_at, row.last_fill_at) {
+                            (Some(current), Some(candidate)) => Some(current.max(candidate)),
+                            (current, candidate) => current.or(candidate),
+                        };
+                    }
+                    None => aggregate.settled_purchases_without_evidence += 1,
+                },
+                None => aggregate.settled_purchases_without_evidence += 1,
+            }
+        }
+        aggregate
+    }
+
     /// The runtime's own identity view of `decision_id`, if it exists.
     #[must_use]
     pub fn decision_identity(&self, decision_id: &str) -> Option<LiveDecisionIdentity> {
@@ -993,6 +1148,90 @@ impl SignerFreeRuntime {
             .collect()
     }
 
+    /// Validates the HYPE side of a settlement and shapes it into the row
+    /// that will be committed with it, or `None` for a release — a decision
+    /// that never had a journal owns no inventory and needs no row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::InvalidHypeAcquisition`] when the workflow
+    /// identity is blank, when the quoted journal is not the one this runtime
+    /// recorded as this decision's intent (a settlement may only be evidenced
+    /// by the journal the decision was bound to), or when the cash and
+    /// inventory sides contradict each other — a settlement that filled USDC
+    /// but credited no HYPE, or credited HYPE without filling any USDC, is a
+    /// caller bug and is refused rather than recorded.
+    fn validated_acquisition_row(
+        &self,
+        decision_id: &str,
+        filled_usdc: UsdcMicros,
+        acquisition: &LiveHypeAcquisition,
+        settled_at: DateTime<Utc>,
+    ) -> Result<Option<RuntimeHypeAcquisition>, RuntimeError> {
+        let recorded_intent = self.state.live_journal_intents.get(decision_id);
+        let LiveHypeAcquisition::Workflow {
+            workflow_id,
+            journal,
+            credited_hype_atoms,
+            last_fill_at,
+        } = acquisition
+        else {
+            // A release: the runtime must agree no journal was ever bound —
+            // the caller's own absence check is not evidence on its own — and
+            // capital that bought nothing cannot have moved.
+            if let Some(intent) = recorded_intent {
+                return Err(RuntimeError::InvalidHypeAcquisition(format!(
+                    "decision {decision_id} declared journal {} but is being settled as though \
+                     no workflow ever existed",
+                    intent.display()
+                )));
+            }
+            if !filled_usdc.is_zero() {
+                return Err(RuntimeError::InvalidHypeAcquisition(format!(
+                    "decision {decision_id} settles {} filled USDC micros with no workflow to \
+                     account for the HYPE it bought",
+                    filled_usdc.as_micros()
+                )));
+            }
+            return Ok(None);
+        };
+        let workflow_id = workflow_id.trim();
+        if workflow_id.is_empty() {
+            return Err(RuntimeError::InvalidHypeAcquisition(
+                "acquisition evidence has no workflow identity".to_owned(),
+            ));
+        }
+        let Some(intent) = recorded_intent else {
+            return Err(RuntimeError::InvalidHypeAcquisition(format!(
+                "decision {decision_id} has no recorded journal intent to evidence a \
+                 settlement with"
+            )));
+        };
+        if intent != journal {
+            return Err(RuntimeError::InvalidHypeAcquisition(format!(
+                "decision {decision_id} is bound to journal {} but its settlement quotes {}",
+                intent.display(),
+                journal.display()
+            )));
+        }
+        if filled_usdc.is_zero() != (*credited_hype_atoms == 0) {
+            return Err(RuntimeError::InvalidHypeAcquisition(format!(
+                "decision {decision_id} settles {} filled USDC micros against {} credited HYPE \
+                 atoms; a purchase that moved cash must credit HYPE and one that credited HYPE \
+                 must have moved cash",
+                filled_usdc.as_micros(),
+                credited_hype_atoms
+            )));
+        }
+        Ok(Some(RuntimeHypeAcquisition {
+            workflow_id: workflow_id.to_owned(),
+            journal: journal.clone(),
+            credited_hype_atoms: *credited_hype_atoms,
+            last_fill_at: *last_fill_at,
+            recorded_at: settled_at,
+        }))
+    }
+
     /// Durably settles a live planned decision from its reconciled terminal
     /// fill: `filled_usdc` is the cumulative filled notional and
     /// `debited_usdc` the cumulative cash debit including fees, both taken
@@ -1016,6 +1255,7 @@ impl SignerFreeRuntime {
         identity: &LiveDecisionIdentity,
         filled_usdc: UsdcMicros,
         debited_usdc: UsdcMicros,
+        acquisition: &LiveHypeAcquisition,
         settled_at: DateTime<Utc>,
     ) -> Result<LiveSettlementOutcome, RuntimeError> {
         self.ensure_runtime_lock_current()?;
@@ -1031,11 +1271,51 @@ impl SignerFreeRuntime {
         if let Some(field) = identity.mismatch_against(&decision) {
             return Err(RuntimeError::LiveDecisionMismatch(field));
         }
+        let acquisition_row =
+            self.validated_acquisition_row(decision_id, filled_usdc, acquisition, settled_at)?;
         if decision.settled {
             // Delegates the exact-replay-vs-conflict distinction to pacing so
             // the two never disagree; a matching replay writes nothing.
             let mut probe = self.state.pacing.clone();
             probe.settle_decision(decision_id, filled_usdc, debited_usdc)?;
+            // The HYPE side gets the same treatment as the USDC side: an
+            // exact replay writes nothing, a replay quoting different
+            // inventory fails closed rather than overwriting the record the
+            // committed settlement was hash-chained with. A settled decision
+            // with no row at all predates bot-strategy#929 and is left for
+            // the explicit backfill: silently minting a row here would let
+            // any later reconcile assert inventory the committed cycle never
+            // authenticated.
+            match (
+                self.state.hype_acquisitions.get(decision_id),
+                acquisition_row.as_ref(),
+            ) {
+                (Some(existing), Some(replayed)) if !same_acquisition(existing, replayed) => {
+                    return Err(RuntimeError::HypeAcquisitionConflict(format!(
+                        "decision {decision_id} already recorded {} HYPE atoms from workflow {} \
+                         ({}) but this settlement reports {} from workflow {} ({})",
+                        existing.credited_hype_atoms,
+                        existing.workflow_id,
+                        existing.journal.display(),
+                        replayed.credited_hype_atoms,
+                        replayed.workflow_id,
+                        replayed.journal.display()
+                    )));
+                }
+                (Some(existing), None) => {
+                    return Err(RuntimeError::HypeAcquisitionConflict(format!(
+                        "decision {decision_id} recorded {} HYPE atoms from workflow {} ({}) \
+                         but is being replayed as though no workflow ever existed",
+                        existing.credited_hype_atoms,
+                        existing.workflow_id,
+                        existing.journal.display()
+                    )));
+                }
+                // A settled decision with no recorded row predates
+                // bot-strategy#929: left to the explicit backfill rather than
+                // minted here (see the comment above).
+                (None, _) | (Some(_), Some(_)) => {}
+            }
             // A retry after a commit whose metrics publication failed must
             // still leave the derived outputs current.
             self.publish_metrics(settled_at)?;
@@ -1051,6 +1331,14 @@ impl SignerFreeRuntime {
             .pacing
             .settle_decision(decision_id, filled_usdc, debited_usdc)?;
         next_state.pacing.validate_for_limits(&self.limits)?;
+        // Same commit as the capital settlement above: the inventory this
+        // decision bought and the cash it spent become durable together or
+        // not at all (bot-strategy#929).
+        if let Some(row) = acquisition_row {
+            next_state
+                .hype_acquisitions
+                .insert(decision_id.to_owned(), row);
+        }
         let ledger_events = vec![LedgerEvent {
             event_id: format!("decision:{decision_id}:live-settlement"),
             occurred_at: settled_at,
@@ -2513,6 +2801,16 @@ fn f64_usdc_micros(value: f64) -> Result<UsdcMicros, RuntimeError> {
     Ok(UsdcMicros::from_micros(floored as u64))
 }
 
+/// Whether two acquisition records describe the same evidence, ignoring when
+/// each was recorded: a retry of the same settlement re-derives the figures
+/// from the same terminal journal but observes a later clock.
+fn same_acquisition(left: &RuntimeHypeAcquisition, right: &RuntimeHypeAcquisition) -> bool {
+    left.workflow_id == right.workflow_id
+        && left.journal == right.journal
+        && left.credited_hype_atoms == right.credited_hype_atoms
+        && left.last_fill_at == right.last_fill_at
+}
+
 #[derive(Debug, Error)]
 pub enum RuntimeError {
     #[error("invalid runtime configuration: {0}")]
@@ -2553,6 +2851,10 @@ pub enum RuntimeError {
     LiveDecisionMismatch(&'static str),
     #[error("live history directory mismatch: {0}")]
     LiveHistoryDirectoryMismatch(String),
+    #[error("live settlement HYPE acquisition evidence is invalid: {0}")]
+    InvalidHypeAcquisition(String),
+    #[error("live settlement replay contradicts the recorded HYPE acquisition: {0}")]
+    HypeAcquisitionConflict(String),
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]

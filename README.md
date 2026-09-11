@@ -77,10 +77,20 @@ This fallback deliberately has no market-signal multiplier, signer, exchange
 submission, state-file backend, or live configuration. The caller must durably
 persist a new decision before any separately approved execution integration.
 
-The read-only status observer therefore treats HYPE attribution as unavailable:
-it reports zero HYPE with degraded health until an authoritative accumulator
-ledger supplies reconciled holdings and last-trade identity. Raw account HYPE
-and account-wide fills are never presented as accumulator activity.
+The read-only status observer attributes HYPE from the runtime's own settled
+decisions: each live settlement durably records, in the same committed cycle as
+its capital settlement, the HYPE the account was actually credited (net of any
+fee charged in HYPE) together with the workflow and journal that prove it. Raw
+account HYPE and account-wide fills are never presented as accumulator
+activity.
+
+Attribution is withheld entirely — zero HYPE, degraded health — while any
+settled purchase is still missing that evidence, rather than reporting a
+partial sum as if it were the whole. Holdings above the attributed amount are
+reported as excluded and degraded; an attributed amount *above* what the
+account holds means bot-owned HYPE has left the account, which is reported as
+a health failure with the account's own balance rather than by refusing to
+publish a status document at all.
 
 ## Offline staking workflow fault injection
 

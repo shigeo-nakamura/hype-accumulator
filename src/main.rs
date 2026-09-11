@@ -4,7 +4,7 @@ use hype_accumulator::{
     bootstrap,
     config::{Config, ProcessEnvironment},
     exchange::UnavailableLiveExchange,
-    monitor::{trade_cadence_label, HypeAttribution, HyperliquidObserver},
+    monitor::{trade_cadence_label, HyperliquidObserver},
     pacing::PacingLimits,
     runtime::{
         AdmissionApprovals, DecisionMode, RuntimeConfig, RuntimeCycleInput, SignerFreeRuntime,
@@ -284,11 +284,13 @@ async fn run_dry_run_cycle(
     };
     let account = config.observation_account(&ProcessEnvironment)?;
     let observer = HyperliquidObserver::new(&config.hyperliquid.endpoint, &account)?;
+    // HYPE this runtime's own settled decisions prove the workflow acquired
+    // (bot-strategy#929). `to_attribution` excludes account holdings outright
+    // while any settled purchase is still missing its evidence, rather than
+    // publishing a partial sum as if it were the whole.
+    let attribution = runtime.attributed_hype().to_attribution();
     let accumulator = observer
-        .observe(
-            &HypeAttribution::Unavailable,
-            trade_cadence_label(&config.schedule),
-        )
+        .observe(&attribution, trade_cadence_label(&config.schedule))
         .await?;
     let observed_at = Utc::now();
     let scan_end_ms = u64::try_from(observed_at.timestamp_millis())?;

@@ -277,14 +277,30 @@ fn reconcile_status_with_balance_window(
         } => {
             finite_nonnegative("attributed HYPE", *hype)?;
             if *hype > observed_hype + attribution_tolerance {
-                return Err(MonitorError::InvalidResponse(
-                    "attributed HYPE exceeds observed account holdings".to_owned(),
-                ));
+                // The workflow ledger says this account should still hold
+                // more bot-owned HYPE than it does: HYPE the bot acquired has
+                // left the account (an external sale, a transfer, or a
+                // staking movement no workflow recorded).
+                //
+                // Deliberately a health failure rather than an error
+                // (bot-strategy#929): refusing to produce a status document
+                // would take the dashboard down — and stall the recurring
+                // cycle that publishes it — in exactly the situation that
+                // most needs to be visible. Reporting the ledger's claim
+                // would overstate holdings, so report what the account
+                // demonstrably holds, which is also the tightest true upper
+                // bound on the bot-owned part, and say why the two disagree.
+                health_reasons.push(
+                    "attributed HYPE exceeds observed account holdings; bot-owned HYPE has left \
+                     the account",
+                );
+                (observed_hype, *last_trade_at)
+            } else {
+                if observed_hype - *hype > attribution_tolerance {
+                    health_reasons.push("unattributed HYPE account holdings excluded");
+                }
+                (*hype, *last_trade_at)
             }
-            if observed_hype - *hype > attribution_tolerance {
-                health_reasons.push("unattributed HYPE account holdings excluded");
-            }
-            (*hype, *last_trade_at)
         }
     };
     let health_reason = (!health_reasons.is_empty()).then(|| health_reasons.join("; "));
