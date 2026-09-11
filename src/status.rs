@@ -5,6 +5,16 @@ use thiserror::Error;
 
 pub const DASHBOARD_SCHEMA_VERSION: u8 = 1;
 
+/// Health reason reported when the workflow ledger claims more bot-owned HYPE
+/// than the account holds (bot-strategy#929).
+///
+/// A decision signal, not only display text: anything that can still act
+/// economically must stop doing so while it holds. Read it through
+/// [`AccumulatorStatus::attribution_exceeds_holdings`], never by re-matching
+/// the text at a call site.
+pub const ATTRIBUTION_EXCEEDS_HOLDINGS: &str =
+    "attributed HYPE exceeds observed account holdings; bot-owned HYPE has left the account";
+
 /// Dashboard-safe HYPE accumulation measurements.
 ///
 /// `hype_balance` is the reconciled total owned by the configured account,
@@ -60,6 +70,29 @@ pub enum StatusError {
 }
 
 impl AccumulatorStatus {
+    /// Whether a last-trade instant can be reported against a balance read
+    /// taken at `balance_observed_at`: the one predicate behind this type's
+    /// own validation and the observer's degrade-instead-of-error filter, so
+    /// the two cannot disagree and drop an observation.
+    #[must_use]
+    pub fn last_trade_is_plausible(
+        last_trade_at: DateTime<Utc>,
+        balance_observed_at: DateTime<Utc>,
+    ) -> bool {
+        last_trade_at <= balance_observed_at
+    }
+
+    /// Whether this observation reports that the workflow ledger claims more
+    /// bot-owned HYPE than the account holds (bot-strategy#929). While true,
+    /// nothing may commit capital or prepare an order; the recurring cycle
+    /// and `prepare` both stop on it.
+    #[must_use]
+    pub fn attribution_exceeds_holdings(&self) -> bool {
+        self.health_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains(ATTRIBUTION_EXCEEDS_HOLDINGS))
+    }
+
     /// Constructs a validated balance snapshot and derives total equity.
     ///
     /// A missing health reason means healthy. Supplying a non-empty reason
@@ -117,7 +150,9 @@ impl AccumulatorStatus {
         if hype_price_usdc <= 0.0 {
             return Err(StatusError::NonPositivePrice);
         }
-        if last_trade_at.is_some_and(|value| value > balance_observed_at) {
+        if last_trade_at
+            .is_some_and(|value| !Self::last_trade_is_plausible(value, balance_observed_at))
+        {
             return Err(StatusError::FutureLastTrade);
         }
         if balance_observation_started_at > balance_observed_at {

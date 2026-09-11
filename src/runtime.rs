@@ -1397,23 +1397,8 @@ impl SignerFreeRuntime {
         accumulator: AccumulatorStatus,
         observed_at: DateTime<Utc>,
     ) -> Result<(), RuntimeError> {
-        let signal = match fs::read_to_string(self.config.signal_snapshot_path()) {
-            Ok(payload) => SignalSnapshot::from_json(&payload).ok(),
-            Err(error) if error.kind() == ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
-        };
-        let metrics = MetricsSnapshot::from_runtime(
-            observed_at,
-            &self.state.pacing,
-            &self.limits,
-            self.ledger.state(),
-            &[],
-            signal.as_ref(),
-            self.state.api_errors_total,
-            self.state.stale_signal_events_total,
-            self.state.dry_run_actions_total,
-            self.config.stuck_after_seconds,
-        )?;
+        let signal = self.disk_signal_for_metrics(observed_at)?;
+        let metrics = self.derive_metrics(observed_at, signal.as_ref())?;
         let status = DashboardStatus::new(
             observed_at,
             self.process_started_at.min(observed_at),
@@ -1943,18 +1928,7 @@ impl SignerFreeRuntime {
         )?;
         self.ensure_runtime_lock_current()?;
         self.state = commit_pending_cycle(&self.config, &self.limits, &mut self.ledger, &pending)?;
-        let metrics = MetricsSnapshot::from_runtime(
-            input.observed_at,
-            &self.state.pacing,
-            &self.limits,
-            self.ledger.state(),
-            &[],
-            decision_signal,
-            self.state.api_errors_total,
-            self.state.stale_signal_events_total,
-            self.state.dry_run_actions_total,
-            self.config.stuck_after_seconds,
-        )?;
+        let metrics = self.derive_metrics(input.observed_at, decision_signal)?;
         let status = DashboardStatus::new(
             input.observed_at,
             self.process_started_at.min(input.observed_at),
@@ -1975,25 +1949,51 @@ impl SignerFreeRuntime {
     /// venue-observation-bound and keeps refreshing through the observer
     /// timer, which stays active during a probe.
     fn publish_metrics(&self, observed_at: DateTime<Utc>) -> Result<(), RuntimeError> {
+        let signal = self.disk_signal_for_metrics(observed_at)?;
+        let metrics = self.derive_metrics(observed_at, signal.as_ref())?;
+        write_metrics_atomic(&self.config.metrics_path, &metrics)?;
+        Ok(())
+    }
+
+    /// The signal snapshot on disk, as an out-of-cycle publication may cite
+    /// it. A snapshot dated after `observed_at` is dropped rather than cited:
+    /// the producer writes the *next* boundary's snapshot ~90 s before that
+    /// boundary, and the metrics validator rejects a future-dated decision —
+    /// which would turn a publication in that window into no publication at
+    /// all. `apply_cycle` filters its signal to the scheduled boundary for
+    /// the same reason.
+    fn disk_signal_for_metrics(
+        &self,
+        observed_at: DateTime<Utc>,
+    ) -> Result<Option<SignalSnapshot>, RuntimeError> {
         let signal = match fs::read_to_string(self.config.signal_snapshot_path()) {
             Ok(payload) => SignalSnapshot::from_json(&payload).ok(),
             Err(error) if error.kind() == ErrorKind::NotFound => None,
             Err(error) => return Err(error.into()),
         };
-        let metrics = MetricsSnapshot::from_runtime(
+        Ok(signal.filter(|signal| signal.decision_at() <= observed_at))
+    }
+
+    /// The one derivation of the metrics document from this runtime's state,
+    /// so every publication — a cycle, a settlement, a halted observation —
+    /// reports the same inputs.
+    fn derive_metrics(
+        &self,
+        observed_at: DateTime<Utc>,
+        signal: Option<&SignalSnapshot>,
+    ) -> Result<MetricsSnapshot, RuntimeError> {
+        Ok(MetricsSnapshot::from_runtime(
             observed_at,
             &self.state.pacing,
             &self.limits,
             self.ledger.state(),
             &[],
-            signal.as_ref(),
+            signal,
             self.state.api_errors_total,
             self.state.stale_signal_events_total,
             self.state.dry_run_actions_total,
             self.config.stuck_after_seconds,
-        )?;
-        write_metrics_atomic(&self.config.metrics_path, &metrics)?;
-        Ok(())
+        )?)
     }
 
     fn ensure_runtime_lock_current(&self) -> Result<(), RuntimeError> {

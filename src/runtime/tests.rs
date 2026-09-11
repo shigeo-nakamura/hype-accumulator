@@ -2895,6 +2895,56 @@ fn live_settlement_records_the_hype_it_bought_and_attributes_it() {
 }
 
 #[test]
+fn a_decision_that_never_bound_a_journal_releases_with_no_acquisition_row() {
+    // The `release` path: `prepare` committed the day's decision and then
+    // failed before any journal existed. Its capital is released at zero with
+    // `NoWorkflow`, which the runtime accepts only because it holds no intent
+    // for the decision and no cash moved — and records no inventory row.
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = start + TimeDelta::hours(1);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-approved", deposit_at, 100);
+    let admission = approvals("deposit-approved", deposit_at, deposit_at);
+    let signal = signal(decision_at);
+
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
+    let decision = live_planned_decision(
+        &mut runtime,
+        start,
+        decision_at,
+        &movement,
+        &admission,
+        &signal,
+    )
+    .decision()
+    .expect("planned decision")
+    .clone();
+    assert_eq!(runtime.live_journal_intent(&decision.decision_id), None);
+
+    assert_eq!(
+        runtime
+            .settle_live_decision(
+                &LiveDecisionIdentity::of(&decision),
+                UsdcMicros::default(),
+                UsdcMicros::default(),
+                &LiveHypeAcquisition::NoWorkflow,
+                decision_at + TimeDelta::minutes(2),
+            )
+            .expect("released at zero"),
+        LiveSettlementOutcome::Settled
+    );
+    assert!(runtime.state.pacing.decisions()[&decision.decision_date].settled);
+    assert!(runtime.state.hype_acquisitions.is_empty());
+    assert_eq!(runtime.attributed_hype(), AttributedHype::default());
+    assert!(runtime.unsettled_planned_decisions().is_empty());
+    drop(runtime);
+    SignerFreeRuntime::open(runtime_config, limits()).expect("reopen after release");
+}
+
+#[test]
 fn a_settlement_may_spell_its_journal_differently_than_the_intent_did() {
     // `prepare` and `reconcile` can be invoked with different spellings of
     // the same file (a symlinked parent, a relative path). A byte comparison
@@ -3023,6 +3073,60 @@ fn a_halted_observation_publishes_the_full_status_without_committing_a_cycle() {
     // Nothing was committed: no new cycle head, no capital movement.
     assert_eq!(runtime.state.last_committed_cycle_hash, head_before);
     assert_eq!(runtime.ledger.state().committed_usdc(), ledger_before);
+}
+
+#[test]
+fn a_halted_observation_still_publishes_while_the_next_boundary_snapshot_is_on_disk() {
+    // The signal producer writes the *next* boundary's snapshot ~90 s before
+    // that boundary. Citing a future-dated snapshot is rejected by the
+    // metrics validator, which would turn a halted observation in that
+    // window into no status document at all — the failure the halt path
+    // exists to avoid (bot-strategy#929 review). The snapshot is dropped
+    // from the citation instead.
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = start + TimeDelta::hours(1);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-approved", deposit_at, 100);
+    let admission = approvals("deposit-approved", deposit_at, deposit_at);
+    let signal = signal(decision_at);
+
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
+    live_planned_decision(
+        &mut runtime,
+        start,
+        decision_at,
+        &movement,
+        &admission,
+        &signal,
+    );
+    // Tomorrow's snapshot, already on disk, dated after this observation.
+    let next_boundary = at(2026, 7, 7, 12, 0);
+    std::fs::write(
+        runtime_config.signal_snapshot_path(),
+        serde_json::to_string(&signal_for(next_boundary, "2026-07-07")).expect("snapshot json"),
+    )
+    .expect("write next boundary snapshot");
+
+    let observed_at = next_boundary - TimeDelta::seconds(90);
+    let degraded = AccumulatorStatus::new(
+        100.0,
+        0.0,
+        10.0,
+        observed_at,
+        None,
+        "daily",
+        Some(crate::status::ATTRIBUTION_EXCEEDS_HOLDINGS.to_owned()),
+    )
+    .expect("degraded status");
+    runtime
+        .publish_halted_status(degraded, observed_at)
+        .expect("publishes despite the future-dated snapshot");
+    assert!(std::fs::read_to_string(&runtime_config.status_path)
+        .expect("status written")
+        .contains(crate::status::ATTRIBUTION_EXCEEDS_HOLDINGS));
 }
 
 #[test]

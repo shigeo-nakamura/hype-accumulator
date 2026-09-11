@@ -89,8 +89,10 @@ settled purchase is still missing that evidence, rather than reporting a
 partial sum as if it were the whole. Holdings above the attributed amount are
 reported as excluded and degraded; an attributed amount *above* what the
 account holds means bot-owned HYPE has left the account, which is reported as
-a health failure with the account's own balance rather than by refusing to
-publish a status document at all.
+a health failure — zero HYPE, as for unavailable attribution, since the account
+total includes holdings that are not the bot's — rather than by refusing to
+publish a status document at all. While that failure stands, the recurring
+cycle and `prepare` both refuse to commit capital.
 
 ## Offline staking workflow fault injection
 

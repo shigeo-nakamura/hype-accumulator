@@ -846,10 +846,7 @@ async fn prepare(
     // only one that commits real capital — must halt harder: refuse before a
     // decision is committed or an order is printed, while HYPE the ledger
     // says the bot owns is unaccounted for (bot-strategy#929).
-    if accumulator
-        .health_reason()
-        .is_some_and(|reason| reason.contains(ATTRIBUTION_EXCEEDS_HOLDINGS))
-    {
+    if accumulator.attribution_exceeds_holdings() {
         return Err(format!(
             "refusing to prepare an order: {ATTRIBUTION_EXCEEDS_HOLDINGS}. Reconcile the \
              account's HYPE against the workflow journals first."

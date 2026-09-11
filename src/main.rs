@@ -300,10 +300,7 @@ async fn run_dry_run_cycle(
     // differences"). Before this attribution existed, the same condition
     // aborted the cycle via an observation error; it must not become
     // advisory just because the status document now survives it.
-    if accumulator
-        .health_reason()
-        .is_some_and(|reason| reason.contains(ATTRIBUTION_EXCEEDS_HOLDINGS))
-    {
+    if accumulator.attribution_exceeds_holdings() {
         // Publishes the same documents a cycle would — operations block
         // included, so the dashboard keeps showing committed capital and
         // stuck detection through the incident — without committing one.

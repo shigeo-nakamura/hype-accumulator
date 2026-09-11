@@ -141,9 +141,7 @@ fn attribution_above_observed_hype_is_degraded_not_a_dropped_observation() {
     // The ledger says 6.0 HYPE is bot-owned but the account only holds 5.75:
     // bot-owned HYPE has left the account. The dashboard must still be
     // published — refusing to produce a document here would hide exactly the
-    // situation that needs attention — reporting what the account
-    // demonstrably holds, which is the tightest true upper bound on the
-    // bot-owned part (bot-strategy#929).
+    // situation that needs attention (bot-strategy#929).
     let status = reconcile_status(
         &BalanceObservation {
             spot_usdc: 25.0,
@@ -165,8 +163,13 @@ fn attribution_above_observed_hype_is_degraded_not_a_dropped_observation() {
     )
     .unwrap();
 
-    assert!((status.hype_balance() - 5.75).abs() < f64::EPSILON);
+    // Zero, not the account total: the total includes whatever else the
+    // account holds, and `hype_balance` must never include holdings that are
+    // not the bot's.
+    assert!(status.hype_balance().abs() < f64::EPSILON);
+    assert!((status.total_equity_usdc() - 25.0).abs() < f64::EPSILON);
     assert!(!status.is_healthy());
+    assert!(status.attribution_exceeds_holdings());
     assert_eq!(
         status.health_reason(),
         Some(

@@ -30,15 +30,7 @@ pub struct StakingObservation {
     pub delegation_rows_hype: f64,
 }
 
-/// Health reason reported when the workflow ledger claims more bot-owned HYPE
-/// than the account holds.
-///
-/// A shared constant because it is a *decision signal*, not only display
-/// text: a caller that can still act economically must stop doing so while it
-/// holds (bot-strategy#929), and matching on a duplicated literal would let
-/// the two drift apart.
-pub const ATTRIBUTION_EXCEEDS_HOLDINGS: &str =
-    "attributed HYPE exceeds observed account holdings; bot-owned HYPE has left the account";
+pub use crate::status::ATTRIBUTION_EXCEEDS_HOLDINGS;
 
 /// Authoritative accumulator-ledger attribution for account-level observations.
 ///
@@ -296,12 +288,14 @@ fn reconcile_status_with_balance_window(
                 // (bot-strategy#929): refusing to produce a status document
                 // would take the dashboard down — and stall the recurring
                 // cycle that publishes it — in exactly the situation that
-                // most needs to be visible. Reporting the ledger's claim
-                // would overstate holdings, so report what the account
-                // demonstrably holds, which is also the tightest true upper
-                // bound on the bot-owned part, and say why the two disagree.
+                // most needs to be visible. What is reported as bot-owned is
+                // zero, the same as `Unavailable`: the ledger's claim would
+                // overstate, and the account total includes whatever else
+                // the account holds, which `hype_balance` must never
+                // include. The reason carries the fact; the number does not
+                // guess.
                 health_reasons.push(ATTRIBUTION_EXCEEDS_HOLDINGS);
-                (observed_hype, *last_trade_at)
+                (0.0, *last_trade_at)
             } else {
                 if observed_hype - *hype > attribution_tolerance {
                     health_reasons.push("unattributed HYPE account holdings excluded");
@@ -318,9 +312,12 @@ fn reconcile_status_with_balance_window(
     // Same judgment as the divergence branch above: degrade loudly, keep
     // publishing.
     let last_trade_at = last_trade_at.filter(|value| {
-        let plausible = *value <= balance_observed_at;
+        let plausible = AccumulatorStatus::last_trade_is_plausible(*value, balance_observed_at);
         if !plausible {
-            health_reasons.push("last attributed fill is after the balance observation; clock or history is inconsistent");
+            health_reasons.push(
+                "last attributed fill is after the balance observation; clock or history is \
+                 inconsistent",
+            );
         }
         plausible
     });
