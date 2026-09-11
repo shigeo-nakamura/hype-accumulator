@@ -204,6 +204,58 @@ under an attestation remain distinguishable in the journal.
 
 No output of this command is a scheduled-live approval or a staking approval.
 
+## Backfilling attribution for purchases settled before the inventory ledger
+
+Attribution is withheld entirely while any settled purchase lacks its
+acquisition evidence (bot-strategy#929): the dashboard reports zero HYPE with
+`HYPE attribution unavailable` rather than a partial sum that would understate
+bot-owned inventory without saying so. Purchases settled by a build older than
+that ledger have no evidence, so they need a one-time migration:
+
+```text
+hype-live-probe backfill-attribution config.local.toml security-policy.local.toml runtime.local.toml operational.local.toml
+```
+
+Run it as the same user the journals belong to, with the recurring timer
+stopped. It is signer-free and economically inert — no capital moves, no order
+is prepared, no venue is contacted — and idempotent: a second run prints
+`mode=nothing-to-backfill`.
+
+It takes no journal argument, for the same reason `release` does not: it works
+from the decisions the runtime itself holds, and refuses to read evidence out
+of any directory other than the one its live decisions were prepared into.
+
+For each settled purchase with no evidence it opens that decision's own
+journal and, **under that journal's append lock**, verifies before recording
+anything:
+
+* the journal is admissible for this network and vault-routing mode;
+* its binding's execution identity is the configured account's — a journal
+  belonging to another account can never attribute HYPE to this one;
+* it is not in `ManualReview` (contested late venue evidence);
+* it is bound to that very decision;
+* it holds exactly the filled and debited USDC the decision settled with.
+
+Deliberately *not* required: that the workflow reached `Complete`. A real
+purchase settles from `OrderFinalized` onward, and reaching `Complete`
+additionally needs the staking-disabled attestation, which is withheld while
+the policy acknowledgement is expired — requiring it would block the migration
+on exactly the hosts that need it.
+
+A missing journal is reported as lost history with the restore path
+(bot-strategy#944), never as an empty one. Any failure aborts before that
+decision is recorded; decisions already recorded stay recorded, and re-running
+continues from where it stopped. The command exits non-zero if any settled
+purchase is still unevidenced when it finishes, so a caller chaining on it
+cannot mistake a partial run for a fixed dashboard.
+
+Expected output on a host whose only real purchase is 2026-09-10:
+
+```text
+mode=backfilled decision=fixed-dca:2026-09-10 workflow=… credited_hype_atoms=29979000 journal=… outcome=Settled
+mode=backfill-complete attributed_hype_atoms=29979000 settled_purchases=1 missing=0 complete=true
+```
+
 ## Releasing a decision that never reached a signer
 
 `prepare` commits the day's pacing decision in the runtime cycle *before* the

@@ -25,7 +25,10 @@ use dex_connector::{HyperliquidAccountConfig, HyperliquidConnector, HyperliquidC
 use hype_accumulator::{
     config::{Config, EffectiveLiveOrderPolicy, ProcessEnvironment},
     live_decision::{bound_decision_identity, prepare_first_live_order_workflow},
-    live_probe::{reconcile_prepared_order, HyperliquidLiveProbe, LiveProbeBinding},
+    live_probe::{
+        execution_identity_hash_for, reconcile_prepared_order, HyperliquidLiveProbe,
+        LiveProbeBinding,
+    },
     monitor::{trade_cadence_label, HyperliquidObserver, ATTRIBUTION_EXCEEDS_HOLDINGS},
     order_envelope::OrderEnvelopeFreshnessPolicy,
     pacing::{DailyDecision, PacingLimits, UsdcMicros},
@@ -38,7 +41,7 @@ use hype_accumulator::{
     workflow::{
         DisabledStakingProof, DurableWorkflow, EligibilityPolicyBinding, ExchangeOrderOwnerStore,
         FileExchangeOrderOwnerStore, FileProtectedWorkflowHeadStore, HypeAtoms,
-        ProtectedWorkflowHeadStore, WorkflowError, WorkflowStage,
+        ProtectedWorkflowHeadStore, WorkflowError, WorkflowStage, WorkflowState,
     },
 };
 use rust_decimal::Decimal;
@@ -1512,34 +1515,16 @@ fn backfill_attribution(
     let prepare_time_binding = PrepareTimeBinding::resolved(&config, &operational)?;
     let network_routing_admissible = network_routing_admissible_for(&prepare_time_binding);
 
+    let expected_execution_identity =
+        execution_identity_hash_for(&config.observation_account(&ProcessEnvironment)?);
+
     for decision in runtime.settled_purchases_without_acquisition() {
-        let decision_id = decision.decision_id.clone();
-        let identity = LiveDecisionIdentity::of(&decision);
-        let journal = runtime
-            .live_journal_intent(&decision_id)
-            .ok_or_else(|| {
-                format!(
-                    "decision {decision_id} settled a purchase but this runtime never recorded \
-                     a journal for it; there is no evidence to attribute it from"
-                )
-            })?
-            .to_path_buf();
-        let acquisition =
-            verified_attribution_evidence(&decision, &journal, &network_routing_admissible)?;
-        let outcome = runtime.backfill_hype_acquisition(&identity, &acquisition, Utc::now())?;
-        let LiveHypeAcquisition::Workflow {
-            workflow_id,
-            credited_hype_atoms,
-            ..
-        } = &acquisition
-        else {
-            unreachable!("verified evidence is always workflow-backed")
-        };
-        println!(
-            "mode=backfilled decision={decision_id} workflow={workflow_id} \
-             credited_hype_atoms={credited_hype_atoms} journal={} outcome={outcome:?}",
-            journal.display()
-        );
+        backfill_one_decision(
+            &mut runtime,
+            &decision,
+            &expected_execution_identity,
+            &network_routing_admissible,
+        )?;
     }
 
     let after = runtime.attributed_hype();
@@ -1551,39 +1536,126 @@ fn backfill_attribution(
         after.settled_purchases_without_evidence,
         after.is_complete()
     );
+    // Attribution is still withheld unless every settled purchase has its
+    // evidence, so a run that leaves any behind must not report success: a
+    // caller chaining on this command would otherwise believe the dashboard
+    // was fixed.
+    if !after.is_complete() {
+        return Err(format!(
+            "{} settled purchase(s) still have no acquisition evidence; attribution stays \
+             unavailable",
+            after.settled_purchases_without_evidence
+        )
+        .into());
+    }
     Ok(())
 }
 
-/// Reads one settled decision's own journal and shapes the acquisition
-/// evidence it proves, or fails closed.
+/// Reads one settled purchase's journal and commits its acquisition
+/// evidence, under that journal's own append lock.
+fn backfill_one_decision(
+    runtime: &mut SignerFreeRuntime,
+    decision: &DailyDecision,
+    expected_execution_identity: &str,
+    network_routing_admissible: &impl Fn(&Path) -> Result<(), WorkflowError>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let decision_id = decision.decision_id.clone();
+    let identity = LiveDecisionIdentity::of(decision);
+    let journal = runtime
+        .live_journal_intent(&decision_id)
+        .ok_or_else(|| {
+            format!(
+                "decision {decision_id} settled a purchase but this runtime never recorded \
+                 a journal for it; there is no evidence to attribute it from"
+            )
+        })?
+        .to_path_buf();
+    // A journal this runtime declared but that is no longer there is lost
+    // history, not an empty journal: the operator needs the restore path
+    // (bot-strategy#944), not a "crashed before its first append" story.
+    if !journal.exists() {
+        return Err(format!(
+            "decision {decision_id} declared journal {} but it is missing; recorded history \
+             is incomplete — restore it from backup (bot-strategy#944) before attributing \
+             anything",
+            journal.display()
+        )
+        .into());
+    }
+    network_routing_admissible(&journal).map_err(box_error)?;
+    let journal_path = journal
+        .to_str()
+        .ok_or_else(|| format!("journal path {} is not valid UTF-8", journal.display()))?;
+    let binding = DurableWorkflow::peek_committed_binding(&journal)?.ok_or_else(|| {
+        format!(
+            "journal {} for decision {decision_id} has no committed binding; its outcome is \
+             unknown and must not be attributed",
+            journal.display()
+        )
+    })?;
+    let (protected_head_store, owner_store) = build_stores(journal_path)?;
+    let workflow =
+        DurableWorkflow::open_or_create(journal_path, &binding, protected_head_store, owner_store)?;
+    // Reads the evidence and commits it under the journal's own append
+    // lock, exactly as `settle_finalized_decision` does: a concurrent
+    // `reconcile` appending late contradictory evidence (moving the
+    // workflow to `ManualReview`) must fail this closed rather than let
+    // contested figures become an immutable attribution row.
+    workflow.with_frozen_state(|state| -> Result<(), Box<dyn std::error::Error>> {
+        let acquisition =
+            verified_attribution_evidence(decision, &journal, state, expected_execution_identity)?;
+        let outcome = runtime.backfill_hype_acquisition(&identity, &acquisition, Utc::now())?;
+        println!(
+            "mode=backfilled decision={decision_id} workflow={} \
+             credited_hype_atoms={} journal={} outcome={outcome:?}",
+            state.workflow_id(),
+            state.purchased_hype().as_atoms(),
+            journal.display()
+        );
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// Shapes the acquisition evidence one settled decision's journal proves, or
+/// fails closed.
 ///
-/// Verified the way `prepare`'s aggregation verifies history — the same
-/// network/routing admissibility check and the journal's independently
-/// protected head — and cross-checked against the settlement that already
+/// `state` is the journal's state read under its own append lock by the
+/// caller, so nothing can append between this verification and the commit
+/// that follows it. Cross-checked against the settlement that already
 /// happened, so a journal can never attribute inventory the capital ledger
 /// does not agree with.
 fn verified_attribution_evidence(
     decision: &DailyDecision,
     journal: &Path,
-    network_routing_admissible: &impl Fn(&Path) -> Result<(), WorkflowError>,
+    state: &WorkflowState,
+    expected_execution_identity: &str,
 ) -> Result<LiveHypeAcquisition, Box<dyn std::error::Error>> {
     let decision_id = decision.decision_id.as_str();
-    network_routing_admissible(journal).map_err(box_error)?;
-    let protected_head_store = historical_protected_head_store_for(journal)?;
-    let state = DurableWorkflow::read_verified_state(journal, protected_head_store.as_ref())?
-        .ok_or_else(|| {
-            format!(
-                "journal {} for decision {decision_id} is empty; its outcome is unknown and \
-                 must not be attributed",
-                journal.display()
-            )
-        })?;
-    if state.stage() != WorkflowStage::Complete {
+    // The one check the network/routing predicate cannot make: that predicate
+    // compares network and vault-routing *mode*, so a different account on
+    // the same network passes it. `aggregate_terminal_residual_hype` refuses
+    // a foreign execution identity explicitly, and this is a write path, so
+    // it refuses one too.
+    if state.binding().inventory_before.execution_identity_hash != expected_execution_identity {
         return Err(format!(
-            "journal {} for decision {decision_id} has not reached a terminal stage \
-             (stage={:?}); finish reconciling it before attributing it",
-            journal.display(),
-            state.stage()
+            "journal {} belongs to a different execution account than the one configured; \
+             refusing to attribute another account's HYPE to this one",
+            journal.display()
+        )
+        .into());
+    }
+    // Deliberately not a `Complete`-only gate: a real purchase settles from
+    // `OrderFinalized` onward (`durable_finality`), and reaching `Complete`
+    // additionally needs the staking-disabled attestation, which is withheld
+    // while the policy acknowledgement is expired. Requiring `Complete` would
+    // block the migration on exactly the hosts that need it. What must be
+    // refused is contested evidence.
+    if state.stage() == WorkflowStage::ManualReview {
+        return Err(format!(
+            "journal {} for decision {decision_id} is in ManualReview (contradictory late venue \
+             evidence); resolve the review before attributing its inventory",
+            journal.display()
         )
         .into());
     }
@@ -2540,6 +2612,54 @@ mod tests {
             "journal.jsonl",
         ]))
         .is_err());
+    }
+
+    #[test]
+    fn parses_a_backfill_attribution_invocation_without_a_journal() {
+        assert_eq!(
+            invocation(args(&[
+                "backfill-attribution",
+                "config.toml",
+                "policy.toml",
+                "runtime.toml",
+                "operational.toml",
+            ])),
+            Ok(Invocation::BackfillAttribution {
+                config_path: "config.toml".to_owned(),
+                security_policy_path: "policy.toml".to_owned(),
+                runtime_config_path: "runtime.toml".to_owned(),
+                operational_params_path: "operational.toml".to_owned(),
+            })
+        );
+        // Like `release`, it works from the decisions the runtime itself
+        // holds and must never be pointed at one journal file.
+        assert!(invocation(args(&[
+            "backfill-attribution",
+            "config.toml",
+            "policy.toml",
+            "runtime.toml",
+            "operational.toml",
+            "journal.jsonl",
+        ]))
+        .is_err());
+        // And it is not `release`: the two five-argument commands must not
+        // be confusable.
+        assert_ne!(
+            invocation(args(&[
+                "backfill-attribution",
+                "config.toml",
+                "policy.toml",
+                "runtime.toml",
+                "operational.toml",
+            ])),
+            invocation(args(&[
+                "release",
+                "config.toml",
+                "policy.toml",
+                "runtime.toml",
+                "operational.toml",
+            ]))
+        );
     }
 
     #[test]

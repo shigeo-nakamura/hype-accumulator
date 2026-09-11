@@ -1637,6 +1637,18 @@ fn validate_binding(
     Ok(())
 }
 
+/// The execution-identity hash a journal prepared for `account` must carry.
+///
+/// Signer-free: derived from the account address alone, so a caller with no
+/// signing material (bot-strategy#929's attribution backfill) can still
+/// refuse a journal that belongs to a different execution account — the
+/// check `lookup_read_only` makes against a live connector, made against
+/// configuration instead.
+#[must_use]
+pub fn execution_identity_hash_for(account: &str) -> String {
+    identity_hash(EXECUTION_IDENTITY_DOMAIN, account)
+}
+
 fn connector_identity_hashes(
     connector: &HyperliquidConnector,
 ) -> Result<(String, String), LiveProbeError> {
