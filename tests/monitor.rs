@@ -206,6 +206,43 @@ fn attribution_within_tolerance_of_observed_hype_stays_healthy() {
 }
 
 #[test]
+fn a_last_trade_after_the_balance_read_degrades_instead_of_dropping_the_status() {
+    // A clock that stepped backwards (NTP correction, restored backup) must
+    // not stop the status document being written: the attributed fill time is
+    // dropped and the disagreement is reported (bot-strategy#929).
+    let status = reconcile_status(
+        &BalanceObservation {
+            spot_usdc: 25.0,
+            spot_hype: 2.0,
+            hype_price_usdc: 40.0,
+        },
+        &StakingObservation {
+            delegated_hype: 0.0,
+            undelegated_hype: 0.0,
+            pending_withdrawal_hype: 0.0,
+            delegation_rows_hype: 0.0,
+        },
+        &HypeAttribution::Reconciled {
+            hype: 2.0,
+            last_trade_at: Some(at(14)),
+        },
+        at(12),
+        "daily",
+    )
+    .unwrap();
+
+    assert_eq!(status.last_trade_at(), None);
+    assert!(!status.is_healthy());
+    assert_eq!(
+        status.health_reason(),
+        Some(
+            "last attributed fill is after the balance observation; clock or history is \
+             inconsistent"
+        )
+    );
+}
+
+#[test]
 fn cadence_label_is_stable_and_deduplicated() {
     assert_eq!(
         trade_cadence_label(&UtcSchedule {

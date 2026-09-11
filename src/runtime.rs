@@ -579,6 +579,9 @@ struct RuntimeHypeAcquisition {
     workflow_id: String,
     journal: PathBuf,
     credited_hype_atoms: u64,
+    /// HYPE the same workflow records as having left the account again.
+    #[serde(default)]
+    consumed_hype_atoms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_fill_at: Option<DateTime<Utc>>,
     recorded_at: DateTime<Utc>,
@@ -677,6 +680,12 @@ pub enum LiveHypeAcquisition {
         /// HYPE atoms credited to the account, net of a HYPE-denominated fee
         /// (bot-strategy#998). Never the matched quantity.
         credited_hype_atoms: u64,
+        /// HYPE atoms the same workflow records as having left the account
+        /// again (a sale or transfer consuming part of its residual
+        /// allocation). Subtracted from the credited amount when inventory
+        /// is attributed, so a recorded outflow cannot leave attribution
+        /// claiming HYPE the account no longer holds.
+        consumed_hype_atoms: u64,
         /// When the last fill backing those atoms executed, if any fill did.
         last_fill_at: Option<DateTime<Utc>>,
     },
@@ -1014,9 +1023,13 @@ impl SignerFreeRuntime {
                 // An unrepresentable total is unusable evidence, not a
                 // capped one: counting it as missing withholds the whole
                 // attribution instead of publishing a saturated number.
-                Some(row) => match aggregate
+                // Net of what the same workflow recorded as having left the
+                // account: attribution reports HYPE the bot still owns, not
+                // everything it ever bought.
+                Some(row) => match row
                     .credited_hype_atoms
-                    .checked_add(row.credited_hype_atoms)
+                    .checked_sub(row.consumed_hype_atoms)
+                    .and_then(|owned| aggregate.credited_hype_atoms.checked_add(owned))
                 {
                     Some(total) => {
                         aggregate.settled_purchases_with_evidence += 1;
@@ -1173,6 +1186,7 @@ impl SignerFreeRuntime {
             workflow_id,
             journal,
             credited_hype_atoms,
+            consumed_hype_atoms,
             last_fill_at,
         } = acquisition
         else {
@@ -1207,7 +1221,7 @@ impl SignerFreeRuntime {
                  settlement with"
             )));
         };
-        if intent != journal {
+        if !same_journal_path(intent, journal) {
             return Err(RuntimeError::InvalidHypeAcquisition(format!(
                 "decision {decision_id} is bound to journal {} but its settlement quotes {}",
                 intent.display(),
@@ -1223,10 +1237,18 @@ impl SignerFreeRuntime {
                 credited_hype_atoms
             )));
         }
+        if consumed_hype_atoms > credited_hype_atoms {
+            return Err(RuntimeError::InvalidHypeAcquisition(format!(
+                "decision {decision_id} records {consumed_hype_atoms} HYPE atoms leaving the \
+                 account against {credited_hype_atoms} credited; a workflow cannot give up more \
+                 than it was credited"
+            )));
+        }
         Ok(Some(RuntimeHypeAcquisition {
             workflow_id: workflow_id.to_owned(),
             journal: journal.clone(),
             credited_hype_atoms: *credited_hype_atoms,
+            consumed_hype_atoms: *consumed_hype_atoms,
             last_fill_at: *last_fill_at,
             recorded_at: settled_at,
         }))
@@ -2801,6 +2823,23 @@ fn f64_usdc_micros(value: f64) -> Result<UsdcMicros, RuntimeError> {
     Ok(UsdcMicros::from_micros(floored as u64))
 }
 
+/// Whether two paths name the same journal.
+///
+/// Compares resolved paths when both resolve, exactly as the live-probe
+/// binary's own submit-time preflight does: `prepare` and `reconcile` can be
+/// invoked with different spellings of the same file (relative vs absolute, a
+/// symlinked parent), and a raw byte comparison would then refuse to settle a
+/// real fill — leaving committed capital permanently unsettleable, which also
+/// fails every later decision day closed with `PriorDecisionUnsettled`.
+/// Falls back to a byte comparison when either side cannot be resolved (a
+/// journal that no longer exists), which is strictly the stricter answer.
+fn same_journal_path(left: &Path, right: &Path) -> bool {
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
 /// Whether two acquisition records describe the same evidence, ignoring when
 /// each was recorded: a retry of the same settlement re-derives the figures
 /// from the same terminal journal but observes a later clock.
@@ -2808,6 +2847,7 @@ fn same_acquisition(left: &RuntimeHypeAcquisition, right: &RuntimeHypeAcquisitio
     left.workflow_id == right.workflow_id
         && left.journal == right.journal
         && left.credited_hype_atoms == right.credited_hype_atoms
+        && left.consumed_hype_atoms == right.consumed_hype_atoms
         && left.last_fill_at == right.last_fill_at
 }
 

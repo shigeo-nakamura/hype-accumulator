@@ -56,18 +56,6 @@ const MARKET_METADATA_DOMAIN: &[u8] = b"hype-accumulator/hyperliquid-hype-usdc-s
 /// `live_probe` are only compiled with the `live-probe` feature, and a
 /// default-build `cargo doc` cannot resolve a link into a module it did not
 /// compile.
-/// Converts HYPE atoms to the fractional HYPE the dashboard reports.
-///
-/// Exact for every balance this account can plausibly hold: `f64` represents
-/// integers exactly up to 2^53, i.e. ~90 million HYPE in atoms, and the
-/// divisor is a power of ten times a power of two. Amounts beyond that would
-/// round, which is why every durable figure stays in atoms and only this
-/// presentation boundary converts.
-#[allow(clippy::cast_precision_loss)]
-pub(crate) fn atoms_to_hype_f64(atoms: u64) -> f64 {
-    atoms as f64 / HYPE_ATOMS_PER_HYPE as f64
-}
-
 #[must_use]
 pub fn hype_usdc_market_metadata_digest() -> String {
     let mut hasher = Sha256::new();
@@ -79,6 +67,18 @@ pub fn hype_usdc_market_metadata_digest() -> String {
     hasher.update([0]);
     hasher.update(HYPE_SIZE_DECIMALS.to_be_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+/// Converts HYPE atoms to the fractional HYPE the dashboard reports.
+///
+/// Exact for every balance this account can plausibly hold: `f64` represents
+/// integers exactly up to 2^53, i.e. ~90 million HYPE in atoms, and the
+/// divisor is a power of ten times a power of two. Amounts beyond that would
+/// round, which is why every durable figure stays in atoms and only this
+/// presentation boundary converts.
+#[allow(clippy::cast_precision_loss)]
+pub(crate) fn atoms_to_hype_f64(atoms: u64) -> f64 {
+    atoms as f64 / HYPE_ATOMS_PER_HYPE as f64
 }
 
 /// Why a venue-reported order grid cannot be the one this crate's constants

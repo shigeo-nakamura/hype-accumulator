@@ -26,7 +26,7 @@ use hype_accumulator::{
     config::{Config, EffectiveLiveOrderPolicy, ProcessEnvironment},
     live_decision::{bound_decision_identity, prepare_first_live_order_workflow},
     live_probe::{reconcile_prepared_order, HyperliquidLiveProbe, LiveProbeBinding},
-    monitor::{trade_cadence_label, HypeAttribution, HyperliquidObserver},
+    monitor::{trade_cadence_label, HyperliquidObserver},
     order_envelope::OrderEnvelopeFreshnessPolicy,
     pacing::{PacingLimits, UsdcMicros},
     runtime::{
@@ -826,11 +826,21 @@ async fn prepare(
     // (bot-strategy#845, 2026-09-07), a path no offline fixture exercises.
     let account = config.observation_account(&ProcessEnvironment)?;
     let observer = HyperliquidObserver::new(&config.hyperliquid.endpoint, &account)?;
+    // Opened before the observation, not after it as everything else in this
+    // function is ordered, because the cycle below republishes the status
+    // document: observing with `Unavailable` here would overwrite the
+    // dashboard's attributed HYPE with zero for as long as the recurring
+    // cycle stays stopped, which on a probe day is the whole probe
+    // (bot-strategy#929). The exclusive state lock is held across the
+    // observation as a result; a probe day has the recurring timer stopped,
+    // so nothing else contends for it.
+    let runtime_config = RuntimeConfig::from_toml(&fs::read_to_string(runtime_config_path)?)?
+        .with_parent_funding_route(config.parent_funding_route(&ProcessEnvironment)?);
+    let limits = PacingLimits::from_config(&config)?;
+    let mut runtime = SignerFreeRuntime::open(runtime_config.clone(), limits)?;
+    let attribution = runtime.attributed_hype().to_attribution();
     let accumulator = observer
-        .observe(
-            &HypeAttribution::Unavailable,
-            trade_cadence_label(&config.schedule),
-        )
+        .observe(&attribution, trade_cadence_label(&config.schedule))
         .await?;
 
     // Re-reads the clock here, after the KMS-backed signer decrypt and the
@@ -853,11 +863,6 @@ async fn prepare(
         config.staking_policy_digest()?,
     );
     let configured_residual_hype_atoms = HypeAtoms::from_atoms(effective.residual_hype_wei);
-
-    let runtime_config = RuntimeConfig::from_toml(&fs::read_to_string(runtime_config_path)?)?
-        .with_parent_funding_route(config.parent_funding_route(&ProcessEnvironment)?);
-    let limits = PacingLimits::from_config(&config)?;
-    let mut runtime = SignerFreeRuntime::open(runtime_config.clone(), limits)?;
 
     let approvals = AdmissionApprovals::from_json(&fs::read_to_string(
         runtime_config.admission_approvals_path(),
@@ -1161,6 +1166,7 @@ fn settle_finalized_decision(
             workflow_id: state.workflow_id().to_owned(),
             journal: workflow.journal_path().to_path_buf(),
             credited_hype_atoms: state.purchased_hype().as_atoms(),
+            consumed_hype_atoms: state.residual_consumed_by_movements_hype().as_atoms(),
             last_fill_at: state.last_fill_at(),
         };
         let outcome = runtime.settle_live_decision(

@@ -917,6 +917,22 @@ impl WorkflowState {
         self.purchased_hype
     }
 
+    /// HYPE this workflow's own eligibility evidence records as having left
+    /// the account again (a sale or transfer that consumed part of its
+    /// residual allocation).
+    ///
+    /// Subtracted from what the workflow is credited with when inventory is
+    /// attributed (bot-strategy#929), so a recorded outflow does not leave
+    /// attribution permanently claiming HYPE the account no longer holds.
+    /// Only movements recorded before `StakingEligibilityRecorded` are ever
+    /// counted here — see the note on
+    /// [`Self::aggregate_terminal_residual_hype`] about post-completion
+    /// movements.
+    #[must_use]
+    pub const fn residual_consumed_by_movements_hype(&self) -> HypeAtoms {
+        self.residual_consumed_by_movements_hype
+    }
+
     #[must_use]
     pub const fn filled_usdc(&self) -> UsdcMicros {
         self.filled_usdc

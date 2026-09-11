@@ -2548,6 +2548,7 @@ fn bound_acquisition(
         workflow_id: format!("workflow:{}", decision.decision_id),
         journal: journal.to_path_buf(),
         credited_hype_atoms,
+        consumed_hype_atoms: 0,
         last_fill_at: (credited_hype_atoms > 0).then_some(recorded_at),
     }
 }
@@ -2774,6 +2775,7 @@ fn live_settlement_records_the_hype_it_bought_and_attributes_it() {
         workflow_id: "workflow-a".to_owned(),
         journal: journal.to_path_buf(),
         credited_hype_atoms: credited,
+        consumed_hype_atoms: 0,
         last_fill_at: Some(fill_at),
     };
 
@@ -2788,6 +2790,7 @@ fn live_settlement_records_the_hype_it_bought_and_attributes_it() {
                 workflow_id: "workflow-a".to_owned(),
                 journal: PathBuf::from("/elsewhere/2026-07-06.jsonl"),
                 credited_hype_atoms: credited,
+                consumed_hype_atoms: 0,
                 last_fill_at: Some(fill_at),
             },
             decision_at + TimeDelta::minutes(1),
@@ -2803,6 +2806,7 @@ fn live_settlement_records_the_hype_it_bought_and_attributes_it() {
                 workflow_id: "workflow-a".to_owned(),
                 journal: journal.to_path_buf(),
                 credited_hype_atoms: 0,
+                consumed_hype_atoms: 0,
                 last_fill_at: None,
             },
             decision_at + TimeDelta::minutes(1),
@@ -2878,6 +2882,7 @@ fn live_settlement_records_the_hype_it_bought_and_attributes_it() {
                 workflow_id: "workflow-a".to_owned(),
                 journal: journal.to_path_buf(),
                 credited_hype_atoms: credited + 1,
+                consumed_hype_atoms: 0,
                 last_fill_at: Some(fill_at),
             },
             settled_at,
@@ -2892,6 +2897,74 @@ fn live_settlement_records_the_hype_it_bought_and_attributes_it() {
     let reopened =
         SignerFreeRuntime::open(runtime_config, limits()).expect("reopen after settlement");
     assert_eq!(reopened.attributed_hype(), attributed);
+}
+
+#[test]
+fn recorded_outflow_is_netted_out_of_attributed_hype() {
+    // A workflow whose own eligibility evidence records HYPE leaving the
+    // account again must not keep claiming it: attribution reports what the
+    // bot still owns (bot-strategy#929).
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = start + TimeDelta::hours(1);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-approved", deposit_at, 100);
+    let admission = approvals("deposit-approved", deposit_at, deposit_at);
+    let signal = signal(decision_at);
+    let journal = Path::new("/var/lib/hype-accumulator/journals/2026-07-06.jsonl");
+
+    let mut runtime = SignerFreeRuntime::open(runtime_config, limits()).expect("open runtime");
+    let decision = live_planned_decision(
+        &mut runtime,
+        start,
+        decision_at,
+        &movement,
+        &admission,
+        &signal,
+    )
+    .decision()
+    .expect("planned decision")
+    .clone();
+    let filled = UsdcMicros::from_micros(decision.planned_usdc.as_micros() - 1_000);
+    bound_acquisition(&mut runtime, &decision, journal, decision_at, 30_000_000);
+
+    // Giving up more than was ever credited is incoherent evidence.
+    assert!(matches!(
+        runtime.settle_live_decision(
+            &LiveDecisionIdentity::of(&decision),
+            filled,
+            filled,
+            &LiveHypeAcquisition::Workflow {
+                workflow_id: "workflow-a".to_owned(),
+                journal: journal.to_path_buf(),
+                credited_hype_atoms: 30_000_000,
+                consumed_hype_atoms: 30_000_001,
+                last_fill_at: None,
+            },
+            decision_at + TimeDelta::minutes(1),
+        ),
+        Err(RuntimeError::InvalidHypeAcquisition(_))
+    ));
+
+    runtime
+        .settle_live_decision(
+            &LiveDecisionIdentity::of(&decision),
+            filled,
+            filled,
+            &LiveHypeAcquisition::Workflow {
+                workflow_id: "workflow-a".to_owned(),
+                journal: journal.to_path_buf(),
+                credited_hype_atoms: 30_000_000,
+                consumed_hype_atoms: 10_000_000,
+                last_fill_at: None,
+            },
+            decision_at + TimeDelta::minutes(2),
+        )
+        .expect("settle with a recorded outflow");
+    let attributed = runtime.attributed_hype();
+    assert_eq!(attributed.credited_hype_atoms, 20_000_000);
+    assert!(attributed.is_complete());
 }
 
 #[test]
@@ -3260,6 +3333,7 @@ fn journal_intent_is_recorded_before_the_journal_and_survives_reopen() {
                 workflow_id: format!("workflow:{}", decision.decision_id),
                 journal: journal.to_path_buf(),
                 credited_hype_atoms: 0,
+                consumed_hype_atoms: 0,
                 last_fill_at: None,
             },
             recorded_at + TimeDelta::minutes(1),

@@ -30,6 +30,16 @@ pub struct StakingObservation {
     pub delegation_rows_hype: f64,
 }
 
+/// Health reason reported when the workflow ledger claims more bot-owned HYPE
+/// than the account holds.
+///
+/// A shared constant because it is a *decision signal*, not only display
+/// text: a caller that can still act economically must stop doing so while it
+/// holds (bot-strategy#929), and matching on a duplicated literal would let
+/// the two drift apart.
+pub const ATTRIBUTION_EXCEEDS_HOLDINGS: &str =
+    "attributed HYPE exceeds observed account holdings; bot-owned HYPE has left the account";
+
 /// Authoritative accumulator-ledger attribution for account-level observations.
 ///
 /// Account balances and fills alone cannot distinguish accumulator activity
@@ -290,10 +300,7 @@ fn reconcile_status_with_balance_window(
                 // would overstate holdings, so report what the account
                 // demonstrably holds, which is also the tightest true upper
                 // bound on the bot-owned part, and say why the two disagree.
-                health_reasons.push(
-                    "attributed HYPE exceeds observed account holdings; bot-owned HYPE has left \
-                     the account",
-                );
+                health_reasons.push(ATTRIBUTION_EXCEEDS_HOLDINGS);
                 (observed_hype, *last_trade_at)
             } else {
                 if observed_hype - *hype > attribution_tolerance {
@@ -303,6 +310,20 @@ fn reconcile_status_with_balance_window(
             }
         }
     };
+    // A last-trade timestamp after the balance read is rejected by
+    // `AccumulatorStatus`, and now that a real journal-derived fill time is
+    // attributed (bot-strategy#929) a clock that steps backwards — an NTP
+    // correction, a restored backup — would make that rejection abort the
+    // whole observation and stop the status document being written at all.
+    // Same judgment as the divergence branch above: degrade loudly, keep
+    // publishing.
+    let last_trade_at = last_trade_at.filter(|value| {
+        let plausible = *value <= balance_observed_at;
+        if !plausible {
+            health_reasons.push("last attributed fill is after the balance observation; clock or history is inconsistent");
+        }
+        plausible
+    });
     let health_reason = (!health_reasons.is_empty()).then(|| health_reasons.join("; "));
     AccumulatorStatus::new_with_balance_window(
         balances.spot_usdc,

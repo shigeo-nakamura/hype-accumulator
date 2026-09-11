@@ -4,7 +4,7 @@ use hype_accumulator::{
     bootstrap,
     config::{Config, ProcessEnvironment},
     exchange::UnavailableLiveExchange,
-    monitor::{trade_cadence_label, HyperliquidObserver},
+    monitor::{trade_cadence_label, HyperliquidObserver, ATTRIBUTION_EXCEEDS_HOLDINGS},
     pacing::PacingLimits,
     runtime::{
         AdmissionApprovals, DecisionMode, RuntimeConfig, RuntimeCycleInput, SignerFreeRuntime,
@@ -14,7 +14,8 @@ use hype_accumulator::{
         build_snapshot, core_health_label, plan_snapshot, publish_snapshot,
         HyperliquidCoreSignalSource, PublishOutcome,
     },
-    status_io::mirror_status_to_s3,
+    status::DashboardStatus,
+    status_io::{mirror_status_to_s3, write_status_atomic},
 };
 use std::{
     env, fs,
@@ -257,6 +258,7 @@ async fn run_dry_run_cycle(
     security_policy_path: &Path,
     runtime_config_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let process_started_at = Utc::now();
     let config = load_config(config_path, Some(security_policy_path))?;
     config.validate_signer_free_runtime(&ProcessEnvironment)?;
     let limits = PacingLimits::from_config(&config)?;
@@ -292,6 +294,31 @@ async fn run_dry_run_cycle(
     let accumulator = observer
         .observe(&attribution, trade_cadence_label(&config.schedule))
         .await?;
+    // The ledger claims HYPE the account no longer holds. The observation is
+    // still published — the dashboard must show this, which is why
+    // `reconcile_status` degrades instead of erroring — but this process must
+    // not go on to commit another decision while bot-owned inventory is
+    // unaccounted for (bot-strategy#929: "fail closed on unexplained
+    // differences"). Before this attribution existed, the same condition
+    // aborted the cycle via an observation error; it must not become
+    // advisory just because the status document now survives it.
+    if accumulator
+        .health_reason()
+        .is_some_and(|reason| reason.contains(ATTRIBUTION_EXCEEDS_HOLDINGS))
+    {
+        let published =
+            DashboardStatus::new(Utc::now(), process_started_at, config.dry_run, accumulator);
+        write_status_atomic(&status_path, &published)?;
+        if let Ok(body) = fs::read_to_string(&status_path) {
+            mirror_status_to_s3(&status_path, body).await;
+        }
+        return Err(format!(
+            "halting this cycle: {ATTRIBUTION_EXCEEDS_HOLDINGS}. The status document was \
+             published; no decision was made. Reconcile the account's HYPE against the \
+             workflow journals before the next cycle."
+        )
+        .into());
+    }
     let observed_at = Utc::now();
     let scan_end_ms = u64::try_from(observed_at.timestamp_millis())?;
     let scan_start_ms = runtime.next_scan_start_ms();
