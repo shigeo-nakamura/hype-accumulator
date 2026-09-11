@@ -11,7 +11,7 @@
 //! never call `submit` again for the same prepared workflow.
 
 use crate::{
-    hype_asset::HYPE_SPOT_MARKET,
+    hype_asset::{verify_hype_usdc_order_grid, OrderGridMismatch, HYPE_SPOT_MARKET},
     pacing::UsdcMicros,
     workflow::{
         AuthenticatedOrderSubmission, ConclusiveAbsenceEvidence, DecisionBinding,
@@ -169,6 +169,10 @@ pub enum LiveProbeError {
     InvalidFeeCeiling,
     #[error("venue-reported order quantity does not match the authorized envelope")]
     QuantityMismatch,
+    #[error("venue order grid does not match this build's bound market metadata: {0}")]
+    OrderGrid(#[from] OrderGridMismatch),
+    #[error("prepared order is not on the venue's current order grid: {0}")]
+    OffGrid(&'static str),
     #[error("a durably observed fill contradicts a previously recorded observation of it: {0}")]
     ContradictoryFillEvidence(String),
     #[error("could not read or write the durable observed-fills record: {0}")]
@@ -286,6 +290,15 @@ impl HyperliquidLiveProbe {
         let action = workflow.pending_prepared_order()?;
         let prepared =
             PreparedIocOrder::from_action(action, &self.binding, self.max_purchase_fee_bps, now)?;
+        // The prepared quantity and price were derived on the venue grid at
+        // prepare time (`order_envelope.rs`); re-check against the venue's
+        // *current* grid right before signing, so the connector's own
+        // normalization is a no-op and the venue accepts exactly what was
+        // authorized — never a silently re-rounded quantity or price
+        // (bot-strategy#991).
+        let grid = self.connector.spot_order_grid(&prepared.symbol).await?;
+        verify_hype_usdc_order_grid(&grid)?;
+        verify_prepared_order_on_grid(&prepared, &grid)?;
         let response = self
             .connector
             .create_spot_ioc_order_with_envelope(
@@ -824,6 +837,12 @@ fn truncate_to_millis(at: DateTime<Utc>) -> DateTime<Utc> {
 /// never be able to enlarge it. Zero does not describe a submitted order.
 /// Spend stays bounded independently by the envelope's `max_debit_usdc`,
 /// and recorded fill totals come from the fills themselves.
+///
+/// Since bot-strategy#991 the envelope derives its quantity on the venue
+/// lot and `submit` refuses to sign anything off-grid, so for a new
+/// binding the venue's `origSz` equals the authorized quantity; the
+/// "rounded down" tolerance stays as defence in depth (and for bindings
+/// prepared before that change), never as the mechanism a fill relies on.
 fn verify_observed_quantity(
     evidence: &HyperliquidOrderReconciliation,
     binding: &DecisionBinding,
@@ -1057,11 +1076,37 @@ fn verify_observed_order_envelope(
     // authorized and still fails closed, which is the property this check
     // exists for. A non-positive price does not describe a real order.
     // Order identity itself comes from the CLOID check above, not from the
-    // price. Deriving the price on the venue's grid up front, so intent
-    // matches what the venue accepts, is bot-strategy#991.
+    // price. Since bot-strategy#991 the envelope derives the price on the
+    // venue's grid up front and `submit` refuses an off-grid price, so a
+    // new binding's venue price equals the authorized one; the ceiling
+    // tolerance stays as defence in depth, not as the mechanism relied on.
     match limit_price {
         Some(price) if price > Decimal::ZERO && price <= expected_limit_price_usdc_per_hype => {}
         _ => return Err(LiveProbeError::BindingMismatch("order limit price")),
+    }
+    Ok(())
+}
+
+/// A prepared buy is on the venue grid when its quantity is already on the
+/// size lot and its limit price already on the price tick: both are then
+/// fixed points of the connector's order-path normalization
+/// (`HyperliquidSpotOrderGrid::floor_size` / `normalize_price`), so what is
+/// signed is what the venue accepts. Anything else is refused before
+/// signing: the venue would round it, and the recorded authorization would
+/// no longer describe the order.
+fn verify_prepared_order_on_grid(
+    prepared: &PreparedIocOrder,
+    grid: &dex_connector::HyperliquidSpotOrderGrid,
+) -> Result<(), LiveProbeError> {
+    if grid.floor_size(prepared.quantity) != prepared.quantity {
+        return Err(LiveProbeError::OffGrid(
+            "quantity is finer than the venue size lot",
+        ));
+    }
+    if grid.normalize_price(prepared.limit_price, OrderSide::Long) != prepared.limit_price {
+        return Err(LiveProbeError::OffGrid(
+            "limit price is finer than the venue price tick",
+        ));
     }
     Ok(())
 }
@@ -1711,6 +1756,49 @@ mod tests {
         assert_eq!(prepared.limit_price, Decimal::from(25));
         assert_eq!(prepared.nonce, 1_700_000_000_123);
         assert_eq!(prepared.expires_after_ms, 30_000);
+    }
+
+    #[test]
+    fn prepared_order_must_sit_on_the_venue_grid_before_signing() {
+        let grid = dex_connector::HyperliquidSpotOrderGrid {
+            pair: "HYPE/USDC".to_string(),
+            coin: "@107".to_string(),
+            asset: 10_107,
+            size_decimals: 2,
+            base_wei_decimals: 8,
+        };
+        let on_grid = PreparedIocOrder::from_action(&order(), &binding(), 0, at(1)).unwrap();
+        assert!(verify_prepared_order_on_grid(&on_grid, &grid).is_ok());
+        // The exact shape of the first real fill's envelope (bot-strategy#845
+        // blocker 10/12): a wei-fine quantity and a micro-fine price that
+        // the venue would silently round are refused before signing.
+        let wei_fine = PreparedIocOrder {
+            quantity: Decimal::from_str("0.30798790").unwrap(),
+            ..on_grid.clone()
+        };
+        assert!(matches!(
+            verify_prepared_order_on_grid(&wei_fine, &grid),
+            Err(LiveProbeError::OffGrid(
+                "quantity is finer than the venue size lot"
+            ))
+        ));
+        let micro_fine = PreparedIocOrder {
+            limit_price: Decimal::from_str("81.172020").unwrap(),
+            ..on_grid.clone()
+        };
+        assert!(matches!(
+            verify_prepared_order_on_grid(&micro_fine, &grid),
+            Err(LiveProbeError::OffGrid(
+                "limit price is finer than the venue price tick"
+            ))
+        ));
+        // Trailing zeros are not "finer": 0.30000000 at 81.172000 is on grid.
+        let trailing_zeros = PreparedIocOrder {
+            quantity: Decimal::from_str("0.30000000").unwrap(),
+            limit_price: Decimal::from_str("81.172000").unwrap(),
+            ..on_grid
+        };
+        assert!(verify_prepared_order_on_grid(&trailing_zeros, &grid).is_ok());
     }
 
     #[test]
