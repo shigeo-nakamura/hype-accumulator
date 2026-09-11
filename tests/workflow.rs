@@ -6,6 +6,7 @@ use hype_accumulator::workflow::{
 };
 use hype_accumulator::{
     pacing::{DailyDecision, DecisionAllocation, DecisionReason, PacingExplanation, UsdcMicros},
+    runtime::LiveHypeAcquisition,
     workflow::{
         ActionKind, AppendOutcome, AuthenticatedOrderSubmission, AuthorizationInputFreshness,
         BoundFillEvidence, BoundMovementEvidence, ConclusiveAbsenceEvidence, DecisionBinding,
@@ -552,6 +553,57 @@ fn accepted_workflow(path: &Path) -> DurableWorkflow {
     ready(workflow.prepare_order(at(1)).expect("order prepared"));
     observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
     workflow
+}
+
+#[test]
+fn acquisition_evidence_needs_durable_finality_not_completion() {
+    // bot-strategy#929: the settlement path and the attribution backfill
+    // shape a workflow's inventory evidence through one constructor, whose
+    // only gate is durable finality. Filled-but-not-finalized is refused — a
+    // journal restored from backup without its finalization still admits new
+    // fills — while `OrderFinalized` is accepted without waiting for
+    // `Complete`, which needs an attestation an expired acknowledgement
+    // withholds.
+    let temp = tempfile::tempdir().expect("temp directory");
+    let path = temp.path().join("finality.jsonl");
+    let mut workflow = accepted_workflow(&path);
+    workflow
+        .observe_order_fill(
+            "fill-observation",
+            hype(250),
+            hype(249),
+            usdc(50_000_000),
+            usdc(50_000_000),
+            true,
+            at(3),
+        )
+        .expect("fill observed");
+    assert!(!workflow.state().stage().is_order_finalized());
+    assert!(LiveHypeAcquisition::from_finalized_workflow(workflow.state(), &path).is_err());
+
+    workflow
+        .finalize_order(
+            hype(250),
+            hype(249),
+            usdc(50_000_000),
+            usdc(50_000_000),
+            OrderFinality::Filled,
+            at(4),
+        )
+        .expect("order finalized");
+    assert!(workflow.state().stage().is_order_finalized());
+    let acquisition = LiveHypeAcquisition::from_finalized_workflow(workflow.state(), &path)
+        .expect("finalized evidence");
+    assert_eq!(
+        acquisition,
+        LiveHypeAcquisition::Workflow {
+            workflow_id: workflow.state().workflow_id().to_owned(),
+            journal: path.clone(),
+            // Credited, never matched.
+            credited_hype_atoms: hype(249).as_atoms(),
+            last_fill_at: workflow.state().last_fill_at(),
+        }
+    );
 }
 
 #[test]

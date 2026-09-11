@@ -399,6 +399,31 @@ pub enum WorkflowStage {
     ManualReview,
 }
 
+impl WorkflowStage {
+    /// Whether the order this workflow placed has reached durable finality:
+    /// its fills can no longer change, so its filled/debited USDC and its
+    /// credited HYPE are the figures a settlement — and any evidence read from
+    /// the journal afterwards — may rely on. Everything from `OrderFinalized`
+    /// through `Complete`; never `ManualReview`, and never a stage at which a
+    /// restored journal could still be missing its finalization.
+    ///
+    /// The single definition behind settlement's `durable_finality` and the
+    /// attribution backfill's gate (bot-strategy#929).
+    #[must_use]
+    pub const fn is_order_finalized(self) -> bool {
+        matches!(
+            self,
+            Self::OrderFinalized
+                | Self::StakingEligibilityRecorded
+                | Self::StakingDepositSubmitted
+                | Self::StakingBalanceConfirmed
+                | Self::DelegationSubmitted
+                | Self::DelegatedConfirmed
+                | Self::Complete
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionKind {
@@ -2128,16 +2153,7 @@ impl WorkflowState {
     }
 
     fn order_is_terminal(&self) -> bool {
-        matches!(
-            self.stage,
-            WorkflowStage::OrderFinalized
-                | WorkflowStage::StakingEligibilityRecorded
-                | WorkflowStage::StakingDepositSubmitted
-                | WorkflowStage::StakingBalanceConfirmed
-                | WorkflowStage::DelegationSubmitted
-                | WorkflowStage::DelegatedConfirmed
-                | WorkflowStage::Complete
-        )
+        self.stage.is_order_finalized()
     }
 
     #[allow(clippy::too_many_lines)]

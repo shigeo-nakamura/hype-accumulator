@@ -936,7 +936,7 @@ async fn prepare(
         decision_mode: decision_mode_for(&config, live_history_directory),
     };
 
-    let (protected_head_store, owner_store) = build_stores(journal_path)?;
+    let (protected_head_store, owner_store) = build_stores(Path::new(journal_path))?;
     let journal = PathBuf::from(journal_path);
 
     // `signal_evidence_valid_through_at` is not `policy_acknowledgement_valid_through_at`
@@ -1034,7 +1034,7 @@ async fn submit(
 
     let binding = DurableWorkflow::peek_committed_binding(journal_path)?
         .ok_or("no prepared order found at this journal path; run `prepare` first")?;
-    let (protected_head_store, owner_store) = build_stores(journal_path)?;
+    let (protected_head_store, owner_store) = build_stores(Path::new(journal_path))?;
     let mut workflow =
         DurableWorkflow::open_or_create(journal_path, &binding, protected_head_store, owner_store)?;
     let action = workflow.pending_prepared_order()?;
@@ -1205,12 +1205,8 @@ fn settle_finalized_decision(
         // frozen terminal state the cash figures come from: HYPE actually
         // credited (net of a HYPE-denominated fee), never matched
         // (bot-strategy#929/#998).
-        let acquisition = LiveHypeAcquisition::Workflow {
-            workflow_id: state.workflow_id().to_owned(),
-            journal: workflow.journal_path().to_path_buf(),
-            credited_hype_atoms: state.purchased_hype().as_atoms(),
-            last_fill_at: state.last_fill_at(),
-        };
+        let acquisition =
+            LiveHypeAcquisition::from_finalized_workflow(state, workflow.journal_path())?;
         let outcome = runtime.settle_live_decision(
             &identity,
             filled_usdc,
@@ -1314,32 +1310,24 @@ fn release(
     runtime_config_path: &str,
     operational_params_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let config = load_config(config_path, security_policy_path)?;
-    let operational = OperationalParams::from_toml(&fs::read_to_string(operational_params_path)?)?;
-    let history_directory = operational
-        .history_directory
-        .as_deref()
-        .ok_or("operational.toml is missing history_directory, required by `release`")?;
-    // Same write-once binding `prepare` enforces: the directory scanned below
-    // must be the one every prepare for this operational config wrote to.
-    let history_binding =
-        HistoryDirectoryBinding::check(operational_params_path, history_directory)?;
-    if history_binding.initialization == HistoryInitialization::FirstEver {
-        return Err(
-            "history_directory was never initialized for this operational config; no \
-                    prepare ever ran through it, so nothing it produced can be released here"
-                .into(),
-        );
-    }
-    let journal_directory = PathBuf::from(history_directory);
-    ensure_history_directory_available(history_binding.initialization, &journal_directory)?;
-
     // The exclusive runtime lock is taken BEFORE the journal scan and held
     // through settlement: `prepare` opens the runtime before it creates its
     // journal, so while this process holds the lock no new journal can
     // appear, and the scan below cannot go stale between reading the
     // directory and releasing a decision.
-    let mut runtime = open_signer_free_runtime(&config, runtime_config_path)?;
+    let BoundSignerFreeRuntime {
+        config,
+        operational,
+        journal_directory,
+        history_binding,
+        mut runtime,
+    } = open_bound_signer_free_runtime(
+        config_path,
+        security_policy_path,
+        runtime_config_path,
+        operational_params_path,
+        "release",
+    )?;
     let unsettled = runtime.unsettled_planned_decisions();
     if unsettled.is_empty() {
         println!("mode=nothing-to-release");
@@ -1349,27 +1337,11 @@ fn release(
     // decisions were prepared into. Scanning any other directory — a renamed
     // or copied operational config binds a fresh, empty namespace — would
     // "prove" absence of a journal that exists elsewhere.
-    let bound_history_directory = fs::canonicalize(&journal_directory)?;
-    match runtime.live_history_directory() {
-        Some(recorded) if recorded == bound_history_directory => {}
-        Some(recorded) => {
-            return Err(format!(
-                "this runtime's live decisions were prepared into {} but this operational \
-                 config binds {}; refusing to treat absence from the wrong directory as proof \
-                 of non-submission",
-                recorded.display(),
-                bound_history_directory.display()
-            )
-            .into());
-        }
-        None => {
-            return Err(
-                "this runtime never recorded a live history directory, so its \
-                        unsettled decision cannot be proven unbound from here"
-                    .into(),
-            );
-        }
-    }
+    let _bound_history_directory = ensure_runtime_prepared_into(
+        &runtime,
+        &journal_directory,
+        "treat absence from the wrong directory as proof of non-submission",
+    )?;
     // Same protected-history verification `prepare`'s aggregation applies:
     // symlinks, orphaned protected heads, rolled-back/truncated/empty
     // journals and duplicate bindings all fail closed, and every journal must
@@ -1440,115 +1412,175 @@ fn release(
 /// runtime recorded inventory (bot-strategy#929).
 ///
 /// Signer-free and economically inert: it commits no capital, prepares no
-/// order, and touches no venue. It reads each decision's own journal —
-/// verified exactly the way `prepare`'s aggregation verifies history, through
-/// the journal's independently protected head and the same network/routing
-/// admissibility check — and writes only what that journal proves.
-///
-/// Root-run by necessity: `*.protected-head.json` is owner-only, so the
-/// read-only observer cannot verify a journal itself. That is precisely why
-/// attribution is a durable record in the runtime rather than something the
-/// observer recomputes.
-///
-/// Every figure is cross-checked against the settlement that already
-/// happened: the journal must be terminal, bound to this very decision, and
-/// hold exactly the filled and debited USDC the decision settled with.
-/// Anything else fails closed rather than attributing a number that the
-/// capital ledger would not recognise.
+/// order, and touches no venue. Each decision's own journal is opened the way
+/// `reconcile` opens it and read under its append lock; the gates, the
+/// required user, and the expected output are in
+/// `docs/runbooks/live-probe-recovery.md` ("Backfilling attribution").
 fn backfill_attribution(
     config_path: &str,
     security_policy_path: &str,
     runtime_config_path: &str,
     operational_params_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let config = load_config(config_path, security_policy_path)?;
-    let operational = OperationalParams::from_toml(&fs::read_to_string(operational_params_path)?)?;
-    let history_directory = operational.history_directory.as_deref().ok_or(
-        "operational.toml is missing history_directory, required by `backfill-attribution`",
+    let BoundSignerFreeRuntime {
+        config,
+        operational,
+        journal_directory,
+        history_binding: _,
+        mut runtime,
+    } = open_bound_signer_free_runtime(
+        config_path,
+        security_policy_path,
+        runtime_config_path,
+        operational_params_path,
+        "backfill-attribution",
     )?;
-    let history_binding =
-        HistoryDirectoryBinding::check(operational_params_path, history_directory)?;
-    if history_binding.initialization == HistoryInitialization::FirstEver {
-        return Err(
-            "history_directory was never initialized for this operational config; \
-                    no prepare ever ran through it, so it holds no evidence to backfill from"
-                .into(),
-        );
-    }
-    let journal_directory = PathBuf::from(history_directory);
-    ensure_history_directory_available(history_binding.initialization, &journal_directory)?;
-
-    let mut runtime = open_signer_free_runtime(&config, runtime_config_path)?;
-    let before = runtime.attributed_hype();
-    if before.is_complete() {
+    // One predicate drives the work list, the early exit and the exit code:
+    // the set of settled purchases with no acquisition row.
+    let missing = runtime.settled_purchases_without_acquisition();
+    if missing.is_empty() {
+        let attributed = runtime.attributed_hype();
         println!(
             "mode=nothing-to-backfill attributed_hype_atoms={} settled_purchases={}",
-            before.credited_hype_atoms, before.settled_purchases_with_evidence
+            attributed.credited_hype_atoms, attributed.settled_purchases_with_evidence
         );
         return Ok(());
     }
-
-    // The runtime's own write-once record of where its live decisions were
-    // prepared. Reading evidence out of any other directory would attribute
-    // one account's history to another (`release` refuses for the same
-    // reason).
-    let bound_history_directory = fs::canonicalize(&journal_directory)?;
-    match runtime.live_history_directory() {
-        Some(recorded) if recorded == bound_history_directory => {}
-        Some(recorded) => {
-            return Err(format!(
-                "this runtime's live decisions were prepared into {} but this operational \
-                 config binds {}; refusing to attribute evidence from the wrong directory",
-                recorded.display(),
-                bound_history_directory.display()
-            )
-            .into());
-        }
-        None => {
-            return Err(
-                "this runtime never recorded a live history directory, so it has no \
-                        journals of its own to attribute"
-                    .into(),
-            );
-        }
-    }
+    // Reading evidence out of any other directory would attribute one
+    // account's history to another.
+    let bound_history_directory = ensure_runtime_prepared_into(
+        &runtime,
+        &journal_directory,
+        "attribute evidence from the wrong directory",
+    )?;
     let prepare_time_binding = PrepareTimeBinding::resolved(&config, &operational)?;
     let network_routing_admissible = network_routing_admissible_for(&prepare_time_binding);
+    // From the connector's canonical form of the account, never the raw
+    // configured value: every journal's identity was hashed from the former,
+    // and a checksummed address in the environment hashes differently.
+    let observer = HyperliquidObserver::new(
+        &config.hyperliquid.endpoint,
+        &config.observation_account(&ProcessEnvironment)?,
+    )?;
+    let expected_execution_identity = execution_identity_hash_for(observer.execution_account()?);
+    let recorded_at = Utc::now();
 
-    let expected_execution_identity =
-        execution_identity_hash_for(&config.observation_account(&ProcessEnvironment)?);
-
-    for decision in runtime.settled_purchases_without_acquisition() {
-        backfill_one_decision(
+    // Every decision is attempted: each is verified against its own journal
+    // and committed on its own, so one permanently refused journal must not
+    // stop the others from being recorded. All failures are reported.
+    let mut failures = Vec::new();
+    for decision in &missing {
+        if let Err(error) = backfill_one_decision(
             &mut runtime,
-            &decision,
+            decision,
+            &bound_history_directory,
             &expected_execution_identity,
             &network_routing_admissible,
-        )?;
+            recorded_at,
+        ) {
+            eprintln!("decision {}: {error}", decision.decision_id);
+            failures.push(decision.decision_id.clone());
+        }
     }
 
     let after = runtime.attributed_hype();
+    let still_missing = runtime.settled_purchases_without_acquisition();
     println!(
         "mode=backfill-complete attributed_hype_atoms={} settled_purchases={} missing={} \
          complete={}",
         after.credited_hype_atoms,
         after.settled_purchases_with_evidence,
-        after.settled_purchases_without_evidence,
-        after.is_complete()
+        still_missing.len(),
+        still_missing.is_empty()
     );
-    // Attribution is still withheld unless every settled purchase has its
-    // evidence, so a run that leaves any behind must not report success: a
-    // caller chaining on this command would otherwise believe the dashboard
-    // was fixed.
-    if !after.is_complete() {
+    // Attribution is withheld unless every settled purchase has its evidence,
+    // so a run that leaves any behind must not report success: a caller
+    // chaining on this command would otherwise believe the dashboard was
+    // fixed.
+    if !failures.is_empty() {
         return Err(format!(
-            "{} settled purchase(s) still have no acquisition evidence; attribution stays \
-             unavailable",
-            after.settled_purchases_without_evidence
+            "{} settled purchase(s) could not be attributed ({}); attribution stays unavailable \
+             until each is resolved",
+            failures.len(),
+            failures.join(", ")
         )
         .into());
     }
     Ok(())
+}
+
+/// What every signer-free, directory-bound command starts from.
+struct BoundSignerFreeRuntime {
+    config: Config,
+    operational: OperationalParams,
+    journal_directory: PathBuf,
+    history_binding: HistoryBindingState,
+    runtime: SignerFreeRuntime,
+}
+
+/// The preamble `release` and `backfill-attribution` share: the operational
+/// config's write-once `history_directory` binding, the directory's
+/// availability, and the exclusive runtime lock — in that order, so the two
+/// commands cannot diverge on which directory they trust.
+fn open_bound_signer_free_runtime(
+    config_path: &str,
+    security_policy_path: &str,
+    runtime_config_path: &str,
+    operational_params_path: &str,
+    command: &str,
+) -> Result<BoundSignerFreeRuntime, Box<dyn std::error::Error>> {
+    let config = load_config(config_path, security_policy_path)?;
+    let operational = OperationalParams::from_toml(&fs::read_to_string(operational_params_path)?)?;
+    let history_directory = operational.history_directory.as_deref().ok_or_else(|| {
+        format!("operational.toml is missing history_directory, required by `{command}`")
+    })?;
+    // Same write-once binding `prepare` enforces: the directory read below
+    // must be the one every prepare for this operational config wrote to.
+    let history_binding =
+        HistoryDirectoryBinding::check(operational_params_path, history_directory)?;
+    if history_binding.initialization == HistoryInitialization::FirstEver {
+        return Err(format!(
+            "history_directory was never initialized for this operational config; no prepare \
+             ever ran through it, so there is nothing for `{command}` to work from"
+        )
+        .into());
+    }
+    let journal_directory = PathBuf::from(history_directory);
+    ensure_history_directory_available(history_binding.initialization, &journal_directory)?;
+    let runtime = open_signer_free_runtime(&config, runtime_config_path)?;
+    Ok(BoundSignerFreeRuntime {
+        config,
+        operational,
+        journal_directory,
+        history_binding,
+        runtime,
+    })
+}
+
+/// Refuses to proceed unless `journal_directory` is the directory this
+/// runtime's live decisions were prepared into (hash-chained, write-once).
+/// `refused_action` completes "refusing to …" in the error.
+fn ensure_runtime_prepared_into(
+    runtime: &SignerFreeRuntime,
+    journal_directory: &Path,
+    refused_action: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let bound_history_directory = fs::canonicalize(journal_directory)?;
+    match runtime.live_history_directory() {
+        Some(recorded) if recorded == bound_history_directory => Ok(bound_history_directory),
+        Some(recorded) => Err(format!(
+            "this runtime's live decisions were prepared into {} but this operational config \
+             binds {}; refusing to {refused_action}",
+            recorded.display(),
+            bound_history_directory.display()
+        )
+        .into()),
+        None => Err(format!(
+            "this runtime never recorded a live history directory, so it has no journals of \
+             its own; refusing to {refused_action}"
+        )
+        .into()),
+    }
 }
 
 /// Reads one settled purchase's journal and commits its acquisition
@@ -1556,46 +1588,61 @@ fn backfill_attribution(
 fn backfill_one_decision(
     runtime: &mut SignerFreeRuntime,
     decision: &DailyDecision,
+    bound_history_directory: &Path,
     expected_execution_identity: &str,
     network_routing_admissible: &impl Fn(&Path) -> Result<(), WorkflowError>,
+    recorded_at: DateTime<Utc>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let decision_id = decision.decision_id.clone();
-    let identity = LiveDecisionIdentity::of(decision);
+    let decision_id = decision.decision_id.as_str();
     let journal = runtime
-        .live_journal_intent(&decision_id)
-        .ok_or_else(|| {
-            format!(
-                "decision {decision_id} settled a purchase but this runtime never recorded \
-                 a journal for it; there is no evidence to attribute it from"
-            )
-        })?
+        .live_journal_intent(decision_id)
+        .ok_or(
+            "settled a purchase but this runtime never recorded a journal for it; there is no \
+             evidence to attribute it from",
+        )?
         .to_path_buf();
     // A journal this runtime declared but that is no longer there is lost
     // history, not an empty journal: the operator needs the restore path
     // (bot-strategy#944), not a "crashed before its first append" story.
-    if !journal.exists() {
+    // Only a genuine absence is that; an unreadable journal (wrong user,
+    // root-owned after an earlier incident) is its own error.
+    if let Err(error) = fs::metadata(&journal) {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Err(format!(
+                "declared journal {} is missing; recorded history is incomplete — restore it \
+                 from backup (bot-strategy#944) before attributing anything",
+                journal.display()
+            )
+            .into());
+        }
+        return Err(format!("journal {}: {error}", journal.display()).into());
+    }
+    // The intent is stored as `prepare` spelled it, which may be relative;
+    // resolved from this process's working directory it must still land in
+    // the directory the runtime bound, or the evidence is being read from
+    // somewhere the runtime never wrote to.
+    let resolved = fs::canonicalize(&journal)?;
+    if resolved.parent() != Some(bound_history_directory) {
         return Err(format!(
-            "decision {decision_id} declared journal {} but it is missing; recorded history \
-             is incomplete — restore it from backup (bot-strategy#944) before attributing \
-             anything",
-            journal.display()
+            "declared journal {} resolves to {}, outside the bound history directory {}; \
+             refusing to read evidence from a directory the runtime never prepared into",
+            journal.display(),
+            resolved.display(),
+            bound_history_directory.display()
         )
         .into());
     }
     network_routing_admissible(&journal).map_err(box_error)?;
-    let journal_path = journal
-        .to_str()
-        .ok_or_else(|| format!("journal path {} is not valid UTF-8", journal.display()))?;
     let binding = DurableWorkflow::peek_committed_binding(&journal)?.ok_or_else(|| {
         format!(
-            "journal {} for decision {decision_id} has no committed binding; its outcome is \
-             unknown and must not be attributed",
+            "journal {} has no committed binding; its outcome is unknown and must not be \
+             attributed",
             journal.display()
         )
     })?;
-    let (protected_head_store, owner_store) = build_stores(journal_path)?;
+    let (protected_head_store, owner_store) = build_stores(&journal)?;
     let workflow =
-        DurableWorkflow::open_or_create(journal_path, &binding, protected_head_store, owner_store)?;
+        DurableWorkflow::open_or_create(&journal, &binding, protected_head_store, owner_store)?;
     // Reads the evidence and commits it under the journal's own append
     // lock, exactly as `settle_finalized_decision` does: a concurrent
     // `reconcile` appending late contradictory evidence (moving the
@@ -1604,17 +1651,20 @@ fn backfill_one_decision(
     workflow.with_frozen_state(|state| -> Result<(), Box<dyn std::error::Error>> {
         let acquisition =
             verified_attribution_evidence(decision, &journal, state, expected_execution_identity)?;
-        let outcome = runtime.backfill_hype_acquisition(&identity, &acquisition, Utc::now())?;
+        // The journal's own view of which decision it serves, so the runtime's
+        // field-by-field `mismatch_against` does the decision check and names
+        // the disagreeing field — the same shape `settle_finalized_decision`
+        // uses, rather than a second, weaker comparison here.
+        let identity = bound_decision_identity(state.binding());
+        runtime.backfill_hype_acquisition(&identity, &acquisition, recorded_at)?;
         println!(
-            "mode=backfilled decision={decision_id} workflow={} \
-             credited_hype_atoms={} journal={} outcome={outcome:?}",
+            "mode=backfilled decision={decision_id} workflow={} credited_hype_atoms={} journal={}",
             state.workflow_id(),
             state.purchased_hype().as_atoms(),
             journal.display()
         );
         Ok(())
-    })?;
-    Ok(())
+    })
 }
 
 /// Shapes the acquisition evidence one settled decision's journal proves, or
@@ -1622,16 +1672,18 @@ fn backfill_one_decision(
 ///
 /// `state` is the journal's state read under its own append lock by the
 /// caller, so nothing can append between this verification and the commit
-/// that follows it. Cross-checked against the settlement that already
-/// happened, so a journal can never attribute inventory the capital ledger
-/// does not agree with.
+/// that follows it. Two gates are this path's own — the journal must belong
+/// to the configured execution account, and its cash figures must be exactly
+/// what the decision settled with — and the shared one, durable finality,
+/// lives in [`LiveHypeAcquisition::from_finalized_workflow`]. Which decision
+/// the journal serves is checked by the runtime against the journal's own
+/// binding, not here.
 fn verified_attribution_evidence(
     decision: &DailyDecision,
     journal: &Path,
     state: &WorkflowState,
     expected_execution_identity: &str,
 ) -> Result<LiveHypeAcquisition, Box<dyn std::error::Error>> {
-    let decision_id = decision.decision_id.as_str();
     // The one check the network/routing predicate cannot make: that predicate
     // compares network and vault-routing *mode*, so a different account on
     // the same network passes it. `aggregate_terminal_residual_hype` refuses
@@ -1645,31 +1697,11 @@ fn verified_attribution_evidence(
         )
         .into());
     }
-    // Deliberately not a `Complete`-only gate: a real purchase settles from
-    // `OrderFinalized` onward (`durable_finality`), and reaching `Complete`
-    // additionally needs the staking-disabled attestation, which is withheld
-    // while the policy acknowledgement is expired. Requiring `Complete` would
-    // block the migration on exactly the hosts that need it. What must be
-    // refused is contested evidence.
-    if state.stage() == WorkflowStage::ManualReview {
-        return Err(format!(
-            "journal {} for decision {decision_id} is in ManualReview (contradictory late venue \
-             evidence); resolve the review before attributing its inventory",
-            journal.display()
-        )
-        .into());
-    }
-    if bound_decision_identity(state.binding()) != LiveDecisionIdentity::of(decision) {
-        return Err(format!(
-            "journal {} is bound to a different decision than {decision_id}",
-            journal.display()
-        )
-        .into());
-    }
+    let acquisition = LiveHypeAcquisition::from_finalized_workflow(state, journal)?;
     if state.filled_usdc() != decision.filled_usdc || state.debited_usdc() != decision.debited_usdc
     {
         return Err(format!(
-            "journal {} holds filled={} debited={} but decision {decision_id} settled filled={} \
+            "journal {} holds filled={} debited={} but the decision settled filled={} \
              debited={}; refusing to attribute inventory the capital ledger does not agree with",
             journal.display(),
             state.filled_usdc().as_micros(),
@@ -1679,12 +1711,7 @@ fn verified_attribution_evidence(
         )
         .into());
     }
-    Ok(LiveHypeAcquisition::Workflow {
-        workflow_id: state.workflow_id().to_owned(),
-        journal: journal.to_path_buf(),
-        credited_hype_atoms: state.purchased_hype().as_atoms(),
-        last_fill_at: state.last_fill_at(),
-    })
+    Ok(acquisition)
 }
 
 fn print_observation(
@@ -1713,7 +1740,7 @@ async fn reconcile(
     )?;
     let binding = DurableWorkflow::peek_committed_binding(journal_path)?
         .ok_or("no committed workflow; reconciliation never prepares a new order")?;
-    let (protected_head_store, owner_store) = build_stores(journal_path)?;
+    let (protected_head_store, owner_store) = build_stores(Path::new(journal_path))?;
     let mut workflow =
         DurableWorkflow::open_or_create(journal_path, &binding, protected_head_store, owner_store)?;
     // Deliberately do not validate live approval or load/decrypt the signer.
@@ -1809,15 +1836,15 @@ type WorkflowStores = (
     Arc<dyn ExchangeOrderOwnerStore>,
 );
 
-fn build_stores(journal_path: &str) -> Result<WorkflowStores, Box<dyn std::error::Error>> {
-    let head_path = DurableWorkflow::protected_head_path_for(Path::new(journal_path));
+fn build_stores(journal_path: &Path) -> Result<WorkflowStores, Box<dyn std::error::Error>> {
+    let head_path = DurableWorkflow::protected_head_path_for(journal_path);
     let protected_head_store: Arc<dyn ProtectedWorkflowHeadStore> =
         Arc::new(FileProtectedWorkflowHeadStore::new(head_path)?);
     // Deliberately outside the per-journal path: this store must be shared
     // across every workflow for this execution identity, never scoped to
     // one decision's journal (see `FileExchangeOrderOwnerStore`'s doc
     // comment and bot-strategy#845 PR #28's review note on this exact risk).
-    let owner_store_path = PathBuf::from(journal_path)
+    let owner_store_path = journal_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("exchange-order-owners.json");
