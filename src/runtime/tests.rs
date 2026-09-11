@@ -2529,6 +2529,29 @@ fn live_cycle_leaves_the_planned_decision_committed_and_unsettled() {
     );
 }
 
+/// Records `decision`'s journal intent (a live settlement may only be
+/// evidenced by the journal its decision was bound to) and returns the
+/// acquisition evidence a settlement crediting `credited_hype_atoms` must
+/// quote.
+#[allow(clippy::needless_pass_by_value)]
+fn bound_acquisition(
+    runtime: &mut SignerFreeRuntime,
+    decision: &DailyDecision,
+    journal: &Path,
+    recorded_at: DateTime<Utc>,
+    credited_hype_atoms: u64,
+) -> LiveHypeAcquisition {
+    runtime
+        .record_live_journal_intent(&LiveDecisionIdentity::of(decision), journal, recorded_at)
+        .expect("record journal intent");
+    LiveHypeAcquisition::Workflow {
+        workflow_id: format!("workflow:{}", decision.decision_id),
+        journal: journal.to_path_buf(),
+        credited_hype_atoms,
+        last_fill_at: (credited_hype_atoms > 0).then_some(recorded_at),
+    }
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn live_settlement_converts_the_commitment_to_spend_exactly_once() {
@@ -2564,6 +2587,8 @@ fn live_settlement_converts_the_commitment_to_spend_exactly_once() {
     let filled = UsdcMicros::from_micros(planned - 10_000);
     let debited = UsdcMicros::from_micros(planned - 5_000);
     assert!(debited > filled && debited <= decision.committed_usdc);
+    let journal = Path::new("/var/lib/hype-accumulator/journals/2026-07-06.jsonl");
+    let acquired = bound_acquisition(&mut runtime, &decision, journal, decision_at, 30_000_000);
 
     // Settlement dated before the decision is refused.
     assert!(runtime
@@ -2571,6 +2596,7 @@ fn live_settlement_converts_the_commitment_to_spend_exactly_once() {
             &LiveDecisionIdentity::of(&decision),
             filled,
             debited,
+            &acquired,
             decision_at - TimeDelta::seconds(1),
         )
         .is_err());
@@ -2579,7 +2605,7 @@ fn live_settlement_converts_the_commitment_to_spend_exactly_once() {
     let mut unknown = LiveDecisionIdentity::of(&decision);
     unknown.decision_id = "fixed-dca:2026-07-05".to_owned();
     assert!(runtime
-        .settle_live_decision(&unknown, filled, debited, decision_at)
+        .settle_live_decision(&unknown, filled, debited, &acquired, decision_at)
         .is_err());
     let overfill = UsdcMicros::from_micros(planned + 1);
     assert!(runtime
@@ -2587,6 +2613,7 @@ fn live_settlement_converts_the_commitment_to_spend_exactly_once() {
             &LiveDecisionIdentity::of(&decision),
             overfill,
             overfill,
+            &acquired,
             decision_at + TimeDelta::minutes(1),
         )
         .is_err());
@@ -2595,6 +2622,7 @@ fn live_settlement_converts_the_commitment_to_spend_exactly_once() {
             &LiveDecisionIdentity::of(&decision),
             filled,
             UsdcMicros::from_micros(decision.committed_usdc.as_micros() + 1),
+            &acquired,
             decision_at + TimeDelta::minutes(1),
         )
         .is_err());
@@ -2611,6 +2639,7 @@ fn live_settlement_converts_the_commitment_to_spend_exactly_once() {
                 &LiveDecisionIdentity::of(&decision),
                 filled,
                 debited,
+                &acquired,
                 settled_at
             )
             .expect("settle from the terminal fill"),
@@ -2655,6 +2684,7 @@ fn live_settlement_converts_the_commitment_to_spend_exactly_once() {
                 &LiveDecisionIdentity::of(&decision),
                 filled,
                 debited,
+                &acquired,
                 settled_at
             )
             .expect("idempotent replay"),
@@ -2669,6 +2699,7 @@ fn live_settlement_converts_the_commitment_to_spend_exactly_once() {
             &LiveDecisionIdentity::of(&decision),
             decision.planned_usdc,
             decision.planned_usdc,
+            &acquired,
             settled_at
         )
         .is_err());
@@ -2703,6 +2734,453 @@ fn live_settlement_converts_the_commitment_to_spend_exactly_once() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn live_settlement_records_the_hype_it_bought_and_attributes_it() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = start + TimeDelta::hours(1);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-approved", deposit_at, 100);
+    let admission = approvals("deposit-approved", deposit_at, deposit_at);
+    let signal = signal(decision_at);
+    let journal = Path::new("/var/lib/hype-accumulator/journals/2026-07-06.jsonl");
+
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
+    let decision = live_planned_decision(
+        &mut runtime,
+        start,
+        decision_at,
+        &movement,
+        &admission,
+        &signal,
+    )
+    .decision()
+    .expect("planned decision")
+    .clone();
+    // Nothing is attributed before a settlement, and an empty ledger is
+    // complete: there is no purchase whose evidence could be missing.
+    assert_eq!(runtime.attributed_hype(), AttributedHype::default());
+    assert!(runtime.attributed_hype().is_complete());
+
+    let filled = UsdcMicros::from_micros(decision.planned_usdc.as_micros() - 1_000);
+    let credited = 29_979_000_u64;
+    let fill_at = decision_at + TimeDelta::seconds(20);
+    // Binds the decision to its journal the way `prepare` does, then quotes
+    // that journal's own workflow as the settlement's evidence.
+    bound_acquisition(&mut runtime, &decision, journal, decision_at, credited);
+    let acquired = LiveHypeAcquisition::Workflow {
+        workflow_id: "workflow-a".to_owned(),
+        journal: journal.to_path_buf(),
+        credited_hype_atoms: credited,
+        last_fill_at: Some(fill_at),
+    };
+
+    // A settlement quoting a journal this decision was never bound to is
+    // refused, as is one whose cash and inventory sides contradict.
+    assert!(matches!(
+        runtime.settle_live_decision(
+            &LiveDecisionIdentity::of(&decision),
+            filled,
+            filled,
+            &LiveHypeAcquisition::Workflow {
+                workflow_id: "workflow-a".to_owned(),
+                journal: PathBuf::from("/elsewhere/2026-07-06.jsonl"),
+                credited_hype_atoms: credited,
+                last_fill_at: Some(fill_at),
+            },
+            decision_at + TimeDelta::minutes(1),
+        ),
+        Err(RuntimeError::InvalidHypeAcquisition(_))
+    ));
+    assert!(matches!(
+        runtime.settle_live_decision(
+            &LiveDecisionIdentity::of(&decision),
+            filled,
+            filled,
+            &LiveHypeAcquisition::Workflow {
+                workflow_id: "workflow-a".to_owned(),
+                journal: journal.to_path_buf(),
+                credited_hype_atoms: 0,
+                last_fill_at: None,
+            },
+            decision_at + TimeDelta::minutes(1),
+        ),
+        Err(RuntimeError::InvalidHypeAcquisition(_))
+    ));
+    // A decision that *was* bound to a journal can never be settled as
+    // though no workflow existed.
+    assert!(matches!(
+        runtime.settle_live_decision(
+            &LiveDecisionIdentity::of(&decision),
+            UsdcMicros::default(),
+            UsdcMicros::default(),
+            &LiveHypeAcquisition::NoWorkflow,
+            decision_at + TimeDelta::minutes(1),
+        ),
+        Err(RuntimeError::InvalidHypeAcquisition(_))
+    ));
+    assert!(!runtime.state.pacing.decisions()[&decision.decision_date].settled);
+    assert_eq!(runtime.attributed_hype(), AttributedHype::default());
+
+    let settled_at = decision_at + TimeDelta::minutes(2);
+    assert_eq!(
+        runtime
+            .settle_live_decision(
+                &LiveDecisionIdentity::of(&decision),
+                filled,
+                filled,
+                &acquired,
+                settled_at,
+            )
+            .expect("settle with its inventory"),
+        LiveSettlementOutcome::Settled
+    );
+    let attributed = runtime.attributed_hype();
+    assert_eq!(attributed.credited_hype_atoms, credited);
+    assert_eq!(attributed.last_fill_at, Some(fill_at));
+    assert_eq!(attributed.settled_purchases_with_evidence, 1);
+    assert_eq!(attributed.settled_purchases_without_evidence, 0);
+    assert!(attributed.is_complete());
+    assert!((attributed.credited_hype() - 0.299_79).abs() < 1e-12);
+    assert_eq!(
+        attributed.to_attribution(),
+        HypeAttribution::Reconciled {
+            hype: 0.299_79,
+            last_trade_at: Some(fill_at),
+        }
+    );
+
+    // Exact replay is idempotent; a replay quoting different inventory for
+    // the same decision fails closed rather than overwriting the record the
+    // committed settlement was hash-chained with.
+    let head_before = runtime.state.last_committed_cycle_hash.clone();
+    assert_eq!(
+        runtime
+            .settle_live_decision(
+                &LiveDecisionIdentity::of(&decision),
+                filled,
+                filled,
+                &acquired,
+                settled_at,
+            )
+            .expect("idempotent replay"),
+        LiveSettlementOutcome::AlreadySettled
+    );
+    assert_eq!(runtime.state.last_committed_cycle_hash, head_before);
+    assert!(matches!(
+        runtime.settle_live_decision(
+            &LiveDecisionIdentity::of(&decision),
+            filled,
+            filled,
+            &LiveHypeAcquisition::Workflow {
+                workflow_id: "workflow-a".to_owned(),
+                journal: journal.to_path_buf(),
+                credited_hype_atoms: credited + 1,
+                last_fill_at: Some(fill_at),
+            },
+            settled_at,
+        ),
+        Err(RuntimeError::HypeAcquisitionConflict(_))
+    ));
+    assert_eq!(runtime.attributed_hype().credited_hype_atoms, credited);
+
+    // The record survives a reopen: it is part of the committed state, not a
+    // cache the next process rebuilds.
+    drop(runtime);
+    let reopened =
+        SignerFreeRuntime::open(runtime_config, limits()).expect("reopen after settlement");
+    assert_eq!(reopened.attributed_hype(), attributed);
+}
+
+#[test]
+fn a_decision_that_never_bound_a_journal_releases_with_no_acquisition_row() {
+    // The `release` path: `prepare` committed the day's decision and then
+    // failed before any journal existed. Its capital is released at zero with
+    // `NoWorkflow`, which the runtime accepts only because it holds no intent
+    // for the decision and no cash moved — and records no inventory row.
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = start + TimeDelta::hours(1);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-approved", deposit_at, 100);
+    let admission = approvals("deposit-approved", deposit_at, deposit_at);
+    let signal = signal(decision_at);
+
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
+    let decision = live_planned_decision(
+        &mut runtime,
+        start,
+        decision_at,
+        &movement,
+        &admission,
+        &signal,
+    )
+    .decision()
+    .expect("planned decision")
+    .clone();
+    assert_eq!(runtime.live_journal_intent(&decision.decision_id), None);
+
+    assert_eq!(
+        runtime
+            .settle_live_decision(
+                &LiveDecisionIdentity::of(&decision),
+                UsdcMicros::default(),
+                UsdcMicros::default(),
+                &LiveHypeAcquisition::NoWorkflow,
+                decision_at + TimeDelta::minutes(2),
+            )
+            .expect("released at zero"),
+        LiveSettlementOutcome::Settled
+    );
+    assert!(runtime.state.pacing.decisions()[&decision.decision_date].settled);
+    assert!(runtime.state.hype_acquisitions.is_empty());
+    assert_eq!(runtime.attributed_hype(), AttributedHype::default());
+    assert!(runtime.unsettled_planned_decisions().is_empty());
+    drop(runtime);
+    SignerFreeRuntime::open(runtime_config, limits()).expect("reopen after release");
+}
+
+#[test]
+fn a_settlement_may_spell_its_journal_differently_than_the_intent_did() {
+    // `prepare` and `reconcile` can be invoked with different spellings of
+    // the same file (a symlinked parent, a relative path). A byte comparison
+    // would refuse to settle a real fill and leave committed capital
+    // permanently unsettleable, failing every later decision day closed
+    // (bot-strategy#929 review).
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let journals = directory.path().join("journals");
+    std::fs::create_dir_all(&journals).expect("journal directory");
+    let journal = journals.join("2026-07-06.jsonl");
+    std::fs::write(&journal, b"").expect("journal file");
+    let linked_parent = directory.path().join("by-link");
+    std::os::unix::fs::symlink(&journals, &linked_parent).expect("symlink");
+    let same_journal_other_spelling = linked_parent.join("2026-07-06.jsonl");
+    assert_ne!(journal, same_journal_other_spelling);
+
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = start + TimeDelta::hours(1);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-approved", deposit_at, 100);
+    let admission = approvals("deposit-approved", deposit_at, deposit_at);
+    let signal = signal(decision_at);
+
+    let mut runtime = SignerFreeRuntime::open(runtime_config, limits()).expect("open runtime");
+    let decision = live_planned_decision(
+        &mut runtime,
+        start,
+        decision_at,
+        &movement,
+        &admission,
+        &signal,
+    )
+    .decision()
+    .expect("planned decision")
+    .clone();
+    let filled = UsdcMicros::from_micros(decision.planned_usdc.as_micros() - 1_000);
+    bound_acquisition(&mut runtime, &decision, &journal, decision_at, 30_000_000);
+
+    let quoting_the_link = LiveHypeAcquisition::Workflow {
+        workflow_id: "workflow-a".to_owned(),
+        journal: same_journal_other_spelling,
+        credited_hype_atoms: 30_000_000,
+        last_fill_at: None,
+    };
+    assert_eq!(
+        runtime
+            .settle_live_decision(
+                &LiveDecisionIdentity::of(&decision),
+                filled,
+                filled,
+                &quoting_the_link,
+                decision_at + TimeDelta::minutes(2),
+            )
+            .expect("the same journal by another spelling settles"),
+        LiveSettlementOutcome::Settled
+    );
+    // And the replay of that same settlement stays idempotent rather than
+    // becoming a conflict because the two spellings differ byte-for-byte.
+    assert_eq!(
+        runtime
+            .settle_live_decision(
+                &LiveDecisionIdentity::of(&decision),
+                filled,
+                filled,
+                &quoting_the_link,
+                decision_at + TimeDelta::minutes(3),
+            )
+            .expect("idempotent replay through the link"),
+        LiveSettlementOutcome::AlreadySettled
+    );
+    assert_eq!(runtime.attributed_hype().credited_hype_atoms, 30_000_000);
+}
+
+#[test]
+fn a_halted_observation_publishes_the_full_status_without_committing_a_cycle() {
+    // The divergence halt must not cost the dashboard the operations block it
+    // needs during an incident, and must not become a cycle
+    // (bot-strategy#929).
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = start + TimeDelta::hours(1);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-approved", deposit_at, 100);
+    let admission = approvals("deposit-approved", deposit_at, deposit_at);
+    let signal = signal(decision_at);
+
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
+    live_planned_decision(
+        &mut runtime,
+        start,
+        decision_at,
+        &movement,
+        &admission,
+        &signal,
+    );
+    let head_before = runtime.state.last_committed_cycle_hash.clone();
+    let ledger_before = runtime.ledger.state().committed_usdc();
+
+    let observed_at = decision_at + TimeDelta::minutes(5);
+    let degraded = AccumulatorStatus::new(
+        100.0,
+        0.5,
+        10.0,
+        observed_at,
+        None,
+        "daily",
+        Some(crate::monitor::ATTRIBUTION_EXCEEDS_HOLDINGS.to_owned()),
+    )
+    .expect("degraded status");
+    runtime
+        .publish_halted_status(degraded, observed_at)
+        .expect("publish without committing");
+
+    let published = std::fs::read_to_string(&runtime_config.status_path).expect("status written");
+    assert!(published.contains(crate::monitor::ATTRIBUTION_EXCEEDS_HOLDINGS));
+    assert!(
+        published.contains("operations"),
+        "the halted status keeps the operations block: {published}"
+    );
+    assert!(std::fs::read_to_string(&runtime_config.metrics_path)
+        .expect("metrics written")
+        .contains("hype_accumulator_committed_usdc"));
+    // Nothing was committed: no new cycle head, no capital movement.
+    assert_eq!(runtime.state.last_committed_cycle_hash, head_before);
+    assert_eq!(runtime.ledger.state().committed_usdc(), ledger_before);
+}
+
+#[test]
+fn a_halted_observation_still_publishes_while_the_next_boundary_snapshot_is_on_disk() {
+    // The signal producer writes the *next* boundary's snapshot ~90 s before
+    // that boundary. Citing a future-dated snapshot is rejected by the
+    // metrics validator, which would turn a halted observation in that
+    // window into no status document at all — the failure the halt path
+    // exists to avoid (bot-strategy#929 review). The snapshot is dropped
+    // from the citation instead.
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = start + TimeDelta::hours(1);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-approved", deposit_at, 100);
+    let admission = approvals("deposit-approved", deposit_at, deposit_at);
+    let signal = signal(decision_at);
+
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
+    live_planned_decision(
+        &mut runtime,
+        start,
+        decision_at,
+        &movement,
+        &admission,
+        &signal,
+    );
+    // Tomorrow's snapshot, already on disk, dated after this observation.
+    let next_boundary = at(2026, 7, 7, 12, 0);
+    std::fs::write(
+        runtime_config.signal_snapshot_path(),
+        serde_json::to_string(&signal_for(next_boundary, "2026-07-07")).expect("snapshot json"),
+    )
+    .expect("write next boundary snapshot");
+
+    let observed_at = next_boundary - TimeDelta::seconds(90);
+    let degraded = AccumulatorStatus::new(
+        100.0,
+        0.0,
+        10.0,
+        observed_at,
+        None,
+        "daily",
+        Some(crate::status::ATTRIBUTION_EXCEEDS_HOLDINGS.to_owned()),
+    )
+    .expect("degraded status");
+    runtime
+        .publish_halted_status(degraded, observed_at)
+        .expect("publishes despite the future-dated snapshot");
+    assert!(std::fs::read_to_string(&runtime_config.status_path)
+        .expect("status written")
+        .contains(crate::status::ATTRIBUTION_EXCEEDS_HOLDINGS));
+}
+
+#[test]
+fn a_settled_purchase_without_acquisition_evidence_excludes_all_holdings() {
+    // A purchase settled by a build older than bot-strategy#929 has no
+    // acquisition row. Reporting the remaining rows as if they were the whole
+    // would understate bot-owned inventory without saying so, so the whole
+    // attribution is withheld until the missing row is backfilled.
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = start + TimeDelta::hours(1);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-approved", deposit_at, 100);
+    let admission = approvals("deposit-approved", deposit_at, deposit_at);
+    let signal = signal(decision_at);
+    let journal = Path::new("/var/lib/hype-accumulator/journals/2026-07-06.jsonl");
+
+    let mut runtime = SignerFreeRuntime::open(runtime_config, limits()).expect("open runtime");
+    let decision = live_planned_decision(
+        &mut runtime,
+        start,
+        decision_at,
+        &movement,
+        &admission,
+        &signal,
+    )
+    .decision()
+    .expect("planned decision")
+    .clone();
+    let filled = UsdcMicros::from_micros(decision.planned_usdc.as_micros() - 1_000);
+    let acquired = bound_acquisition(&mut runtime, &decision, journal, decision_at, 29_979_000);
+    runtime
+        .settle_live_decision(
+            &LiveDecisionIdentity::of(&decision),
+            filled,
+            filled,
+            &acquired,
+            decision_at + TimeDelta::minutes(2),
+        )
+        .expect("settle");
+    assert!(runtime.attributed_hype().is_complete());
+
+    // Simulate the legacy state: the settled purchase is there, its evidence
+    // is not.
+    runtime.state.hype_acquisitions.clear();
+    let attributed = runtime.attributed_hype();
+    assert_eq!(attributed.credited_hype_atoms, 0);
+    assert_eq!(attributed.settled_purchases_without_evidence, 1);
+    assert!(!attributed.is_complete());
+    assert_eq!(attributed.to_attribution(), HypeAttribution::Unavailable);
+}
+
+#[test]
 fn live_settlement_at_zero_releases_an_unfilled_commitment() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let start = at(2026, 7, 6, 8, 0);
@@ -2724,6 +3202,10 @@ fn live_settlement_at_zero_releases_an_unfilled_commitment() {
         &signal,
     );
     let decision = report.decision().expect("planned decision").clone();
+    let journal = Path::new("/var/lib/hype-accumulator/journals/2026-07-06.jsonl");
+    // An IOC canceled unfilled credits no HYPE, and the acquisition record
+    // says exactly that.
+    let acquired = bound_acquisition(&mut runtime, &decision, journal, decision_at, 0);
     // An IOC canceled unfilled finalizes at zero: the commitment is released
     // and nothing is recorded as spent.
     assert_eq!(
@@ -2732,6 +3214,7 @@ fn live_settlement_at_zero_releases_an_unfilled_commitment() {
                 &LiveDecisionIdentity::of(&decision),
                 UsdcMicros::default(),
                 UsdcMicros::default(),
+                &acquired,
                 decision_at + TimeDelta::seconds(30),
             )
             .expect("zero settlement"),
@@ -2773,6 +3256,8 @@ fn live_settlement_refuses_a_decision_identity_from_another_runtime() {
         runtime.unsettled_planned_decisions(),
         vec![decision.clone()]
     );
+    let journal = Path::new("/var/lib/hype-accumulator/journals/2026-07-06.jsonl");
+    let acquired = bound_acquisition(&mut runtime, &decision, journal, decision_at, 0);
     let head_before = runtime.state.last_committed_cycle_hash.clone();
     let settled_at = decision_at + TimeDelta::minutes(2);
 
@@ -2800,6 +3285,7 @@ fn live_settlement_refuses_a_decision_identity_from_another_runtime() {
             &identity,
             UsdcMicros::default(),
             UsdcMicros::default(),
+            &acquired,
             settled_at,
         ) {
             Err(RuntimeError::LiveDecisionMismatch(mismatch)) => assert_eq!(mismatch, field),
@@ -2816,6 +3302,7 @@ fn live_settlement_refuses_a_decision_identity_from_another_runtime() {
                 &LiveDecisionIdentity::of(&decision),
                 UsdcMicros::default(),
                 UsdcMicros::default(),
+                &acquired,
                 settled_at,
             )
             .expect("genuine identity settles"),
@@ -3004,6 +3491,12 @@ fn journal_intent_is_recorded_before_the_journal_and_survives_reopen() {
             &LiveDecisionIdentity::of(&decision),
             UsdcMicros::default(),
             UsdcMicros::default(),
+            &LiveHypeAcquisition::Workflow {
+                workflow_id: format!("workflow:{}", decision.decision_id),
+                journal: journal.to_path_buf(),
+                credited_hype_atoms: 0,
+                last_fill_at: None,
+            },
             recorded_at + TimeDelta::minutes(1),
         )
         .expect("settle day one");

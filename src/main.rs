@@ -4,7 +4,7 @@ use hype_accumulator::{
     bootstrap,
     config::{Config, ProcessEnvironment},
     exchange::UnavailableLiveExchange,
-    monitor::{trade_cadence_label, HypeAttribution, HyperliquidObserver},
+    monitor::{trade_cadence_label, HyperliquidObserver, ATTRIBUTION_EXCEEDS_HOLDINGS},
     pacing::PacingLimits,
     runtime::{
         AdmissionApprovals, DecisionMode, RuntimeConfig, RuntimeCycleInput, SignerFreeRuntime,
@@ -284,12 +284,42 @@ async fn run_dry_run_cycle(
     };
     let account = config.observation_account(&ProcessEnvironment)?;
     let observer = HyperliquidObserver::new(&config.hyperliquid.endpoint, &account)?;
+    // HYPE this runtime's own settled decisions prove the workflow acquired
+    // (bot-strategy#929). `to_attribution` excludes account holdings outright
+    // while any settled purchase is still missing its evidence, rather than
+    // publishing a partial sum as if it were the whole.
+    let attribution = runtime.attributed_hype().to_attribution();
     let accumulator = observer
-        .observe(
-            &HypeAttribution::Unavailable,
-            trade_cadence_label(&config.schedule),
-        )
+        .observe(&attribution, trade_cadence_label(&config.schedule))
         .await?;
+    // The ledger claims HYPE the account no longer holds. The observation is
+    // still published — the dashboard must show this, which is why
+    // `reconcile_status` degrades instead of erroring — but this process must
+    // not go on to commit another decision while bot-owned inventory is
+    // unaccounted for (bot-strategy#929: "fail closed on unexplained
+    // differences"). Before this attribution existed, the same condition
+    // aborted the cycle via an observation error; it must not become
+    // advisory just because the status document now survives it.
+    if accumulator.attribution_exceeds_holdings() {
+        // Publishes the same documents a cycle would — operations block
+        // included, so the dashboard keeps showing committed capital and
+        // stuck detection through the incident — without committing one.
+        runtime.publish_halted_status(accumulator, Utc::now())?;
+        // Releases the exclusive state lock before the mirror's network call,
+        // for the reason spelled out at the end of the normal path: an
+        // unresponsive S3 endpoint would otherwise hold the lock an operator
+        // needs in order to run the very reconcile this error asks for.
+        drop(runtime);
+        if let Ok(body) = fs::read_to_string(&status_path) {
+            mirror_status_to_s3(&status_path, body).await;
+        }
+        return Err(format!(
+            "halting this cycle: {ATTRIBUTION_EXCEEDS_HOLDINGS}. The status document was \
+             published; no decision was made. Reconcile the account's HYPE against the \
+             workflow journals before the next cycle."
+        )
+        .into());
+    }
     let observed_at = Utc::now();
     let scan_end_ms = u64::try_from(observed_at.timestamp_millis())?;
     let scan_start_ms = runtime.next_scan_start_ms();

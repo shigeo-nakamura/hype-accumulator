@@ -30,6 +30,8 @@ pub struct StakingObservation {
     pub delegation_rows_hype: f64,
 }
 
+pub use crate::status::ATTRIBUTION_EXCEEDS_HOLDINGS;
+
 /// Authoritative accumulator-ledger attribution for account-level observations.
 ///
 /// Account balances and fills alone cannot distinguish accumulator activity
@@ -277,16 +279,48 @@ fn reconcile_status_with_balance_window(
         } => {
             finite_nonnegative("attributed HYPE", *hype)?;
             if *hype > observed_hype + attribution_tolerance {
-                return Err(MonitorError::InvalidResponse(
-                    "attributed HYPE exceeds observed account holdings".to_owned(),
-                ));
+                // The workflow ledger says this account should still hold
+                // more bot-owned HYPE than it does: HYPE the bot acquired has
+                // left the account (an external sale, a transfer, or a
+                // staking movement no workflow recorded).
+                //
+                // Deliberately a health failure rather than an error
+                // (bot-strategy#929): refusing to produce a status document
+                // would take the dashboard down — and stall the recurring
+                // cycle that publishes it — in exactly the situation that
+                // most needs to be visible. What is reported as bot-owned is
+                // zero, the same as `Unavailable`: the ledger's claim would
+                // overstate, and the account total includes whatever else
+                // the account holds, which `hype_balance` must never
+                // include. The reason carries the fact; the number does not
+                // guess.
+                health_reasons.push(ATTRIBUTION_EXCEEDS_HOLDINGS);
+                (0.0, *last_trade_at)
+            } else {
+                if observed_hype - *hype > attribution_tolerance {
+                    health_reasons.push("unattributed HYPE account holdings excluded");
+                }
+                (*hype, *last_trade_at)
             }
-            if observed_hype - *hype > attribution_tolerance {
-                health_reasons.push("unattributed HYPE account holdings excluded");
-            }
-            (*hype, *last_trade_at)
         }
     };
+    // A last-trade timestamp after the balance read is rejected by
+    // `AccumulatorStatus`, and now that a real journal-derived fill time is
+    // attributed (bot-strategy#929) a clock that steps backwards — an NTP
+    // correction, a restored backup — would make that rejection abort the
+    // whole observation and stop the status document being written at all.
+    // Same judgment as the divergence branch above: degrade loudly, keep
+    // publishing.
+    let last_trade_at = last_trade_at.filter(|value| {
+        let plausible = AccumulatorStatus::last_trade_is_plausible(*value, balance_observed_at);
+        if !plausible {
+            health_reasons.push(
+                "last attributed fill is after the balance observation; clock or history is \
+                 inconsistent",
+            );
+        }
+        plausible
+    });
     let health_reason = (!health_reasons.is_empty()).then(|| health_reasons.join("; "));
     AccumulatorStatus::new_with_balance_window(
         balances.spot_usdc,
