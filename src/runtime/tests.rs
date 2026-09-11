@@ -2900,10 +2900,6 @@ fn a_decision_that_never_bound_a_journal_releases_with_no_acquisition_row() {
     // failed before any journal existed. Its capital is released at zero with
     // `NoWorkflow`, which the runtime accepts only because it holds no intent
     // for the decision and no cash moved — and records no inventory row.
-fn a_purchase_settled_before_the_ledger_existed_can_be_backfilled_once() {
-    // The migration path for the purchases already settled on the live host
-    // (bot-strategy#929): attribution is withheld until every settled
-    // purchase has evidence, and the backfill supplies exactly that, once.
     let directory = tempfile::tempdir().expect("temporary directory");
     let start = at(2026, 7, 6, 8, 0);
     let deposit_at = start + TimeDelta::hours(1);
@@ -2915,9 +2911,6 @@ fn a_purchase_settled_before_the_ledger_existed_can_be_backfilled_once() {
 
     let mut runtime =
         SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
-    let journal = Path::new("/var/lib/hype-accumulator/journals/2026-07-06.jsonl");
-
-    let mut runtime = SignerFreeRuntime::open(runtime_config, limits()).expect("open runtime");
     let decision = live_planned_decision(
         &mut runtime,
         start,
@@ -2949,6 +2942,35 @@ fn a_purchase_settled_before_the_ledger_existed_can_be_backfilled_once() {
     assert!(runtime.unsettled_planned_decisions().is_empty());
     drop(runtime);
     SignerFreeRuntime::open(runtime_config, limits()).expect("reopen after release");
+}
+
+#[test]
+fn a_purchase_settled_before_the_ledger_existed_can_be_backfilled_once() {
+    // The migration path for the purchases already settled on the live host
+    // (bot-strategy#929): attribution is withheld until every settled
+    // purchase has evidence, and the backfill supplies exactly that, once.
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = start + TimeDelta::hours(1);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-approved", deposit_at, 100);
+    let admission = approvals("deposit-approved", deposit_at, deposit_at);
+    let signal = signal(decision_at);
+    let journal = Path::new("/var/lib/hype-accumulator/journals/2026-07-06.jsonl");
+
+    let mut runtime = SignerFreeRuntime::open(runtime_config, limits()).expect("open runtime");
+    let decision = live_planned_decision(
+        &mut runtime,
+        start,
+        decision_at,
+        &movement,
+        &admission,
+        &signal,
+    )
+    .decision()
+    .expect("planned decision")
+    .clone();
     let identity = LiveDecisionIdentity::of(&decision);
     let filled = UsdcMicros::from_micros(decision.planned_usdc.as_micros() - 1_000);
     let acquired = bound_acquisition(&mut runtime, &decision, journal, decision_at, 29_979_000);
