@@ -28,7 +28,7 @@ use hype_accumulator::{
     live_probe::{reconcile_prepared_order, HyperliquidLiveProbe, LiveProbeBinding},
     monitor::{trade_cadence_label, HyperliquidObserver, ATTRIBUTION_EXCEEDS_HOLDINGS},
     order_envelope::OrderEnvelopeFreshnessPolicy,
-    pacing::{PacingLimits, UsdcMicros},
+    pacing::{DailyDecision, PacingLimits, UsdcMicros},
     runtime::{
         AdmissionApprovals, DecisionMode, LiveDecisionIdentity, LiveHypeAcquisition, RuntimeConfig,
         RuntimeCycleInput, SignerFreeRuntime,
@@ -565,7 +565,8 @@ const USAGE: &str = "usage:\n  hype-live-probe prepare <config.toml> <security-p
      <journal.jsonl> --confirm <client_order_id>\n  hype-live-probe reconcile <config.toml> \
      <security-policy.toml> <runtime-config.toml> <operational.toml> <journal.jsonl>\n  \
      hype-live-probe release <config.toml> <security-policy.toml> <runtime-config.toml> \
-     <operational.toml>";
+     <operational.toml>\n  hype-live-probe backfill-attribution <config.toml> \
+     <security-policy.toml> <runtime-config.toml> <operational.toml>";
 
 #[derive(Debug, Eq, PartialEq)]
 enum Invocation {
@@ -592,6 +593,12 @@ enum Invocation {
         confirm_client_order_id: String,
     },
     Release {
+        config_path: String,
+        security_policy_path: String,
+        runtime_config_path: String,
+        operational_params_path: String,
+    },
+    BackfillAttribution {
         config_path: String,
         security_policy_path: String,
         runtime_config_path: String,
@@ -644,6 +651,16 @@ where
             if command == "release" =>
         {
             Ok(Invocation::Release {
+                config_path: config_path.clone(),
+                security_policy_path: security_policy_path.clone(),
+                runtime_config_path: runtime_config_path.clone(),
+                operational_params_path: operational_params_path.clone(),
+            })
+        }
+        [command, config_path, security_policy_path, runtime_config_path, operational_params_path]
+            if command == "backfill-attribution" =>
+        {
+            Ok(Invocation::BackfillAttribution {
                 config_path: config_path.clone(),
                 security_policy_path: security_policy_path.clone(),
                 runtime_config_path: runtime_config_path.clone(),
@@ -713,6 +730,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             runtime_config_path,
             operational_params_path,
         } => release(
+            &config_path,
+            &security_policy_path,
+            &runtime_config_path,
+            &operational_params_path,
+        ),
+
+        Invocation::BackfillAttribution {
+            config_path,
+            security_policy_path,
+            runtime_config_path,
+            operational_params_path,
+        } => backfill_attribution(
             &config_path,
             &security_policy_path,
             &runtime_config_path,
@@ -1402,6 +1431,188 @@ fn release(
         );
     }
     Ok(())
+}
+
+/// Records the HYPE acquisition of purchases that were settled before this
+/// runtime recorded inventory (bot-strategy#929).
+///
+/// Signer-free and economically inert: it commits no capital, prepares no
+/// order, and touches no venue. It reads each decision's own journal —
+/// verified exactly the way `prepare`'s aggregation verifies history, through
+/// the journal's independently protected head and the same network/routing
+/// admissibility check — and writes only what that journal proves.
+///
+/// Root-run by necessity: `*.protected-head.json` is owner-only, so the
+/// read-only observer cannot verify a journal itself. That is precisely why
+/// attribution is a durable record in the runtime rather than something the
+/// observer recomputes.
+///
+/// Every figure is cross-checked against the settlement that already
+/// happened: the journal must be terminal, bound to this very decision, and
+/// hold exactly the filled and debited USDC the decision settled with.
+/// Anything else fails closed rather than attributing a number that the
+/// capital ledger would not recognise.
+fn backfill_attribution(
+    config_path: &str,
+    security_policy_path: &str,
+    runtime_config_path: &str,
+    operational_params_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = load_config(config_path, security_policy_path)?;
+    let operational = OperationalParams::from_toml(&fs::read_to_string(operational_params_path)?)?;
+    let history_directory = operational.history_directory.as_deref().ok_or(
+        "operational.toml is missing history_directory, required by `backfill-attribution`",
+    )?;
+    let history_binding =
+        HistoryDirectoryBinding::check(operational_params_path, history_directory)?;
+    if history_binding.initialization == HistoryInitialization::FirstEver {
+        return Err(
+            "history_directory was never initialized for this operational config; \
+                    no prepare ever ran through it, so it holds no evidence to backfill from"
+                .into(),
+        );
+    }
+    let journal_directory = PathBuf::from(history_directory);
+    ensure_history_directory_available(history_binding.initialization, &journal_directory)?;
+
+    let mut runtime = open_signer_free_runtime(&config, runtime_config_path)?;
+    let before = runtime.attributed_hype();
+    if before.is_complete() {
+        println!(
+            "mode=nothing-to-backfill attributed_hype_atoms={} settled_purchases={}",
+            before.credited_hype_atoms, before.settled_purchases_with_evidence
+        );
+        return Ok(());
+    }
+
+    // The runtime's own write-once record of where its live decisions were
+    // prepared. Reading evidence out of any other directory would attribute
+    // one account's history to another (`release` refuses for the same
+    // reason).
+    let bound_history_directory = fs::canonicalize(&journal_directory)?;
+    match runtime.live_history_directory() {
+        Some(recorded) if recorded == bound_history_directory => {}
+        Some(recorded) => {
+            return Err(format!(
+                "this runtime's live decisions were prepared into {} but this operational \
+                 config binds {}; refusing to attribute evidence from the wrong directory",
+                recorded.display(),
+                bound_history_directory.display()
+            )
+            .into());
+        }
+        None => {
+            return Err(
+                "this runtime never recorded a live history directory, so it has no \
+                        journals of its own to attribute"
+                    .into(),
+            );
+        }
+    }
+    let prepare_time_binding = PrepareTimeBinding::resolved(&config, &operational)?;
+    let network_routing_admissible = network_routing_admissible_for(&prepare_time_binding);
+
+    for decision in runtime.settled_purchases_without_acquisition() {
+        let decision_id = decision.decision_id.clone();
+        let identity = LiveDecisionIdentity::of(&decision);
+        let journal = runtime
+            .live_journal_intent(&decision_id)
+            .ok_or_else(|| {
+                format!(
+                    "decision {decision_id} settled a purchase but this runtime never recorded \
+                     a journal for it; there is no evidence to attribute it from"
+                )
+            })?
+            .to_path_buf();
+        let acquisition =
+            verified_attribution_evidence(&decision, &journal, &network_routing_admissible)?;
+        let outcome = runtime.backfill_hype_acquisition(&identity, &acquisition, Utc::now())?;
+        let LiveHypeAcquisition::Workflow {
+            workflow_id,
+            credited_hype_atoms,
+            ..
+        } = &acquisition
+        else {
+            unreachable!("verified evidence is always workflow-backed")
+        };
+        println!(
+            "mode=backfilled decision={decision_id} workflow={workflow_id} \
+             credited_hype_atoms={credited_hype_atoms} journal={} outcome={outcome:?}",
+            journal.display()
+        );
+    }
+
+    let after = runtime.attributed_hype();
+    println!(
+        "mode=backfill-complete attributed_hype_atoms={} settled_purchases={} missing={} \
+         complete={}",
+        after.credited_hype_atoms,
+        after.settled_purchases_with_evidence,
+        after.settled_purchases_without_evidence,
+        after.is_complete()
+    );
+    Ok(())
+}
+
+/// Reads one settled decision's own journal and shapes the acquisition
+/// evidence it proves, or fails closed.
+///
+/// Verified the way `prepare`'s aggregation verifies history — the same
+/// network/routing admissibility check and the journal's independently
+/// protected head — and cross-checked against the settlement that already
+/// happened, so a journal can never attribute inventory the capital ledger
+/// does not agree with.
+fn verified_attribution_evidence(
+    decision: &DailyDecision,
+    journal: &Path,
+    network_routing_admissible: &impl Fn(&Path) -> Result<(), WorkflowError>,
+) -> Result<LiveHypeAcquisition, Box<dyn std::error::Error>> {
+    let decision_id = decision.decision_id.as_str();
+    network_routing_admissible(journal).map_err(box_error)?;
+    let protected_head_store = historical_protected_head_store_for(journal)?;
+    let state = DurableWorkflow::read_verified_state(journal, protected_head_store.as_ref())?
+        .ok_or_else(|| {
+            format!(
+                "journal {} for decision {decision_id} is empty; its outcome is unknown and \
+                 must not be attributed",
+                journal.display()
+            )
+        })?;
+    if state.stage() != WorkflowStage::Complete {
+        return Err(format!(
+            "journal {} for decision {decision_id} has not reached a terminal stage \
+             (stage={:?}); finish reconciling it before attributing it",
+            journal.display(),
+            state.stage()
+        )
+        .into());
+    }
+    if bound_decision_identity(state.binding()) != LiveDecisionIdentity::of(decision) {
+        return Err(format!(
+            "journal {} is bound to a different decision than {decision_id}",
+            journal.display()
+        )
+        .into());
+    }
+    if state.filled_usdc() != decision.filled_usdc || state.debited_usdc() != decision.debited_usdc
+    {
+        return Err(format!(
+            "journal {} holds filled={} debited={} but decision {decision_id} settled filled={} \
+             debited={}; refusing to attribute inventory the capital ledger does not agree with",
+            journal.display(),
+            state.filled_usdc().as_micros(),
+            state.debited_usdc().as_micros(),
+            decision.filled_usdc.as_micros(),
+            decision.debited_usdc.as_micros()
+        )
+        .into());
+    }
+    Ok(LiveHypeAcquisition::Workflow {
+        workflow_id: state.workflow_id().to_owned(),
+        journal: journal.to_path_buf(),
+        credited_hype_atoms: state.purchased_hype().as_atoms(),
+        last_fill_at: state.last_fill_at(),
+    })
 }
 
 fn print_observation(
