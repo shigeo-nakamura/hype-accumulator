@@ -204,6 +204,82 @@ under an attestation remain distinguishable in the journal.
 
 No output of this command is a scheduled-live approval or a staking approval.
 
+## Backfilling attribution for purchases settled before the inventory ledger
+
+Attribution is withheld entirely while any settled purchase lacks its
+acquisition evidence (bot-strategy#929): the dashboard reports zero HYPE with
+`HYPE attribution unavailable` rather than a partial sum that would understate
+bot-owned inventory without saying so. Purchases settled by a build older than
+that ledger have no evidence, so they need a one-time migration:
+
+```text
+hype-live-probe backfill-attribution config.local.toml security-policy.local.toml runtime.local.toml operational.local.toml
+```
+
+**Run it exactly the way a probe-day `reconcile` is run**: same user, same
+environment. On the current host that means as root with the observer
+environment sourced (the account variables must be present — `sudo -u` drops
+them and the command then fails on a missing account), the recurring timer
+stopped, and `fix-anchor-ownership.sh` run afterwards, because a root run
+leaves runtime state and lock files root-owned just as a probe does
+(bot-strategy#972). The protected-head sidecars are owner-only, which is why
+the read-only observer can never do this itself.
+
+It is signer-free and economically inert — no capital moves, no order is
+prepared, no venue is contacted — and idempotent: a second run prints
+`mode=nothing-to-backfill`. It takes no journal argument, for the same reason
+`release` does not: it works from the decisions the runtime itself holds, and
+refuses to read evidence out of any directory other than the one its live
+decisions were prepared into (each declared journal must also resolve into
+that directory).
+
+For each settled purchase with no evidence it opens that decision's own
+journal **the way `reconcile` opens it** — which includes the exchange-order
+owner reconciliation; an owner conflict moves the journal to `ManualReview`
+exactly as a `reconcile` would, and that is then refused below — and, under
+the journal's append lock, verifies before recording anything:
+
+* the journal is admissible for this network and vault-routing mode;
+* its binding's execution identity is the configured account's (derived from
+  the connector's canonical form of the address, so a checksummed address in
+  the environment is fine);
+* the order reached durable finality — `OrderFinalized` or later, never
+  `ManualReview`, never a stage at which a restored journal could still be
+  missing its finalization;
+* it is bound to that very decision (checked by the runtime against the
+  journal's own binding, which names the disagreeing field);
+* it holds exactly the filled and debited USDC the decision settled with.
+
+Deliberately *not* required: that the workflow reached `Complete`. Reaching
+`Complete` needs the staking-disabled attestation, which is withheld while the
+policy acknowledgement is expired — requiring it would block the migration on
+exactly the hosts that need it.
+
+One thing the journal cannot prove: a fill event written before
+bot-strategy#998 carried no credited quantity and replays as the matched one,
+which in the journal looks exactly like a modern fee-free fill. Settlement
+guards this with the venue's own credited figure; a venue-free backfill
+cannot. A pre-#998 journal whose fee was charged in HYPE is therefore
+attributed the fee too, and that shows up as attribution above holdings — the
+divergence halt — not as a silently accepted number. (The only such journal on
+the current host, 2026-09-10, had its terminal events rewritten after #998
+and carries the credited quantity.)
+
+A missing journal is reported as lost history with the restore path
+(bot-strategy#944); an unreadable one as its own error. **Every decision is
+attempted**: each is verified against its own journal and committed on its
+own, so one refused journal does not stop the others from being recorded.
+Failures are printed per decision and the command exits non-zero if any
+remain, so a caller chaining on it cannot mistake a partial run for a fixed
+dashboard; re-running records only what is still missing.
+
+Expected output on a host whose only real purchase is 2026-09-10:
+
+```text
+mode=backfilled decision=fixed-dca:2026-09-10 workflow=… credited_hype_atoms=29979000 journal=…
+mode=backfill-complete attributed_hype_atoms=29979000 settled_purchases=1 missing=0 complete=true
+```
+
 ## Releasing a decision that never reached a signer
 
 `prepare` commits the day's pacing decision in the runtime cycle *before* the

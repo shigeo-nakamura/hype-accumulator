@@ -2945,6 +2945,124 @@ fn a_decision_that_never_bound_a_journal_releases_with_no_acquisition_row() {
 }
 
 #[test]
+fn a_purchase_settled_before_the_ledger_existed_can_be_backfilled_once() {
+    // The migration path for the purchases already settled on the live host
+    // (bot-strategy#929): attribution is withheld until every settled
+    // purchase has evidence, and the backfill supplies exactly that, once.
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = start + TimeDelta::hours(1);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-approved", deposit_at, 100);
+    let admission = approvals("deposit-approved", deposit_at, deposit_at);
+    let signal = signal(decision_at);
+    let journal = Path::new("/var/lib/hype-accumulator/journals/2026-07-06.jsonl");
+
+    let mut runtime = SignerFreeRuntime::open(runtime_config, limits()).expect("open runtime");
+    let decision = live_planned_decision(
+        &mut runtime,
+        start,
+        decision_at,
+        &movement,
+        &admission,
+        &signal,
+    )
+    .decision()
+    .expect("planned decision")
+    .clone();
+    let identity = LiveDecisionIdentity::of(&decision);
+    let filled = UsdcMicros::from_micros(decision.planned_usdc.as_micros() - 1_000);
+    let acquired = bound_acquisition(&mut runtime, &decision, journal, decision_at, 29_979_000);
+    let settled_at = decision_at + TimeDelta::minutes(2);
+
+    // Backfilling something that is not yet a settled purchase is refused.
+    assert!(matches!(
+        runtime.backfill_hype_acquisition(&identity, &acquired, settled_at),
+        Err(RuntimeError::InvalidCycle(_))
+    ));
+
+    runtime
+        .settle_live_decision(&identity, filled, filled, &acquired, settled_at)
+        .expect("settle");
+    // Simulates the pre-#929 state: the purchase is settled, its evidence is
+    // not recorded.
+    runtime.state.hype_acquisitions.clear();
+    assert_eq!(
+        runtime
+            .settled_purchases_without_acquisition()
+            .into_iter()
+            .map(|decision| decision.decision_id)
+            .collect::<Vec<_>>(),
+        vec![decision.decision_id.clone()]
+    );
+    assert_eq!(
+        runtime.attributed_hype().to_attribution(),
+        HypeAttribution::Unavailable
+    );
+
+    // Evidence quoting a journal this decision was never bound to is refused
+    // exactly as it is at settlement.
+    assert!(matches!(
+        runtime.backfill_hype_acquisition(
+            &identity,
+            &LiveHypeAcquisition::Workflow {
+                workflow_id: "workflow-a".to_owned(),
+                journal: PathBuf::from("/elsewhere/2026-07-06.jsonl"),
+                credited_hype_atoms: 29_979_000,
+                last_fill_at: None,
+            },
+            settled_at + TimeDelta::minutes(1),
+        ),
+        Err(RuntimeError::InvalidHypeAcquisition(_))
+    ));
+    // So is claiming a purchase had no workflow at all.
+    assert!(matches!(
+        runtime.backfill_hype_acquisition(
+            &identity,
+            &LiveHypeAcquisition::NoWorkflow,
+            settled_at + TimeDelta::minutes(1),
+        ),
+        Err(RuntimeError::InvalidHypeAcquisition(_))
+    ));
+
+    assert_eq!(
+        runtime
+            .backfill_hype_acquisition(&identity, &acquired, settled_at + TimeDelta::minutes(2))
+            .expect("backfill the missing evidence"),
+        LiveSettlementOutcome::Settled
+    );
+    let attributed = runtime.attributed_hype();
+    assert_eq!(attributed.credited_hype_atoms, 29_979_000);
+    assert!(attributed.is_complete());
+    assert!(runtime.settled_purchases_without_acquisition().is_empty());
+
+    // Re-running it is a no-op; offering different evidence for the same
+    // decision fails closed rather than rewriting history.
+    let head_after = runtime.state.last_committed_cycle_hash.clone();
+    assert_eq!(
+        runtime
+            .backfill_hype_acquisition(&identity, &acquired, settled_at + TimeDelta::minutes(3))
+            .expect("idempotent"),
+        LiveSettlementOutcome::AlreadySettled
+    );
+    assert_eq!(runtime.state.last_committed_cycle_hash, head_after);
+    assert!(matches!(
+        runtime.backfill_hype_acquisition(
+            &identity,
+            &LiveHypeAcquisition::Workflow {
+                workflow_id: "workflow-a".to_owned(),
+                journal: journal.to_path_buf(),
+                credited_hype_atoms: 29_979_001,
+                last_fill_at: None,
+            },
+            settled_at + TimeDelta::minutes(4),
+        ),
+        Err(RuntimeError::HypeAcquisitionConflict(_))
+    ));
+}
+
+#[test]
 fn a_settlement_may_spell_its_journal_differently_than_the_intent_did() {
     // `prepare` and `reconcile` can be invoked with different spellings of
     // the same file (a symlinked parent, a relative path). A byte comparison

@@ -23,6 +23,7 @@ use crate::{
     status_io::{
         write_metrics_atomic, write_private_json_atomic, write_status_atomic, StatusIoError,
     },
+    workflow::WorkflowState,
 };
 use chrono::{DateTime, Datelike, TimeDelta, TimeZone, Utc};
 use dex_connector::{HyperliquidAccountMovement, HyperliquidAccountMovementKind};
@@ -699,6 +700,54 @@ pub enum LiveHypeAcquisition {
     NoWorkflow,
 }
 
+impl LiveHypeAcquisition {
+    /// The evidence a finalized workflow's state proves, shaped for
+    /// settlement or backfill — the one place the field mapping lives, so
+    /// a row written at settlement and one written by the backfill can never
+    /// describe different quantities under the same names.
+    ///
+    /// Callers own the gates that differ between them (venue-vs-journal at
+    /// settlement, decision-vs-journal at backfill); this owns the one they
+    /// share: the order must have reached durable finality
+    /// (`WorkflowStage::is_order_finalized`) — never `ManualReview`, and
+    /// never a stage at which a restored journal might still be missing its
+    /// finalization.
+    ///
+    /// `credited_hype_atoms` is the journal's `purchased_hype`. An event
+    /// written before bot-strategy#998 carried no credited quantity and
+    /// replays it as the matched one — indistinguishable in the journal from
+    /// a modern fee-free fill, so no reader can refuse it. Settlement guards
+    /// this with the venue's own credited figure; a venue-free reader cannot,
+    /// and a pre-#998 journal whose fee was charged in HYPE would then be
+    /// attributed the fee too. That surfaces as attribution above holdings —
+    /// the divergence halt — rather than as a silently accepted number.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::InvalidHypeAcquisition`] when the workflow is
+    /// not finalized.
+    pub fn from_finalized_workflow(
+        state: &WorkflowState,
+        journal: &Path,
+    ) -> Result<Self, RuntimeError> {
+        if !state.stage().is_order_finalized() {
+            return Err(RuntimeError::InvalidHypeAcquisition(format!(
+                "workflow {} in {} has not reached durable finality (stage={:?}); its figures \
+                 may still change and must not be recorded as inventory",
+                state.workflow_id(),
+                journal.display(),
+                state.stage()
+            )));
+        }
+        Ok(Self::Workflow {
+            workflow_id: state.workflow_id().to_owned(),
+            journal: journal.to_path_buf(),
+            credited_hype_atoms: state.purchased_hype().as_atoms(),
+            last_fill_at: state.last_fill_at(),
+        })
+    }
+}
+
 /// HYPE this runtime's own settled history proves the workflow acquired,
 /// plus how much of that history is still missing its evidence.
 ///
@@ -1015,13 +1064,7 @@ impl SignerFreeRuntime {
     #[must_use]
     pub fn attributed_hype(&self) -> AttributedHype {
         let mut aggregate = AttributedHype::default();
-        for decision in self.state.pacing.decisions().values() {
-            // Only a settled decision that actually spent cash can own HYPE.
-            // A dry-run cycle settles a planned decision at zero fill, and a
-            // skip never had an order at all; neither has an inventory side.
-            if !decision.settled || decision.filled_usdc.is_zero() {
-                continue;
-            }
+        for decision in self.settled_purchases() {
             match self.state.hype_acquisitions.get(&decision.decision_id) {
                 // An unrepresentable total is unusable evidence, not a
                 // capped one: counting it as missing withholds the whole
@@ -1044,6 +1087,35 @@ impl SignerFreeRuntime {
             }
         }
         aggregate
+    }
+
+    /// Every settled purchase whose HYPE acquisition was never recorded.
+    ///
+    /// These are the decisions [`Self::attributed_hype`] counts as missing
+    /// evidence — settled by a build older than bot-strategy#929 — and the
+    /// exact set a backfill must supply before attribution can be reported
+    /// at all.
+    #[must_use]
+    pub fn settled_purchases_without_acquisition(&self) -> Vec<DailyDecision> {
+        self.settled_purchases()
+            .filter(|decision| {
+                !self
+                    .state
+                    .hype_acquisitions
+                    .contains_key(&decision.decision_id)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The decisions that can own HYPE — see
+    /// [`DailyDecision::is_settled_purchase`].
+    fn settled_purchases(&self) -> impl Iterator<Item = &DailyDecision> {
+        self.state
+            .pacing
+            .decisions()
+            .values()
+            .filter(|decision| decision.is_settled_purchase())
     }
 
     /// The runtime's own identity view of `decision_id`, if it exists.
@@ -1132,18 +1204,7 @@ impl SignerFreeRuntime {
         next_state
             .live_journal_intents
             .insert(decision_id.to_owned(), journal_path.to_path_buf());
-        let pending = PendingRuntimeCycle::new(recorded_at, next_state, Vec::new())?;
-        let replayed = self
-            .ledger
-            .validate_append_batch(&pending_cycle_ledger_events(&pending))?;
-        ensure_capital_totals_match(&pending.body.state.pacing, &replayed)?;
-        self.ensure_runtime_lock_current()?;
-        write_private_json_atomic(
-            self.config.state_directory.join(PENDING_CYCLE_FILE_NAME),
-            &pending,
-        )?;
-        self.ensure_runtime_lock_current()?;
-        self.state = commit_pending_cycle(&self.config, &self.limits, &mut self.ledger, &pending)?;
+        self.commit_state_change(recorded_at, next_state, Vec::new())?;
         Ok(LiveSettlementOutcome::Settled)
     }
 
@@ -1158,6 +1219,123 @@ impl SignerFreeRuntime {
             .filter(|decision| !decision.settled && !decision.planned_usdc.is_zero())
             .cloned()
             .collect()
+    }
+
+    /// Records the HYPE acquisition of a decision that was already settled
+    /// without one (bot-strategy#929).
+    ///
+    /// Exists because settlements committed before this runtime recorded
+    /// inventory left their purchases unevidenced, and attribution is
+    /// withheld entirely while any such purchase remains — see
+    /// [`Self::attributed_hype`]. It changes no capital: the decision is
+    /// already settled and its cash figures are untouched.
+    ///
+    /// Idempotent by content. Re-running it with the same evidence writes
+    /// nothing; different evidence for the same decision fails closed rather
+    /// than replacing a record the caller cannot prove is wrong.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::LiveDecisionMismatch`] when `identity` is not
+    /// this runtime's view of the decision, [`RuntimeError::InvalidCycle`]
+    /// when the decision is not a settled purchase (nothing unsettled, and
+    /// nothing that never bought anything, has inventory to backfill),
+    /// [`RuntimeError::InvalidHypeAcquisition`] when the evidence does not
+    /// match the journal this runtime bound the decision to,
+    /// [`RuntimeError::HypeAcquisitionConflict`] when a different record
+    /// already exists, and the usual persistence errors.
+    pub fn backfill_hype_acquisition(
+        &mut self,
+        identity: &LiveDecisionIdentity,
+        acquisition: &LiveHypeAcquisition,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<LiveSettlementOutcome, RuntimeError> {
+        self.ensure_runtime_lock_current()?;
+        let decision_id = identity.decision_id.as_str();
+        let decision = self
+            .state
+            .pacing
+            .decisions()
+            .values()
+            .find(|decision| decision.decision_id == decision_id)
+            .cloned()
+            .ok_or(PacingError::UnknownDecision)?;
+        if let Some(field) = identity.mismatch_against(&decision) {
+            return Err(RuntimeError::LiveDecisionMismatch(field));
+        }
+        if !decision.is_settled_purchase() {
+            return Err(RuntimeError::InvalidCycle(format!(
+                "decision {decision_id} is not a settled purchase (settled={}, filled_usdc={}); \
+                 an unsettled decision records its inventory through the settlement itself, and \
+                 one that filled nothing bought no HYPE to backfill",
+                decision.settled,
+                decision.filled_usdc.as_micros()
+            )));
+        }
+        // The same checks a live settlement's evidence passes: the quoted
+        // journal must be the one this decision was bound to, and the cash
+        // and inventory sides must agree.
+        let Some(row) = self.validated_acquisition_row(
+            decision_id,
+            decision.filled_usdc,
+            acquisition,
+            recorded_at,
+        )?
+        else {
+            return Err(RuntimeError::InvalidHypeAcquisition(format!(
+                "decision {decision_id} settled a purchase, so it cannot be backfilled as \
+                 though no workflow ever existed"
+            )));
+        };
+        if let Some(existing) = self.state.hype_acquisitions.get(decision_id) {
+            if same_acquisition(existing, &row) {
+                return Ok(LiveSettlementOutcome::AlreadySettled);
+            }
+            return Err(RuntimeError::HypeAcquisitionConflict(format!(
+                "decision {decision_id} already records {} HYPE atoms from workflow {} ({}) \
+                 but the backfill offers {} from workflow {} ({})",
+                existing.credited_hype_atoms,
+                existing.workflow_id,
+                existing.journal.display(),
+                row.credited_hype_atoms,
+                row.workflow_id,
+                row.journal.display()
+            )));
+        }
+        let mut next_state = self.state.clone();
+        next_state
+            .hype_acquisitions
+            .insert(decision_id.to_owned(), row);
+        self.commit_state_change(recorded_at, next_state, Vec::new())?;
+        Ok(LiveSettlementOutcome::Settled)
+    }
+
+    /// Commits one durable state change: the single write protocol behind
+    /// every cycle, settlement, journal intent and acquisition record, so a
+    /// change to it (an extra lock re-check, a different pending-file name)
+    /// cannot be applied to some write paths and not others.
+    ///
+    /// Publishes nothing: derived documents are the caller's decision, since
+    /// only some state changes affect them.
+    fn commit_state_change(
+        &mut self,
+        at: DateTime<Utc>,
+        next_state: RuntimeState,
+        ledger_events: Vec<LedgerEvent>,
+    ) -> Result<(), RuntimeError> {
+        let pending = PendingRuntimeCycle::new(at, next_state, ledger_events)?;
+        let replayed = self
+            .ledger
+            .validate_append_batch(&pending_cycle_ledger_events(&pending))?;
+        ensure_capital_totals_match(&pending.body.state.pacing, &replayed)?;
+        self.ensure_runtime_lock_current()?;
+        write_private_json_atomic(
+            self.config.state_directory.join(PENDING_CYCLE_FILE_NAME),
+            &pending,
+        )?;
+        self.ensure_runtime_lock_current()?;
+        self.state = commit_pending_cycle(&self.config, &self.limits, &mut self.ledger, &pending)?;
+        Ok(())
     }
 
     /// Validates the HYPE side of a settlement and shapes it into the row
@@ -1359,18 +1537,7 @@ impl SignerFreeRuntime {
                 debited_usdc,
             },
         }];
-        let pending = PendingRuntimeCycle::new(settled_at, next_state, ledger_events)?;
-        let replayed = self
-            .ledger
-            .validate_append_batch(&pending_cycle_ledger_events(&pending))?;
-        ensure_capital_totals_match(&pending.body.state.pacing, &replayed)?;
-        self.ensure_runtime_lock_current()?;
-        write_private_json_atomic(
-            self.config.state_directory.join(PENDING_CYCLE_FILE_NAME),
-            &pending,
-        )?;
-        self.ensure_runtime_lock_current()?;
-        self.state = commit_pending_cycle(&self.config, &self.limits, &mut self.ledger, &pending)?;
+        self.commit_state_change(settled_at, next_state, ledger_events)?;
         // Committed and durable; the derived metrics must not keep showing
         // the pre-settlement commitment until some later scheduled cycle.
         self.publish_metrics(settled_at)?;
@@ -1916,18 +2083,7 @@ impl SignerFreeRuntime {
             signal_available: decision_evidence.signal_available,
             boundary_balance_available: decision_evidence.boundary_balance_available,
         };
-        let pending = PendingRuntimeCycle::new(input.observed_at, next_state, ledger_events)?;
-        let replayed = self
-            .ledger
-            .validate_append_batch(&pending_cycle_ledger_events(&pending))?;
-        ensure_capital_totals_match(&pending.body.state.pacing, &replayed)?;
-        self.ensure_runtime_lock_current()?;
-        write_private_json_atomic(
-            self.config.state_directory.join(PENDING_CYCLE_FILE_NAME),
-            &pending,
-        )?;
-        self.ensure_runtime_lock_current()?;
-        self.state = commit_pending_cycle(&self.config, &self.limits, &mut self.ledger, &pending)?;
+        self.commit_state_change(input.observed_at, next_state, ledger_events)?;
         let metrics = self.derive_metrics(input.observed_at, decision_signal)?;
         let status = DashboardStatus::new(
             input.observed_at,

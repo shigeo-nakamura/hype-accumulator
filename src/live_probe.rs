@@ -432,9 +432,7 @@ async fn lookup_read_only(
 ) -> Result<HyperliquidOrderReconciliation, LiveProbeError> {
     let binding = workflow_state.binding();
     let account = connector.execution_account_address()?;
-    if binding.inventory_before.execution_identity_hash
-        != identity_hash(EXECUTION_IDENTITY_DOMAIN, account)
-    {
+    if binding.inventory_before.execution_identity_hash != execution_identity_hash_for(account) {
         return Err(LiveProbeError::BindingMismatch("execution identity"));
     }
     if binding.order_envelope.market_metadata_digest
@@ -966,17 +964,7 @@ async fn record_order_submission_if_new(
 /// even when this call's own fills are incomplete or the order is not
 /// otherwise touched again.
 fn order_already_finalized(stage: crate::workflow::WorkflowStage) -> bool {
-    use crate::workflow::WorkflowStage;
-    matches!(
-        stage,
-        WorkflowStage::OrderFinalized
-            | WorkflowStage::StakingEligibilityRecorded
-            | WorkflowStage::StakingDepositSubmitted
-            | WorkflowStage::StakingBalanceConfirmed
-            | WorkflowStage::DelegationSubmitted
-            | WorkflowStage::DelegatedConfirmed
-            | WorkflowStage::Complete
-    )
+    stage.is_order_finalized()
 }
 
 /// Maps a raw Hyperliquid order status string to durable order finality.
@@ -1637,13 +1625,27 @@ fn validate_binding(
     Ok(())
 }
 
+/// The execution-identity hash a journal prepared for `canonical_account`
+/// must carry — the one derivation of it, used by every check in this crate.
+///
+/// `canonical_account` must be the address **as the connector holds it**
+/// (`HyperliquidConnector::execution_account_address`, or
+/// `HyperliquidObserver::execution_account` for a signer-free caller), never
+/// the raw configured value: the connector canonicalizes on construction, so
+/// a checksummed address from the environment would hash to an identity no
+/// journal carries and every legitimate journal would read as foreign.
+#[must_use]
+pub fn execution_identity_hash_for(canonical_account: &str) -> String {
+    identity_hash(EXECUTION_IDENTITY_DOMAIN, canonical_account)
+}
+
 fn connector_identity_hashes(
     connector: &HyperliquidConnector,
 ) -> Result<(String, String), LiveProbeError> {
     let execution_account = connector.execution_account_address()?;
     let api_wallet = connector.api_wallet_address()?;
     Ok((
-        identity_hash(EXECUTION_IDENTITY_DOMAIN, execution_account),
+        execution_identity_hash_for(execution_account),
         identity_hash(SIGNER_IDENTITY_DOMAIN, &api_wallet),
     ))
 }
@@ -1689,6 +1691,35 @@ fn decimal_to_atoms(value: Decimal, atoms_per_hype: u64) -> Result<HypeAtoms, Li
         .to_u64()
         .map(HypeAtoms::from_atoms)
         .ok_or(LiveProbeError::InvalidDecimal("reconciled HYPE quantity"))
+}
+
+#[cfg(test)]
+mod execution_identity_tests {
+    use super::execution_identity_hash_for;
+    use crate::monitor::HyperliquidObserver;
+
+    #[test]
+    fn identity_is_derived_from_the_connector_canonical_account_not_the_raw_value() {
+        // A checksummed (mixed-case) address is the usual way an address is
+        // copied into an environment file. The connector canonicalizes it on
+        // construction and every journal's execution identity was hashed from
+        // that canonical form, so the expected identity must come from the
+        // same place — hashing the raw value would refuse every legitimate
+        // journal as a foreign account (bot-strategy#929 review).
+        let checksummed = "0xAbCdEf0123456789aBcDeF0123456789AbCdEf01";
+        let observer =
+            HyperliquidObserver::new("https://api.hyperliquid.xyz", checksummed).expect("observer");
+        let canonical = observer.execution_account().expect("account");
+        assert_eq!(canonical, checksummed.to_ascii_lowercase());
+        assert_eq!(
+            execution_identity_hash_for(canonical),
+            execution_identity_hash_for(&checksummed.to_ascii_lowercase())
+        );
+        assert_ne!(
+            execution_identity_hash_for(canonical),
+            execution_identity_hash_for(checksummed)
+        );
+    }
 }
 
 #[cfg(test)]

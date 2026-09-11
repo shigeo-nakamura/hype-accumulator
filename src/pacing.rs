@@ -385,6 +385,20 @@ pub struct DailyDecision {
     pub explanation: PacingExplanation,
 }
 
+impl DailyDecision {
+    /// Whether this decision is a settled purchase — the only kind of decision
+    /// that can own HYPE. A dry-run cycle settles a planned decision at zero
+    /// fill, and a skip never had an order; neither has an inventory side.
+    ///
+    /// The single definition behind attribution, the list of purchases still
+    /// missing their acquisition evidence, and what the backfill accepts
+    /// (bot-strategy#929): those three must be the same set.
+    #[must_use]
+    pub const fn is_settled_purchase(&self) -> bool {
+        self.settled && !self.filled_usdc.is_zero()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DecisionInput {
     pub at: DateTime<Utc>,

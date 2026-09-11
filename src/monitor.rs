@@ -80,6 +80,26 @@ pub struct HyperliquidObserver {
 }
 
 impl HyperliquidObserver {
+    /// The execution account this observer watches, in the exact canonical
+    /// form the connector holds it in.
+    ///
+    /// Anything that must agree with a value the connector derived from the
+    /// account — the execution-identity hash bound into every workflow
+    /// journal, in particular — has to start from this string, not from the
+    /// configured value: the connector canonicalizes on construction, and a
+    /// checksummed (mixed-case) address in the environment would otherwise
+    /// hash to a different identity than the one the journals carry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MonitorError::Connector`] if the connector has no account,
+    /// which `new` makes impossible.
+    pub fn execution_account(&self) -> Result<&str, MonitorError> {
+        self.connector
+            .execution_account_address()
+            .map_err(|error| MonitorError::Connector(error.to_string()))
+    }
+
     /// Creates a read-only observer. No signer or nonce state is constructed.
     ///
     /// # Errors
