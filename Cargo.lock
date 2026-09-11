@@ -745,8 +745,8 @@ dependencies = [
 
 [[package]]
 name = "dex-connector"
-version = "4.7.25"
-source = "git+https://github.com/shigeo-nakamura/dex-connector?tag=v4.7.25#9c1848e8d16b7cb1629ddcbfab9c2aec7224a18b"
+version = "4.7.27"
+source = "git+https://github.com/shigeo-nakamura/dex-connector?tag=v4.7.27#faadb54489a97c710bc095c47de72109e2d5a525"
 dependencies = [
  "async-trait",
  "base64 0.21.7",

@@ -25,21 +25,31 @@
 //! - The book's best ask is taken as `asks.first()`, assuming the connector
 //!   returns levels best-first (as Hyperliquid's `l2Book` does).
 //! - `market_metadata_digest` is a fixed digest of HYPE/USDC's static,
-//!   protocol-level asset properties (decimals), not a live query — spot
-//!   asset metadata is not currently exposed as a public dex-connector API,
-//!   and these properties do not change.
+//!   protocol-level asset properties (wei decimals and the venue size lot).
+//!   The venue's live `spotMeta` grid is verified against those constants
+//!   here (`hype_asset::verify_hype_usdc_order_grid`), and the quantity and
+//!   limit price are derived *on* that grid, so what is authorized is
+//!   exactly what the venue will accept (bot-strategy#991): a quantity at
+//!   wei precision was silently truncated to the `szDecimals` lot and a
+//!   micro-USDC price to five significant figures on the first real fill
+//!   (bot-strategy#845 blockers 10 and 12).
 //! - Account and fee-schedule reads exist to attest current reachability
 //!   (their success stamps `*_valid_through_at`); their content does not
 //!   flow into the envelope, which relies only on the durable, config-bound
 //!   `max_purchase_fee_bps`.
 
 use crate::{
-    hype_asset::{hype_usdc_market_metadata_digest, HYPE_ATOMS_PER_HYPE, HYPE_SPOT_MARKET},
+    hype_asset::{
+        hype_usdc_market_metadata_digest, verify_hype_usdc_order_grid, OrderGridMismatch,
+        HYPE_ATOMS_PER_HYPE, HYPE_SPOT_MARKET,
+    },
     pacing::UsdcMicros,
     workflow::{AuthorizationInputFreshness, HypeAtoms, OrderEnvelopeBinding},
 };
 use chrono::{DateTime, TimeDelta, Utc};
-use dex_connector::{DexConnector, DexError, HyperliquidConnector};
+use dex_connector::{
+    DexConnector, DexError, HyperliquidConnector, HyperliquidSpotOrderGrid, OrderSide,
+};
 use rust_decimal::{prelude::ToPrimitive, Decimal};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -76,6 +86,8 @@ pub enum OrderEnvelopeError {
     InvalidVenueTime,
     #[error("computed expiry window is invalid: {0}")]
     InvalidExpiryWindow(&'static str),
+    #[error("venue order grid does not match this build's bound market metadata: {0}")]
+    OrderGrid(#[from] OrderGridMismatch),
 }
 
 /// Assembles a fully-bound [`OrderEnvelopeBinding`] for one HYPE/USDC spot
@@ -114,6 +126,11 @@ pub async fn assemble_order_envelope_binding(
         return Err(OrderEnvelopeError::NonPositivePlanned);
     }
 
+    // The venue's own lot/tick rule, verified against the constants the
+    // digest below binds, before anything is derived on it.
+    let grid = connector.spot_order_grid(HYPE_SPOT_MARKET).await?;
+    verify_hype_usdc_order_grid(&grid)?;
+
     let venue_book = connector
         .get_order_book_with_venue_time(HYPE_SPOT_MARKET, policy.order_book_depth)
         .await?;
@@ -136,12 +153,15 @@ pub async fn assemble_order_envelope_binding(
     // above, so run them concurrently.
     tokio::try_join!(connector.get_combined_balance(), connector.get_user_fees())?;
 
-    let limit_price = worst_case_price_with_slippage(best_ask.price, policy.max_slippage_bps)?;
+    let limit_price = limit_price_on_grid(
+        worst_case_price_with_slippage(best_ask.price, policy.max_slippage_bps)?,
+        &grid,
+    )?;
     // Quantity from the micro-rounded limit, so the (rounded-up) fill
     // notional in `workflow.rs::max_fill_notional_usdc` never exceeds the plan.
     let limit_price_usdc_per_hype = decimal_to_usdc_micros(limit_price)?;
     let original_quantity_hype =
-        quantity_for_budget(planned_usdc, limit_price_usdc_per_hype.as_decimal())?;
+        quantity_for_budget(planned_usdc, limit_price_usdc_per_hype.as_decimal(), &grid)?;
 
     let book_evidence_valid_through_at =
         now + seconds(policy.book_stale_after_seconds, "book_stale_after_seconds")?;
@@ -258,9 +278,31 @@ fn worst_case_price_with_slippage(
         .ok_or(OrderEnvelopeError::InvalidDecimal("limit price"))
 }
 
+/// Normalizes a buy's worst-case limit price onto the venue's price tick
+/// (rounding down, the way the connector's order path does for a buy), and
+/// requires the result to be exactly representable in micro-USDC — the
+/// precision the envelope binds — so the price that is authorized is the
+/// price the venue accepts, byte for byte.
+fn limit_price_on_grid(
+    worst_case: Decimal,
+    grid: &HyperliquidSpotOrderGrid,
+) -> Result<Decimal, OrderEnvelopeError> {
+    let on_grid = grid.normalize_price(worst_case, OrderSide::Long);
+    if on_grid <= Decimal::ZERO {
+        return Err(OrderEnvelopeError::InvalidDecimal("limit price"));
+    }
+    if decimal_to_usdc_micros(on_grid)?.as_decimal() != on_grid.normalize() {
+        return Err(OrderEnvelopeError::InvalidDecimal(
+            "limit price on the venue grid is not representable in micro-USDC",
+        ));
+    }
+    Ok(on_grid)
+}
+
 fn quantity_for_budget(
     planned_usdc: UsdcMicros,
     limit_price: Decimal,
+    grid: &HyperliquidSpotOrderGrid,
 ) -> Result<HypeAtoms, OrderEnvelopeError> {
     if limit_price <= Decimal::ZERO {
         return Err(OrderEnvelopeError::InvalidDecimal("limit price"));
@@ -272,8 +314,12 @@ fn quantity_for_budget(
     // Always round the quantity down: overspending the planned budget is
     // never acceptable, and the live-probe's own debit-cap check
     // (`live_probe.rs`'s `apply_bps_markup`-based debit bound) independently
-    // re-bounds this at submission time regardless.
-    let atoms = quantity_hype
+    // re-bounds this at submission time regardless. Down onto the venue's
+    // size lot, not merely to wei: the venue truncates to the lot itself,
+    // and an authorized quantity finer than the lot is one the venue can
+    // never report back (bot-strategy#991).
+    let atoms = grid
+        .floor_size(quantity_hype)
         .checked_mul(Decimal::from(HYPE_ATOMS_PER_HYPE))
         .ok_or(OrderEnvelopeError::InvalidDecimal("quantity atoms"))?
         .trunc()
@@ -315,6 +361,26 @@ mod tests {
         Utc.timestamp_opt(second, 0).single().unwrap()
     }
 
+    /// The live HYPE/USDC grid (`spotMeta` on 2026-09-10: `szDecimals` 2,
+    /// `weiDecimals` 8).
+    fn grid() -> HyperliquidSpotOrderGrid {
+        HyperliquidSpotOrderGrid {
+            pair: "HYPE/USDC".to_string(),
+            coin: "@107".to_string(),
+            asset: 10_107,
+            size_decimals: 2,
+            base_wei_decimals: 8,
+        }
+    }
+
+    /// A hypothetical wei-fine lot, to show the lot itself is what floors.
+    fn wei_fine_grid() -> HyperliquidSpotOrderGrid {
+        HyperliquidSpotOrderGrid {
+            size_decimals: 8,
+            ..grid()
+        }
+    }
+
     fn policy() -> OrderEnvelopeFreshnessPolicy {
         OrderEnvelopeFreshnessPolicy {
             max_venue_clock_lag_ms: 2_000,
@@ -346,24 +412,37 @@ mod tests {
     #[test]
     fn quantity_rounds_down_and_rejects_nonpositive_price() {
         // $25 budget at $25/HYPE with 8 decimals = exactly 1.0 HYPE.
-        let exact =
-            quantity_for_budget(UsdcMicros::from_micros(25_000_000), Decimal::from(25)).unwrap();
+        let exact = quantity_for_budget(
+            UsdcMicros::from_micros(25_000_000),
+            Decimal::from(25),
+            &grid(),
+        )
+        .unwrap();
         assert_eq!(exact, HypeAtoms::from_atoms(HYPE_ATOMS_PER_HYPE));
 
         // $10 at a price that doesn't divide evenly must floor, never round up.
-        let floored =
-            quantity_for_budget(UsdcMicros::from_micros(10_000_000), Decimal::from(3)).unwrap();
-        // 10/3 = 3.333...HYPE -> floor at 8 decimals, never overspending $10.
+        let floored = quantity_for_budget(
+            UsdcMicros::from_micros(10_000_000),
+            Decimal::from(3),
+            &grid(),
+        )
+        .unwrap();
+        // 10/3 = 3.333...HYPE -> floor onto the 0.01 lot, never overspending $10.
+        assert_eq!(floored, HypeAtoms::from_atoms(333_000_000));
         let spent = Decimal::from(floored.as_atoms()) / Decimal::from(HYPE_ATOMS_PER_HYPE)
             * Decimal::from(3);
         assert!(spent <= Decimal::from(10));
 
         assert!(matches!(
-            quantity_for_budget(UsdcMicros::from_micros(1), Decimal::ZERO),
+            quantity_for_budget(UsdcMicros::from_micros(1), Decimal::ZERO, &grid()),
             Err(OrderEnvelopeError::InvalidDecimal("limit price"))
         ));
         assert!(matches!(
-            quantity_for_budget(UsdcMicros::from_micros(1), Decimal::from(1_000_000_000)),
+            quantity_for_budget(
+                UsdcMicros::from_micros(1),
+                Decimal::from(1_000_000_000),
+                &grid()
+            ),
             Err(OrderEnvelopeError::ZeroQuantity)
         ));
     }
@@ -443,6 +522,64 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn refuses_to_derive_anything_on_a_venue_grid_that_drifted() {
+        // The venue reports a finer lot than this build's digest binds.
+        let spot_meta = serde_json::json!({
+            "universe": [{"name": "HYPE/USDC", "tokens": [1, 0], "index": 0, "isCanonical": true}],
+            "tokens": [
+                {"name": "USDC", "szDecimals": 2, "weiDecimals": 6, "index": 0},
+                {"name": "HYPE", "szDecimals": 3, "weiDecimals": 8, "index": 1},
+            ],
+        })
+        .to_string();
+        let responses = std::collections::HashMap::from([("spotMeta", spot_meta)]);
+        // Assembly must stop at the grid: no book, account or fee request.
+        let (address, server) = spawn_typed_mock_server(responses, 1).await;
+        let nonce_path =
+            std::env::temp_dir().join(format!("hype-grid-drift-nonce-{}.json", std::process::id()));
+        let connector = HyperliquidConnector::new(HyperliquidConnectorConfig {
+            base_url: format!("http://{address}"),
+            tracked_symbols: Vec::new(),
+        })
+        .unwrap()
+        .with_account(HyperliquidAccountConfig {
+            account_address: "0x0000000000000000000000000000000000000001".to_string(),
+            signer_private_key: Some(TEST_SIGNER_KEY.to_string()),
+            vault_address: None,
+            is_mainnet: false,
+            nonce_state_path: Some(nonce_path.clone()),
+            max_taker_notional: None,
+            max_taker_slippage_bps: None,
+            max_taker_book_age_ms: 60_000,
+        })
+        .unwrap();
+
+        let now = Utc::now();
+        let result = assemble_order_envelope_binding(
+            &connector,
+            "signer-identity-hash-a".to_string(),
+            UsdcMicros::from_micros(25_000_000),
+            now + TimeDelta::hours(1),
+            now + TimeDelta::hours(1),
+            &policy(),
+            now,
+        )
+        .await;
+        server.await.unwrap();
+        let _ = std::fs::remove_file(nonce_path);
+
+        assert!(matches!(
+            result,
+            Err(OrderEnvelopeError::OrderGrid(
+                OrderGridMismatch::SizeDecimals {
+                    venue: 3,
+                    expected: 2
+                }
+            ))
+        ));
+    }
+
     #[test]
     fn quantity_from_the_micro_rounded_limit_never_exceeds_the_budget_after_ceil() {
         // The bound limit price is rounded to micros (nearest, so possibly
@@ -451,6 +588,10 @@ mod tests {
         // it above `planned_usdc`. Deriving the quantity from the unrounded
         // price can overshoot by one micro; deriving it from the rounded
         // price cannot. Sweep asks whose 20 bps markup has 7 decimals.
+        // On a wei-fine lot, so the sweep still exercises the micro-rounding
+        // argument itself: the live 0.01 lot floors far more coarsely and
+        // would hide it.
+        let grid = wei_fine_grid();
         let planned = UsdcMicros::from_micros(25_000_000);
         let scale = u128::from(HYPE_ATOMS_PER_HYPE);
         let ceil_notional = |atoms: u64, limit_micros: u64| -> u128 {
@@ -463,13 +604,14 @@ mod tests {
             let best_ask = Decimal::from(800_001 + tenth) / Decimal::from(10_000);
             let limit = worst_case_price_with_slippage(best_ask, 20).unwrap();
             let limit_micros = decimal_to_usdc_micros(limit).unwrap();
-            let rounded_atoms = quantity_for_budget(planned, limit_micros.as_decimal()).unwrap();
+            let rounded_atoms =
+                quantity_for_budget(planned, limit_micros.as_decimal(), &grid).unwrap();
             assert!(
                 ceil_notional(rounded_atoms.as_atoms(), limit_micros.as_micros())
                     <= u128::from(planned.as_micros()),
                 "ask {best_ask}: rounded-price quantity overshoots"
             );
-            let unrounded_atoms = quantity_for_budget(planned, limit).unwrap();
+            let unrounded_atoms = quantity_for_budget(planned, limit, &grid).unwrap();
             if ceil_notional(unrounded_atoms.as_atoms(), limit_micros.as_micros())
                 > u128::from(planned.as_micros())
             {
@@ -478,6 +620,70 @@ mod tests {
         }
         // The sweep must actually contain the failure mode being fixed.
         assert!(unrounded_overshoots > 0);
+    }
+
+    /// The first real fill (bot-strategy#845 blockers 10 and 12), re-derived
+    /// on the venue grid: the envelope now authorizes exactly what the venue
+    /// accepted (`origSz` 0.3 at `limitPx` 81.172) instead of 0.30798790 at
+    /// 81.172020.
+    #[test]
+    fn derives_the_first_real_fill_on_the_venue_grid() {
+        // 81.172020 = best ask 81.01 × (1 + 20 bps).
+        let best_ask = Decimal::from_str("81.01").unwrap();
+        let worst_case = worst_case_price_with_slippage(best_ask, 20).unwrap();
+        assert_eq!(worst_case, Decimal::from_str("81.17202").unwrap());
+        let limit = limit_price_on_grid(worst_case, &grid()).unwrap();
+        assert_eq!(limit, Decimal::from_str("81.172").unwrap());
+        let limit_micros = decimal_to_usdc_micros(limit).unwrap();
+        assert_eq!(limit_micros.as_micros(), 81_172_000);
+        let quantity =
+            quantity_for_budget(UsdcMicros::from_micros(25_000_000), limit, &grid()).unwrap();
+        assert_eq!(quantity, HypeAtoms::from_atoms(30_000_000));
+        // Both are fixed points of the connector's own order-path
+        // normalization, so they reach the venue unchanged.
+        assert_eq!(
+            grid().floor_size(Decimal::from_str("0.3").unwrap()),
+            Decimal::from_str("0.3").unwrap()
+        );
+        assert_eq!(grid().normalize_price(limit, OrderSide::Long), limit);
+        // And still inside the plan: 0.3 × 81.172 = 24.3516 ≤ 25.
+        assert!(
+            Decimal::from(quantity.as_atoms()) / Decimal::from(HYPE_ATOMS_PER_HYPE) * limit
+                <= Decimal::from(25)
+        );
+    }
+
+    #[test]
+    fn limit_price_on_grid_rounds_a_buy_down_and_rejects_the_unrepresentable() {
+        // Rounding is toward the cheaper side for a buy: the authorized
+        // ceiling never rises above the worst case that was computed.
+        let worst_case = Decimal::from_str("81.17299").unwrap();
+        assert_eq!(
+            limit_price_on_grid(worst_case, &grid()).unwrap(),
+            Decimal::from_str("81.172").unwrap()
+        );
+        // A four-digit price has a 0.1 tick: 1234.5678 → 1234.5.
+        assert_eq!(
+            limit_price_on_grid(Decimal::from_str("1234.5678").unwrap(), &grid()).unwrap(),
+            Decimal::from_str("1234.5").unwrap()
+        );
+        // A sub-dollar price on a fine lot lands on a tick finer than a
+        // micro-USDC; the envelope cannot bind it exactly, so it is refused
+        // rather than silently re-rounded a second time.
+        let fine = HyperliquidSpotOrderGrid {
+            size_decimals: 0,
+            ..grid()
+        };
+        assert!(matches!(
+            limit_price_on_grid(Decimal::from_str("0.0012345678").unwrap(), &fine),
+            Err(OrderEnvelopeError::InvalidDecimal(
+                "limit price on the venue grid is not representable in micro-USDC"
+            ))
+        ));
+        assert!(matches!(
+            limit_price_on_grid(Decimal::ZERO, &grid()),
+            Err(OrderEnvelopeError::InvalidDecimal("limit price"))
+        ));
     }
 
     #[test]
@@ -642,6 +848,16 @@ mod tests {
                 / Decimal::from(HYPE_ATOMS_PER_HYPE)
                 * Decimal::from_str("25.05").unwrap()
                 <= Decimal::from(25)
+        );
+        // …and onto the venue's 0.01 lot: 25 / 25.05 = 0.998003… → 0.99.
+        assert_eq!(
+            envelope.original_quantity_hype,
+            HypeAtoms::from_atoms(99_000_000)
+        );
+        assert_eq!(envelope.limit_price_usdc_per_hype.as_micros(), 25_050_000);
+        assert_eq!(
+            envelope.market_metadata_digest,
+            hype_usdc_market_metadata_digest()
         );
         assert_eq!(envelope.hype_atoms_per_hype, HYPE_ATOMS_PER_HYPE);
         assert_eq!(
