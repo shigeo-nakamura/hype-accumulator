@@ -16,15 +16,16 @@
 //!   own client order ID exactly, so an operator must have actually read
 //!   `prepare`'s output before this proceeds.
 //!
-//! This binary only supports an account's first-ever live economic action
-//! (see `live_decision.rs`'s module doc for why). It is feature-gated
-//! behind `live-probe` and is not built by default.
+//! This binary requires the account's staking, delegation, and
+//! pending-withdrawal HYPE to be exactly zero (see `live_decision.rs`'s
+//! module doc for why); repeat purchases on the same account are supported.
+//! It is feature-gated behind `live-probe` and is not built by default.
 
 use chrono::{DateTime, Utc};
 use dex_connector::{HyperliquidAccountConfig, HyperliquidConnector, HyperliquidConnectorConfig};
 use hype_accumulator::{
     config::{Config, EffectiveLiveOrderPolicy, ProcessEnvironment},
-    live_decision::{bound_decision_identity, prepare_first_live_order_workflow},
+    live_decision::{bound_decision_identity, prepare_live_order_workflow},
     live_probe::{
         execution_identity_hash_for, reconcile_prepared_order, HyperliquidLiveProbe,
         LiveProbeBinding,
@@ -842,7 +843,7 @@ async fn prepare(
 
     // Decrypts the signer now, even though the signal-free
     // `SignerFreeRuntime::apply_cycle` below (inside
-    // `prepare_first_live_order_workflow`) might still find no decision
+    // `prepare_live_order_workflow`) might still find no decision
     // due. This can't be deferred further: envelope assembly's nonce
     // reservation runs inside that same call, and splitting the signer-free
     // and signer-requiring halves of that flow is out of this binary's
@@ -958,7 +959,7 @@ async fn prepare(
     // journal that never belonged there (Codex review, hype-accumulator#54).
     let validated = RefCell::new(BTreeSet::new());
     let admissible = collecting_journal_admissible(network_routing_admissible, &validated);
-    let workflow = prepare_first_live_order_workflow(
+    let workflow = prepare_live_order_workflow(
         &connector,
         &mut runtime,
         cycle_input,

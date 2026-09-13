@@ -487,7 +487,7 @@ impl Config {
     /// one-shot live-probe binary) needs to build most of
     /// `order_envelope::OrderEnvelopeFreshnessPolicy` and
     /// `workflow::EligibilityPolicyBinding`, plus the validator/residual
-    /// inputs to `live_decision::prepare_first_live_order_workflow`. Two
+    /// inputs to `live_decision::prepare_live_order_workflow`. Two
     /// values these callers also need are deliberately absent because
     /// `SecurityPolicy` has no field for either: `order_timeout_seconds`/
     /// `order_book_depth` are operational parameters, not security policy,
