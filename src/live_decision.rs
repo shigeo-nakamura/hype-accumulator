@@ -2,26 +2,28 @@
 //! signer-free order-envelope workflow, ready for
 //! [`crate::live_probe::HyperliquidLiveProbe`].
 //!
-//! # Scope limitation: first-live-probe only
+//! # Scope limitation: staking must be provably zero
 //!
-//! [`InventoryBaseline`]'s staking and delegated fields are asserted to be
-//! exactly zero — verified against a live read, never merely assumed — and
-//! a nonzero read fails closed rather than guessing. The unconsumed-residual
-//! field is now genuinely computed, not assumed:
+//! This crate does not stake, delegate, or withdraw HYPE (staking is
+//! deliberately unimplemented — bot-strategy#929, owner decision
+//! 2026-09-10), and no ledger in this crate tracks staking, delegation, or
+//! pending-withdrawal movements across days. So [`InventoryBaseline`]'s
+//! staking and delegated fields are asserted to be exactly zero — verified
+//! against a live read, never merely assumed — and a nonzero read fails
+//! closed rather than guessing: it is evidence that HYPE moved through a
+//! path this module cannot account for. That assertion is the only thing
+//! this gate enforces; it is *not* a first-purchase-only restriction.
+//!
+//! Residual HYPE across days is genuinely computed, not assumed:
 //! [`crate::workflow::DurableWorkflow::aggregate_terminal_residual_hype`]
 //! sums the terminal `residual_hype` left behind by every completed
 //! workflow journal in `journal_directory` (see `workflow.rs`) and
 //! reconciles that sum against this same call's live spot balance read,
 //! failing closed on any journal that is not yet terminal or on a sum that
-//! exceeds the live balance. This function remains restricted to an
-//! account's first live economic action for a narrower reason than before:
-//! no cross-workflow ledger in this crate yet tracks staking or delegation
-//! across days (bot-strategy#929's remaining scope), so the zero
-//! staking/delegation check above is still what this module's safety
-//! depends on beyond residual HYPE. Building that ledger, a daily
-//! scheduler, and observer/dashboard attribution wiring is required before
-//! this module can support anything beyond an account's first live
-//! economic action.
+//! exceeds the live balance. A second, third, or Nth purchase on the same
+//! account therefore works as long as staking stays at zero. Lifting the
+//! staking-zero assertion needs the cross-day staking/delegation ledger
+//! (bot-strategy#929's remaining scope) before anything else.
 
 use crate::{
     hype_asset::hype_usdc_market_metadata_digest,
@@ -61,10 +63,10 @@ pub enum LiveDecisionError {
     #[error("Hyperliquid connector error: {0}")]
     Connector(#[from] DexError),
     #[error(
-        "account already has nonzero {0}; this module only supports an \
-         account's first live economic action (see module doc)"
+        "account has nonzero {0}; this crate does not stake and has no ledger \
+         for staking movements, so it fails closed (see module doc)"
     )]
-    NotFirstLiveProbe(&'static str),
+    StakingActivityDetected(&'static str),
     #[error("live-probe binding error: {0}")]
     LiveProbeBinding(#[from] LiveProbeError),
     #[error("order envelope assembly failed: {0}")]
@@ -189,13 +191,13 @@ pub fn bound_decision_identity(binding: &DecisionBinding) -> LiveDecisionIdentit
 ///
 /// Returns [`LiveDecisionError::NoDecisionDue`] when no scheduled decision
 /// boundary is due this cycle. Returns
-/// [`LiveDecisionError::NotFirstLiveProbe`] when a live read finds nonzero
-/// staking, delegation, or pending-withdrawal HYPE — evidence this account
-/// has prior live activity this module cannot safely account for (see
-/// module doc). Otherwise propagates the underlying runtime, connector,
+/// [`LiveDecisionError::StakingActivityDetected`] when a live read finds
+/// nonzero staking, delegation, or pending-withdrawal HYPE — evidence HYPE
+/// moved through a path this module cannot account for (see module doc).
+/// Otherwise propagates the underlying runtime, connector,
 /// envelope-assembly, or workflow error.
 #[allow(clippy::too_many_arguments)]
-pub async fn prepare_first_live_order_workflow(
+pub async fn prepare_live_order_workflow(
     connector: &HyperliquidConnector,
     runtime: &mut SignerFreeRuntime,
     cycle_input: RuntimeCycleInput<'_>,
@@ -264,7 +266,7 @@ pub async fn prepare_first_live_order_workflow(
             connector.get_staking_summary()
         )?;
 
-        let (staking_hype_atoms, delegated_hype_atoms) = first_live_probe_staking_atoms(&staking)?;
+        let (staking_hype_atoms, delegated_hype_atoms) = staking_disabled_atoms(&staking)?;
         let spot_hype_atoms = hype_atoms_from_decimal(spot_hype_balance(&balance))?;
 
         // Genuinely aggregated and reconciled, not assumed (see module
@@ -362,18 +364,18 @@ fn spot_hype_balance(balance: &CombinedBalanceResponse) -> Decimal {
         .sum()
 }
 
-/// Verifies a live staking read is consistent with an account's first-ever
-/// live economic action (see module doc), returning
-/// `(staking_hype_atoms, delegated_hype_atoms)` — both provably zero when
-/// this succeeds.
+/// Verifies a live staking read shows no staking activity at all — the
+/// invariant this crate depends on while staking is unimplemented (see
+/// module doc) — returning `(staking_hype_atoms, delegated_hype_atoms)`,
+/// both provably zero when this succeeds.
 ///
 /// # Errors
 ///
-/// Returns [`LiveDecisionError::NotFirstLiveProbe`] when any of
+/// Returns [`LiveDecisionError::StakingActivityDetected`] when any of
 /// `pending_withdrawal_hype`, `undelegated_hype`, or `delegated_hype` is
 /// nonzero, or [`LiveDecisionError::InvalidBalance`] when a nonzero amount
 /// is not exactly representable in HYPE atoms.
-fn first_live_probe_staking_atoms(
+fn staking_disabled_atoms(
     staking: &HyperliquidStakingSummary,
 ) -> Result<(HypeAtoms, HypeAtoms), LiveDecisionError> {
     // Check the raw, un-floored decimal first: flooring to atom precision
@@ -381,15 +383,19 @@ fn first_live_probe_staking_atoms(
     // 0.000000004 HYPE) pass as zero, defeating exactly the fail-closed
     // guarantee this function exists to provide.
     if staking.pending_withdrawal_hype != Decimal::ZERO {
-        return Err(LiveDecisionError::NotFirstLiveProbe(
+        return Err(LiveDecisionError::StakingActivityDetected(
             "pending_withdrawal_hype",
         ));
     }
     if staking.undelegated_hype != Decimal::ZERO {
-        return Err(LiveDecisionError::NotFirstLiveProbe("staking_hype_atoms"));
+        return Err(LiveDecisionError::StakingActivityDetected(
+            "staking_hype_atoms",
+        ));
     }
     if staking.delegated_hype != Decimal::ZERO {
-        return Err(LiveDecisionError::NotFirstLiveProbe("delegated_hype_atoms"));
+        return Err(LiveDecisionError::StakingActivityDetected(
+            "delegated_hype_atoms",
+        ));
     }
     let staking_hype_atoms = hype_atoms_from_decimal(staking.undelegated_hype)?;
     let delegated_hype_atoms = hype_atoms_from_decimal(staking.delegated_hype)?;
@@ -412,8 +418,7 @@ mod tests {
 
     #[test]
     fn accepts_an_all_zero_staking_summary() {
-        let (staking_atoms, delegated_atoms) =
-            first_live_probe_staking_atoms(&zero_staking()).unwrap();
+        let (staking_atoms, delegated_atoms) = staking_disabled_atoms(&zero_staking()).unwrap();
         assert!(staking_atoms.is_zero());
         assert!(delegated_atoms.is_zero());
     }
@@ -423,8 +428,8 @@ mod tests {
         let mut staking = zero_staking();
         staking.pending_withdrawal_hype = Decimal::from(1);
         assert!(matches!(
-            first_live_probe_staking_atoms(&staking),
-            Err(LiveDecisionError::NotFirstLiveProbe(
+            staking_disabled_atoms(&staking),
+            Err(LiveDecisionError::StakingActivityDetected(
                 "pending_withdrawal_hype"
             ))
         ));
@@ -435,8 +440,10 @@ mod tests {
         let mut staking = zero_staking();
         staking.undelegated_hype = Decimal::from(1);
         assert!(matches!(
-            first_live_probe_staking_atoms(&staking),
-            Err(LiveDecisionError::NotFirstLiveProbe("staking_hype_atoms"))
+            staking_disabled_atoms(&staking),
+            Err(LiveDecisionError::StakingActivityDetected(
+                "staking_hype_atoms"
+            ))
         ));
     }
 
@@ -448,22 +455,26 @@ mod tests {
         let mut staking = zero_staking();
         staking.undelegated_hype = Decimal::new(4, 9);
         assert!(matches!(
-            first_live_probe_staking_atoms(&staking),
-            Err(LiveDecisionError::NotFirstLiveProbe("staking_hype_atoms"))
+            staking_disabled_atoms(&staking),
+            Err(LiveDecisionError::StakingActivityDetected(
+                "staking_hype_atoms"
+            ))
         ));
 
         let mut staking = zero_staking();
         staking.delegated_hype = Decimal::new(4, 9);
         assert!(matches!(
-            first_live_probe_staking_atoms(&staking),
-            Err(LiveDecisionError::NotFirstLiveProbe("delegated_hype_atoms"))
+            staking_disabled_atoms(&staking),
+            Err(LiveDecisionError::StakingActivityDetected(
+                "delegated_hype_atoms"
+            ))
         ));
 
         let mut staking = zero_staking();
         staking.pending_withdrawal_hype = Decimal::new(4, 9);
         assert!(matches!(
-            first_live_probe_staking_atoms(&staking),
-            Err(LiveDecisionError::NotFirstLiveProbe(
+            staking_disabled_atoms(&staking),
+            Err(LiveDecisionError::StakingActivityDetected(
                 "pending_withdrawal_hype"
             ))
         ));
@@ -474,8 +485,10 @@ mod tests {
         let mut staking = zero_staking();
         staking.delegated_hype = Decimal::from(1);
         assert!(matches!(
-            first_live_probe_staking_atoms(&staking),
-            Err(LiveDecisionError::NotFirstLiveProbe("delegated_hype_atoms"))
+            staking_disabled_atoms(&staking),
+            Err(LiveDecisionError::StakingActivityDetected(
+                "delegated_hype_atoms"
+            ))
         ));
     }
 

@@ -47,7 +47,9 @@ fails; the standalone recovery command needs no KMS decrypt, active signing
 key, or unexpired live acknowledgement. Neither lookup records durable order
 finality or authorizes another purchase. See
 [the recovery runbook](docs/runbooks/live-probe-recovery.md).
-This remains a first-purchase probe, with no scheduled live or staking path.
+This remains an operator-supervised one-purchase-per-run probe (repeat purchases
+on the same account are supported while its staking stays at zero), with no
+scheduled live or staking path.
 
 ## Offline fixed-DCA fallback
 
