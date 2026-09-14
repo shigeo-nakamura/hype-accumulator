@@ -860,6 +860,7 @@ async fn prepare(
         runtime_config_path,
         operational_params_path,
         journal_path,
+        None,
     )
     .await?;
     print_prepared_order(
@@ -876,6 +877,11 @@ async fn prepare(
 /// workflow so an unattended caller (`run-cycle`) can take the confirmation
 /// from its binding instead of re-parsing `prepare`'s output. Holds the
 /// exclusive runtime lock only for the duration of the call.
+///
+/// `expected_decision_date`, when given, is the UTC date the caller named
+/// the journal after; it is checked against the clock read that the runtime
+/// cycle decides on, *before* that cycle runs, so a decision can never be
+/// committed under a journal whose name says another day.
 #[allow(clippy::too_many_lines)]
 async fn prepare_workflow(
     config_path: &str,
@@ -883,6 +889,7 @@ async fn prepare_workflow(
     runtime_config_path: &str,
     operational_params_path: &str,
     journal_path: &str,
+    expected_decision_date: Option<chrono::NaiveDate>,
 ) -> Result<DurableWorkflow, Box<dyn std::error::Error>> {
     let now = Utc::now();
     let config = load_config(config_path, security_policy_path)?;
@@ -966,6 +973,20 @@ async fn prepare_workflow(
     // This is also what keeps `observed_at >= balance_observed_at` and
     // `scan_end_ms == observed_at` for `validate_cycle_range`.
     let now = Utc::now();
+    // This `now` is the cycle's `observed_at`, i.e. the clock the runtime
+    // keys the decision date on (`observed_at.date_naive()`). A caller that
+    // named the journal after an earlier clock read must be refused here,
+    // before anything is committed, if the two reads straddle UTC midnight.
+    if let Some(expected) = expected_decision_date {
+        if now.date_naive() != expected {
+            return Err(format!(
+                "the decision clock reads {} but the journal {journal_path} was named for \
+                 {expected}; refusing to decide under a journal named for another day — rerun",
+                now.date_naive()
+            )
+            .into());
+        }
+    }
     let effective = config.effective_live_order_policy(&ProcessEnvironment, now)?;
     let policy_version = config.effective_security_policy_digest(&ProcessEnvironment, now)?;
     let (envelope_policy, eligibility_policy) = build_prepare_policies(
@@ -1192,10 +1213,14 @@ async fn submit(
 /// * no journal yet → `prepare` and, in the same process, `submit` the order
 ///   it just prepared (its signed expiry is seconds long, which is why the
 ///   two cannot be separate timer firings) and reconcile/settle;
-/// * a journal already exists → an earlier run reached at least the
-///   prepared-order stage, so this run is **reconciliation-only**: it never
-///   submits, exactly as the recovery runbook requires after any attempt.
-///   Whether the venue saw the earlier order is what the reconcile answers.
+/// * a journal exists but holds only the decision binding (a crash between
+///   `open_or_create` and `prepare_order`) → provably no submit-capable
+///   action was ever produced, so preparation resumes on that binding;
+/// * a journal exists with a prepared action, or past submission → an
+///   earlier run may have reached the venue, so this run is
+///   **reconciliation-only**: it never submits, exactly as the recovery
+///   runbook requires after any attempt. Whether the venue saw the earlier
+///   order is what the reconcile answers.
 ///
 /// A decision that is not due (before the boundary, or a weekday the
 /// schedule excludes) exits successfully without preparing anything. Every
@@ -1221,23 +1246,36 @@ async fn run_cycle(
         .to_owned();
     println!("mode=run-cycle date={decision_date} journal={journal_path}");
 
-    if DurableWorkflow::peek_committed_binding(&journal_path)?.is_some() {
-        println!("mode=run-cycle disposition=journal-exists reconcile-only=true");
-        reconcile(
-            config_path,
-            security_policy_path,
-            runtime_config_path,
-            operational_params_path,
-            &journal_path,
-        )
-        .await?;
-    } else {
+    let resumable = match DurableWorkflow::peek_committed_binding(&journal_path)? {
+        None => true,
+        Some(binding) => {
+            // An earlier run got at least as far as committing the binding.
+            // Whether it also prepared an action decides everything: a
+            // journal holding only the binding provably never produced a
+            // submit-capable action (`prepare_order` is what appends it), so
+            // `prepare_live_order_workflow` resumes it on the same binding;
+            // a journal that did prepare one may have been submitted — the
+            // send has no durable marker of its own — and is reconciliation-
+            // only from here, exactly as after any operator `submit`.
+            let (protected_head_store, owner_store) = build_stores(Path::new(&journal_path))?;
+            let workflow = DurableWorkflow::open_or_create(
+                &journal_path,
+                &binding,
+                protected_head_store,
+                owner_store,
+            )?;
+            let state = workflow.state();
+            state.stage() == WorkflowStage::Decided && state.pending_action().is_none()
+        }
+    };
+    if resumable {
         let prepared = prepare_workflow(
             config_path,
             security_policy_path,
             runtime_config_path,
             operational_params_path,
             &journal_path,
+            Some(decision_date),
         )
         .await;
         let workflow = match prepared {
@@ -1249,14 +1287,12 @@ async fn run_cycle(
             Err(error) => return Err(error),
         };
         let identity = bound_decision_identity(workflow.state().binding());
-        // The journal is named after the date this process started on; the
-        // runtime decided on its own clock read a few network round trips
-        // later. They can only differ across a UTC midnight, which a 12:00
-        // schedule never straddles — but a mismatch would be a journal whose
-        // name lies about its decision, so refuse before signing.
+        // Already enforced before the cycle ran (`expected_decision_date`);
+        // a disagreement here would mean the runtime keyed the decision on
+        // something other than that clock, which is a bug, not a race.
         if identity.decision_date != decision_date {
             return Err(format!(
-                "prepared decision {} is dated {} but today's journal is {journal_path}; \
+                "prepared decision {} is dated {} but the journal is {journal_path}; \
                  refusing to submit — reconcile/release by hand",
                 identity.decision_id, identity.decision_date
             )
@@ -1277,6 +1313,16 @@ async fn run_cycle(
             operational_params_path,
             &journal_path,
             &client_order_id,
+        )
+        .await?;
+    } else {
+        println!("mode=run-cycle disposition=journal-exists reconcile-only=true");
+        reconcile(
+            config_path,
+            security_policy_path,
+            runtime_config_path,
+            operational_params_path,
+            &journal_path,
         )
         .await?;
     }

@@ -224,19 +224,29 @@ it like any other). Then:
   in the same process, because the prepared order's signed expiry is seconds
   long — then reconcile and settle. The confirmation is the client order ID
   read from the durable binding; no text is parsed.
-- **A journal already exists** → an earlier run reached at least the
-  prepared-order stage. The run is **reconciliation-only**: it never
-  submits, exactly as this runbook requires after any attempt. Whether the
-  venue saw the earlier order is what the reconcile answers.
+- **A journal exists holding only the decision binding** (a crash between
+  `open_or_create` and `prepare_order`) → provably no submit-capable action
+  was ever produced; preparation resumes on that binding and the run
+  continues as above.
+- **A journal exists with a prepared action, or past submission** → an
+  earlier run may have reached the venue (the send itself leaves no durable
+  marker, and the action expired seconds later). The run is
+  **reconciliation-only**: it never submits, exactly as this runbook requires
+  after any attempt. Whether the venue saw the earlier order is what the
+  reconcile answers.
 - **No decision due** (before the boundary, an excluded weekday) → exits 0
   having prepared nothing.
 
 Every other outcome short of a *settled* decision exits non-zero — including
 `settlement-deferred` (fills not yet fully visible), which for an operator
 means "rerun later" and for a timer must read as failure. The unit's failure
-is the alert. Rerunning is always safe: a journal makes the rerun
-reconcile-only, and a decision committed without a journal (a crash inside
-`prepare`) is picked up again as the same unsettled decision. A decision left
+is the alert. Rerunning is always safe: a prepared action makes the rerun
+reconcile-only, and a decision committed with no journal or a binding-only
+journal (a crash inside `prepare`) is picked up again as the same unsettled
+decision. The journal is named for the UTC date of the process start, and
+`prepare` refuses — before its runtime cycle commits anything — to decide on
+a clock that reads a different date, so a schedule near midnight cannot
+commit a decision under a journal named for another day. A decision left
 unsettled blocks the next day (`PriorDecisionUnsettled`) until an operator
 runs `reconcile` or `release`, as before.
 
