@@ -1946,7 +1946,12 @@ impl SignerFreeRuntime {
                 boundary_admission_events,
                 &next_state.pacing,
             ));
-            if matches!(input.decision_mode, DecisionMode::Observe) {
+            let observe = matches!(input.decision_mode, DecisionMode::Observe);
+            // The same eligibility the pacing decision itself applies
+            // (weekday schedule, final catch-up): on a day no decision is
+            // due, an observe cycle has no slot to keep open and must not
+            // freeze capital at noon for nothing.
+            if observe && next_state.pacing.is_decision_due(boundary, &self.limits) {
                 // The slot belongs to the scheduled live unit
                 // (bot-strategy#1028). Capital is reconciled exactly up to
                 // the boundary and no further: a watermark past it would
@@ -1961,43 +1966,48 @@ impl SignerFreeRuntime {
                 None
             } else {
                 let boundary_pacing = next_state.pacing.clone();
-                let decision_input = DecisionInput {
-                    at: boundary,
-                    observed_spot_usdc: boundary_observed_spot_usdc,
-                    capital_history_complete: capital_history_complete
-                        && boundary_balance_available,
-                    manual_pause: input.manual_pause,
-                };
-                let result = match decision_signal {
-                    Some(signal) => {
-                        next_state
+                let decision = if observe {
+                    None
+                } else {
+                    let decision_input = DecisionInput {
+                        at: boundary,
+                        observed_spot_usdc: boundary_observed_spot_usdc,
+                        capital_history_complete: capital_history_complete
+                            && boundary_balance_available,
+                        manual_pause: input.manual_pause,
+                    };
+                    let result = match decision_signal {
+                        Some(signal) => next_state.pacing.decide_with_signal(
+                            &decision_input,
+                            &self.limits,
+                            signal,
+                        ),
+                        None => next_state
                             .pacing
-                            .decide_with_signal(&decision_input, &self.limits, signal)
+                            .decide_with_unavailable_signal(&decision_input, &self.limits),
+                    };
+                    let mut decision = match result {
+                        Ok(result) => Some(result),
+                        Err(PacingError::DecisionNotDue) => None,
+                        Err(error) => return Err(error.into()),
+                    };
+                    if let Some(result) = &mut decision {
+                        ledger_events.extend(match input.decision_mode {
+                            DecisionMode::DryRun => {
+                                dry_run_decision_events(&mut next_state.pacing, result)?
+                            }
+                            DecisionMode::Live { .. } => live_decision_events(result)?,
+                            // Unreachable by construction (`observe` never reaches
+                            // this block); refuse rather than record.
+                            DecisionMode::Observe => {
+                                return Err(RuntimeError::InvalidCycle(
+                                    "observe mode must not record a new decision".to_owned(),
+                                ))
+                            }
+                        });
                     }
-                    None => next_state
-                        .pacing
-                        .decide_with_unavailable_signal(&decision_input, &self.limits),
+                    decision
                 };
-                let mut decision = match result {
-                    Ok(result) => Some(result),
-                    Err(PacingError::DecisionNotDue) => None,
-                    Err(error) => return Err(error.into()),
-                };
-                if let Some(result) = &mut decision {
-                    ledger_events.extend(match input.decision_mode {
-                        DecisionMode::DryRun => {
-                            dry_run_decision_events(&mut next_state.pacing, result)?
-                        }
-                        DecisionMode::Live { .. } => live_decision_events(result)?,
-                        // Unreachable by construction (the branch above is not
-                        // entered in observe mode); refuse rather than record.
-                        DecisionMode::Observe => {
-                            return Err(RuntimeError::InvalidCycle(
-                                "observe mode must not record a new decision".to_owned(),
-                            ))
-                        }
-                    });
-                }
                 next_state.pacing.reconcile_capital_preserving_admissions(
                     &capital_events,
                     input.observed_at,

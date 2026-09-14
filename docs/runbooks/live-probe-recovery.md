@@ -225,15 +225,18 @@ it like any other). Then:
   long — then reconcile and settle. The confirmation is the client order ID
   read from the durable binding; no text is parsed.
 - **A journal exists holding only the decision binding** (a crash between
-  `open_or_create` and `prepare_order`) → provably no submit-capable action
-  was ever produced; preparation resumes on that binding and the run
-  continues as above.
-- **A journal exists with a prepared action, or past submission** → an
-  earlier run may have reached the venue (the send itself leaves no durable
-  marker, and the action expired seconds later). The run is
-  **reconciliation-only**: it never submits, exactly as this runbook requires
-  after any attempt. Whether the venue saw the earlier order is what the
-  reconcile answers.
+  `open_or_create` and `prepare_order`) **and the bound envelope has not
+  expired** → provably no submit-capable action was ever produced;
+  preparation resumes on that binding and the run continues as above.
+- **A journal exists with a prepared action, past submission, or with an
+  expired binding** → an earlier run may have reached the venue (the send
+  itself leaves no durable marker, and the action expired seconds later), or
+  the binding can no longer be prepared (`prepare_order` refuses it at or
+  after expiry). The run is **reconciliation-only**: it never submits,
+  exactly as this runbook requires after any attempt. Whether the venue saw
+  the earlier order — or provably never did (conclusive absence,
+  bot-strategy#982, which settles the day at zero) — is what the reconcile
+  answers.
 - **No decision due** (before the boundary, an excluded weekday) → exits 0
   having prepared nothing.
 
@@ -264,11 +267,12 @@ decision_owner = "scheduled_live_unit"   # default: "recurring_cycle"
 
 The recurring cycle then runs in observe mode: movements, admissions,
 capital reconciliation, status and the attribution halt are unchanged, but it
-never records a decision. At an undecided boundary it reconciles capital
-exactly *through* the boundary and pins its scan cursor there — a watermark
-past the boundary would make the boundary replay unsafe and close the slot as
-surely as a recorded decision — and resumes past it once the live unit has
-decided. If the live unit never runs, that day's slot simply stays open
+never records a decision. At an undecided boundary on a day a decision is
+actually due (the schedule's weekdays, or a final catch-up day) it reconciles
+capital exactly *through* the boundary and pins its scan cursor there — a
+watermark past the boundary would make the boundary replay unsafe and close
+the slot as surely as a recorded decision — and resumes past it once the live
+unit has decided. On a day no decision is due it behaves like any other cycle. If the live unit never runs, that day's slot simply stays open
 (`cycle=deferred` in the cycle log, an ageing `last_decision_at` in status),
 and capital tracking for that day lags until the next boundary; nothing is
 decided on the live unit's behalf. The field is rejected on a live pair

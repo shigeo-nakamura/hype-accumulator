@@ -1214,13 +1214,15 @@ async fn submit(
 ///   it just prepared (its signed expiry is seconds long, which is why the
 ///   two cannot be separate timer firings) and reconcile/settle;
 /// * a journal exists but holds only the decision binding (a crash between
-///   `open_or_create` and `prepare_order`) → provably no submit-capable
-///   action was ever produced, so preparation resumes on that binding;
-/// * a journal exists with a prepared action, or past submission → an
-///   earlier run may have reached the venue, so this run is
+///   `open_or_create` and `prepare_order`) and that binding's envelope has
+///   not expired → provably no submit-capable action was ever produced, so
+///   preparation resumes on that binding;
+/// * a journal exists with a prepared action, past submission, or with an
+///   expired binding → an earlier run may have reached the venue (or the
+///   binding can no longer be prepared), so this run is
 ///   **reconciliation-only**: it never submits, exactly as the recovery
 ///   runbook requires after any attempt. Whether the venue saw the earlier
-///   order is what the reconcile answers.
+///   order — or provably never did — is what the reconcile answers.
 ///
 /// A decision that is not due (before the boundary, or a weekday the
 /// schedule excludes) exits successfully without preparing anything. Every
@@ -1246,29 +1248,7 @@ async fn run_cycle(
         .to_owned();
     println!("mode=run-cycle date={decision_date} journal={journal_path}");
 
-    let resumable = match DurableWorkflow::peek_committed_binding(&journal_path)? {
-        None => true,
-        Some(binding) => {
-            // An earlier run got at least as far as committing the binding.
-            // Whether it also prepared an action decides everything: a
-            // journal holding only the binding provably never produced a
-            // submit-capable action (`prepare_order` is what appends it), so
-            // `prepare_live_order_workflow` resumes it on the same binding;
-            // a journal that did prepare one may have been submitted — the
-            // send has no durable marker of its own — and is reconciliation-
-            // only from here, exactly as after any operator `submit`.
-            let (protected_head_store, owner_store) = build_stores(Path::new(&journal_path))?;
-            let workflow = DurableWorkflow::open_or_create(
-                &journal_path,
-                &binding,
-                protected_head_store,
-                owner_store,
-            )?;
-            let state = workflow.state();
-            state.stage() == WorkflowStage::Decided && state.pending_action().is_none()
-        }
-    };
-    if resumable {
+    if journal_resumable_into_prepare(&journal_path)? {
         let prepared = prepare_workflow(
             config_path,
             security_policy_path,
@@ -1348,6 +1328,52 @@ async fn run_cycle(
     }
     println!("mode=run-cycle outcome=settled date={decision_date}");
     Ok(())
+}
+
+/// Whether `run-cycle` may go to `prepare` for this journal path: trivially
+/// when no journal exists; otherwise per [`binding_only_resumable`]. An
+/// earlier run that got as far as committing the binding may or may not
+/// have prepared an action — a journal holding only the binding provably
+/// never produced a submit-capable action (`prepare_order` is what appends
+/// it), so `prepare_live_order_workflow` resumes it on the same binding; a
+/// journal that did prepare one may have been submitted (the send has no
+/// durable marker of its own) and is reconciliation-only from here, exactly
+/// as after any operator `submit`.
+fn journal_resumable_into_prepare(journal_path: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    let Some(binding) = DurableWorkflow::peek_committed_binding(journal_path)? else {
+        return Ok(true);
+    };
+    let (protected_head_store, owner_store) = build_stores(Path::new(journal_path))?;
+    let workflow =
+        DurableWorkflow::open_or_create(journal_path, &binding, protected_head_store, owner_store)?;
+    let state = workflow.state();
+    let envelope = &state.binding().order_envelope;
+    Ok(binding_only_resumable(
+        state.stage(),
+        state.pending_action().is_some(),
+        envelope.signed_expiry_at,
+        envelope.effective_expiry_at,
+        Utc::now(),
+    ))
+}
+
+/// Whether an existing journal may be resumed into `prepare` rather than
+/// sent to reconciliation: only a workflow that never prepared an action
+/// (`Decided`, no pending action) **and** whose bound envelope is still live.
+/// `prepare_order` refuses a binding at or after either expiry, so resuming
+/// an expired one would fail identically on every rerun; reconciliation is
+/// the path that can record conclusive absence for an order that was never
+/// sent (bot-strategy#982) and settle the day from it.
+fn binding_only_resumable(
+    stage: WorkflowStage,
+    has_pending_action: bool,
+    signed_expiry_at: DateTime<Utc>,
+    effective_expiry_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> bool {
+    stage == WorkflowStage::Decided
+        && !has_pending_action
+        && now < signed_expiry_at.min(effective_expiry_at)
 }
 
 fn is_no_decision_due(error: &(dyn std::error::Error + 'static)) -> bool {
@@ -2345,9 +2371,9 @@ async fn build_signed_connector(
 #[cfg(test)]
 mod tests {
     use super::{
-        invocation, is_no_decision_due, network_routing_admissible_for, validate_journal_path,
-        HistoryDirectoryBinding, HistoryInitialization, Invocation, LiveDecisionError,
-        PrepareTimeBinding,
+        binding_only_resumable, invocation, is_no_decision_due, network_routing_admissible_for,
+        validate_journal_path, HistoryDirectoryBinding, HistoryInitialization, Invocation,
+        LiveDecisionError, PrepareTimeBinding, WorkflowStage,
     };
     use std::cell::RefCell;
     use std::collections::BTreeSet;
@@ -2981,6 +3007,62 @@ mod tests {
                 "operational.toml",
             ]))
         );
+    }
+
+    #[test]
+    fn only_a_live_binding_without_a_prepared_action_is_resumable() {
+        use chrono::{TimeDelta, TimeZone, Utc};
+        let signed = Utc.with_ymd_and_hms(2026, 9, 16, 12, 0, 40).unwrap();
+        let effective = signed + TimeDelta::seconds(5);
+        let before = signed - TimeDelta::seconds(3);
+        // Binding committed, nothing prepared, envelope still live → resume.
+        assert!(binding_only_resumable(
+            WorkflowStage::Decided,
+            false,
+            signed,
+            effective,
+            before
+        ));
+        // A prepared action may already have been sent → reconcile only.
+        assert!(!binding_only_resumable(
+            WorkflowStage::Decided,
+            true,
+            signed,
+            effective,
+            before
+        ));
+        // Past submission → reconcile only, whatever the clock says.
+        assert!(!binding_only_resumable(
+            WorkflowStage::OrderSubmitted,
+            false,
+            signed,
+            effective,
+            before
+        ));
+        // At or after the earlier of the two expiries `prepare_order` would
+        // refuse the binding → reconcile only (conclusive absence path).
+        assert!(!binding_only_resumable(
+            WorkflowStage::Decided,
+            false,
+            signed,
+            effective,
+            signed
+        ));
+        let effective_first = signed - TimeDelta::seconds(2);
+        assert!(!binding_only_resumable(
+            WorkflowStage::Decided,
+            false,
+            signed,
+            effective_first,
+            effective_first
+        ));
+        assert!(binding_only_resumable(
+            WorkflowStage::Decided,
+            false,
+            signed,
+            effective_first,
+            effective_first - TimeDelta::milliseconds(1)
+        ));
     }
 
     #[test]

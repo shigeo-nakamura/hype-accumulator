@@ -2558,6 +2558,56 @@ fn observe_cycle_leaves_the_decision_slot_open_past_the_boundary() {
     assert_eq!(reopened.state.pacing.decisions().len(), 1);
 }
 
+/// On a day the schedule excludes, no decision is due, so an observe cycle
+/// has no slot to keep open: it reconciles through `observed_at` like any
+/// other cycle instead of freezing capital at noon (Codex review, #67).
+#[test]
+fn observe_cycle_does_not_defer_on_a_day_no_decision_is_due() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = start + TimeDelta::hours(1);
+    // 2026-07-06 is a Monday; a Monday-only schedule makes Tuesday ineligible.
+    let tuesday_boundary = at(2026, 7, 7, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-approved", deposit_at, 100);
+    let admission = approvals("deposit-approved", deposit_at, deposit_at);
+    let signal = signal_for(tuesday_boundary, "2026-07-07");
+    let mut weekday_limits = limits();
+    weekday_limits.weekdays = [1].into_iter().collect();
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config, weekday_limits).expect("open runtime");
+
+    let observed_at = tuesday_boundary + TimeDelta::minutes(5);
+    let report = runtime
+        .apply_cycle(RuntimeCycleInput {
+            observed_at,
+            scan_start_ms: ms(start),
+            scan_end_ms: ms(observed_at),
+            movements: std::slice::from_ref(&movement),
+            approvals: &admission,
+            signal: Some(&signal),
+            accumulator: status(observed_at, 100.0),
+            capital_history_complete: true,
+            manual_pause: true,
+            api_errors: 0,
+            decision_mode: DecisionMode::Observe,
+        })
+        .expect("observe cycle on an ineligible day");
+    assert!(report.decision().is_none());
+    // Not deferred: watermark and cursor advanced to the observation, and
+    // the deposit was admitted.
+    assert_eq!(
+        runtime.state.pacing.capital_reconciled_through(),
+        Some(observed_at)
+    );
+    assert_eq!(
+        runtime.state.last_complete_scan_end_ms,
+        Some(ms(observed_at))
+    );
+    assert_eq!(runtime.state.pacing.deposits().len(), 1);
+    assert!(runtime.state.pacing.decisions().is_empty());
+}
+
 /// A movement that lands after an undecided boundary is neither admitted by
 /// the observe cycles that see it nor lost: the pinned cursor rescans it,
 /// and the cycle that decides records it (bot-strategy#1028).
