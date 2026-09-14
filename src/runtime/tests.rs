@@ -2677,6 +2677,34 @@ fn live_cycle_fails_loudly_when_capital_advanced_past_a_due_boundary() {
     );
 }
 
+/// `decision_is_settled` distinguishes "settled", "unsettled" and "not held
+/// at all" — the last must never read as settled (Codex, #67).
+#[test]
+fn decision_is_settled_reports_none_for_a_decision_the_runtime_does_not_hold() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = start + TimeDelta::hours(1);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-approved", deposit_at, 100);
+    let admission = approvals("deposit-approved", deposit_at, deposit_at);
+    let signal = signal(decision_at);
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
+    assert_eq!(runtime.decision_is_settled("fixed-dca:2026-07-06"), None);
+    let report = live_planned_decision(
+        &mut runtime,
+        start,
+        decision_at,
+        &movement,
+        &admission,
+        &signal,
+    );
+    let decision_id = report.decision().expect("decision").decision_id.clone();
+    assert_eq!(runtime.decision_is_settled(&decision_id), Some(false));
+    assert_eq!(runtime.decision_is_settled("fixed-dca:2026-07-07"), None);
+}
+
 /// A movement that lands after an undecided boundary is neither admitted by
 /// the observe cycles that see it nor lost: the pinned cursor rescans it,
 /// and the cycle that decides records it (bot-strategy#1028).

@@ -1374,27 +1374,74 @@ async fn run_cycle(
         .await?;
     }
 
-    // The only success condition: the runtime no longer holds today's
-    // decision unsettled. `submit`/`reconcile` print `settlement-deferred`
-    // and return `Ok` when finality or fill visibility is still pending —
-    // fine for an operator who will rerun, wrong for a timer that would
-    // otherwise report a clean run.
+    let decision_id = assert_today_settled(
+        config_path,
+        security_policy_path,
+        runtime_config_path,
+        &journal_path,
+    )?;
+    println!("mode=run-cycle outcome=settled decision={decision_id} date={decision_date}");
+    Ok(())
+}
+
+/// `run-cycle`'s only success condition, checked after the flow: the runtime
+/// holds exactly the decision today's journal is bound to — same identity,
+/// declared for this very journal — and that decision is settled. Returns
+/// the decision ID. `submit`/`reconcile` print `settlement-deferred` and
+/// return `Ok` when finality or fill visibility is still pending — fine for
+/// an operator who will rerun, wrong for a timer that would otherwise report
+/// a clean run. Absence from the runtime is not settlement either: a
+/// `runtime.toml` pointing at some other state directory must fail here,
+/// not pass by having nothing.
+fn assert_today_settled(
+    config_path: &str,
+    security_policy_path: &str,
+    runtime_config_path: &str,
+    journal_path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let binding = DurableWorkflow::peek_committed_binding(journal_path)?
+        .ok_or("run-cycle finished without a committed journal binding for today")?;
+    let identity = bound_decision_identity(&binding);
+    let decision_id = identity.decision_id.clone();
     let config = load_config(config_path, security_policy_path)?;
     let runtime = open_signer_free_runtime(&config, runtime_config_path)?;
-    if let Some(pending) = runtime
-        .unsettled_planned_decisions()
-        .into_iter()
-        .find(|decision| decision.decision_date == decision_date)
-    {
+    match runtime.decision_identity(&decision_id) {
+        Some(held) if held == identity => {}
+        Some(_) => {
+            return Err(format!(
+                "runtime holds decision {decision_id} with a different identity than \
+                 {journal_path} is bound to; refusing to report it settled"
+            )
+            .into())
+        }
+        None => {
+            return Err(format!(
+                "runtime does not hold decision {decision_id} that {journal_path} is bound to \
+                 (wrong runtime.toml / state directory?); refusing to report it settled"
+            )
+            .into())
+        }
+    }
+    let declared = runtime
+        .live_journal_intent(&decision_id)
+        .map(fs::canonicalize)
+        .transpose()?;
+    if declared.as_deref() != Some(fs::canonicalize(journal_path)?.as_path()) {
         return Err(format!(
-            "decision {} is still unsettled after this run; rerun `run-cycle` (or the \
-             signer-free `reconcile`) once the order's fills are visible — never resubmit",
-            pending.decision_id
+            "runtime declared journal {} for decision {decision_id}, not {journal_path}; \
+             refusing to report it settled",
+            declared.map_or_else(|| "<none>".to_owned(), |path| path.display().to_string())
         )
         .into());
     }
-    println!("mode=run-cycle outcome=settled date={decision_date}");
-    Ok(())
+    if runtime.decision_is_settled(&decision_id) != Some(true) {
+        return Err(format!(
+            "decision {decision_id} is still unsettled after this run; rerun `run-cycle` (or \
+             the signer-free `reconcile`) once the order's fills are visible — never resubmit"
+        )
+        .into());
+    }
+    Ok(decision_id)
 }
 
 /// Makes the history directory exist for the command lock to live in, but

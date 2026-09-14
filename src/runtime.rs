@@ -1219,6 +1219,19 @@ impl SignerFreeRuntime {
         Ok(LiveSettlementOutcome::Settled)
     }
 
+    /// Whether the decision `decision_id` is held by this runtime and
+    /// settled; `None` when the runtime holds no such decision at all —
+    /// which a caller must never read as "nothing left to settle".
+    #[must_use]
+    pub fn decision_is_settled(&self, decision_id: &str) -> Option<bool> {
+        self.state
+            .pacing
+            .decisions()
+            .values()
+            .find(|decision| decision.decision_id == decision_id)
+            .map(|decision| decision.settled)
+    }
+
     /// Planned decisions that a live cycle committed and nothing has settled
     /// yet. Empty for a runtime that has only ever run `DRY_RUN` cycles.
     #[must_use]
