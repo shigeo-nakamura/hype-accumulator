@@ -854,6 +854,7 @@ async fn prepare(
     operational_params_path: &str,
     journal_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let _command_lock = acquire_journal_command_lock(journal_path)?;
     let workflow = prepare_workflow(
         config_path,
         security_policy_path,
@@ -1099,6 +1100,28 @@ async fn submit(
     journal_path: &str,
     confirm_client_order_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let _command_lock = acquire_journal_command_lock(journal_path)?;
+    submit_journal(
+        config_path,
+        security_policy_path,
+        runtime_config_path,
+        operational_params_path,
+        journal_path,
+        confirm_client_order_id,
+    )
+    .await
+}
+
+/// `submit` without the journal command lock, for a caller that already
+/// holds it (`run-cycle`).
+async fn submit_journal(
+    config_path: &str,
+    security_policy_path: &str,
+    runtime_config_path: &str,
+    operational_params_path: &str,
+    journal_path: &str,
+    confirm_client_order_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let now = Utc::now();
     let config = load_config(config_path, security_policy_path)?;
     config.validate_at(&ProcessEnvironment, now)?;
@@ -1247,13 +1270,12 @@ async fn run_cycle(
         .ok_or("journal path is not valid UTF-8")?
         .to_owned();
     println!("mode=run-cycle date={decision_date} journal={journal_path}");
-    // One run per journal at a time, from classification through submission:
-    // the venue send has no durable marker, so two overlapping runs that both
-    // classified the journal as fresh could both reach `submit` (the second
-    // reusing the first's prepared action). systemd never overlaps a oneshot
-    // with itself; this closes the operator-run-alongside-the-unit case.
-    // Held until this function returns.
-    let _run_lock = acquire_run_cycle_lock(&journal_path)?;
+    // One command per journal at a time, from classification through
+    // submission: the venue send has no durable marker, so an overlapping
+    // `run-cycle` or operator `submit` that loaded the same prepared action
+    // could send it a second time. Held until this function returns; the
+    // internals below are the lock-free variants of the operator commands.
+    let _command_lock = acquire_journal_command_lock(&journal_path)?;
 
     if journal_resumable_into_prepare(&journal_path)? {
         let prepared = prepare_workflow(
@@ -1293,7 +1315,7 @@ async fn run_cycle(
         // `submit` re-opens the journal and the runtime itself; the prepared
         // workflow handle must not outlive this point.
         drop(workflow);
-        submit(
+        submit_journal(
             config_path,
             security_policy_path,
             runtime_config_path,
@@ -1304,7 +1326,7 @@ async fn run_cycle(
         .await?;
     } else {
         println!("mode=run-cycle disposition=journal-exists reconcile-only=true");
-        reconcile(
+        reconcile_journal(
             config_path,
             security_policy_path,
             runtime_config_path,
@@ -1337,13 +1359,26 @@ async fn run_cycle(
     Ok(())
 }
 
-/// Exclusive, process-lifetime lock for one `run-cycle` over one journal
-/// (`<journal>.run-cycle.lock`, next to the journal's own append lock).
-/// Fails closed with `WouldBlock` rather than waiting: a run that finds the
-/// lock held must not proceed to a classification that the holder is about
-/// to invalidate; its own rerun (or the timer's) will reconcile.
-fn acquire_run_cycle_lock(journal_path: &str) -> Result<fs::File, Box<dyn std::error::Error>> {
-    let lock_path = format!("{journal_path}.run-cycle.lock");
+/// Exclusive, process-lifetime lock for one command over one journal
+/// (`<journal>.command.lock`, next to the journal's own append lock), held
+/// by `prepare`, `submit`, `reconcile` and `run-cycle` alike. The venue send
+/// in `submit` has no durable marker of its own, so two commands that both
+/// loaded the same prepared action — `run-cycle` and an operator `submit`,
+/// or two `run-cycle`s — could send it twice; this refuses the second one
+/// outright (`WouldBlock`, never waiting) rather than let it act on a
+/// classification the holder is about to invalidate. Creates the journal's
+/// directory if needed, as the journal's own append lock does, so a
+/// first-ever `run-cycle` can still initialize a fresh history directory.
+fn acquire_journal_command_lock(
+    journal_path: &str,
+) -> Result<fs::File, Box<dyn std::error::Error>> {
+    if let Some(parent) = Path::new(journal_path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let lock_path = format!("{journal_path}.command.lock");
     let lock = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -1353,7 +1388,8 @@ fn acquire_run_cycle_lock(journal_path: &str) -> Result<fs::File, Box<dyn std::e
     match fs2::FileExt::try_lock_exclusive(&lock) {
         Ok(()) => Ok(lock),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Err(format!(
-            "another run-cycle holds {lock_path}; refusing to classify or submit alongside it"
+            "another hype-live-probe command holds {lock_path}; refusing to act on this journal \
+             alongside it"
         )
         .into()),
         Err(error) => Err(error.into()),
@@ -2022,6 +2058,26 @@ async fn reconcile(
     operational_params_path: &str,
     journal_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let _command_lock = acquire_journal_command_lock(journal_path)?;
+    reconcile_journal(
+        config_path,
+        security_policy_path,
+        runtime_config_path,
+        operational_params_path,
+        journal_path,
+    )
+    .await
+}
+
+/// `reconcile` without the journal command lock, for a caller that already
+/// holds it (`run-cycle`).
+async fn reconcile_journal(
+    config_path: &str,
+    security_policy_path: &str,
+    runtime_config_path: &str,
+    operational_params_path: &str,
+    journal_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config(config_path, security_policy_path)?;
     let operational = OperationalParams::from_toml(&fs::read_to_string(operational_params_path)?)?;
     PrepareTimeBinding::verify(
@@ -2401,7 +2457,7 @@ async fn build_signed_connector(
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_run_cycle_lock, binding_only_resumable, invocation, is_no_decision_due,
+        acquire_journal_command_lock, binding_only_resumable, invocation, is_no_decision_due,
         network_routing_admissible_for, validate_journal_path, HistoryDirectoryBinding,
         HistoryInitialization, Invocation, LiveDecisionError, PrepareTimeBinding, WorkflowStage,
     };
@@ -3096,17 +3152,36 @@ mod tests {
     }
 
     #[test]
-    fn a_second_run_cycle_on_the_same_journal_is_refused_while_the_first_holds_the_lock() {
+    fn a_second_command_on_the_same_journal_is_refused_while_the_first_holds_the_lock() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let journal = directory.path().join("2026-09-16.jsonl");
         let journal = journal.to_str().expect("utf-8 path");
-        let held = acquire_run_cycle_lock(journal).expect("first lock");
-        let refused = acquire_run_cycle_lock(journal)
+        let held = acquire_journal_command_lock(journal).expect("first lock");
+        let refused = acquire_journal_command_lock(journal)
             .map(|_| ())
-            .expect_err("second run-cycle must be refused");
-        assert!(refused.to_string().contains("another run-cycle holds"));
+            .expect_err("second command must be refused");
+        assert!(refused
+            .to_string()
+            .contains("another hype-live-probe command holds"));
         drop(held);
-        acquire_run_cycle_lock(journal).expect("lock is free again once the holder exits");
+        acquire_journal_command_lock(journal).expect("lock is free again once the holder exits");
+    }
+
+    #[test]
+    fn the_command_lock_creates_a_missing_history_directory_like_the_append_lock() {
+        // A first-ever `run-cycle` must be able to take the lock before
+        // `prepare` initializes the directory (Codex review, #67).
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let fresh = directory.path().join("journals");
+        assert!(!fresh.exists());
+        let journal = fresh.join("2026-09-16.jsonl");
+        let _held =
+            acquire_journal_command_lock(journal.to_str().expect("utf-8 path")).expect("lock");
+        assert!(fresh.is_dir());
+        assert!(
+            !journal.exists(),
+            "the lock must not create the journal itself"
+        );
     }
 
     #[test]
