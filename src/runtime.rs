@@ -1647,6 +1647,32 @@ impl SignerFreeRuntime {
                     .capital_reconciled_through()
                     .is_none_or(|watermark| watermark <= boundary)
         });
+        // A live cycle that is due but finds the slot closed — capital
+        // already reconciled past an undecided boundary — must say so, not
+        // return "no decision" and let an unattended caller exit clean
+        // (bot-strategy#1028). The usual cause is a recurring cycle whose
+        // pair does not hand this slot to the live unit, or whose schedule
+        // disagrees with the live pair's about this date being eligible.
+        if let (DecisionMode::Live { .. }, Some(boundary), false) = (
+            &input.decision_mode,
+            scheduled_boundary,
+            boundary_replay_safe,
+        ) {
+            if existing_decision.is_none()
+                && self.state.pacing.is_decision_due(boundary, &self.limits)
+            {
+                return Err(RuntimeError::DecisionSlotClosed(format!(
+                    "a decision is due at {boundary} but capital is already reconciled through \
+                     {}; the recurring cycle advanced past the boundary before this live cycle \
+                     (check the recurring pair's decision_owner and that both pairs share one \
+                     schedule)",
+                    self.state
+                        .pacing
+                        .capital_reconciled_through()
+                        .map_or_else(|| "<never>".to_owned(), |at| at.to_string())
+                )));
+            }
+        }
         let mut capital_history_complete = input.capital_history_complete;
         let balance_observation_started_at = *input.accumulator.balance_observation_started_at();
         let balance_observed_at = *input.accumulator.balance_observed_at();
@@ -3118,6 +3144,8 @@ pub enum RuntimeError {
     InvalidAdmissionArtifact(String),
     #[error("runtime cycle is invalid: {0}")]
     InvalidCycle(String),
+    #[error("live decision slot closed: {0}")]
+    DecisionSlotClosed(String),
     #[error("account movement is invalid: {0}")]
     InvalidMovement(String),
     #[error("admission approval references unknown deposit: {0}")]

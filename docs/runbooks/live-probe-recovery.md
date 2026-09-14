@@ -244,6 +244,9 @@ marker of its own. Then:
   answers.
 - **No decision due** (before the boundary, an excluded weekday) → exits 0
   having prepared nothing.
+- **A journal at today's path bound to another decision date** (the
+  operator `prepare` accepts any `.jsonl` name) → refused before anything
+  is read further; resolve by hand.
 
 Every other outcome short of a *settled* decision exits non-zero — including
 `settlement-deferred` (fills not yet fully visible), which for an operator
@@ -277,7 +280,13 @@ actually due (the schedule's weekdays, or a final catch-up day) it reconciles
 capital exactly *through* the boundary and pins its scan cursor there — a
 watermark past the boundary would make the boundary replay unsafe and close
 the slot as surely as a recorded decision — and resumes past it once the live
-unit has decided. On a day no decision is due it behaves like any other cycle. If the live unit never runs, that day's slot simply stays open
+unit has decided. On a day no decision is due it behaves like any other cycle.
+The two pairs must therefore agree on the schedule (`[schedule]` hour,
+minute, weekdays, `final_catch_up_days`): eligibility is judged by the
+recurring pair, and if the live pair considers a date due that the recurring
+pair does not, the live cycle finds capital already reconciled past the
+boundary and fails with `live decision slot closed` — loudly, never as a
+clean "no decision" (`run-cycle` exits non-zero). If the live unit never runs, that day's slot simply stays open
 (`cycle=deferred` in the cycle log, an ageing `last_decision_at` in status),
 and capital tracking for that day lags until the next boundary; nothing is
 decided on the live unit's behalf. The field is rejected on a live pair

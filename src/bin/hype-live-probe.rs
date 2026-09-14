@@ -1276,6 +1276,22 @@ async fn run_cycle(
     // could send it a second time. Held until this function returns; the
     // internals below are the lock-free variants of the operator commands.
     let _command_lock = acquire_journal_command_lock(&journal_path)?;
+    // A journal at today's path must be today's decision. The operator
+    // `prepare` accepts any `.jsonl` name inside the history directory, so a
+    // journal named for today but bound to another date is possible; acting
+    // on it here would reconcile that foreign decision and then report
+    // today as settled without ever deciding it.
+    if let Some(binding) = DurableWorkflow::peek_committed_binding(&journal_path)? {
+        let bound = bound_decision_identity(&binding);
+        if bound.decision_date != decision_date {
+            return Err(format!(
+                "{journal_path} is bound to decision {} dated {}, not {decision_date}; refusing \
+                 to act on a journal named for another day — resolve it by hand",
+                bound.decision_id, bound.decision_date
+            )
+            .into());
+        }
+    }
 
     if journal_resumable_into_prepare(&journal_path)? {
         let prepared = prepare_workflow(

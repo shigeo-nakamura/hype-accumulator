@@ -2608,6 +2608,75 @@ fn observe_cycle_does_not_defer_on_a_day_no_decision_is_due() {
     assert!(runtime.state.pacing.decisions().is_empty());
 }
 
+/// If the recurring pair's schedule says a date is ineligible but the live
+/// pair's says it is due, the observe cycle advances past the boundary and
+/// the live cycle finds the slot closed. That must be a loud error, never a
+/// clean "no decision" an unattended caller would exit 0 on (Codex, #67).
+#[test]
+fn live_cycle_fails_loudly_when_capital_advanced_past_a_due_boundary() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = start + TimeDelta::hours(1);
+    let tuesday_boundary = at(2026, 7, 7, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-approved", deposit_at, 100);
+    let admission = approvals("deposit-approved", deposit_at, deposit_at);
+    let signal = signal_for(tuesday_boundary, "2026-07-07");
+
+    // The recurring pair: Mondays only, so on Tuesday its observe cycle has
+    // nothing to defer and reconciles through its observation.
+    let mut monday_only = limits();
+    monday_only.weekdays = [1].into_iter().collect();
+    let mut recurring =
+        SignerFreeRuntime::open(runtime_config.clone(), monday_only).expect("open runtime");
+    let observed_at = tuesday_boundary + TimeDelta::minutes(5);
+    recurring
+        .apply_cycle(RuntimeCycleInput {
+            observed_at,
+            scan_start_ms: ms(start),
+            scan_end_ms: ms(observed_at),
+            movements: std::slice::from_ref(&movement),
+            approvals: &admission,
+            signal: Some(&signal),
+            accumulator: status(observed_at, 100.0),
+            capital_history_complete: true,
+            manual_pause: true,
+            api_errors: 0,
+            decision_mode: DecisionMode::Observe,
+        })
+        .expect("observe cycle");
+    assert_eq!(
+        recurring.state.pacing.capital_reconciled_through(),
+        Some(observed_at)
+    );
+    drop(recurring);
+
+    // The live pair: every day. Its cycle is due, finds the slot closed, and
+    // must refuse rather than return no decision.
+    let mut live = SignerFreeRuntime::open(runtime_config, limits()).expect("reopen runtime");
+    let live_at = observed_at + TimeDelta::minutes(1);
+    let scan_start_ms = live.next_scan_start_ms();
+    let result = live.apply_cycle(RuntimeCycleInput {
+        observed_at: live_at,
+        scan_start_ms,
+        scan_end_ms: ms(live_at),
+        // Nothing new since the observe cycle: without the guard this cycle
+        // would return a clean report with no decision.
+        movements: &[],
+        approvals: &admission,
+        signal: Some(&signal),
+        accumulator: status(live_at, 100.0),
+        capital_history_complete: true,
+        manual_pause: false,
+        api_errors: 0,
+        decision_mode: live_mode(),
+    });
+    assert!(
+        matches!(result, Err(RuntimeError::DecisionSlotClosed(_))),
+        "expected DecisionSlotClosed, got {result:?}"
+    );
+}
+
 /// A movement that lands after an undecided boundary is neither admitted by
 /// the observe cycles that see it nor lost: the pinned cursor rescans it,
 /// and the cycle that decides records it (bot-strategy#1028).
