@@ -204,6 +204,101 @@ under an attestation remain distinguishable in the journal.
 
 No output of this command is a scheduled-live approval or a staking approval.
 
+## Scheduled live: `run-cycle` and the observing recurring pair (bot-strategy#1028)
+
+The stage-4 probe days were run by hand: stop the recurring timer before
+12:00 UTC, `prepare`, review, `submit --confirm`, repair ownership, resume
+the timer. `run-cycle` is that day as one unattended process, for a systemd
+timer that fires shortly after the decision boundary:
+
+```text
+hype-live-probe run-cycle config.local.toml security-policy.local.toml runtime.local.toml operational.local.toml
+```
+
+It takes no journal argument: today's journal is
+`<history_directory>/<UTC date>.jsonl` (the same shape the probe days used,
+so `aggregate_terminal_residual_hype` and `backfill-attribution` rediscover
+it like any other). Then:
+
+- **No journal yet** → `prepare`, then `submit` the order it just prepared —
+  in the same process, because the prepared order's signed expiry is seconds
+  long — then reconcile and settle. The confirmation is the client order ID
+  read from the durable binding; no text is parsed.
+- **A journal already exists** → an earlier run reached at least the
+  prepared-order stage. The run is **reconciliation-only**: it never
+  submits, exactly as this runbook requires after any attempt. Whether the
+  venue saw the earlier order is what the reconcile answers.
+- **No decision due** (before the boundary, an excluded weekday) → exits 0
+  having prepared nothing.
+
+Every other outcome short of a *settled* decision exits non-zero — including
+`settlement-deferred` (fills not yet fully visible), which for an operator
+means "rerun later" and for a timer must read as failure. The unit's failure
+is the alert. Rerunning is always safe: a journal makes the rerun
+reconcile-only, and a decision committed without a journal (a crash inside
+`prepare`) is picked up again as the same unsettled decision. A decision left
+unsettled blocks the next day (`PriorDecisionUnsettled`) until an operator
+runs `reconcile` or `release`, as before.
+
+### The recurring pair must stop owning the decision slot
+
+A `--dry-run-cycle` past 12:00 UTC records that date's decision itself
+(`manual_pause`/planned-zero on a halted pair; a zero-settled purchase on an
+unhalted one), and `prepare` then refuses the date — this is what lost the
+2026-09-11 probe. Give the slot to the live unit on the **signer-free
+recurring pair's** `config.toml`:
+
+```toml
+decision_owner = "scheduled_live_unit"   # default: "recurring_cycle"
+```
+
+The recurring cycle then runs in observe mode: movements, admissions,
+capital reconciliation, status and the attribution halt are unchanged, but it
+never records a decision. At an undecided boundary it reconciles capital
+exactly *through* the boundary and pins its scan cursor there — a watermark
+past the boundary would make the boundary replay unsafe and close the slot as
+surely as a recorded decision — and resumes past it once the live unit has
+decided. If the live unit never runs, that day's slot simply stays open
+(`cycle=deferred` in the cycle log, an ageing `last_decision_at` in status),
+and capital tracking for that day lags until the next boundary; nothing is
+decided on the live unit's behalf. The field is rejected on a live pair
+(`dry_run = false`): the live pair always owns the decision it prepares.
+
+With the slot handed over, the public status document's `dry_run` flag reports
+`false`: the pair is observing an account that the scheduled unit trades.
+
+### Unit shape
+
+`run-cycle` needs the signer (`signer.env`) and the observer identity, and
+must run as the service user so it leaves no root-owned state behind
+(bot-strategy#972 — relocate the operational binding files out of
+`/etc/hype-accumulator` first). `Persistent=true` is safe: a catch-up firing
+later the same UTC day still finds the decision due, and a firing on the next
+day is a new decision. `Restart=on-failure` with a bounded start limit is
+safe for the same reason reruns are.
+
+```ini
+# hype-accumulator-live.timer
+[Timer]
+OnCalendar=*-*-* 12:00:30 UTC
+Persistent=true
+AccuracySec=1s
+
+# hype-accumulator-live.service
+[Service]
+Type=oneshot
+User=ec2-user
+EnvironmentFile=/etc/hype-accumulator/observer.env
+EnvironmentFile=/etc/hype-accumulator/signer.env
+ExecStart=/opt/hype-accumulator/live-probe/current/hype-live-probe run-cycle \
+  /etc/hype-accumulator/live-probe-config.toml \
+  /etc/hype-accumulator/live-probe-security-policy.toml \
+  /etc/hype-accumulator/runtime.toml \
+  /var/lib/hype-accumulator/live-probe/live-probe-operational.toml
+Restart=on-failure
+RestartSec=120
+```
+
 ## Backfilling attribution for purchases settled before the inventory ledger
 
 Attribution is withheld entirely while any settled purchase lacks its

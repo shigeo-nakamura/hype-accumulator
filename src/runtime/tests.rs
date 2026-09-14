@@ -2424,6 +2424,265 @@ fn live_planned_decision(
         .expect("live cycle")
 }
 
+#[allow(clippy::too_many_arguments)]
+fn cycle_at(
+    runtime: &mut SignerFreeRuntime,
+    scan_start_ms: u64,
+    observed_at: DateTime<Utc>,
+    movement: &HyperliquidAccountMovement,
+    admission: &AdmissionApprovals,
+    signal: &SignalSnapshot,
+    manual_pause: bool,
+    decision_mode: DecisionMode,
+) -> RuntimeCycleReport {
+    runtime
+        .apply_cycle(RuntimeCycleInput {
+            observed_at,
+            scan_start_ms,
+            scan_end_ms: ms(observed_at),
+            movements: std::slice::from_ref(movement),
+            approvals: admission,
+            signal: Some(signal),
+            accumulator: status(observed_at, 100.0),
+            capital_history_complete: true,
+            manual_pause,
+            api_errors: 0,
+            decision_mode,
+        })
+        .expect("cycle")
+}
+
+/// bot-strategy#1028: a recurring cycle in observe mode never records a
+/// decision, however many times it runs past the boundary and whatever its
+/// `manual_pause` says — the slot stays open for the scheduled live unit.
+#[test]
+fn observe_cycle_leaves_the_decision_slot_open_past_the_boundary() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = start + TimeDelta::hours(1);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-approved", deposit_at, 100);
+    let admission = approvals("deposit-approved", deposit_at, deposit_at);
+    let signal = signal(decision_at);
+
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
+    // Exactly the 5-minute cadence the host runs: at, and then well after,
+    // the 12:00 boundary — with `manual_pause` true, which in DryRun mode
+    // is what writes the `manual_pause`/planned-zero record that cost the
+    // 2026-09-11 probe.
+    let mut scan_start_ms = ms(start);
+    for minutes in [0, 5, 10, 60] {
+        let observed_at = decision_at + TimeDelta::minutes(minutes);
+        let report = cycle_at(
+            &mut runtime,
+            scan_start_ms,
+            observed_at,
+            &movement,
+            &admission,
+            &signal,
+            true,
+            DecisionMode::Observe,
+        );
+        assert!(
+            report.decision().is_none(),
+            "observe cycle at +{minutes}m decided"
+        );
+        assert!(!report.is_new_decision());
+        assert!(report.economic_action_suppressed);
+        assert!(!report.signed_action_created);
+        scan_start_ms = runtime.next_scan_start_ms();
+    }
+    assert!(runtime.state.pacing.decisions().is_empty());
+    assert_eq!(runtime.state.dry_run_actions_total, 0);
+    assert_eq!(runtime.state.stale_signal_events_total, 0);
+    // The non-decision duties still ran: the deposit was admitted and the
+    // capital ledger advanced.
+    assert!(runtime.ledger.state().last_runtime_cycle_hash().is_some());
+    assert_eq!(runtime.state.pacing.deposits().len(), 1);
+    // But capital is reconciled exactly through the boundary and the scan
+    // cursor is pinned there: a watermark past 12:00 would have made the
+    // boundary replay unsafe and closed the slot as surely as a recorded
+    // decision would.
+    assert_eq!(
+        runtime.state.pacing.capital_reconciled_through(),
+        Some(decision_at)
+    );
+    assert_eq!(
+        runtime.state.last_complete_scan_end_ms,
+        Some(ms(decision_at))
+    );
+    drop(runtime);
+
+    // The scheduled live unit then decides on the still-open slot, later
+    // the same day, exactly as if nothing had run before it.
+    let live_at = decision_at + TimeDelta::minutes(61);
+    let mut reopened =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("reopen runtime");
+    let live_scan_start_ms = reopened.next_scan_start_ms();
+    let live = cycle_at(
+        &mut reopened,
+        live_scan_start_ms,
+        live_at,
+        &movement,
+        &admission,
+        &signal,
+        false,
+        live_mode(),
+    );
+    assert!(live.is_new_decision());
+    let decision = live.decision().expect("live decision").clone();
+    assert_eq!(decision.reason, DecisionReason::Planned);
+    assert!(!decision.planned_usdc.is_zero());
+    assert!(!decision.settled);
+
+    // And every later observe cycle reports that decision as existing —
+    // never a second one, never a settlement of its own.
+    let after_scan_start_ms = reopened.next_scan_start_ms();
+    let after = cycle_at(
+        &mut reopened,
+        after_scan_start_ms,
+        live_at + TimeDelta::minutes(4),
+        &movement,
+        &admission,
+        &signal,
+        true,
+        DecisionMode::Observe,
+    );
+    assert!(!after.is_new_decision());
+    let existing = after.decision().expect("existing decision");
+    assert_eq!(existing.decision_id, decision.decision_id);
+    assert!(!existing.settled);
+    assert!(after.economic_action_suppressed);
+    assert_eq!(reopened.state.pacing.decisions().len(), 1);
+}
+
+/// A movement that lands after an undecided boundary is neither admitted by
+/// the observe cycles that see it nor lost: the pinned cursor rescans it,
+/// and the cycle that decides records it (bot-strategy#1028).
+#[test]
+fn observe_cycle_neither_admits_nor_loses_a_post_boundary_deposit() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = start + TimeDelta::hours(1);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let late_deposit_at = decision_at + TimeDelta::minutes(2);
+    let runtime_config = config(directory.path(), ms(start));
+    let first = deposit("deposit-approved", deposit_at, 100);
+    let late = deposit("deposit-late", late_deposit_at, 50);
+    let admission = approvals("deposit-approved", deposit_at, deposit_at);
+    let signal = signal(decision_at);
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
+
+    let cycle = |runtime: &mut SignerFreeRuntime,
+                 observed_at: DateTime<Utc>,
+                 movements: &[HyperliquidAccountMovement],
+                 balance: f64,
+                 decision_mode: DecisionMode| {
+        let scan_start_ms = runtime.next_scan_start_ms();
+        runtime
+            .apply_cycle(RuntimeCycleInput {
+                observed_at,
+                scan_start_ms,
+                scan_end_ms: ms(observed_at),
+                movements,
+                approvals: &admission,
+                signal: Some(&signal),
+                accumulator: status(observed_at, balance),
+                capital_history_complete: true,
+                // The recurring pair is halted; the live pair is not.
+                manual_pause: matches!(decision_mode, DecisionMode::Observe),
+                api_errors: 0,
+                decision_mode,
+            })
+            .expect("cycle")
+    };
+
+    let both = [first.clone(), late.clone()];
+    for minutes in [5, 10] {
+        let report = cycle(
+            &mut runtime,
+            decision_at + TimeDelta::minutes(minutes),
+            &both,
+            150.0,
+            DecisionMode::Observe,
+        );
+        assert!(report.decision().is_none());
+        // Seen, but not admitted: admission happens at reconciliation time,
+        // and reconciliation stopped at the boundary.
+        assert!(!runtime.state.pacing.deposits().contains_key("deposit-late"));
+        assert_eq!(
+            runtime.state.last_complete_scan_end_ms,
+            Some(ms(decision_at))
+        );
+    }
+
+    // The live unit decides; its own cycle reconciles past the boundary and
+    // admits the late deposit — it was never dropped.
+    let live = cycle(
+        &mut runtime,
+        decision_at + TimeDelta::minutes(15),
+        &both,
+        150.0,
+        live_mode(),
+    );
+    assert!(live.is_new_decision());
+    let decision = live.decision().expect("live decision");
+    assert_eq!(decision.reason, DecisionReason::Planned);
+    assert!(runtime.state.pacing.deposits().contains_key("deposit-late"));
+    assert_eq!(
+        runtime.state.last_complete_scan_end_ms,
+        Some(ms(decision_at + TimeDelta::minutes(15)))
+    );
+}
+
+/// The public status document's `dry_run` flag follows the mode: only a
+/// `DryRun` cycle labels the account as paper-trading (bot-strategy#1028).
+#[test]
+fn status_dry_run_flag_follows_the_decision_mode() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let deposit_at = start + TimeDelta::hours(1);
+    let observed_at = at(2026, 7, 6, 9, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let movement = deposit("deposit-approved", deposit_at, 100);
+    let admission = approvals("deposit-approved", deposit_at, deposit_at);
+    let signal = signal(at(2026, 7, 6, 12, 0));
+    let status_path = runtime_config.status_path().to_path_buf();
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
+
+    let mut scan_start_ms = ms(start);
+    for (minutes, mode, expected) in [
+        (0, DecisionMode::DryRun, true),
+        (5, DecisionMode::Observe, false),
+        (10, live_mode(), false),
+    ] {
+        let at = observed_at + TimeDelta::minutes(minutes);
+        let label = format!("{mode:?}");
+        cycle_at(
+            &mut runtime,
+            scan_start_ms,
+            at,
+            &movement,
+            &admission,
+            &signal,
+            false,
+            mode,
+        );
+        scan_start_ms = runtime.next_scan_start_ms();
+        let body = std::fs::read_to_string(&status_path).expect("status document");
+        let document: serde_json::Value = serde_json::from_str(&body).expect("status json");
+        assert_eq!(
+            document["dry_run"],
+            serde_json::Value::Bool(expected),
+            "dry_run after a {label} cycle"
+        );
+    }
+}
+
 #[test]
 fn live_cycle_leaves_the_planned_decision_committed_and_unsettled() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -3176,7 +3435,7 @@ fn a_halted_observation_publishes_the_full_status_without_committing_a_cycle() {
     )
     .expect("degraded status");
     runtime
-        .publish_halted_status(degraded, observed_at)
+        .publish_halted_status(degraded, true, observed_at)
         .expect("publish without committing");
 
     let published = std::fs::read_to_string(&runtime_config.status_path).expect("status written");
@@ -3240,7 +3499,7 @@ fn a_halted_observation_still_publishes_while_the_next_boundary_snapshot_is_on_d
     )
     .expect("degraded status");
     runtime
-        .publish_halted_status(degraded, observed_at)
+        .publish_halted_status(degraded, true, observed_at)
         .expect("publishes despite the future-dated snapshot");
     assert!(std::fs::read_to_string(&runtime_config.status_path)
         .expect("status written")

@@ -16,6 +16,14 @@
 //!   own client order ID exactly, so an operator must have actually read
 //!   `prepare`'s output before this proceeds.
 //!
+//! - `run-cycle`: the unattended composition of the two for a scheduled
+//!   live unit (bot-strategy#1028): derives today's journal path from the
+//!   bound `history_directory`, prepares, submits the order it just prepared
+//!   (the confirmation is taken from the durable binding, never from text)
+//!   and reconciles — or, when today's journal already exists, only
+//!   reconciles. Exits non-zero unless the day's decision is settled or no
+//!   decision was due.
+//!
 //! This binary requires the account's staking, delegation, and
 //! pending-withdrawal HYPE to be exactly zero (see `live_decision.rs`'s
 //! module doc for why); repeat purchases on the same account are supported.
@@ -25,7 +33,7 @@ use chrono::{DateTime, Utc};
 use dex_connector::{HyperliquidAccountConfig, HyperliquidConnector, HyperliquidConnectorConfig};
 use hype_accumulator::{
     config::{Config, EffectiveLiveOrderPolicy, ProcessEnvironment},
-    live_decision::{bound_decision_identity, prepare_live_order_workflow},
+    live_decision::{bound_decision_identity, prepare_live_order_workflow, LiveDecisionError},
     live_probe::{
         execution_identity_hash_for, reconcile_prepared_order, HyperliquidLiveProbe,
         LiveProbeBinding,
@@ -570,7 +578,8 @@ const USAGE: &str = "usage:\n  hype-live-probe prepare <config.toml> <security-p
      <security-policy.toml> <runtime-config.toml> <operational.toml> <journal.jsonl>\n  \
      hype-live-probe release <config.toml> <security-policy.toml> <runtime-config.toml> \
      <operational.toml>\n  hype-live-probe backfill-attribution <config.toml> \
-     <security-policy.toml> <runtime-config.toml> <operational.toml>";
+     <security-policy.toml> <runtime-config.toml> <operational.toml>\n  hype-live-probe \
+     run-cycle <config.toml> <security-policy.toml> <runtime-config.toml> <operational.toml>";
 
 #[derive(Debug, Eq, PartialEq)]
 enum Invocation {
@@ -603,6 +612,12 @@ enum Invocation {
         operational_params_path: String,
     },
     BackfillAttribution {
+        config_path: String,
+        security_policy_path: String,
+        runtime_config_path: String,
+        operational_params_path: String,
+    },
+    RunCycle {
         config_path: String,
         security_policy_path: String,
         runtime_config_path: String,
@@ -665,6 +680,16 @@ where
             if command == "backfill-attribution" =>
         {
             Ok(Invocation::BackfillAttribution {
+                config_path: config_path.clone(),
+                security_policy_path: security_policy_path.clone(),
+                runtime_config_path: runtime_config_path.clone(),
+                operational_params_path: operational_params_path.clone(),
+            })
+        }
+        [command, config_path, security_policy_path, runtime_config_path, operational_params_path]
+            if command == "run-cycle" =>
+        {
+            Ok(Invocation::RunCycle {
                 config_path: config_path.clone(),
                 security_policy_path: security_policy_path.clone(),
                 runtime_config_path: runtime_config_path.clone(),
@@ -751,6 +776,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             &runtime_config_path,
             &operational_params_path,
         ),
+        Invocation::RunCycle {
+            config_path,
+            security_policy_path,
+            runtime_config_path,
+            operational_params_path,
+        } => {
+            run_cycle(
+                &config_path,
+                &security_policy_path,
+                &runtime_config_path,
+                &operational_params_path,
+            )
+            .await
+        }
     }
 }
 
@@ -808,7 +847,6 @@ fn bind_history_directory_for_prepare(
     Ok((journal_directory, live_history_directory, history_binding))
 }
 
-#[allow(clippy::too_many_lines)]
 async fn prepare(
     config_path: &str,
     security_policy_path: &str,
@@ -816,6 +854,36 @@ async fn prepare(
     operational_params_path: &str,
     journal_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let workflow = prepare_workflow(
+        config_path,
+        security_policy_path,
+        runtime_config_path,
+        operational_params_path,
+        journal_path,
+    )
+    .await?;
+    print_prepared_order(
+        &workflow,
+        config_path,
+        security_policy_path,
+        runtime_config_path,
+        operational_params_path,
+        journal_path,
+    )
+}
+
+/// Everything `prepare` does except printing: returns the durably prepared
+/// workflow so an unattended caller (`run-cycle`) can take the confirmation
+/// from its binding instead of re-parsing `prepare`'s output. Holds the
+/// exclusive runtime lock only for the duration of the call.
+#[allow(clippy::too_many_lines)]
+async fn prepare_workflow(
+    config_path: &str,
+    security_policy_path: &str,
+    runtime_config_path: &str,
+    operational_params_path: &str,
+    journal_path: &str,
+) -> Result<DurableWorkflow, Box<dyn std::error::Error>> {
     let now = Utc::now();
     let config = load_config(config_path, security_policy_path)?;
     config.validate_at(&ProcessEnvironment, now)?;
@@ -959,7 +1027,7 @@ async fn prepare(
     // journal that never belonged there (Codex review, hype-accumulator#54).
     let validated = RefCell::new(BTreeSet::new());
     let admissible = collecting_journal_admissible(network_routing_admissible, &validated);
-    let workflow = prepare_live_order_workflow(
+    Ok(prepare_live_order_workflow(
         &connector,
         &mut runtime,
         cycle_input,
@@ -978,16 +1046,7 @@ async fn prepare(
         owner_store,
         now,
     )
-    .await?;
-
-    print_prepared_order(
-        &workflow,
-        config_path,
-        security_policy_path,
-        runtime_config_path,
-        operational_params_path,
-        journal_path,
-    )
+    .await?)
 }
 
 /// Prints the prepared (but unsigned, unsent) order and the exact `submit`
@@ -1124,6 +1183,134 @@ async fn submit(
 /// itself to `history_directory` (the namespace the journal is created in).
 /// A `DRY_RUN` pair keeps zero-settling it in-cycle, so `prepare` still fails
 /// closed at the binding.
+/// The scheduled live unit's whole day in one process (bot-strategy#1028).
+///
+/// Today's journal is `<history_directory>/<UTC date>.jsonl`, the same shape
+/// the operator-run probe days used, so `aggregate_terminal_residual_hype`
+/// and `backfill-attribution` rediscover it like any other. The flow is:
+///
+/// * no journal yet → `prepare` and, in the same process, `submit` the order
+///   it just prepared (its signed expiry is seconds long, which is why the
+///   two cannot be separate timer firings) and reconcile/settle;
+/// * a journal already exists → an earlier run reached at least the
+///   prepared-order stage, so this run is **reconciliation-only**: it never
+///   submits, exactly as the recovery runbook requires after any attempt.
+///   Whether the venue saw the earlier order is what the reconcile answers.
+///
+/// A decision that is not due (before the boundary, or a weekday the
+/// schedule excludes) exits successfully without preparing anything. Every
+/// other outcome short of a settled decision exits non-zero, so the timer
+/// unit's failure is the alert: the runtime already refuses the next day's
+/// decision (`PriorDecisionUnsettled`) until an operator resolves it.
+async fn run_cycle(
+    config_path: &str,
+    security_policy_path: &str,
+    runtime_config_path: &str,
+    operational_params_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let operational = OperationalParams::from_toml(&fs::read_to_string(operational_params_path)?)?;
+    let history_directory = operational
+        .history_directory
+        .as_deref()
+        .ok_or("operational.toml is missing history_directory, required by `run-cycle`")?;
+    let decision_date = Utc::now().date_naive();
+    let journal_path = Path::new(history_directory).join(format!("{decision_date}.jsonl"));
+    let journal_path = journal_path
+        .to_str()
+        .ok_or("journal path is not valid UTF-8")?
+        .to_owned();
+    println!("mode=run-cycle date={decision_date} journal={journal_path}");
+
+    if DurableWorkflow::peek_committed_binding(&journal_path)?.is_some() {
+        println!("mode=run-cycle disposition=journal-exists reconcile-only=true");
+        reconcile(
+            config_path,
+            security_policy_path,
+            runtime_config_path,
+            operational_params_path,
+            &journal_path,
+        )
+        .await?;
+    } else {
+        let prepared = prepare_workflow(
+            config_path,
+            security_policy_path,
+            runtime_config_path,
+            operational_params_path,
+            &journal_path,
+        )
+        .await;
+        let workflow = match prepared {
+            Ok(workflow) => workflow,
+            Err(error) if is_no_decision_due(error.as_ref()) => {
+                println!("mode=run-cycle disposition=not-due date={decision_date}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let identity = bound_decision_identity(workflow.state().binding());
+        // The journal is named after the date this process started on; the
+        // runtime decided on its own clock read a few network round trips
+        // later. They can only differ across a UTC midnight, which a 12:00
+        // schedule never straddles — but a mismatch would be a journal whose
+        // name lies about its decision, so refuse before signing.
+        if identity.decision_date != decision_date {
+            return Err(format!(
+                "prepared decision {} is dated {} but today's journal is {journal_path}; \
+                 refusing to submit — reconcile/release by hand",
+                identity.decision_id, identity.decision_date
+            )
+            .into());
+        }
+        let client_order_id = workflow.state().client_order_id();
+        println!(
+            "mode=run-cycle disposition=prepared decision={} client_order_id={client_order_id}",
+            identity.decision_id
+        );
+        // `submit` re-opens the journal and the runtime itself; the prepared
+        // workflow handle must not outlive this point.
+        drop(workflow);
+        submit(
+            config_path,
+            security_policy_path,
+            runtime_config_path,
+            operational_params_path,
+            &journal_path,
+            &client_order_id,
+        )
+        .await?;
+    }
+
+    // The only success condition: the runtime no longer holds today's
+    // decision unsettled. `submit`/`reconcile` print `settlement-deferred`
+    // and return `Ok` when finality or fill visibility is still pending —
+    // fine for an operator who will rerun, wrong for a timer that would
+    // otherwise report a clean run.
+    let config = load_config(config_path, security_policy_path)?;
+    let runtime = open_signer_free_runtime(&config, runtime_config_path)?;
+    if let Some(pending) = runtime
+        .unsettled_planned_decisions()
+        .into_iter()
+        .find(|decision| decision.decision_date == decision_date)
+    {
+        return Err(format!(
+            "decision {} is still unsettled after this run; rerun `run-cycle` (or the \
+             signer-free `reconcile`) once the order's fills are visible — never resubmit",
+            pending.decision_id
+        )
+        .into());
+    }
+    println!("mode=run-cycle outcome=settled date={decision_date}");
+    Ok(())
+}
+
+fn is_no_decision_due(error: &(dyn std::error::Error + 'static)) -> bool {
+    matches!(
+        error.downcast_ref::<LiveDecisionError>(),
+        Some(LiveDecisionError::NoDecisionDue)
+    )
+}
+
 fn decision_mode_for(config: &Config, history_directory: PathBuf) -> DecisionMode {
     if config.dry_run {
         DecisionMode::DryRun
@@ -2112,8 +2299,9 @@ async fn build_signed_connector(
 #[cfg(test)]
 mod tests {
     use super::{
-        invocation, network_routing_admissible_for, validate_journal_path, HistoryDirectoryBinding,
-        HistoryInitialization, Invocation, PrepareTimeBinding,
+        invocation, is_no_decision_due, network_routing_admissible_for, validate_journal_path,
+        HistoryDirectoryBinding, HistoryInitialization, Invocation, LiveDecisionError,
+        PrepareTimeBinding,
     };
     use std::cell::RefCell;
     use std::collections::BTreeSet;
@@ -2688,6 +2876,77 @@ mod tests {
                 "operational.toml",
             ]))
         );
+    }
+
+    #[test]
+    fn parses_a_run_cycle_invocation_without_a_journal() {
+        // `run-cycle` derives today's journal from the bound history
+        // directory (bot-strategy#1028); a caller must not be able to point
+        // it at an arbitrary file, or at a stale date's journal.
+        assert_eq!(
+            invocation(args(&[
+                "run-cycle",
+                "config.toml",
+                "policy.toml",
+                "runtime.toml",
+                "operational.toml",
+            ])),
+            Ok(Invocation::RunCycle {
+                config_path: "config.toml".to_owned(),
+                security_policy_path: "policy.toml".to_owned(),
+                runtime_config_path: "runtime.toml".to_owned(),
+                operational_params_path: "operational.toml".to_owned(),
+            })
+        );
+        assert!(invocation(args(&[
+            "run-cycle",
+            "config.toml",
+            "policy.toml",
+            "runtime.toml",
+            "operational.toml",
+            "journal.jsonl",
+        ]))
+        .is_err());
+        // Nor may it take a `--confirm`: the confirmation comes from the
+        // binding it prepared itself, never from the command line.
+        assert!(invocation(args(&[
+            "run-cycle",
+            "config.toml",
+            "policy.toml",
+            "runtime.toml",
+            "operational.toml",
+            "--confirm",
+            "0xabc123",
+        ]))
+        .is_err());
+        assert_ne!(
+            invocation(args(&[
+                "run-cycle",
+                "config.toml",
+                "policy.toml",
+                "runtime.toml",
+                "operational.toml",
+            ])),
+            invocation(args(&[
+                "release",
+                "config.toml",
+                "policy.toml",
+                "runtime.toml",
+                "operational.toml",
+            ]))
+        );
+    }
+
+    #[test]
+    fn a_no_decision_due_error_is_recognised_through_the_box() {
+        let boxed: Box<dyn std::error::Error> = Box::new(LiveDecisionError::NoDecisionDue);
+        assert!(is_no_decision_due(boxed.as_ref()));
+        let other: Box<dyn std::error::Error> = Box::new(
+            LiveDecisionError::StakingActivityDetected("delegated_hype_atoms"),
+        );
+        assert!(!is_no_decision_due(other.as_ref()));
+        let plain: Box<dyn std::error::Error> = "no pacing decision is due this cycle".into();
+        assert!(!is_no_decision_due(plain.as_ref()));
     }
 
     #[test]
