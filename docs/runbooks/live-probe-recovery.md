@@ -228,7 +228,11 @@ marker of its own. Then:
 - **No journal yet** → `prepare`, then `submit` the order it just prepared —
   in the same process, because the prepared order's signed expiry is seconds
   long — then reconcile and settle. The confirmation is the client order ID
-  read from the durable binding; no text is parsed.
+  read from the durable binding; no text is parsed. The exclusive runtime
+  handle opened by `prepare` is kept through the settlement preflight and
+  the settlement itself, so the recurring cycle's try-lock cannot slip in
+  between the prepared action and the check that it can be settled (a
+  recurring tick that collides fails and runs 5 min later).
 - **A journal exists holding only the decision binding** (a crash between
   `open_or_create` and `prepare_order`) **and the bound envelope has not
   expired** → provably no submit-capable action was ever produced;
@@ -300,7 +304,10 @@ With the slot handed over, the public status document's `dry_run` flag reports
 `run-cycle` needs the signer (`signer.env`) and the observer identity, and
 must run as the service user so it leaves no root-owned state behind
 (bot-strategy#972 — relocate the operational binding files out of
-`/etc/hype-accumulator` first). `Persistent=true` is safe: a catch-up firing
+`/etc/hype-accumulator` first). A first-ever `run-cycle` creates a missing `history_directory` only when
+the history binding says no `prepare` has ever run for this operational
+config; an initialized history whose directory is gone is reported as lost
+before anything else happens. `Persistent=true` is safe: a catch-up firing
 later the same UTC day still finds the decision due, and a firing on the next
 day is a new decision. `Restart=on-failure` with a bounded start limit is
 safe for the same reason reruns are.
