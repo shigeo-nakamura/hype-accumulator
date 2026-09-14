@@ -2,7 +2,7 @@ use hype_accumulator::{
     account::CapitalSnapshot,
     bootstrap,
     capital::automatically_deployable,
-    config::{Config, ConfigError},
+    config::{Config, ConfigError, DecisionOwner},
     exchange::{DryRunExchange, Exchange, OrderIntent, OrderTimeInForce, Submission},
 };
 use std::{cell::Cell, collections::HashMap, rc::Rc};
@@ -108,6 +108,54 @@ fn invalid_capital_snapshot_fails_closed() {
         deployed_cumulative_usdc: 0.0,
     };
     assert!(automatically_deployable(&snapshot, &fixture().capital).abs() < f64::EPSILON);
+}
+
+#[test]
+fn decision_owner_defaults_to_the_recurring_cycle_and_reports_dry_run() {
+    let config = fixture();
+    assert_eq!(config.decision_owner, DecisionOwner::RecurringCycle);
+    assert!(config.reports_dry_run());
+}
+
+#[test]
+fn scheduled_live_unit_owner_makes_the_recurring_pair_report_live() {
+    // bot-strategy#1028: the signer-free pair still runs dry-run cycles,
+    // but the account it observes is traded by the scheduled live unit, so
+    // the public `dry_run` flag must say so.
+    let input = format!(
+        "decision_owner = \"scheduled_live_unit\"\n{}",
+        include_str!("fixtures/safe.toml")
+    );
+    let config = Config::from_toml(&input).expect("parses");
+    assert_eq!(config.decision_owner, DecisionOwner::ScheduledLiveUnit);
+    assert!(config.dry_run);
+    assert!(!config.reports_dry_run());
+    assert!(config.validate(&HashMap::new()).is_ok());
+}
+
+#[test]
+fn scheduled_live_unit_owner_is_rejected_on_a_live_pair() {
+    // The live pair always owns the decision it prepares; the field only
+    // means something for the observing pair, so a live pair carrying it
+    // is a misconfiguration rather than a no-op.
+    let input = format!(
+        "decision_owner = \"scheduled_live_unit\"\n{}",
+        include_str!("fixtures/safe.toml").replace("dry_run = true\n", "dry_run = false\n")
+    );
+    let config = Config::from_toml(&input).expect("parses");
+    assert!(matches!(
+        config.validate(&HashMap::new()),
+        Err(ConfigError::Invalid(message)) if message.contains("decision_owner")
+    ));
+}
+
+#[test]
+fn unknown_decision_owner_values_are_rejected() {
+    let input = format!(
+        "decision_owner = \"someone_else\"\n{}",
+        include_str!("fixtures/safe.toml")
+    );
+    assert!(Config::from_toml(&input).is_err());
 }
 
 #[test]

@@ -22,6 +22,11 @@ pub struct Config {
     pub manual_halt: bool,
     #[serde(default)]
     pub live_approved: bool,
+    /// Which process makes the UTC day's pacing decision (bot-strategy#1028).
+    /// Only the signer-free recurring cycle reads this; `hype-live-probe`
+    /// always owns the decision it prepares.
+    #[serde(default)]
+    pub decision_owner: DecisionOwner,
     pub capital: CapitalConfig,
     pub pacing: PacingConfig,
     pub schedule: UtcSchedule,
@@ -58,6 +63,40 @@ impl ParentFundingRoute {
             execution_account,
             parent_account,
         })
+    }
+}
+
+/// Who records the UTC day's pacing decision in the shared runtime state.
+///
+/// The decision slot is consumed by whichever process reaches it first, and
+/// `hype-live-probe prepare` refuses a date that already holds one. With the
+/// recurring `--dry-run-cycle` owning the slot, a scheduled live purchase is
+/// impossible: the 12:00 UTC cycle writes `manual_pause`/planned-zero (or a
+/// zero-settled dry-run purchase) before any live unit can prepare
+/// (bot-strategy#929, 2026-09-11). `ScheduledLiveUnit` hands the slot to the
+/// separately scheduled `hype-live-probe run-cycle`: the recurring cycle then
+/// keeps every other duty (capital movements, admissions, status, the
+/// attribution halt) but never records a decision of its own — a date on
+/// which the live unit never ran stays undecided and visible as such.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionOwner {
+    /// The recurring cycle decides (and, being signer-free, zero-settles
+    /// or suppresses the decision in the same cycle).
+    #[default]
+    RecurringCycle,
+    /// The scheduled live unit (`hype-live-probe run-cycle`) decides; the
+    /// recurring cycle only observes (`DecisionMode::Observe`).
+    ScheduledLiveUnit,
+}
+
+impl DecisionOwner {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RecurringCycle => "recurring_cycle",
+            Self::ScheduledLiveUnit => "scheduled_live_unit",
+        }
     }
 }
 
@@ -248,6 +287,16 @@ impl Config {
         self.validate_at(env, Utc::now())
     }
 
+    /// What the public status document's `dry_run` flag should say for this
+    /// pair: whether real orders are submitted for the account this pair
+    /// observes. A signer-free recurring pair that has handed its decision
+    /// slot to the scheduled live unit is observing a *live* bot, so it must
+    /// not label the account as paper-trading (bot-strategy#1028).
+    #[must_use]
+    pub fn reports_dry_run(&self) -> bool {
+        self.dry_run && self.decision_owner == DecisionOwner::RecurringCycle
+    }
+
     /// Validates the artifact-install boundary without enabling runtime actions.
     ///
     /// This gate is intentionally stricter than ordinary dry-run startup: an
@@ -371,6 +420,13 @@ impl Config {
             "cumulative_deployment_cap_usdc",
             self.capital.cumulative_deployment_cap_usdc,
         )?;
+        if self.decision_owner == DecisionOwner::ScheduledLiveUnit && !self.dry_run {
+            return Err(ConfigError::Invalid(
+                "decision_owner = \"scheduled_live_unit\" belongs on the signer-free recurring \
+                 pair (dry_run = true); the live pair always owns the decision it prepares"
+                    .into(),
+            ));
+        }
         positive("pacing.min_order_usdc", self.pacing.min_order_usdc)?;
         positive("pacing.max_order_usdc", self.pacing.max_order_usdc)?;
         positive("execution.max_order_usdc", self.execution.max_order_usdc)?;

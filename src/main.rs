@@ -2,7 +2,7 @@ use chrono::Utc;
 use hype_accumulator::{
     backup::{create_ledger_backup, restore_ledger_backup, verify_ledger_backup},
     bootstrap,
-    config::{Config, ProcessEnvironment},
+    config::{Config, DecisionOwner, ProcessEnvironment},
     exchange::UnavailableLiveExchange,
     monitor::{trade_cadence_label, HyperliquidObserver, ATTRIBUTION_EXCEEDS_HOLDINGS},
     pacing::PacingLimits,
@@ -304,7 +304,7 @@ async fn run_dry_run_cycle(
         // Publishes the same documents a cycle would — operations block
         // included, so the dashboard keeps showing committed capital and
         // stuck detection through the incident — without committing one.
-        runtime.publish_halted_status(accumulator, Utc::now())?;
+        runtime.publish_halted_status(accumulator, config.reports_dry_run(), Utc::now())?;
         // Releases the exclusive state lock before the mirror's network call,
         // for the reason spelled out at the end of the normal path: an
         // unresponsive S3 endpoint would otherwise hold the lock an operator
@@ -343,7 +343,10 @@ async fn run_dry_run_cycle(
         capital_history_complete,
         manual_pause: config.manual_halt,
         api_errors,
-        decision_mode: DecisionMode::DryRun,
+        decision_mode: match config.decision_owner {
+            DecisionOwner::RecurringCycle => DecisionMode::DryRun,
+            DecisionOwner::ScheduledLiveUnit => DecisionMode::Observe,
+        },
     })?;
     // Release the exclusive runtime/state-directory lock before the S3
     // mirror's network call: `runtime` (and the `File` locks it owns) would
@@ -360,15 +363,24 @@ async fn run_dry_run_cycle(
     if let Ok(body) = fs::read_to_string(&status_path) {
         mirror_status_to_s3(&status_path, body).await;
     }
-    let disposition = if report.decision().is_none() {
-        "not-due"
-    } else if report.is_new_decision() {
-        "new"
+    let disposition = if report.decision().is_some() {
+        if report.is_new_decision() {
+            "new"
+        } else {
+            "existing"
+        }
+    } else if config.decision_owner == DecisionOwner::ScheduledLiveUnit {
+        // Either not yet due, or due and left for the scheduled live unit:
+        // this cycle never decides, so "not-due" would misreport a slot
+        // that is open and waiting (bot-strategy#1028).
+        "deferred"
     } else {
-        "existing"
+        "not-due"
     };
     println!(
-        "mode=dry-run cycle={disposition} economic_action_suppressed=true signed_action_created=false"
+        "mode=dry-run cycle={disposition} decision_owner={} economic_action_suppressed=true \
+         signed_action_created=false",
+        config.decision_owner.as_str()
     );
     Ok(())
 }

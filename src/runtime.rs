@@ -806,6 +806,10 @@ impl AttributedHype {
 ///   planned decision is immediately settled at zero fill / zero debit in
 ///   the same cycle (`decision:<id>:dry-run-settlement`), so no commitment
 ///   ever outlives the cycle and no later settlement is expected.
+/// * [`DecisionMode::Observe`] — the recurring cycle when the scheduled live
+///   unit owns the decision slot. No new decision is ever recorded; the
+///   cycle reports `Existing` once the live unit has decided, and nothing
+///   (not `manual_pause`, not planned-zero) before that.
 /// * [`DecisionMode::Live`] — the live-probe `prepare` path. A new planned
 ///   decision is committed and left **unsettled**; the execution workflow
 ///   binds it (`DecisionBinding::from_pacing_decision` refuses a settled
@@ -817,6 +821,13 @@ impl AttributedHype {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DecisionMode {
     DryRun,
+    /// The recurring cycle of a pair whose `decision_owner` is the scheduled
+    /// live unit (bot-strategy#1028): performs every non-decision duty of a
+    /// cycle — movement scan, admissions, capital reconciliation, status —
+    /// but never records a new pacing decision, so the UTC day's slot stays
+    /// free for `hype-live-probe run-cycle`. A decision the live unit already
+    /// recorded is reported as `Existing`, exactly as in the other modes.
+    Observe,
     /// `history_directory` is the (canonical) workflow-journal namespace the
     /// caller will create this decision's journal in. The runtime records it
     /// in its hash-chained state on the first live cycle and refuses any
@@ -1208,6 +1219,19 @@ impl SignerFreeRuntime {
         Ok(LiveSettlementOutcome::Settled)
     }
 
+    /// Whether the decision `decision_id` is held by this runtime and
+    /// settled; `None` when the runtime holds no such decision at all —
+    /// which a caller must never read as "nothing left to settle".
+    #[must_use]
+    pub fn decision_is_settled(&self, decision_id: &str) -> Option<bool> {
+        self.state
+            .pacing
+            .decisions()
+            .values()
+            .find(|decision| decision.decision_id == decision_id)
+            .map(|decision| decision.settled)
+    }
+
     /// Planned decisions that a live cycle committed and nothing has settled
     /// yet. Empty for a runtime that has only ever run `DRY_RUN` cycles.
     #[must_use]
@@ -1562,6 +1586,7 @@ impl SignerFreeRuntime {
     pub fn publish_halted_status(
         &self,
         accumulator: AccumulatorStatus,
+        dry_run: bool,
         observed_at: DateTime<Utc>,
     ) -> Result<(), RuntimeError> {
         let signal = self.disk_signal_for_metrics(observed_at)?;
@@ -1569,7 +1594,7 @@ impl SignerFreeRuntime {
         let status = DashboardStatus::new(
             observed_at,
             self.process_started_at.min(observed_at),
-            true,
+            dry_run,
             accumulator,
         )
         .with_operations(metrics.clone())?;
@@ -1635,6 +1660,32 @@ impl SignerFreeRuntime {
                     .capital_reconciled_through()
                     .is_none_or(|watermark| watermark <= boundary)
         });
+        // A live cycle that is due but finds the slot closed — capital
+        // already reconciled past an undecided boundary — must say so, not
+        // return "no decision" and let an unattended caller exit clean
+        // (bot-strategy#1028). The usual cause is a recurring cycle whose
+        // pair does not hand this slot to the live unit, or whose schedule
+        // disagrees with the live pair's about this date being eligible.
+        if let (DecisionMode::Live { .. }, Some(boundary), false) = (
+            &input.decision_mode,
+            scheduled_boundary,
+            boundary_replay_safe,
+        ) {
+            if existing_decision.is_none()
+                && self.state.pacing.is_decision_due(boundary, &self.limits)
+            {
+                return Err(RuntimeError::DecisionSlotClosed(format!(
+                    "a decision is due at {boundary} but capital is already reconciled through \
+                     {}; the recurring cycle advanced past the boundary before this live cycle \
+                     (check the recurring pair's decision_owner and that both pairs share one \
+                     schedule)",
+                    self.state
+                        .pacing
+                        .capital_reconciled_through()
+                        .map_or_else(|| "<never>".to_owned(), |at| at.to_string())
+                )));
+            }
+        }
         let mut capital_history_complete = input.capital_history_complete;
         let balance_observation_started_at = *input.accumulator.balance_observation_started_at();
         let balance_observed_at = *input.accumulator.balance_observed_at();
@@ -1889,6 +1940,9 @@ impl SignerFreeRuntime {
             }
         }
         let mut ledger_events = Vec::new();
+        // Set only by an observe-mode cycle that reached an undecided
+        // boundary: the scan cursor must then stop there too.
+        let mut deferred_at_boundary: Option<DateTime<Utc>> = None;
         let decision_result = if let Some(decision) = existing_decision {
             next_state.pacing.reconcile_capital_preserving_admissions(
                 &capital_events,
@@ -1931,52 +1985,85 @@ impl SignerFreeRuntime {
                 boundary_admission_events,
                 &next_state.pacing,
             ));
-            let boundary_pacing = next_state.pacing.clone();
-            let decision_input = DecisionInput {
-                at: boundary,
-                observed_spot_usdc: boundary_observed_spot_usdc,
-                capital_history_complete: capital_history_complete && boundary_balance_available,
-                manual_pause: input.manual_pause,
-            };
-            let result = match decision_signal {
-                Some(signal) => {
-                    next_state
-                        .pacing
-                        .decide_with_signal(&decision_input, &self.limits, signal)
-                }
-                None => next_state
-                    .pacing
-                    .decide_with_unavailable_signal(&decision_input, &self.limits),
-            };
-            let mut decision = match result {
-                Ok(result) => Some(result),
-                Err(PacingError::DecisionNotDue) => None,
-                Err(error) => return Err(error.into()),
-            };
-            if let Some(result) = &mut decision {
-                ledger_events.extend(match input.decision_mode {
-                    DecisionMode::DryRun => {
-                        dry_run_decision_events(&mut next_state.pacing, result)?
+            let observe = matches!(input.decision_mode, DecisionMode::Observe);
+            // The same eligibility the pacing decision itself applies
+            // (weekday schedule, final catch-up): on a day no decision is
+            // due, an observe cycle has no slot to keep open and must not
+            // freeze capital at noon for nothing.
+            if observe && next_state.pacing.is_decision_due(boundary, &self.limits) {
+                // The slot belongs to the scheduled live unit
+                // (bot-strategy#1028). Capital is reconciled exactly up to
+                // the boundary and no further: a watermark past it would
+                // make the boundary replay unsafe and silently close the
+                // slot the live unit is about to decide on. Everything after
+                // the boundary — the later movements above, their
+                // admissions, the scan cursor — is left for the cycle that
+                // decides (or for the next observe cycle once it has).
+                // Movements re-observed then append as duplicates, which
+                // the ledger accepts.
+                deferred_at_boundary = Some(boundary);
+                None
+            } else {
+                let boundary_pacing = next_state.pacing.clone();
+                let decision = if observe {
+                    None
+                } else {
+                    let decision_input = DecisionInput {
+                        at: boundary,
+                        observed_spot_usdc: boundary_observed_spot_usdc,
+                        capital_history_complete: capital_history_complete
+                            && boundary_balance_available,
+                        manual_pause: input.manual_pause,
+                    };
+                    let result = match decision_signal {
+                        Some(signal) => next_state.pacing.decide_with_signal(
+                            &decision_input,
+                            &self.limits,
+                            signal,
+                        ),
+                        None => next_state
+                            .pacing
+                            .decide_with_unavailable_signal(&decision_input, &self.limits),
+                    };
+                    let mut decision = match result {
+                        Ok(result) => Some(result),
+                        Err(PacingError::DecisionNotDue) => None,
+                        Err(error) => return Err(error.into()),
+                    };
+                    if let Some(result) = &mut decision {
+                        ledger_events.extend(match input.decision_mode {
+                            DecisionMode::DryRun => {
+                                dry_run_decision_events(&mut next_state.pacing, result)?
+                            }
+                            DecisionMode::Live { .. } => live_decision_events(result)?,
+                            // Unreachable by construction (`observe` never reaches
+                            // this block); refuse rather than record.
+                            DecisionMode::Observe => {
+                                return Err(RuntimeError::InvalidCycle(
+                                    "observe mode must not record a new decision".to_owned(),
+                                ))
+                            }
+                        });
                     }
-                    DecisionMode::Live { .. } => live_decision_events(result)?,
-                });
+                    decision
+                };
+                next_state.pacing.reconcile_capital_preserving_admissions(
+                    &capital_events,
+                    input.observed_at,
+                    &self.limits,
+                )?;
+                let later_admission_events = admission_delta_events_between(
+                    &boundary_pacing,
+                    &next_state.pacing,
+                    input.observed_at,
+                )?;
+                ledger_events.extend(ordered_capital_ledger_events(
+                    later_movements,
+                    later_admission_events,
+                    &next_state.pacing,
+                ));
+                decision
             }
-            next_state.pacing.reconcile_capital_preserving_admissions(
-                &capital_events,
-                input.observed_at,
-                &self.limits,
-            )?;
-            let later_admission_events = admission_delta_events_between(
-                &boundary_pacing,
-                &next_state.pacing,
-                input.observed_at,
-            )?;
-            ledger_events.extend(ordered_capital_ledger_events(
-                later_movements,
-                later_admission_events,
-                &next_state.pacing,
-            ));
-            decision
         } else {
             next_state.pacing.reconcile_capital_preserving_admissions(
                 &capital_events,
@@ -2053,10 +2140,20 @@ impl SignerFreeRuntime {
             .checked_add(input.api_errors)
             .ok_or(RuntimeError::CounterOverflow)?;
         if capital_history_complete {
+            // An observe cycle that deferred the decision recorded nothing
+            // after the boundary, so its cursor may not pass the boundary
+            // either — or the movements it skipped would never be scanned
+            // again.
+            let complete_through_ms = match deferred_at_boundary {
+                Some(boundary) => u64::try_from(boundary.timestamp_millis())
+                    .map_err(|_| RuntimeError::InvalidCycle("negative boundary".to_owned()))?
+                    .min(input.scan_end_ms),
+                None => input.scan_end_ms,
+            };
             next_state.last_complete_scan_end_ms = Some(
                 next_state
                     .last_complete_scan_end_ms
-                    .map_or(input.scan_end_ms, |old| old.max(input.scan_end_ms)),
+                    .map_or(complete_through_ms, |old| old.max(complete_through_ms)),
             );
         }
         ledger_events.push(LedgerEvent {
@@ -2078,7 +2175,10 @@ impl SignerFreeRuntime {
                 .as_ref()
                 .map(|result| result.decision().clone()),
             new_decision: decision_result.as_ref().is_some_and(DecisionResult::is_new),
-            economic_action_suppressed: matches!(input.decision_mode, DecisionMode::DryRun),
+            economic_action_suppressed: matches!(
+                input.decision_mode,
+                DecisionMode::DryRun | DecisionMode::Observe
+            ),
             signed_action_created: false,
             signal_available: decision_evidence.signal_available,
             boundary_balance_available: decision_evidence.boundary_balance_available,
@@ -2088,7 +2188,11 @@ impl SignerFreeRuntime {
         let status = DashboardStatus::new(
             input.observed_at,
             self.process_started_at.min(input.observed_at),
-            true,
+            // The public `dry_run` flag says whether real orders are
+            // submitted for this account: only a pair that both decides and
+            // suppresses (`DryRun`) is paper-trading. An observe-mode cycle
+            // watches a live account, and a live cycle is live.
+            matches!(input.decision_mode, DecisionMode::DryRun),
             input.accumulator,
         )
         .with_operations(metrics.clone())?;
@@ -3053,6 +3157,8 @@ pub enum RuntimeError {
     InvalidAdmissionArtifact(String),
     #[error("runtime cycle is invalid: {0}")]
     InvalidCycle(String),
+    #[error("live decision slot closed: {0}")]
+    DecisionSlotClosed(String),
     #[error("account movement is invalid: {0}")]
     InvalidMovement(String),
     #[error("admission approval references unknown deposit: {0}")]

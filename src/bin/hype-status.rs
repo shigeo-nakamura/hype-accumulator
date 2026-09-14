@@ -35,7 +35,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
     let updated_at = Utc::now();
-    let status = DashboardStatus::new(updated_at, process_started_at, config.dry_run, accumulator);
+    let status = DashboardStatus::new(
+        updated_at,
+        process_started_at,
+        config.reports_dry_run(),
+        accumulator,
+    );
     write_status_atomic(&output_path, &status)?;
     mirror_status_to_s3(&output_path, status.to_json()?).await;
     println!("status observation written");

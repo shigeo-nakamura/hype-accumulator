@@ -1477,7 +1477,7 @@ impl PacingState {
         Ok(())
     }
 
-    fn is_decision_due(&self, at: DateTime<Utc>, limits: &PacingLimits) -> bool {
+    pub(crate) fn is_decision_due(&self, at: DateTime<Utc>, limits: &PacingLimits) -> bool {
         if at.hour() < u32::from(limits.utc_hour)
             || (at.hour() == u32::from(limits.utc_hour)
                 && at.minute() < u32::from(limits.utc_minute))

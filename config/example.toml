@@ -2,6 +2,11 @@
 dry_run = true
 manual_halt = true
 live_approved = false
+# Who records the UTC day's pacing decision (bot-strategy#1028). The default
+# "recurring_cycle" lets --dry-run-cycle decide (and zero-settle/suppress) it.
+# "scheduled_live_unit" hands the slot to `hype-live-probe run-cycle` and makes
+# --dry-run-cycle observe-only; it is only valid on a dry_run = true pair.
+decision_owner = "recurring_cycle"
 validator_allowlist = ["validator-test"]
 
 [capital]
