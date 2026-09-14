@@ -218,7 +218,12 @@ hype-live-probe run-cycle config.local.toml security-policy.local.toml runtime.l
 It takes no journal argument: today's journal is
 `<history_directory>/<UTC date>.jsonl` (the same shape the probe days used,
 so `aggregate_terminal_residual_hype` and `backfill-attribution` rediscover
-it like any other). Then:
+it like any other). It holds an exclusive lock on
+`<journal>.run-cycle.lock` from classification through submission, so a
+second `run-cycle` on the same day (an operator alongside the unit) is
+refused outright rather than allowed to reuse a prepared action the first
+run is about to send — the venue send has no durable marker of its own.
+Then:
 
 - **No journal yet** → `prepare`, then `submit` the order it just prepared —
   in the same process, because the prepared order's signed expiry is seconds

@@ -1247,6 +1247,13 @@ async fn run_cycle(
         .ok_or("journal path is not valid UTF-8")?
         .to_owned();
     println!("mode=run-cycle date={decision_date} journal={journal_path}");
+    // One run per journal at a time, from classification through submission:
+    // the venue send has no durable marker, so two overlapping runs that both
+    // classified the journal as fresh could both reach `submit` (the second
+    // reusing the first's prepared action). systemd never overlaps a oneshot
+    // with itself; this closes the operator-run-alongside-the-unit case.
+    // Held until this function returns.
+    let _run_lock = acquire_run_cycle_lock(&journal_path)?;
 
     if journal_resumable_into_prepare(&journal_path)? {
         let prepared = prepare_workflow(
@@ -1328,6 +1335,29 @@ async fn run_cycle(
     }
     println!("mode=run-cycle outcome=settled date={decision_date}");
     Ok(())
+}
+
+/// Exclusive, process-lifetime lock for one `run-cycle` over one journal
+/// (`<journal>.run-cycle.lock`, next to the journal's own append lock).
+/// Fails closed with `WouldBlock` rather than waiting: a run that finds the
+/// lock held must not proceed to a classification that the holder is about
+/// to invalidate; its own rerun (or the timer's) will reconcile.
+fn acquire_run_cycle_lock(journal_path: &str) -> Result<fs::File, Box<dyn std::error::Error>> {
+    let lock_path = format!("{journal_path}.run-cycle.lock");
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+    match fs2::FileExt::try_lock_exclusive(&lock) {
+        Ok(()) => Ok(lock),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Err(format!(
+            "another run-cycle holds {lock_path}; refusing to classify or submit alongside it"
+        )
+        .into()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Whether `run-cycle` may go to `prepare` for this journal path: trivially
@@ -2371,9 +2401,9 @@ async fn build_signed_connector(
 #[cfg(test)]
 mod tests {
     use super::{
-        binding_only_resumable, invocation, is_no_decision_due, network_routing_admissible_for,
-        validate_journal_path, HistoryDirectoryBinding, HistoryInitialization, Invocation,
-        LiveDecisionError, PrepareTimeBinding, WorkflowStage,
+        acquire_run_cycle_lock, binding_only_resumable, invocation, is_no_decision_due,
+        network_routing_admissible_for, validate_journal_path, HistoryDirectoryBinding,
+        HistoryInitialization, Invocation, LiveDecisionError, PrepareTimeBinding, WorkflowStage,
     };
     use std::cell::RefCell;
     use std::collections::BTreeSet;
@@ -3063,6 +3093,20 @@ mod tests {
             effective_first,
             effective_first - TimeDelta::milliseconds(1)
         ));
+    }
+
+    #[test]
+    fn a_second_run_cycle_on_the_same_journal_is_refused_while_the_first_holds_the_lock() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let journal = directory.path().join("2026-09-16.jsonl");
+        let journal = journal.to_str().expect("utf-8 path");
+        let held = acquire_run_cycle_lock(journal).expect("first lock");
+        let refused = acquire_run_cycle_lock(journal)
+            .map(|_| ())
+            .expect_err("second run-cycle must be refused");
+        assert!(refused.to_string().contains("another run-cycle holds"));
+        drop(held);
+        acquire_run_cycle_lock(journal).expect("lock is free again once the holder exits");
     }
 
     #[test]
