@@ -1,10 +1,12 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use hype_accumulator::{
     backup::{create_ledger_backup, restore_ledger_backup, verify_ledger_backup},
     bootstrap,
     config::{Config, DecisionOwner, ProcessEnvironment},
     exchange::UnavailableLiveExchange,
-    monitor::{trade_cadence_label, HyperliquidObserver, ATTRIBUTION_EXCEEDS_HOLDINGS},
+    monitor::{
+        trade_cadence_label, HypeAttribution, HyperliquidObserver, ATTRIBUTION_EXCEEDS_HOLDINGS,
+    },
     pacing::PacingLimits,
     runtime::{
         AdmissionApprovals, DecisionMode, RuntimeConfig, RuntimeCycleInput, SignerFreeRuntime,
@@ -14,6 +16,7 @@ use hype_accumulator::{
         build_snapshot, core_health_label, plan_snapshot, publish_snapshot,
         HyperliquidCoreSignalSource, PublishOutcome,
     },
+    status::AccumulatorStatus,
     status_io::mirror_status_to_s3,
 };
 use std::{
@@ -267,21 +270,7 @@ async fn run_dry_run_cycle(
     let status_path = runtime_config.status_path().to_path_buf();
     let mut runtime = SignerFreeRuntime::open(runtime_config, limits)?;
     let approvals = AdmissionApprovals::from_json(&fs::read_to_string(approvals_path)?)?;
-    let signal = match fs::read_to_string(signal_path) {
-        Ok(payload) => {
-            if let Ok(signal) = SignalSnapshot::from_json(&payload) {
-                Some(signal)
-            } else {
-                eprintln!("signal snapshot invalid; recording fail-closed unavailable state");
-                None
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("signal snapshot absent; recording fail-closed unavailable state");
-            None
-        }
-        Err(error) => return Err(error.into()),
-    };
+    let signal = load_cycle_signal(&signal_path)?;
     let account = config.observation_account(&ProcessEnvironment)?;
     let observer = HyperliquidObserver::new(&config.hyperliquid.endpoint, &account)?;
     // The account read comes first and the movement scan second, so the
@@ -308,7 +297,28 @@ async fn run_dry_run_cycle(
     // (bot-strategy#929). `to_attribution` excludes account holdings outright
     // while any settled purchase is still missing its evidence, rather than
     // publishing a partial sum as if it were the whole.
-    let attribution = runtime.attributed_hype_with(&movements)?.to_attribution();
+    let attribution =
+        match runtime.attributed_hype_with(&movements, observation.balance_observed_at) {
+            Ok(attributed) => attributed.to_attribution(),
+            // The scan returned a HYPE row this state refuses to record. Nothing
+            // is committed, but the dashboard must not go stale on it: publish
+            // this read with attribution withheld (degraded, holdings excluded)
+            // the way the divergence halt publishes its own, then fail.
+            Err(error) => {
+                let accumulator = observation.reconcile(
+                    &HypeAttribution::Unavailable,
+                    trade_cadence_label(&config.schedule),
+                )?;
+                publish_halted_and_mirror(runtime, accumulator, &config, &status_path, observed_at)
+                    .await?;
+                return Err(format!(
+                    "halting this cycle: HYPE movement scan cannot be recorded ({error}). The \
+                 status document was published with attribution withheld; no decision was \
+                 made."
+                )
+                .into());
+            }
+        };
     let accumulator = observation.reconcile(&attribution, trade_cadence_label(&config.schedule))?;
     // The ledger claims HYPE the account no longer holds. The observation is
     // still published — the dashboard must show this, which is why
@@ -319,18 +329,7 @@ async fn run_dry_run_cycle(
     // aborted the cycle via an observation error; it must not become
     // advisory just because the status document now survives it.
     if accumulator.attribution_exceeds_holdings() {
-        // Publishes the same documents a cycle would — operations block
-        // included, so the dashboard keeps showing committed capital and
-        // stuck detection through the incident — without committing one.
-        runtime.publish_halted_status(accumulator, config.reports_dry_run(), Utc::now())?;
-        // Releases the exclusive state lock before the mirror's network call,
-        // for the reason spelled out at the end of the normal path: an
-        // unresponsive S3 endpoint would otherwise hold the lock an operator
-        // needs in order to run the very reconcile this error asks for.
-        drop(runtime);
-        if let Ok(body) = fs::read_to_string(&status_path) {
-            mirror_status_to_s3(&status_path, body).await;
-        }
+        publish_halted_and_mirror(runtime, accumulator, &config, &status_path, Utc::now()).await?;
         return Err(format!(
             "halting this cycle: {ATTRIBUTION_EXCEEDS_HOLDINGS}. The status document was \
              published; no decision was made. Reconcile the account's HYPE against the \
@@ -388,6 +387,49 @@ async fn run_dry_run_cycle(
          signed_action_created=false",
         config.decision_owner.as_str()
     );
+    Ok(())
+}
+
+/// The signal snapshot for a cycle, or `None` (fail-closed unavailable
+/// state) when it is absent or unreadable.
+fn load_cycle_signal(signal_path: &Path) -> Result<Option<SignalSnapshot>, std::io::Error> {
+    match fs::read_to_string(signal_path) {
+        Ok(payload) => {
+            if let Ok(signal) = SignalSnapshot::from_json(&payload) {
+                Ok(Some(signal))
+            } else {
+                eprintln!("signal snapshot invalid; recording fail-closed unavailable state");
+                Ok(None)
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("signal snapshot absent; recording fail-closed unavailable state");
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Publishes the same documents a cycle would — operations block included,
+/// so the dashboard keeps showing committed capital and stuck detection
+/// through the incident — without committing one, then mirrors the status.
+///
+/// Takes `runtime` by value and drops it before the mirror's network call,
+/// for the reason spelled out at the end of the normal cycle path: an
+/// unresponsive S3 endpoint would otherwise hold the exclusive state lock an
+/// operator needs in order to run the very reconcile the halt asks for.
+async fn publish_halted_and_mirror(
+    runtime: SignerFreeRuntime,
+    accumulator: AccumulatorStatus,
+    config: &Config,
+    status_path: &Path,
+    observed_at: DateTime<Utc>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    runtime.publish_halted_status(accumulator, config.reports_dry_run(), observed_at)?;
+    drop(runtime);
+    if let Ok(body) = fs::read_to_string(status_path) {
+        mirror_status_to_s3(status_path, body).await;
+    }
     Ok(())
 }
 

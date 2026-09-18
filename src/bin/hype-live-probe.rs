@@ -1006,7 +1006,9 @@ async fn prepare_workflow(
     // Reconciled against the same scan the cycle below commits, so a HYPE
     // transfer this scan found is netted before divergence is judged
     // (bot-strategy#929 slice C) — same order as `main.rs`.
-    let attribution = runtime.attributed_hype_with(&movements)?.to_attribution();
+    let attribution = runtime
+        .attributed_hype_with(&movements, observation.balance_observed_at)?
+        .to_attribution();
     let accumulator = observation.reconcile(&attribution, trade_cadence_label(&config.schedule))?;
     // The recurring cycle halts on this (see `main.rs`), and this path — the
     // only one that commits real capital — must halt harder: refuse before a

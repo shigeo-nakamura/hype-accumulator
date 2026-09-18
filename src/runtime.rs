@@ -665,14 +665,18 @@ impl RuntimeHypeMovement {
     }
 
     /// Whether `other` is the same venue movement re-observed (an
-    /// overlapping scan), ignoring only when this state first recorded it.
+    /// overlapping scan). Compares only what the netting depends on —
+    /// direction, amount, time — so a connector release that normalizes a
+    /// row's metadata differently (counterparty casing, a tx-hash fallback)
+    /// re-observes an already recorded row as the same one instead of
+    /// wedging every later cycle on it; the record keeps what was first
+    /// seen. A changed amount or direction under the same id is a real
+    /// contradiction and is refused.
     fn same_movement(&self, other: &Self) -> bool {
         self.movement_id == other.movement_id
             && self.direction == other.direction
             && self.amount_hype_atoms == other.amount_hype_atoms
             && self.occurred_at == other.occurred_at
-            && self.counterparty == other.counterparty
-            && self.transaction_hash == other.transaction_hash
     }
 }
 
@@ -1294,6 +1298,14 @@ impl SignerFreeRuntime {
     /// this state has not recorded yet netted in, as the cycle that is about
     /// to consume `movements` will record them (bot-strategy#929 slice C).
     ///
+    /// Only movements that occurred at or before `as_of` are netted: the
+    /// caller judges the result against a balance read taken at `as_of`,
+    /// and the scan window closes later than that read. A movement in the
+    /// gap is not yet in the balance — netting an inflow there would raise
+    /// the claim above a balance that predates it and halt a cycle that has
+    /// nothing wrong with it — so it is left for the next cycle, whose
+    /// balance read will include it and whose state will already record it.
+    ///
     /// Callers pass exactly the movement list they then hand to
     /// [`Self::apply_cycle`]; anything else would let the divergence check
     /// and the committed record disagree about the same transfer.
@@ -1301,13 +1313,18 @@ impl SignerFreeRuntime {
     /// # Errors
     ///
     /// Returns [`RuntimeError::InvalidMovement`] for a HYPE row that cannot
-    /// be recorded, or a re-observed movement whose content changed.
+    /// be recorded, or a re-observed movement whose amount changed.
     pub fn attributed_hype_with(
         &self,
         movements: &[HyperliquidAccountMovement],
+        as_of: DateTime<Utc>,
     ) -> Result<AttributedHype, RuntimeError> {
-        let pending = self.unrecorded_hype_movements(movements, Utc::now())?;
-        self.attributed_hype().net_of(&pending)
+        let pending = self.unrecorded_hype_movements(movements, as_of)?;
+        let settled = pending
+            .into_iter()
+            .filter(|movement| movement.occurred_at <= as_of)
+            .collect::<Vec<_>>();
+        self.attributed_hype().net_of(&settled)
     }
 
     /// The HYPE movements among `movements` this state has not recorded, in

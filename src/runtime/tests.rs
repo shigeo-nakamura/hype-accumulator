@@ -4208,8 +4208,17 @@ fn an_explained_hype_outflow_is_recorded_once_and_netted_from_attribution() {
 
     // Netted from the scan before anything is committed — this is what the
     // divergence check sees — while the committed record is still untouched.
+    // A balance read taken *before* the transfer does not net it yet (the
+    // balance it would be judged against predates the transfer); one taken
+    // after does.
+    assert_eq!(
+        runtime
+            .attributed_hype_with(&scan, transfer_at - TimeDelta::seconds(1))
+            .expect("netting as of before the transfer"),
+        before
+    );
     let pending = runtime
-        .attributed_hype_with(&scan)
+        .attributed_hype_with(&scan, transfer_at)
         .expect("pending netting");
     assert_eq!(pending.outflow_hype_atoms, 10_000_000);
     assert_eq!(pending.inflow_hype_atoms, 0);
@@ -4261,14 +4270,14 @@ fn an_explained_hype_outflow_is_recorded_once_and_netted_from_attribution() {
         "the cycle itself committed"
     );
 
-    // The same id re-observed with different content is a scan the runtime
-    // must not trust, before and inside the cycle alike.
+    // The same id re-observed with a different amount is a scan the runtime
+    // must not trust, before and inside the cycle alike …
     let rewritten = HyperliquidAccountMovement {
         amount: Decimal::new(-20_000_000, 8),
         ..outflow.clone()
     };
     assert!(matches!(
-        runtime.attributed_hype_with(std::slice::from_ref(&rewritten)),
+        runtime.attributed_hype_with(std::slice::from_ref(&rewritten), later),
         Err(RuntimeError::InvalidMovement(_))
     ));
     assert!(matches!(
@@ -4280,6 +4289,22 @@ fn an_explained_hype_outflow_is_recorded_once_and_netted_from_attribution() {
         ),
         Err(RuntimeError::InvalidMovement(_))
     ));
+    assert_eq!(runtime.state.hype_movements["hype-send-1"], recorded);
+    // … while metadata a connector release may normalize differently
+    // (counterparty, tx hash) is not what the netting depends on: the row is
+    // the same movement, and the record keeps what was first seen.
+    let renormalized = HyperliquidAccountMovement {
+        counterparty: None,
+        transaction_hash: None,
+        ..outflow.clone()
+    };
+    observe_cycle_with(
+        &mut runtime,
+        later + TimeDelta::minutes(10),
+        std::slice::from_ref(&renormalized),
+        &admission,
+    )
+    .expect("renormalized metadata is the same movement");
     assert_eq!(runtime.state.hype_movements["hype-send-1"], recorded);
 
     // Part of the committed state, not a cache.
@@ -4369,7 +4394,10 @@ fn a_hype_movement_finer_than_an_atom_refuses_the_cycle() {
         HyperliquidAccountMovementKind::InternalTransfer,
     );
     assert!(matches!(
-        runtime.attributed_hype_with(std::slice::from_ref(&row)),
+        runtime.attributed_hype_with(
+            std::slice::from_ref(&row),
+            decision_at + TimeDelta::hours(2)
+        ),
         Err(RuntimeError::InvalidMovement(_))
     ));
     assert!(matches!(
