@@ -30,6 +30,7 @@ fn reconciliation_includes_only_ledger_attributed_hype() {
         &HypeAttribution::Reconciled {
             hype: 5.75,
             last_trade_at: Some(at(10)),
+            transferred_out_hype: 0.0,
         },
         at(12),
         "Mon/Wed/Fri at 12:00 UTC",
@@ -60,6 +61,7 @@ fn delegation_summary_mismatch_is_degraded_not_hidden() {
         &HypeAttribution::Reconciled {
             hype: 5.0,
             last_trade_at: None,
+            transferred_out_hype: 0.0,
         },
         at(12),
         "daily",
@@ -120,6 +122,7 @@ fn unattributed_hype_is_excluded_and_visible_as_degraded() {
         &HypeAttribution::Reconciled {
             hype: 4.0,
             last_trade_at: Some(at(10)),
+            transferred_out_hype: 0.0,
         },
         at(12),
         "daily",
@@ -157,6 +160,7 @@ fn attribution_above_observed_hype_is_degraded_not_a_dropped_observation() {
         &HypeAttribution::Reconciled {
             hype: 6.0,
             last_trade_at: Some(at(10)),
+            transferred_out_hype: 0.0,
         },
         at(12),
         "daily",
@@ -199,6 +203,7 @@ fn attribution_within_tolerance_of_observed_hype_stays_healthy() {
         &HypeAttribution::Reconciled {
             hype: 5.75 + 1e-12,
             last_trade_at: None,
+            transferred_out_hype: 0.0,
         },
         at(12),
         "daily",
@@ -228,6 +233,7 @@ fn a_last_trade_after_the_balance_read_degrades_instead_of_dropping_the_status()
         &HypeAttribution::Reconciled {
             hype: 2.0,
             last_trade_at: Some(at(14)),
+            transferred_out_hype: 0.0,
         },
         at(12),
         "daily",
@@ -263,4 +269,86 @@ fn cadence_label_is_stable_and_deduplicated() {
         }),
         "Daily at 00:00 UTC"
     );
+}
+
+/// bot-strategy#929 slice C: HYPE that left the account by an explained
+/// movement is reported beside `hype_balance`, never inside it, and does not
+/// change how the divergence check bounds the held claim by the holdings.
+#[test]
+fn transferred_out_hype_is_reported_beside_the_held_balance() {
+    let balances = BalanceObservation {
+        spot_usdc: 25.0,
+        spot_hype: 0.7,
+        hype_price_usdc: 40.0,
+    };
+    let staking = StakingObservation {
+        delegated_hype: 0.0,
+        undelegated_hype: 0.0,
+        pending_withdrawal_hype: 0.0,
+        delegation_rows_hype: 0.0,
+    };
+    // Bought 1.2, 0.5 moved out through the ledger: the account holds 0.7.
+    let status = reconcile_status(
+        &balances,
+        &staking,
+        &HypeAttribution::Reconciled {
+            hype: 0.7,
+            last_trade_at: Some(at(10)),
+            transferred_out_hype: 0.5,
+        },
+        at(12),
+        "daily",
+    )
+    .unwrap();
+    assert!(status.is_healthy());
+    assert!((status.hype_balance() - 0.7).abs() < f64::EPSILON);
+    assert_eq!(status.hype_transferred_out(), Some(0.5));
+    assert!(
+        (status.total_equity_usdc() - 53.0).abs() < 1e-9,
+        "equity counts held HYPE only"
+    );
+
+    // The ledger still claims more than the account holds (a further 0.2
+    // left by a path the ledger does not show): degraded, claim zeroed, the
+    // explained part still reported.
+    let degraded = reconcile_status(
+        &balances,
+        &staking,
+        &HypeAttribution::Reconciled {
+            hype: 0.9,
+            last_trade_at: Some(at(10)),
+            transferred_out_hype: 0.5,
+        },
+        at(12),
+        "daily",
+    )
+    .unwrap();
+    assert!(degraded.attribution_exceeds_holdings());
+    assert!((degraded.hype_balance()).abs() < f64::EPSILON);
+    assert_eq!(degraded.hype_transferred_out(), Some(0.5));
+
+    // Without an attribution there is nothing to report as transferred out.
+    let unavailable = reconcile_status(
+        &balances,
+        &staking,
+        &HypeAttribution::Unavailable,
+        at(12),
+        "daily",
+    )
+    .unwrap();
+    assert_eq!(unavailable.hype_transferred_out(), None);
+
+    // A negative or non-finite figure is refused like every other amount.
+    assert!(reconcile_status(
+        &balances,
+        &staking,
+        &HypeAttribution::Reconciled {
+            hype: 0.7,
+            last_trade_at: None,
+            transferred_out_hype: -0.1,
+        },
+        at(12),
+        "daily",
+    )
+    .is_err());
 }

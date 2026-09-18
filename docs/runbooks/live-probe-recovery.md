@@ -410,6 +410,65 @@ mode=backfilled decision=fixed-dca:2026-09-10 workflow=… credited_hype_atoms=2
 mode=backfill-complete attributed_hype_atoms=29979000 settled_purchases=1 missing=0 complete=true
 ```
 
+## HYPE that left the account: explained movements versus the divergence halt
+
+`attributed HYPE exceeds observed account holdings` (the divergence halt) means
+the settled acquisitions claim more HYPE than the account holds. Since
+bot-strategy#929 slice C the cycle nets **explained** outflows before it judges
+this: every non-trade HYPE row the venue's account ledger returns for the scan
+window (`send`, `spotTransfer`, `subAccountTransfer`, external deposit or
+withdrawal of the HYPE token) is recorded under `hype_movements` in
+`runtime-state.json`, keyed by the venue's movement id, in the same committed
+cycle. A transfer the owner makes out of the account therefore does not halt
+anything: the first cycle whose scan covers it records it, `hype_balance` drops
+by the bot-acquired part that left, and `hype_transferred_out` reports that
+part. An inflow from outside is recorded too, and an outflow is taken from such
+inflows first — the claim on the account only shrinks by what the ledger cannot
+otherwise account for.
+
+If the halt fires anyway:
+
+1. Read `hype_movements` in `runtime-state.json` (as `ec2-user`, read-only) and
+   compare with the venue's `userNonFundingLedgerUpdates` for the account. A
+   row the venue shows and the state lacks is one of two things:
+   - **after `last_complete_scan_end_ms`** — the scan did not reach it yet
+     (the cycle's `capital_history_complete=false` line, an API error); the
+     next complete scan records it, nothing to repair by hand;
+   - **before `last_complete_scan_end_ms`** — the window was consumed by a
+     build that predates this record (deployed 2026-09-18), and the cursor
+     will never revisit it. There is no `backfill-movements` counterpart to
+     `backfill-attribution` yet; this is a manual review (below) until one
+     exists. On the current host nothing precedes the record: the account's
+     HYPE equalled the attributed total at deploy time, so no earlier
+     movement can be missing.
+2. A **sale** is a fill, not a movement, and is never explained by this record:
+   bot-acquired HYPE sold from the account stays an unexplained outflow. There is
+   no automatic correction for it; it is a manual review under
+   "Settlement is final" below.
+3. A `send` to a **not-yet-activated** address is charged its activation fee in
+   the sent token, and the connector's movement row carries the amount without
+   the fee. The account then loses `amount + fee` while the record explains only
+   `amount`, so the halt persists by the fee — deliberately: the record cannot
+   claim what the ledger did not show it. Transfers to an activated account (the
+   master, another existing account) carry no such fee. Folding the fee in
+   needs the connector to expose it; until then, manual review.
+4. A HYPE row whose amount is finer than an atom, or a movement id re-observed
+   with a different amount, direction or time, refuses the cycle outright
+   (`InvalidMovement`) and, because a refused cycle does not advance the
+   cursor, every later cycle too — this is the venue's ledger disagreeing with
+   itself and must be understood, not worked around. Metadata a connector
+   release may normalize differently (counterparty, transaction hash) is not
+   compared, so a connector bump alone cannot cause this.
+
+While a netting error stands, the recurring cycle publishes the status document
+with attribution withheld (`HYPE attribution unavailable`, degraded) so the
+dashboard shows the condition rather than a stale document, and makes no
+decision.
+
+Staking transfers *within* the account (`cDeposit`) are not outflows: the
+observer counts spot, undelegated, delegated and pending-withdrawal HYPE
+together, so they change nothing here.
+
 ## Releasing a decision that never reached a signer
 
 `prepare` commits the day's pacing decision in the runtime cycle *before* the
