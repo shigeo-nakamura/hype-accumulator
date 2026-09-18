@@ -16,7 +16,6 @@
 
 #[cfg(feature = "live-probe")]
 use dex_connector::HyperliquidSpotOrderGrid;
-#[cfg(feature = "live-probe")]
 use rust_decimal::{prelude::ToPrimitive, Decimal};
 use sha2::{Digest, Sha256};
 
@@ -144,9 +143,41 @@ pub(crate) fn decimal_hype_to_atoms_floor(value: Decimal) -> Option<u64> {
         .to_u64()
 }
 
+/// Converts a decimal HYPE quantity to atoms exactly.
+///
+/// Returns `None` when the value is negative, overflows, or is not a whole
+/// number of atoms — a venue ledger row finer than `weiDecimals` is not a
+/// quantity this crate can account for and must not be rounded into one.
+pub(crate) fn decimal_hype_to_atoms_exact(value: Decimal) -> Option<u64> {
+    if value < Decimal::ZERO {
+        return None;
+    }
+    let scaled = value.checked_mul(Decimal::from(HYPE_ATOMS_PER_HYPE))?;
+    if scaled != scaled.trunc() {
+        return None;
+    }
+    scaled.to_u64()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_atoms_reject_fractional_atoms_and_negatives() {
+        assert_eq!(
+            decimal_hype_to_atoms_exact(Decimal::new(30_978_301, 8)),
+            Some(30_978_301)
+        );
+        assert_eq!(
+            decimal_hype_to_atoms_exact(Decimal::from(2)),
+            Some(2 * HYPE_ATOMS_PER_HYPE)
+        );
+        assert_eq!(decimal_hype_to_atoms_exact(Decimal::ZERO), Some(0));
+        // Finer than an atom: refused, never truncated.
+        assert_eq!(decimal_hype_to_atoms_exact(Decimal::new(1, 9)), None);
+        assert_eq!(decimal_hype_to_atoms_exact(Decimal::new(-1, 8)), None);
+    }
 
     #[test]
     fn digest_is_deterministic() {

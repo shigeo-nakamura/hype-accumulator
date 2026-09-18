@@ -951,21 +951,7 @@ async fn prepare_workflow(
         .with_parent_funding_route(config.parent_funding_route(&ProcessEnvironment)?);
     let limits = PacingLimits::from_config(&config)?;
     let mut runtime = SignerFreeRuntime::open(runtime_config.clone(), limits)?;
-    let attribution = runtime.attributed_hype().to_attribution();
-    let accumulator = observer
-        .observe(&attribution, trade_cadence_label(&config.schedule))
-        .await?;
-    // The recurring cycle halts on this (see `main.rs`), and this path — the
-    // only one that commits real capital — must halt harder: refuse before a
-    // decision is committed or an order is printed, while HYPE the ledger
-    // says the bot owns is unaccounted for (bot-strategy#929).
-    if accumulator.attribution_exceeds_holdings() {
-        return Err(format!(
-            "refusing to prepare an order: {ATTRIBUTION_EXCEEDS_HOLDINGS}. Reconcile the \
-             account's HYPE against the workflow journals first."
-        )
-        .into());
-    }
+    let observation = observer.observe_account().await?;
 
     // Re-reads the clock here, after the KMS-backed signer decrypt and the
     // account observation above (network round trips whose latency is
@@ -1017,6 +1003,22 @@ async fn prepare_workflow(
             Ok(movements) => (movements, true, 0),
             Err(_) => (Vec::new(), false, 1),
         };
+    // Reconciled against the same scan the cycle below commits, so a HYPE
+    // transfer this scan found is netted before divergence is judged
+    // (bot-strategy#929 slice C) — same order as `main.rs`.
+    let attribution = runtime.attributed_hype_with(&movements)?.to_attribution();
+    let accumulator = observation.reconcile(&attribution, trade_cadence_label(&config.schedule))?;
+    // The recurring cycle halts on this (see `main.rs`), and this path — the
+    // only one that commits real capital — must halt harder: refuse before a
+    // decision is committed or an order is printed, while HYPE the ledger
+    // says the bot owns is unaccounted for (bot-strategy#929).
+    if accumulator.attribution_exceeds_holdings() {
+        return Err(format!(
+            "refusing to prepare an order: {ATTRIBUTION_EXCEEDS_HOLDINGS}. Reconcile the \
+             account's HYPE against the workflow journals first."
+        )
+        .into());
+    }
     let cycle_input = RuntimeCycleInput {
         observed_at: now,
         scan_start_ms,

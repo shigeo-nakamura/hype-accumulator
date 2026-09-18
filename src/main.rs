@@ -284,14 +284,32 @@ async fn run_dry_run_cycle(
     };
     let account = config.observation_account(&ProcessEnvironment)?;
     let observer = HyperliquidObserver::new(&config.hyperliquid.endpoint, &account)?;
-    // HYPE this runtime's own settled decisions prove the workflow acquired
+    // The account read comes first and the movement scan second, so the
+    // scan window closes at `observed_at`, after the balance read — and the
+    // attribution judged against that balance can already net any HYPE
+    // transfer the scan found (bot-strategy#929 slice C). The other order
+    // would halt on a transfer in the cycle that first sees it, before the
+    // commit that records it, and never recover.
+    let observation = observer.observe_account().await?;
+    let observed_at = Utc::now();
+    let scan_end_ms = u64::try_from(observed_at.timestamp_millis())?;
+    let scan_start_ms = runtime.next_scan_start_ms();
+    let (movements, capital_history_complete, api_errors) =
+        if let Ok(movements) = observer.account_movements(scan_start_ms, scan_end_ms).await {
+            (movements, true, 0)
+        } else {
+            eprintln!(
+                "account movement history unavailable; cursor retained and decision fails closed"
+            );
+            (Vec::new(), false, 1)
+        };
+    // HYPE this runtime's own settled decisions prove the workflow acquired,
+    // net of the explained movements it recorded plus the ones in this scan
     // (bot-strategy#929). `to_attribution` excludes account holdings outright
     // while any settled purchase is still missing its evidence, rather than
     // publishing a partial sum as if it were the whole.
-    let attribution = runtime.attributed_hype().to_attribution();
-    let accumulator = observer
-        .observe(&attribution, trade_cadence_label(&config.schedule))
-        .await?;
+    let attribution = runtime.attributed_hype_with(&movements)?.to_attribution();
+    let accumulator = observation.reconcile(&attribution, trade_cadence_label(&config.schedule))?;
     // The ledger claims HYPE the account no longer holds. The observation is
     // still published — the dashboard must show this, which is why
     // `reconcile_status` degrades instead of erroring — but this process must
@@ -320,18 +338,6 @@ async fn run_dry_run_cycle(
         )
         .into());
     }
-    let observed_at = Utc::now();
-    let scan_end_ms = u64::try_from(observed_at.timestamp_millis())?;
-    let scan_start_ms = runtime.next_scan_start_ms();
-    let (movements, capital_history_complete, api_errors) =
-        if let Ok(movements) = observer.account_movements(scan_start_ms, scan_end_ms).await {
-            (movements, true, 0)
-        } else {
-            eprintln!(
-                "account movement history unavailable; cursor retained and decision fails closed"
-            );
-            (Vec::new(), false, 1)
-        };
     let report = runtime.apply_cycle(RuntimeCycleInput {
         observed_at,
         scan_start_ms,

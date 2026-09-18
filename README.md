@@ -98,6 +98,17 @@ total includes holdings that are not the bot's — rather than by refusing to
 publish a status document at all. While that failure stands, the recurring
 cycle and `prepare` both refuse to commit capital.
 
+Non-trade HYPE movements the venue's own account ledger shows (`send`,
+`spotTransfer`, `subAccountTransfer`, deposits, withdrawals of the HYPE token)
+are recorded by the cycle that scans them, keyed by the venue's movement id and
+hash-chained with that cycle, and netted against the settled acquisitions
+before divergence is judged. An outflow is taken from HYPE that arrived from
+outside any workflow first and from bot-acquired HYPE only beyond that, so a
+transfer of unattributed HYPE can never explain away bot-owned HYPE that left by
+a path the ledger does not show. The bot-acquired part that left is published as
+`hype_transferred_out` beside `hype_balance`, never inside it. A sale is a fill,
+not a movement: it stays an unexplained outflow and halts as above.
+
 ## Offline staking workflow fault injection
 
 The optional `offline-staking-simulation` feature exercises the durable

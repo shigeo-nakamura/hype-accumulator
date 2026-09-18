@@ -40,9 +40,46 @@ pub use crate::status::ATTRIBUTION_EXCEEDS_HOLDINGS;
 pub enum HypeAttribution {
     Unavailable,
     Reconciled {
+        /// Bot-acquired HYPE the ledger says the account still holds.
         hype: f64,
         last_trade_at: Option<DateTime<Utc>>,
+        /// Bot-acquired HYPE that left the account by a movement the venue's
+        /// ledger records (bot-strategy#929 slice C); reported, not held.
+        transferred_out_hype: f64,
     },
+}
+
+/// One venue read of the account, taken within a closed window and not yet
+/// reconciled against an attribution.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AccountObservation {
+    pub balances: BalanceObservation,
+    pub staking: StakingObservation,
+    pub balance_observation_started_at: DateTime<Utc>,
+    pub balance_observed_at: DateTime<Utc>,
+}
+
+impl AccountObservation {
+    /// Produces the fail-closed dashboard status block for this read under
+    /// `attribution`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MonitorError`] when reconciliation fails.
+    pub fn reconcile(
+        &self,
+        attribution: &HypeAttribution,
+        trade_cadence: impl Into<String>,
+    ) -> Result<AccumulatorStatus, MonitorError> {
+        reconcile_status_with_balance_window(
+            &self.balances,
+            &self.staking,
+            attribution,
+            self.balance_observation_started_at,
+            self.balance_observed_at,
+            trade_cadence,
+        )
+    }
 }
 
 #[derive(Debug, Error)]
@@ -170,6 +207,23 @@ impl HyperliquidObserver {
         attribution: &HypeAttribution,
         trade_cadence: impl Into<String>,
     ) -> Result<AccumulatorStatus, MonitorError> {
+        let observation = self.observe_account().await?;
+        observation.reconcile(attribution, trade_cadence)
+    }
+
+    /// Reads spot balances, current HYPE mark, staking summary, and staking
+    /// delegations, without reconciling them against an attribution yet.
+    ///
+    /// Split from [`Self::observe`] so a caller can take the account read
+    /// first and decide the attribution afterwards — the recurring cycle
+    /// nets HYPE movements from the same scan it is about to commit before
+    /// it judges divergence (bot-strategy#929 slice C) — while the balance
+    /// window the status reports stays the one this read took.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MonitorError`] when any required read fails.
+    pub async fn observe_account(&self) -> Result<AccountObservation, MonitorError> {
         let balance_observation_started_at = Utc::now();
         let combined = self
             .connector
@@ -208,14 +262,12 @@ impl HyperliquidObserver {
                 },
             )?,
         };
-        reconcile_status_with_balance_window(
-            &balances,
-            &staking,
-            attribution,
+        Ok(AccountObservation {
+            balances,
+            staking,
             balance_observation_started_at,
             balance_observed_at,
-            trade_cadence,
-        )
+        })
     }
 
     async fn post_info<T: DeserializeOwned>(&self, body: Value) -> Result<T, MonitorError> {
@@ -288,16 +340,18 @@ fn reconcile_status_with_balance_window(
     if mismatch > delegation_tolerance {
         health_reasons.push("staking delegation total does not match delegator summary");
     }
-    let (attributed_hype, last_trade_at) = match attribution {
+    let (attributed_hype, last_trade_at, transferred_out_hype) = match attribution {
         HypeAttribution::Unavailable => {
             health_reasons.push("HYPE attribution unavailable; account holdings excluded");
-            (0.0, None)
+            (0.0, None, None)
         }
         HypeAttribution::Reconciled {
             hype,
             last_trade_at,
+            transferred_out_hype,
         } => {
             finite_nonnegative("attributed HYPE", *hype)?;
+            finite_nonnegative("transferred-out HYPE", *transferred_out_hype)?;
             if *hype > observed_hype + attribution_tolerance {
                 // The workflow ledger says this account should still hold
                 // more bot-owned HYPE than it does: HYPE the bot acquired has
@@ -315,12 +369,12 @@ fn reconcile_status_with_balance_window(
                 // include. The reason carries the fact; the number does not
                 // guess.
                 health_reasons.push(ATTRIBUTION_EXCEEDS_HOLDINGS);
-                (0.0, *last_trade_at)
+                (0.0, *last_trade_at, Some(*transferred_out_hype))
             } else {
                 if observed_hype - *hype > attribution_tolerance {
                     health_reasons.push("unattributed HYPE account holdings excluded");
                 }
-                (*hype, *last_trade_at)
+                (*hype, *last_trade_at, Some(*transferred_out_hype))
             }
         }
     };
@@ -342,7 +396,7 @@ fn reconcile_status_with_balance_window(
         plausible
     });
     let health_reason = (!health_reasons.is_empty()).then(|| health_reasons.join("; "));
-    AccumulatorStatus::new_with_balance_window(
+    let status = AccumulatorStatus::new_with_balance_window(
         balances.spot_usdc,
         attributed_hype,
         balances.hype_price_usdc,
@@ -351,7 +405,11 @@ fn reconcile_status_with_balance_window(
         last_trade_at,
         trade_cadence,
         health_reason,
-    )
+    )?;
+    match transferred_out_hype {
+        Some(hype) => status.with_hype_transferred_out(hype),
+        None => Ok(status),
+    }
     .map_err(MonitorError::from)
 }
 

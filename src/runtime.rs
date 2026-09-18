@@ -566,7 +566,119 @@ struct RuntimeState {
     /// forget, and a conflicting replay fails closed.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     hype_acquisitions: BTreeMap<String, RuntimeHypeAcquisition>,
+    /// Movement id → every authoritative non-trade HYPE movement of this
+    /// account the cycle scan has observed (bot-strategy#929 slice C).
+    /// Append-only, keyed by the venue's own movement id so an overlapping
+    /// re-scan records nothing twice, and hash-chained with the cycle that
+    /// observed it. This is what lets an *explained* outflow — a transfer
+    /// the venue's ledger shows — net against `hype_acquisitions` instead
+    /// of tripping the divergence halt, while an outflow the ledger does
+    /// not show (a sale, a movement the scan missed) still does.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    hype_movements: BTreeMap<String, RuntimeHypeMovement>,
 }
+
+/// Which way a non-trade HYPE movement crossed the account boundary.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum HypeMovementDirection {
+    /// HYPE arrived from outside a workflow: never bot-owned, but it is what
+    /// a later outflow is taken from first (see [`AttributedHype`]).
+    Inflow,
+    /// HYPE left the account by a transfer or withdrawal the venue's ledger
+    /// records.
+    Outflow,
+}
+
+/// One authoritative non-trade HYPE movement, as the cycle scan observed it.
+///
+/// Fills are not movements: purchased HYPE is recorded by settlement in
+/// `hype_acquisitions`, and a sale is a fill the account-movement scan does
+/// not see at all — which is why it remains an *unexplained* outflow and
+/// halts. Only `send`/`spotTransfer`/`subAccountTransfer`-shaped rows and
+/// external deposits/withdrawals of the HYPE token land here; a row the
+/// connector could not classify (`Unknown`) is not evidence of anything and
+/// is not recorded.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeHypeMovement {
+    movement_id: String,
+    direction: HypeMovementDirection,
+    /// Unsigned magnitude, exact in atoms; a row finer than an atom is
+    /// refused rather than rounded.
+    amount_hype_atoms: u64,
+    occurred_at: DateTime<Utc>,
+    /// The other account of a directional transfer, lowercased, when the
+    /// connector reported one. Kept in this private state for the audit
+    /// trail; never published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    counterparty: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transaction_hash: Option<String>,
+    recorded_at: DateTime<Utc>,
+}
+
+impl RuntimeHypeMovement {
+    /// Classifies one scanned movement as a HYPE movement this state
+    /// records, or `None` when it is not one (another token, a zero row, or
+    /// a row the connector could not classify).
+    ///
+    /// # Errors
+    ///
+    /// A HYPE row whose amount is not a whole number of atoms is refused:
+    /// recording it rounded would make the netting below silently wrong by
+    /// the rounding, and skipping it would leave a real outflow unexplained
+    /// without saying why.
+    fn classify(
+        movement: &HyperliquidAccountMovement,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<Option<Self>, RuntimeError> {
+        if !movement.token.eq_ignore_ascii_case(HYPE_TOKEN)
+            || movement.kind == HyperliquidAccountMovementKind::Unknown
+            || movement.amount.is_zero()
+        {
+            return Ok(None);
+        }
+        let direction = if movement.amount < Decimal::ZERO {
+            HypeMovementDirection::Outflow
+        } else {
+            HypeMovementDirection::Inflow
+        };
+        let amount_hype_atoms = crate::hype_asset::decimal_hype_to_atoms_exact(
+            movement.amount.abs(),
+        )
+        .ok_or_else(|| {
+            RuntimeError::InvalidMovement(format!(
+                "HYPE movement {} amount {} is not a whole number of atoms",
+                movement.event_id, movement.amount
+            ))
+        })?;
+        Ok(Some(Self {
+            movement_id: movement.event_id.clone(),
+            direction,
+            amount_hype_atoms,
+            occurred_at: timestamp_ms(movement.timestamp_ms)?,
+            counterparty: movement.counterparty.clone(),
+            transaction_hash: movement.transaction_hash.clone(),
+            recorded_at,
+        }))
+    }
+
+    /// Whether `other` is the same venue movement re-observed (an
+    /// overlapping scan), ignoring only when this state first recorded it.
+    fn same_movement(&self, other: &Self) -> bool {
+        self.movement_id == other.movement_id
+            && self.direction == other.direction
+            && self.amount_hype_atoms == other.amount_hype_atoms
+            && self.occurred_at == other.occurred_at
+            && self.counterparty == other.counterparty
+            && self.transaction_hash == other.transaction_hash
+    }
+}
+
+/// The venue's spot token symbol for HYPE as it appears in account-movement
+/// rows (`token`), matched case-insensitively like `monitor.rs::spot_total`.
+const HYPE_TOKEN: &str = "HYPE";
 
 /// One settled decision's HYPE acquisition, as durably recorded beside the
 /// capital settlement that produced it.
@@ -663,6 +775,7 @@ impl RuntimeState {
             live_history_directory: None,
             live_journal_intents: BTreeMap::new(),
             hype_acquisitions: BTreeMap::new(),
+            hype_movements: BTreeMap::new(),
         }
     }
 }
@@ -757,12 +870,36 @@ impl LiveHypeAcquisition {
 /// bot-strategy#929 has no acquisition row until it is backfilled, and
 /// reporting the partial sum as if it were the whole would understate
 /// bot-owned inventory without saying so.
+///
+/// Non-trade HYPE movements the scan recorded (bot-strategy#929 slice C)
+/// are netted here, and only here. The rule is that an outflow is taken
+/// from HYPE the account holds for other reasons (recorded inflows) first,
+/// and from bot-acquired HYPE only beyond that:
+///
+/// ```text
+/// bot_outflow = outflows − min(outflows, inflows)
+/// held        = credited − min(credited, bot_outflow)
+/// ```
+///
+/// That is the direction that keeps the divergence check honest: the claim
+/// on the account stays as high as the ledger can justify, so HYPE that
+/// left by a path the ledger does *not* show (a sale) still exceeds the
+/// holdings and halts, and an explained transfer of unattributed HYPE can
+/// never be used to hide it. What is reported as bot-owned is `held`, which
+/// the divergence check bounds by the account's holdings before it is
+/// published; the part of bot inventory that left by an explained movement
+/// is reported separately as [`Self::transferred_out_hype_atoms`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AttributedHype {
     pub credited_hype_atoms: u64,
     pub last_fill_at: Option<DateTime<Utc>>,
     pub settled_purchases_with_evidence: usize,
     pub settled_purchases_without_evidence: usize,
+    /// Non-trade HYPE that arrived from outside any workflow, summed over
+    /// the recorded movements.
+    pub inflow_hype_atoms: u64,
+    /// HYPE that left by recorded transfers/withdrawals, summed.
+    pub outflow_hype_atoms: u64,
 }
 
 impl AttributedHype {
@@ -778,6 +915,46 @@ impl AttributedHype {
         crate::hype_asset::atoms_to_hype_f64(self.credited_hype_atoms)
     }
 
+    /// Bot-acquired HYPE that left the account by an explained movement.
+    #[must_use]
+    pub const fn transferred_out_hype_atoms(&self) -> u64 {
+        let bot_outflow = self
+            .outflow_hype_atoms
+            .saturating_sub(self.inflow_hype_atoms);
+        if bot_outflow < self.credited_hype_atoms {
+            bot_outflow
+        } else {
+            self.credited_hype_atoms
+        }
+    }
+
+    /// Bot-acquired HYPE the ledger says the account should still hold.
+    #[must_use]
+    pub const fn held_hype_atoms(&self) -> u64 {
+        self.credited_hype_atoms
+            .saturating_sub(self.transferred_out_hype_atoms())
+    }
+
+    /// Nets `movements` the scan observed but this state has not recorded
+    /// yet, exactly as [`SignerFreeRuntime::apply_cycle`] will record them.
+    ///
+    /// The cycle's divergence check runs before the cycle commits, on an
+    /// attribution that must already account for an outflow the same scan
+    /// just found — otherwise the cycle that first sees a transfer would
+    /// halt on it and never reach the commit that explains it.
+    fn net_of(mut self, pending: &[RuntimeHypeMovement]) -> Result<Self, RuntimeError> {
+        for movement in pending {
+            let total = match movement.direction {
+                HypeMovementDirection::Inflow => &mut self.inflow_hype_atoms,
+                HypeMovementDirection::Outflow => &mut self.outflow_hype_atoms,
+            };
+            *total = total
+                .checked_add(movement.amount_hype_atoms)
+                .ok_or(RuntimeError::CounterOverflow)?;
+        }
+        Ok(self)
+    }
+
     /// The attribution an observer may report for this account.
     ///
     /// The single place the "incomplete evidence excludes holdings" rule
@@ -787,8 +964,11 @@ impl AttributedHype {
     pub fn to_attribution(&self) -> HypeAttribution {
         if self.is_complete() {
             HypeAttribution::Reconciled {
-                hype: self.credited_hype(),
+                hype: crate::hype_asset::atoms_to_hype_f64(self.held_hype_atoms()),
                 last_trade_at: self.last_fill_at,
+                transferred_out_hype: crate::hype_asset::atoms_to_hype_f64(
+                    self.transferred_out_hype_atoms(),
+                ),
             }
         } else {
             HypeAttribution::Unavailable
@@ -1075,6 +1255,16 @@ impl SignerFreeRuntime {
     #[must_use]
     pub fn attributed_hype(&self) -> AttributedHype {
         let mut aggregate = AttributedHype::default();
+        for movement in self.state.hype_movements.values() {
+            let total = match movement.direction {
+                HypeMovementDirection::Inflow => &mut aggregate.inflow_hype_atoms,
+                HypeMovementDirection::Outflow => &mut aggregate.outflow_hype_atoms,
+            };
+            // Saturating on purpose: a committed record can only be
+            // reported, never refused, and a saturated outflow total errs
+            // toward claiming less.
+            *total = total.saturating_add(movement.amount_hype_atoms);
+        }
         for decision in self.settled_purchases() {
             match self.state.hype_acquisitions.get(&decision.decision_id) {
                 // An unrepresentable total is unusable evidence, not a
@@ -1098,6 +1288,54 @@ impl SignerFreeRuntime {
             }
         }
         aggregate
+    }
+
+    /// [`Self::attributed_hype`] with the HYPE movements in `movements` that
+    /// this state has not recorded yet netted in, as the cycle that is about
+    /// to consume `movements` will record them (bot-strategy#929 slice C).
+    ///
+    /// Callers pass exactly the movement list they then hand to
+    /// [`Self::apply_cycle`]; anything else would let the divergence check
+    /// and the committed record disagree about the same transfer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::InvalidMovement`] for a HYPE row that cannot
+    /// be recorded, or a re-observed movement whose content changed.
+    pub fn attributed_hype_with(
+        &self,
+        movements: &[HyperliquidAccountMovement],
+    ) -> Result<AttributedHype, RuntimeError> {
+        let pending = self.unrecorded_hype_movements(movements, Utc::now())?;
+        self.attributed_hype().net_of(&pending)
+    }
+
+    /// The HYPE movements among `movements` this state has not recorded, in
+    /// scan order. A movement already recorded must re-observe identically;
+    /// the venue's ledger does not rewrite history, so a changed row is a
+    /// scan the runtime must not trust.
+    fn unrecorded_hype_movements(
+        &self,
+        movements: &[HyperliquidAccountMovement],
+        recorded_at: DateTime<Utc>,
+    ) -> Result<Vec<RuntimeHypeMovement>, RuntimeError> {
+        let mut pending = Vec::new();
+        for movement in unique_ordered_movements(movements)? {
+            let Some(record) = RuntimeHypeMovement::classify(movement, recorded_at)? else {
+                continue;
+            };
+            match self.state.hype_movements.get(&record.movement_id) {
+                Some(existing) if existing.same_movement(&record) => {}
+                Some(_) => {
+                    return Err(RuntimeError::InvalidMovement(format!(
+                        "HYPE movement {} re-observed with different content than recorded",
+                        record.movement_id
+                    )))
+                }
+                None => pending.push(record),
+            }
+        }
+        Ok(pending)
     }
 
     /// Every settled purchase whose HYPE acquisition was never recorded.
@@ -1640,6 +1878,11 @@ impl SignerFreeRuntime {
                 "deposit approval evidence must not be in the future".to_owned(),
             ));
         }
+        // Classified before anything else is derived from the scan: a HYPE
+        // row this state cannot record refuses the whole cycle up front
+        // (bot-strategy#929 slice C).
+        let pending_hype_movements =
+            self.unrecorded_hype_movements(input.movements, input.observed_at)?;
         let existing_decision = self
             .state
             .pacing
@@ -1927,6 +2170,21 @@ impl SignerFreeRuntime {
         next_state
             .parent_funding_route
             .clone_from(&self.config.parent_funding_route);
+        // Recorded whether or not this cycle's cursor advances past them:
+        // the record is keyed by the venue's movement id, so the re-scan an
+        // observe cycle deferred at the boundary leaves behind re-observes
+        // them as already recorded. What matters is that a movement the
+        // divergence check above already netted is committed by the same
+        // cycle, never left for a later one to explain again.
+        for movement in pending_hype_movements {
+            if next_state
+                .hype_movements
+                .insert(movement.movement_id.clone(), movement)
+                .is_some()
+            {
+                return Err(RuntimeError::IncompatibleRuntimeState);
+            }
+        }
         if let DecisionMode::Live { history_directory } = &input.decision_mode {
             match &next_state.live_history_directory {
                 Some(bound) if bound != history_directory => {

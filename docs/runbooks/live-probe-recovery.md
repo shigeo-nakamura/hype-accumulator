@@ -410,6 +410,43 @@ mode=backfilled decision=fixed-dca:2026-09-10 workflow=… credited_hype_atoms=2
 mode=backfill-complete attributed_hype_atoms=29979000 settled_purchases=1 missing=0 complete=true
 ```
 
+## HYPE that left the account: explained movements versus the divergence halt
+
+`attributed HYPE exceeds observed account holdings` (the divergence halt) means
+the settled acquisitions claim more HYPE than the account holds. Since
+bot-strategy#929 slice C the cycle nets **explained** outflows before it judges
+this: every non-trade HYPE row the venue's account ledger returns for the scan
+window (`send`, `spotTransfer`, `subAccountTransfer`, external deposit or
+withdrawal of the HYPE token) is recorded under `hype_movements` in
+`runtime-state.json`, keyed by the venue's movement id, in the same committed
+cycle. A transfer the owner makes out of the account therefore does not halt
+anything: the first cycle whose scan covers it records it, `hype_balance` drops
+by the bot-acquired part that left, and `hype_transferred_out` reports that
+part. An inflow from outside is recorded too, and an outflow is taken from such
+inflows first — the claim on the account only shrinks by what the ledger cannot
+otherwise account for.
+
+If the halt fires anyway:
+
+1. Read `hype_movements` in `runtime-state.json` (as `ec2-user`, read-only) and
+   compare with the venue's `userNonFundingLedgerUpdates` for the account since
+   the last complete scan (`last_complete_scan_end_ms`). A row the venue shows
+   and the state lacks means the scan did not reach it yet (the cycle's
+   `capital_history_complete=false` line, an API error) — the next complete
+   scan records it; nothing to repair by hand.
+2. A **sale** is a fill, not a movement, and is never explained by this record:
+   bot-acquired HYPE sold from the account stays an unexplained outflow. There is
+   no automatic correction for it; it is a manual review under
+   "Settlement is final" below.
+3. A HYPE row whose amount is finer than an atom, or a movement id re-observed
+   with different content, refuses the cycle outright (`InvalidMovement`) —
+   this is the venue's ledger disagreeing with itself and must be understood,
+   not worked around.
+
+Staking transfers *within* the account (`cDeposit`) are not outflows: the
+observer counts spot, undelegated, delegated and pending-withdrawal HYPE
+together, so they change nothing here.
+
 ## Releasing a decision that never reached a signer
 
 `prepare` commits the day's pacing decision in the runtime cycle *before* the

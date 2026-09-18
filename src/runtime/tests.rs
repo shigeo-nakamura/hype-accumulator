@@ -3255,6 +3255,7 @@ fn live_settlement_records_the_hype_it_bought_and_attributes_it() {
         HypeAttribution::Reconciled {
             hype: 0.299_79,
             last_trade_at: Some(fill_at),
+            transferred_out_hype: 0.0,
         }
     );
 
@@ -4068,4 +4069,318 @@ fn journal_intent_is_recorded_before_the_journal_and_survives_reopen() {
     assert!(reopened
         .record_live_journal_intent(&LiveDecisionIdentity::of(&decision), journal, recorded_at)
         .is_err());
+}
+
+/// bot-strategy#929 slice C fixtures: non-trade HYPE movements as the
+/// connector normalizes them (`send`/`spotTransfer` rows carry the token and
+/// a signed amount; the destination of an outgoing transfer is the
+/// counterparty).
+fn hype_transfer(
+    event_id: &str,
+    occurred_at: DateTime<Utc>,
+    amount: Decimal,
+    kind: HyperliquidAccountMovementKind,
+) -> HyperliquidAccountMovement {
+    HyperliquidAccountMovement {
+        event_id: event_id.to_owned(),
+        timestamp_ms: ms(occurred_at),
+        kind,
+        token: "HYPE".to_owned(),
+        amount,
+        transaction_hash: Some(format!("0x{event_id}")),
+        counterparty: Some("0xmaster".to_owned()),
+    }
+}
+
+/// A runtime holding one settled purchase of `credited` atoms, decided at
+/// `decision_at` (the same shape `live_settlement_records_the_hype_it_bought_
+/// and_attributes_it` builds), reopened so the next cycle starts clean.
+fn runtime_with_settled_purchase(
+    runtime_config: &RuntimeConfig,
+    start: DateTime<Utc>,
+    decision_at: DateTime<Utc>,
+    credited: u64,
+) -> (SignerFreeRuntime, AdmissionApprovals) {
+    let deposit_at = start + TimeDelta::hours(1);
+    let movement = deposit("deposit-approved", deposit_at, 100);
+    let admission = approvals("deposit-approved", deposit_at, deposit_at);
+    let signal = signal(decision_at);
+    let journal = Path::new("/var/lib/hype-accumulator/journals/2026-07-06.jsonl");
+    let mut runtime =
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("open runtime");
+    let decision = live_planned_decision(
+        &mut runtime,
+        start,
+        decision_at,
+        &movement,
+        &admission,
+        &signal,
+    )
+    .decision()
+    .expect("planned decision")
+    .clone();
+    let acquired = bound_acquisition(&mut runtime, &decision, journal, decision_at, credited);
+    assert_eq!(
+        runtime
+            .settle_live_decision(
+                &LiveDecisionIdentity::of(&decision),
+                decision.planned_usdc,
+                decision.planned_usdc,
+                &acquired,
+                decision_at + TimeDelta::minutes(2),
+            )
+            .expect("settled"),
+        LiveSettlementOutcome::Settled
+    );
+    drop(runtime);
+    (
+        SignerFreeRuntime::open(runtime_config.clone(), limits()).expect("reopen"),
+        admission,
+    )
+}
+
+fn observe_cycle_with(
+    runtime: &mut SignerFreeRuntime,
+    observed_at: DateTime<Utc>,
+    movements: &[HyperliquidAccountMovement],
+    admission: &AdmissionApprovals,
+) -> Result<RuntimeCycleReport, RuntimeError> {
+    let scan_start_ms = runtime.next_scan_start_ms();
+    runtime.apply_cycle(RuntimeCycleInput {
+        observed_at,
+        scan_start_ms,
+        scan_end_ms: ms(observed_at),
+        movements,
+        approvals: admission,
+        signal: None,
+        accumulator: status(observed_at, 100.0),
+        capital_history_complete: true,
+        manual_pause: false,
+        api_errors: 0,
+        decision_mode: DecisionMode::Observe,
+    })
+}
+
+/// bot-strategy#929 slice C: a HYPE transfer the venue's ledger shows is
+/// recorded by the cycle that scans it, is netted against the settled
+/// acquisition *before* that cycle commits (so the divergence check does not
+/// halt on it), survives an overlapping re-scan and a reopen, and is
+/// reported as transferred out rather than as held.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn an_explained_hype_outflow_is_recorded_once_and_netted_from_attribution() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let credited = 29_979_000_u64;
+    let (mut runtime, admission) =
+        runtime_with_settled_purchase(&runtime_config, start, decision_at, credited);
+    let before = runtime.attributed_hype();
+    assert_eq!(before.credited_hype_atoms, credited);
+    assert_eq!(before.held_hype_atoms(), credited);
+    assert_eq!(before.transferred_out_hype_atoms(), 0);
+
+    // The owner moves 0.1 HYPE to the master account after settlement.
+    let transfer_at = decision_at + TimeDelta::hours(2);
+    let outflow = hype_transfer(
+        "hype-send-1",
+        transfer_at,
+        Decimal::new(-10_000_000, 8),
+        HyperliquidAccountMovementKind::InternalTransfer,
+    );
+    // A USDC row and a row the connector could not classify are never HYPE
+    // movements, whatever their token.
+    let unrelated = [
+        withdrawal("usdc-out", transfer_at, 1),
+        HyperliquidAccountMovement {
+            kind: HyperliquidAccountMovementKind::Unknown,
+            amount: Decimal::new(5_000_000, 8),
+            ..hype_transfer(
+                "hype-unknown",
+                transfer_at,
+                Decimal::ZERO,
+                HyperliquidAccountMovementKind::Unknown,
+            )
+        },
+    ];
+    let scan = [outflow.clone(), unrelated[0].clone(), unrelated[1].clone()];
+
+    // Netted from the scan before anything is committed — this is what the
+    // divergence check sees — while the committed record is still untouched.
+    let pending = runtime
+        .attributed_hype_with(&scan)
+        .expect("pending netting");
+    assert_eq!(pending.outflow_hype_atoms, 10_000_000);
+    assert_eq!(pending.inflow_hype_atoms, 0);
+    assert_eq!(pending.held_hype_atoms(), credited - 10_000_000);
+    assert_eq!(pending.transferred_out_hype_atoms(), 10_000_000);
+    assert_eq!(
+        pending.to_attribution(),
+        HypeAttribution::Reconciled {
+            hype: 0.199_79,
+            last_trade_at: before.last_fill_at,
+            transferred_out_hype: 0.1,
+        }
+    );
+    assert_eq!(runtime.attributed_hype(), before);
+    assert!(runtime.state.hype_movements.is_empty());
+
+    // The cycle that scans the transfer commits it.
+    let observed_at = transfer_at + TimeDelta::minutes(5);
+    observe_cycle_with(&mut runtime, observed_at, &scan, &admission).expect("observe cycle");
+    let recorded = runtime
+        .state
+        .hype_movements
+        .get("hype-send-1")
+        .expect("outflow recorded")
+        .clone();
+    assert_eq!(recorded.direction, HypeMovementDirection::Outflow);
+    assert_eq!(recorded.amount_hype_atoms, 10_000_000);
+    assert_eq!(recorded.occurred_at, transfer_at);
+    assert_eq!(recorded.recorded_at, observed_at);
+    assert_eq!(recorded.counterparty.as_deref(), Some("0xmaster"));
+    assert_eq!(recorded.transaction_hash.as_deref(), Some("0xhype-send-1"));
+    assert_eq!(
+        runtime.state.hype_movements.len(),
+        1,
+        "USDC/unknown rows are not recorded"
+    );
+    assert_eq!(runtime.attributed_hype(), pending);
+    let head = runtime.state.last_committed_cycle_hash.clone();
+
+    // The overlapping re-scan of the next cycle re-observes the same row:
+    // nothing is recorded twice and the record's first-seen time is kept.
+    let later = observed_at + TimeDelta::minutes(5);
+    observe_cycle_with(&mut runtime, later, &scan, &admission).expect("overlapping rescan");
+    assert_eq!(runtime.state.hype_movements.len(), 1);
+    assert_eq!(runtime.state.hype_movements["hype-send-1"], recorded);
+    assert_eq!(runtime.attributed_hype(), pending);
+    assert_ne!(
+        runtime.state.last_committed_cycle_hash, head,
+        "the cycle itself committed"
+    );
+
+    // The same id re-observed with different content is a scan the runtime
+    // must not trust, before and inside the cycle alike.
+    let rewritten = HyperliquidAccountMovement {
+        amount: Decimal::new(-20_000_000, 8),
+        ..outflow.clone()
+    };
+    assert!(matches!(
+        runtime.attributed_hype_with(std::slice::from_ref(&rewritten)),
+        Err(RuntimeError::InvalidMovement(_))
+    ));
+    assert!(matches!(
+        observe_cycle_with(
+            &mut runtime,
+            later + TimeDelta::minutes(5),
+            std::slice::from_ref(&rewritten),
+            &admission
+        ),
+        Err(RuntimeError::InvalidMovement(_))
+    ));
+    assert_eq!(runtime.state.hype_movements["hype-send-1"], recorded);
+
+    // Part of the committed state, not a cache.
+    drop(runtime);
+    let reopened = SignerFreeRuntime::open(runtime_config, limits()).expect("reopen");
+    assert_eq!(reopened.attributed_hype(), pending);
+    assert_eq!(reopened.state.hype_movements["hype-send-1"], recorded);
+}
+
+/// bot-strategy#929 slice C: an outflow is taken from HYPE that arrived from
+/// outside any workflow first, so a transfer of unattributed HYPE can never
+/// be used to explain away bot-acquired HYPE that left by an unrecorded
+/// path — the claim stays as high as the ledger justifies.
+#[test]
+fn hype_outflows_consume_external_inflows_before_bot_inventory() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let credited = 29_979_000_u64;
+    let (mut runtime, admission) =
+        runtime_with_settled_purchase(&runtime_config, start, decision_at, credited);
+
+    let inflow_at = decision_at + TimeDelta::hours(1);
+    let outflow_at = decision_at + TimeDelta::hours(2);
+    let scan = [
+        // 0.5 HYPE sent in by the master (an external inflow, never bot-owned)
+        hype_transfer(
+            "hype-in",
+            inflow_at,
+            Decimal::new(50_000_000, 8),
+            HyperliquidAccountMovementKind::InternalTransfer,
+        ),
+        // then 0.6 HYPE sent out: 0.5 of it is the inflow, 0.1 is bot inventory
+        hype_transfer(
+            "hype-out",
+            outflow_at,
+            Decimal::new(-60_000_000, 8),
+            HyperliquidAccountMovementKind::TradingRelated,
+        ),
+    ];
+    observe_cycle_with(
+        &mut runtime,
+        outflow_at + TimeDelta::minutes(5),
+        &scan,
+        &admission,
+    )
+    .expect("observe cycle");
+    let attributed = runtime.attributed_hype();
+    assert_eq!(attributed.inflow_hype_atoms, 50_000_000);
+    assert_eq!(attributed.outflow_hype_atoms, 60_000_000);
+    assert_eq!(attributed.transferred_out_hype_atoms(), 10_000_000);
+    assert_eq!(attributed.held_hype_atoms(), credited - 10_000_000);
+
+    // An outflow larger than everything the ledger can account for leaves
+    // the claim at zero, never negative, and reports only the bot part.
+    let excess = AttributedHype {
+        outflow_hype_atoms: 200_000_000,
+        ..attributed
+    };
+    assert_eq!(excess.transferred_out_hype_atoms(), credited);
+    assert_eq!(excess.held_hype_atoms(), 0);
+    // Inflows alone change nothing bot-owned.
+    let inflow_only = AttributedHype {
+        outflow_hype_atoms: 0,
+        ..attributed
+    };
+    assert_eq!(inflow_only.transferred_out_hype_atoms(), 0);
+    assert_eq!(inflow_only.held_hype_atoms(), credited);
+}
+
+/// bot-strategy#929 slice C: a HYPE row finer than an atom is refused, not
+/// rounded into the record — the cycle fails before it commits anything.
+#[test]
+fn a_hype_movement_finer_than_an_atom_refuses_the_cycle() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let runtime_config = config(directory.path(), ms(start));
+    let (mut runtime, admission) =
+        runtime_with_settled_purchase(&runtime_config, start, decision_at, 29_979_000);
+    let head = runtime.state.last_committed_cycle_hash.clone();
+    let row = hype_transfer(
+        "hype-fractional",
+        decision_at + TimeDelta::hours(1),
+        Decimal::new(-1, 9),
+        HyperliquidAccountMovementKind::InternalTransfer,
+    );
+    assert!(matches!(
+        runtime.attributed_hype_with(std::slice::from_ref(&row)),
+        Err(RuntimeError::InvalidMovement(_))
+    ));
+    assert!(matches!(
+        observe_cycle_with(
+            &mut runtime,
+            decision_at + TimeDelta::hours(2),
+            std::slice::from_ref(&row),
+            &admission
+        ),
+        Err(RuntimeError::InvalidMovement(_))
+    ));
+    assert_eq!(runtime.state.last_committed_cycle_hash, head);
+    assert!(runtime.state.hype_movements.is_empty());
 }

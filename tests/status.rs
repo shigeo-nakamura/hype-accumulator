@@ -107,3 +107,34 @@ fn invalid_or_future_measurements_fail_closed() {
         Err(StatusError::InvalidBalanceObservationWindow)
     );
 }
+
+/// bot-strategy#929 slice C: `hype_transferred_out` is published only when
+/// set, and validated like every other amount.
+#[test]
+fn transferred_out_hype_serializes_only_when_recorded() {
+    let base =
+        AccumulatorStatus::new(25.0, 0.7, 40.0, at(12), Some(at(10)), "daily", None).unwrap();
+    let without = DashboardStatus::new(at(12), at(8), false, base.clone());
+    let value: serde_json::Value = serde_json::from_str(&without.to_json().unwrap()).unwrap();
+    assert!(value["accumulator"].get("hype_transferred_out").is_none());
+
+    let with = DashboardStatus::new(
+        at(12),
+        at(8),
+        false,
+        base.clone().with_hype_transferred_out(0.5).unwrap(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&with.to_json().unwrap()).unwrap();
+    assert_eq!(value["accumulator"]["hype_transferred_out"], 0.5);
+    assert_eq!(value["accumulator"]["hype_balance"], 0.7);
+    assert_eq!(value["accumulator"]["total_equity_usdc"], 53.0);
+
+    assert!(matches!(
+        base.clone().with_hype_transferred_out(-0.5),
+        Err(StatusError::Negative("hype_transferred_out"))
+    ));
+    assert!(matches!(
+        base.with_hype_transferred_out(f64::NAN),
+        Err(StatusError::NonFinite("hype_transferred_out"))
+    ));
+}

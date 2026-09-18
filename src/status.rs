@@ -34,6 +34,12 @@ pub struct AccumulatorStatus {
     healthy: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     health_reason: Option<String>,
+    /// Bot-acquired HYPE that left the account by a transfer the venue's
+    /// ledger records (bot-strategy#929 slice C). Not part of
+    /// `hype_balance`, which counts only what the account still holds, and
+    /// absent when attribution is unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hype_transferred_out: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -180,7 +186,25 @@ impl AccumulatorStatus {
             trade_cadence,
             healthy: health_reason.is_none(),
             health_reason,
+            hype_transferred_out: None,
         })
+    }
+
+    /// Records how much bot-acquired HYPE left the account by explained
+    /// movements. Reported beside `hype_balance`, never folded into it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StatusError`] when the amount is not finite or is negative.
+    pub fn with_hype_transferred_out(mut self, hype: f64) -> Result<Self, StatusError> {
+        finite_non_negative("hype_transferred_out", hype)?;
+        self.hype_transferred_out = Some(hype);
+        Ok(self)
+    }
+
+    #[must_use]
+    pub const fn hype_transferred_out(&self) -> Option<f64> {
+        self.hype_transferred_out
     }
 
     #[must_use]
