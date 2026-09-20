@@ -121,7 +121,7 @@ jobs:
             config/example.toml \
             config/security-policy.example.toml)" = \
             "mode=dry-run halted install-ready"
-          if target/al2023/${TARGET}/release/hype-status extra argument rejected; then
+          if target/al2023/${TARGET}/release/hype-status config status policy excess; then
             printf "hype-status unexpectedly accepted excess arguments\n" >&2
             exit 1
           else

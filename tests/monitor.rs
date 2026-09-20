@@ -31,6 +31,7 @@ fn reconciliation_includes_only_ledger_attributed_hype() {
             hype: 5.75,
             last_trade_at: Some(at(10)),
             transferred_out_hype: 0.0,
+            custodian: None,
         },
         at(12),
         "Mon/Wed/Fri at 12:00 UTC",
@@ -62,6 +63,7 @@ fn delegation_summary_mismatch_is_degraded_not_hidden() {
             hype: 5.0,
             last_trade_at: None,
             transferred_out_hype: 0.0,
+            custodian: None,
         },
         at(12),
         "daily",
@@ -123,6 +125,7 @@ fn unattributed_hype_is_excluded_and_visible_as_degraded() {
             hype: 4.0,
             last_trade_at: Some(at(10)),
             transferred_out_hype: 0.0,
+            custodian: None,
         },
         at(12),
         "daily",
@@ -161,6 +164,7 @@ fn attribution_above_observed_hype_is_degraded_not_a_dropped_observation() {
             hype: 6.0,
             last_trade_at: Some(at(10)),
             transferred_out_hype: 0.0,
+            custodian: None,
         },
         at(12),
         "daily",
@@ -204,6 +208,7 @@ fn attribution_within_tolerance_of_observed_hype_stays_healthy() {
             hype: 5.75 + 1e-12,
             last_trade_at: None,
             transferred_out_hype: 0.0,
+            custodian: None,
         },
         at(12),
         "daily",
@@ -234,6 +239,7 @@ fn a_last_trade_after_the_balance_read_degrades_instead_of_dropping_the_status()
             hype: 2.0,
             last_trade_at: Some(at(14)),
             transferred_out_hype: 0.0,
+            custodian: None,
         },
         at(12),
         "daily",
@@ -295,6 +301,7 @@ fn transferred_out_hype_is_reported_beside_the_held_balance() {
             hype: 0.7,
             last_trade_at: Some(at(10)),
             transferred_out_hype: 0.5,
+            custodian: None,
         },
         at(12),
         "daily",
@@ -318,6 +325,7 @@ fn transferred_out_hype_is_reported_beside_the_held_balance() {
             hype: 0.9,
             last_trade_at: Some(at(10)),
             transferred_out_hype: 0.5,
+            custodian: None,
         },
         at(12),
         "daily",
@@ -346,6 +354,182 @@ fn transferred_out_hype_is_reported_beside_the_held_balance() {
             hype: 0.7,
             last_trade_at: None,
             transferred_out_hype: -0.1,
+            custodian: None,
+        },
+        at(12),
+        "daily",
+    )
+    .is_err());
+}
+
+/// bot-strategy#847: with a staking custodian named, the ledger's custodian
+/// view and the custodian's own staking balances are published beside the
+/// held balance; a transfer the custodian has not staked yet degrades the
+/// status with its shortfall; a failed custodian read degrades instead of
+/// failing the observation; and the divergence halt zeroes the eligible
+/// figure while keeping the transferred record.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn custodian_view_is_published_and_an_unstaked_transfer_degrades() {
+    use hype_accumulator::{
+        monitor::{reconcile_status_with_custodian, CustodianAttribution, CustodianObservation},
+        status::CUSTODIAN_STAKING_SHORTFALL,
+    };
+    let balances = BalanceObservation {
+        spot_usdc: 25.0,
+        spot_hype: 0.7,
+        hype_price_usdc: 40.0,
+    };
+    let staking = StakingObservation {
+        delegated_hype: 0.0,
+        undelegated_hype: 0.0,
+        pending_withdrawal_hype: 0.0,
+        delegation_rows_hype: 0.0,
+    };
+    // Bought 1.2; 0.5 left, 0.4 of it to the custodian; residual 0.1 keeps
+    // 0.6 eligible. The custodian has 0.4 in staking (0.3 delegated, 0.1
+    // still undelegated after cDeposit).
+    let attribution = HypeAttribution::Reconciled {
+        hype: 0.7,
+        last_trade_at: Some(at(10)),
+        transferred_out_hype: 0.5,
+        custodian: Some(CustodianAttribution {
+            transferred_hype: 0.4,
+            eligible_for_transfer_hype: 0.6,
+        }),
+    };
+    let staked = CustodianObservation::Observed {
+        delegated_hype: 0.3,
+        undelegated_hype: 0.1,
+        pending_withdrawal_hype: 0.0,
+    };
+    let status = reconcile_status_with_custodian(
+        &balances,
+        &staking,
+        &staked,
+        &attribution,
+        at(12),
+        "daily",
+    )
+    .unwrap();
+    assert!(status.is_healthy(), "{:?}", status.health_reason());
+    assert!((status.hype_balance() - 0.7).abs() < f64::EPSILON);
+    assert_eq!(status.hype_transferred_out(), Some(0.5));
+    assert_eq!(status.hype_transferred_to_custodian(), Some(0.4));
+    assert_eq!(status.hype_eligible_for_transfer(), Some(0.6));
+    let custodian_staking = status.custodian_staking().expect("custodian staking");
+    assert!((custodian_staking.delegated_hype - 0.3).abs() < f64::EPSILON);
+    assert!((custodian_staking.undelegated_hype - 0.1).abs() < f64::EPSILON);
+    assert_eq!(custodian_staking.shortfall_hype, Some(0.0));
+    assert!(!status.custodian_staking_shortfall());
+    assert!(
+        (status.total_equity_usdc() - 53.0).abs() < 1e-9,
+        "equity counts held HYPE only; the custodian's staking is not the bot's"
+    );
+
+    // The custodian holds less in staking than was transferred: the owner
+    // moved HYPE but did not stake it. Degraded, with the shortfall.
+    let unstaked = CustodianObservation::Observed {
+        delegated_hype: 0.25,
+        undelegated_hype: 0.0,
+        pending_withdrawal_hype: 0.0,
+    };
+    let degraded = reconcile_status_with_custodian(
+        &balances,
+        &staking,
+        &unstaked,
+        &attribution,
+        at(12),
+        "daily",
+    )
+    .unwrap();
+    assert!(!degraded.is_healthy());
+    assert!(degraded.custodian_staking_shortfall());
+    assert!(degraded
+        .health_reason()
+        .is_some_and(|reason| reason.contains(CUSTODIAN_STAKING_SHORTFALL)));
+    let shortfall = degraded
+        .custodian_staking()
+        .and_then(|staking| staking.shortfall_hype)
+        .expect("shortfall");
+    assert!((shortfall - 0.15).abs() < 1e-9, "{shortfall}");
+    // Still a status document with every other figure intact.
+    assert!((degraded.hype_balance() - 0.7).abs() < f64::EPSILON);
+    assert_eq!(degraded.hype_eligible_for_transfer(), Some(0.6));
+
+    // A custodian read that failed degrades; nothing else is lost.
+    let unavailable = reconcile_status_with_custodian(
+        &balances,
+        &staking,
+        &CustodianObservation::Unavailable,
+        &attribution,
+        at(12),
+        "daily",
+    )
+    .unwrap();
+    assert!(!unavailable.is_healthy());
+    assert!(unavailable
+        .health_reason()
+        .is_some_and(|reason| reason.contains("staking custodian read unavailable")));
+    assert_eq!(unavailable.custodian_staking(), None);
+    assert_eq!(unavailable.hype_transferred_to_custodian(), Some(0.4));
+
+    // No custodian named: none of the custodian fields exist, whatever the
+    // attribution says about transfers.
+    let plain = reconcile_status(
+        &balances,
+        &staking,
+        &HypeAttribution::Reconciled {
+            hype: 0.7,
+            last_trade_at: Some(at(10)),
+            transferred_out_hype: 0.5,
+            custodian: None,
+        },
+        at(12),
+        "daily",
+    )
+    .unwrap();
+    assert_eq!(plain.hype_transferred_to_custodian(), None);
+    assert_eq!(plain.hype_eligible_for_transfer(), None);
+    assert_eq!(plain.custodian_staking(), None);
+
+    // The divergence halt: the eligible figure is derived from a claim this
+    // read refused, so it is zeroed; the transferred record stays.
+    let halted = reconcile_status_with_custodian(
+        &balances,
+        &staking,
+        &staked,
+        &HypeAttribution::Reconciled {
+            hype: 0.9,
+            last_trade_at: Some(at(10)),
+            transferred_out_hype: 0.5,
+            custodian: Some(CustodianAttribution {
+                transferred_hype: 0.4,
+                eligible_for_transfer_hype: 0.8,
+            }),
+        },
+        at(12),
+        "daily",
+    )
+    .unwrap();
+    assert!(halted.attribution_exceeds_holdings());
+    assert_eq!(halted.hype_transferred_to_custodian(), Some(0.4));
+    assert_eq!(halted.hype_eligible_for_transfer(), Some(0.0));
+
+    // A custodian part larger than the whole transferred-out figure is not
+    // an attribution this reconciliation will publish.
+    assert!(reconcile_status_with_custodian(
+        &balances,
+        &staking,
+        &staked,
+        &HypeAttribution::Reconciled {
+            hype: 0.7,
+            last_trade_at: None,
+            transferred_out_hype: 0.5,
+            custodian: Some(CustodianAttribution {
+                transferred_hype: 0.6,
+                eligible_for_transfer_hype: 0.6,
+            }),
         },
         at(12),
         "daily",

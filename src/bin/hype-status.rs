@@ -21,13 +21,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let output_path = args
         .next()
         .map_or_else(|| PathBuf::from("status.json"), PathBuf::from);
+    let security_policy_path = args.next().map(PathBuf::from);
     if args.next().is_some() {
-        return Err("usage: hype-status [config.toml] [status.json]".into());
+        return Err("usage: hype-status [config.toml] [status.json] [security-policy.toml]".into());
     }
-    let config = Config::from_toml(&fs::read_to_string(config_path)?)?;
+    // The custodian view exists only on the security policy: without it the
+    // config names no custodian and the status document omits
+    // `custodian_staking`, so a deployment that publishes the view must pass
+    // the same policy the accumulator runs under.
+    let runtime = fs::read_to_string(config_path)?;
+    let config = match security_policy_path {
+        Some(path) => Config::from_toml_with_security_policy(&runtime, &fs::read_to_string(path)?)?,
+        None => Config::from_toml(&runtime)?,
+    };
     let account = config.observation_account(&ProcessEnvironment)?;
     let process_started_at = Utc::now();
-    let observer = HyperliquidObserver::new(&config.hyperliquid.endpoint, &account)?;
+    let observer = HyperliquidObserver::new(&config.hyperliquid.endpoint, &account)?
+        .with_custodian(
+            config
+                .hype_staking_custodian(&ProcessEnvironment)?
+                .as_deref(),
+        )?;
     let accumulator = observer
         .observe(
             &HypeAttribution::Unavailable,

@@ -1049,6 +1049,84 @@ fn designated_parent_funding_binds_the_source_and_rejects_inheritance_claims() {
     assert!(cfg.parent_funding_route(&env).is_err());
 }
 
+/// bot-strategy#847: the staking custodian is the designated funding parent
+/// or nothing — never a new address; it is acknowledged (digest-bound) only
+/// when set, so a policy written before the field existed keeps its
+/// acknowledgement; and it requires designated-parent funding.
+#[test]
+fn staking_custodian_is_the_designated_parent_and_digest_bound_only_when_set() {
+    const NONE: &str = "hype_staking_custodian = \"none\"";
+    const PARENT: &str = "hype_staking_custodian = \"designated_parent\"";
+    let mut env = live_environment();
+    env.insert("HYPE_PARENT_ACCOUNT".to_owned(), PARENT_ACCOUNT.to_owned());
+    let explicit_none = designated_parent_policy();
+    assert!(
+        explicit_none.contains(NONE),
+        "the example names no custodian"
+    );
+    let absent = explicit_none.replace(NONE, "");
+    let with = explicit_none.replace(NONE, PARENT);
+
+    // Resolution: the parent, lowercased, or nothing — including for a
+    // config with no policy attached, which is how the read-only
+    // `hype-status` binary loads its config.
+    assert_eq!(
+        config_with_policy(&with)
+            .hype_staking_custodian(&env)
+            .unwrap(),
+        Some(PARENT_ACCOUNT.to_ascii_lowercase())
+    );
+    assert_eq!(
+        Config::from_toml(&live_runtime_toml())
+            .expect("runtime config alone")
+            .hype_staking_custodian(&env)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        config_with_policy(&absent)
+            .hype_staking_custodian(&env)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        config_with_policy(&explicit_none)
+            .hype_staking_custodian(&env)
+            .unwrap(),
+        None
+    );
+    // The residual buffer is the staking policy's.
+    assert_eq!(
+        config_with_policy(&with)
+            .staking_residual_hype_atoms()
+            .unwrap(),
+        1000
+    );
+
+    // Digest: absent and explicit `none` acknowledge identically to a policy
+    // that predates the field; `designated_parent` does not.
+    let now = at("2026-08-24T00:00:00Z");
+    let digest = |policy: &str| {
+        config_with_policy(policy)
+            .expected_live_acknowledgement(&env, now)
+            .expect("complete effective policy")
+    };
+    assert_eq!(digest(&absent), digest(&explicit_none));
+    assert_ne!(digest(&absent), digest(&with));
+
+    // A custodian without designated-parent funding is refused at parse,
+    // before any mode-specific validation.
+    let wrong_mode = live_policy_template().replace(NONE, PARENT);
+    assert_ne!(wrong_mode, live_policy_template());
+    assert!(Config::from_toml_with_security_policy(&live_runtime_toml(), &wrong_mode).is_err());
+    // Unknown values are not a custodian.
+    assert!(Config::from_toml_with_security_policy(
+        &live_runtime_toml(),
+        &explicit_none.replace(NONE, "hype_staking_custodian = \"master\""),
+    )
+    .is_err());
+}
+
 #[test]
 fn purchase_fee_ceiling_above_the_pacing_reserve_fails_before_live() {
     // Regression for bot-strategy#844: a decision commits

@@ -61,6 +61,14 @@ allow_traced_parent_transfer_admission = false
 # account address. The resolved value (not only this name) is included in the
 # effective-policy digest covered by the live acknowledgement.
 admitted_parent_account_env = ""
+# Where bot-acquired HYPE may be transferred for offline staking
+# (bot-strategy#847). "none" (the default when absent) names no custodian.
+# "designated_parent" names the account admitted_parent_account_env resolves
+# to — never a new address — and requires designated_parent_funding. The bot
+# never signs a transfer or a staking action itself: it recognizes a transfer
+# to the custodian as explained, reports the eligible amount, and reads the
+# custodian's public staking balances. Acknowledged (digest-bound) only when set.
+hype_staking_custodian = "none"
 
 [execution]
 max_slippage_bps = 0

@@ -42,8 +42,8 @@ use hype_accumulator::{
     order_envelope::OrderEnvelopeFreshnessPolicy,
     pacing::{DailyDecision, PacingLimits, UsdcMicros},
     runtime::{
-        AdmissionApprovals, DecisionMode, LiveDecisionIdentity, LiveHypeAcquisition, RuntimeConfig,
-        RuntimeCycleInput, SignerFreeRuntime,
+        AdmissionApprovals, DecisionMode, HypeStakingCustodianConfig, LiveDecisionIdentity,
+        LiveHypeAcquisition, RuntimeConfig, RuntimeCycleInput, SignerFreeRuntime,
     },
     signal::SignalSnapshot,
     signer::resolve_signer_private_key,
@@ -938,7 +938,9 @@ async fn prepare_workflow(
     // check deterministically — found on the first real mainnet `prepare`
     // (bot-strategy#845, 2026-09-07), a path no offline fixture exercises.
     let account = config.observation_account(&ProcessEnvironment)?;
-    let observer = HyperliquidObserver::new(&config.hyperliquid.endpoint, &account)?;
+    let custodian = config.hype_staking_custodian(&ProcessEnvironment)?;
+    let observer = HyperliquidObserver::new(&config.hyperliquid.endpoint, &account)?
+        .with_custodian(custodian.as_deref())?;
     // Opened before the observation, not after it as everything else in this
     // function is ordered, because the cycle below republishes the status
     // document: observing with `Unavailable` here would overwrite the
@@ -948,7 +950,8 @@ async fn prepare_workflow(
     // observation as a result; a probe day has the recurring timer stopped,
     // so nothing else contends for it.
     let runtime_config = RuntimeConfig::from_toml(&fs::read_to_string(runtime_config_path)?)?
-        .with_parent_funding_route(config.parent_funding_route(&ProcessEnvironment)?);
+        .with_parent_funding_route(config.parent_funding_route(&ProcessEnvironment)?)
+        .with_hype_staking_custodian(staking_custodian_config(&config, custodian.as_deref())?);
     let limits = PacingLimits::from_config(&config)?;
     let mut runtime = SignerFreeRuntime::open(runtime_config.clone(), limits)?;
     let observation = observer.observe_account().await?;
@@ -1713,10 +1716,29 @@ fn open_signer_free_runtime(
     config: &Config,
     runtime_config_path: &str,
 ) -> Result<SignerFreeRuntime, Box<dyn std::error::Error>> {
+    let custodian = config.hype_staking_custodian(&ProcessEnvironment)?;
     let runtime_config = RuntimeConfig::from_toml(&fs::read_to_string(runtime_config_path)?)?
-        .with_parent_funding_route(config.parent_funding_route(&ProcessEnvironment)?);
+        .with_parent_funding_route(config.parent_funding_route(&ProcessEnvironment)?)
+        .with_hype_staking_custodian(staking_custodian_config(config, custodian.as_deref())?);
     let limits = PacingLimits::from_config(config)?;
     Ok(SignerFreeRuntime::open(runtime_config, limits)?)
+}
+
+/// The runtime's view of the staking custodian the policy names
+/// (bot-strategy#847): the resolved account plus the residual buffer. Same
+/// derivation as `main.rs`, so both binaries report the same figures from
+/// the same state.
+fn staking_custodian_config(
+    config: &Config,
+    custodian: Option<&str>,
+) -> Result<Option<HypeStakingCustodianConfig>, Box<dyn std::error::Error>> {
+    Ok(match custodian {
+        Some(account) => Some(HypeStakingCustodianConfig {
+            account: account.to_owned(),
+            residual_hype_atoms: config.staking_residual_hype_atoms()?,
+        }),
+        None => None,
+    })
 }
 
 /// Releases live planned decisions that provably never reached a signer.
