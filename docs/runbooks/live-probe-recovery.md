@@ -643,6 +643,70 @@ Failure cases the ledger already handles:
 - **Custodian read fails**: `staking custodian read unavailable` degrades the
   status; the execution account's own figures are published regardless.
 
+## The network-binding sidecar is not tamper-evident (accepted, bot-strategy#942)
+
+`<journal>.network-binding.json` records which venue endpoint/network and
+vault-address routing mode `prepare` resolved that journal under, and
+`prepare`'s residual aggregation admits a historical journal only when the
+network (`is_mainnet`) and routing mode its sidecar records match the
+current run's (the endpoint is deliberately not compared there; `submit` and
+`reconcile` verify the whole binding). The sidecar is a plain,
+write-once file: it is not part of the journal's hash chain and is not
+anchored by the protected head, so a principal with write access to it could
+relabel a journal's context without touching the journal itself.
+
+This is accepted as a permanent limitation (owner decision 2026-09-20) rather
+than fixed, for a deployment of a single execution account on a single
+network. The two candidate fixes — folding the context into
+`execution_identity_hash`, or a second protected anchor for the sidecar — were
+judged not worth their blast radius for that shape.
+
+What this protects against is measured by who can write the sidecar and
+what else that principal can already write, because the sidecar is no
+weaker than its neighbours:
+
+- The **journal-directory owner** — the trading user in the unit shape
+  above, i.e. the service user `run-cycle` runs as — can rewrite the
+  sidecar, but it can just as well rewrite the journal *together with* its
+  protected head: `FileProtectedWorkflowHeadStore` keeps
+  `<journal>.protected-head.json` beside the journal, so an internally
+  consistent forged pair passes the per-journal check regardless of either
+  file's mode. It can also rewrite the operational parameters:
+  `live-probe-operational.toml` lives under `/var/lib/hype-accumulator/`
+  because the history binding is kept beside it and the service must write
+  that binding (bot-strategy#972), and `prepare`'s network binding takes
+  `is_mainnet` from that file. So this principal can relabel a historical
+  journal's context for `prepare`'s residual aggregation (bounded by the
+  live-balance check, which rejects any residual total larger than the
+  account holds), forge the residual being aggregated, or make the sidecar
+  and the operational file agree on a flipped `is_mainnet` and pass the
+  network half of the prepare→submit drift check without root. What it
+  cannot change is anything under `/etc`, which is root-owned and read-only
+  to it: the venue endpoint, the security policy and
+  `custody.execution_account_kind`, so a submission still goes to the
+  configured endpoint under the configured `vaultAddress` routing. And in
+  this unit shape the process that signs runs as this same user (the unit
+  loads `signer.env` into it), so a principal at this level is not gaining
+  a signature it did not already have. Protecting the sidecar
+  alone would not raise the bar against this principal; the bar is the
+  directory's ACL, and the sidecar is accepted at the same strength as the
+  journal, its head, the history binding and the operational file next to
+  it.
+- A **configuration writer** (root) can additionally change the endpoint,
+  the policy and the routing kind, for example flip a journal's recorded
+  routing mode together with `execution_account_kind` so the prepared IOC is
+  submitted with a different `vaultAddress`. That access already reaches the
+  signer material at rest and everything above, so accepting this adds no
+  privilege that was not already there.
+
+Do not edit a sidecar by hand for any reason; if one is lost or corrupt,
+restore it from backup beside its journal. **Reopen bot-strategy#942 before
+configuring a second network or a second execution account, or if the
+deployment ever gains a principal that can write the sidecar but not the
+journal, its protected head and the operational file beside it** — at that
+point the sidecar would be the weakest link in the directory rather than one
+of equals, and those are the shapes the limitation was accepted against.
+
 ## Settlement is final; late contradictory evidence is a manual review
 
 `submit`/`reconcile` settle the pacing decision once the workflow holds a
