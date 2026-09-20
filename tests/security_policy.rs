@@ -1067,12 +1067,21 @@ fn staking_custodian_is_the_designated_parent_and_digest_bound_only_when_set() {
     let absent = explicit_none.replace(NONE, "");
     let with = explicit_none.replace(NONE, PARENT);
 
-    // Resolution: the parent, lowercased, or nothing.
+    // Resolution: the parent, lowercased, or nothing — including for a
+    // config with no policy attached, which is how the read-only
+    // `hype-status` binary loads its config.
     assert_eq!(
         config_with_policy(&with)
             .hype_staking_custodian(&env)
             .unwrap(),
         Some(PARENT_ACCOUNT.to_ascii_lowercase())
+    );
+    assert_eq!(
+        Config::from_toml(&live_runtime_toml())
+            .expect("runtime config alone")
+            .hype_staking_custodian(&env)
+            .unwrap(),
+        None
     );
     assert_eq!(
         config_with_policy(&absent)

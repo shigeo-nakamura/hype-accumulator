@@ -606,11 +606,14 @@ nothing is lost by waiting):
    It arrives in the next cycle's ledger scan as an outflow whose counterparty
    is the custodian.
 3. **Confirm recognition** on the next 12:05 UTC `status.json` (the first
-   recurring cycle whose scan covers the send): `hype_balance` dropped by the amount,
-   `hype_transferred_to_custodian` rose by it, `hype_transferred_out −
-   hype_transferred_to_custodian` is unchanged, `healthy` is true apart from
-   `CUSTODIAN_STAKING_SHORTFALL` — which is expected between steps 2 and 4 and
-   tells you the transfer is not staked yet.
+   recurring cycle whose scan covers the send): `hype_balance` dropped by the
+   amount and the health reason is exactly `CUSTODIAN_STAKING_SHORTFALL` —
+   expected between steps 2 and 4, it tells you the transfer was recognized
+   as a transfer to the custodian and is not staked yet. With no external
+   HYPE inflows on the account (the normal case) `hype_transferred_to_custodian`
+   also rose by the amount; the ledger nets external inflows first, so after
+   an inflow the custodian figure rises by less than was sent — that is the
+   conservative direction, not a missed transfer.
 4. **Stake on the master**: `cDeposit` (spot → staking, immediate) then
    `tokenDelegate` to a validator on the policy's allowlist (one-day lockup).
    Both signed by the master, off the host. Never `cWithdraw` or undelegate as
@@ -626,8 +629,9 @@ Failure cases the ledger already handles:
   counterparty; `hype_transferred_out` rises but
   `hype_transferred_to_custodian` does not. Nothing halts (the ledger explains
   the movement) — the difference between the two figures is the audit trail,
-  and it never shrinks. Recover the HYPE by hand if you can; do not edit the
-  record.
+  net of external inflows, which the ledger consumes before bot inventory.
+  The recorded movement itself is permanent. Recover the HYPE by hand if you
+  can; do not edit the record.
 - **Sent more than the bot holds**: the excess beyond external inflows is
   reported as bot HYPE that left; beyond what the account can justify, the
   divergence halt fires as it always has.

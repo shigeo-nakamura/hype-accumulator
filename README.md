@@ -113,8 +113,9 @@ When the policy names a staking custodian (`custody.hype_staking_custodian =
 "designated_parent"`, bot-strategy#847), the part of `hype_transferred_out`
 whose destination was that account is reported as
 `hype_transferred_to_custodian` — assigned to other destinations first, so it
-is never overstated and any bot HYPE that left for somewhere else stays visible
-in the difference — together with `hype_eligible_for_transfer` (what is still
+is never overstated and bot HYPE that left for somewhere else stays visible in
+the difference (net of external inflows, which are consumed first) — together
+with `hype_eligible_for_transfer` (what is still
 held less `staking.residual_hype_wei`) and a `custodian_staking` block with the
 custodian's own delegated / undelegated / pending-withdrawal HYPE. Those
 custodian balances are an upper bound on bot HYPE staked there, since the

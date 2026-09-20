@@ -393,16 +393,20 @@ impl Config {
     /// itself, it only recognizes a transfer to this account as explained
     /// and reads this account's staking balances.
     ///
+    /// A config with no security policy attached names no custodian
+    /// (`Ok(None)`), so the policy-free, read-only `hype-status` path keeps
+    /// working unchanged on a host whose policy sets nothing; every path
+    /// that could act on the custodian view loads the policy anyway.
+    ///
     /// # Errors
     /// Rejects a custodian policy whose parent route cannot be resolved.
     pub fn hype_staking_custodian<E: Environment>(
         &self,
         env: &E,
     ) -> Result<Option<String>, ConfigError> {
-        let policy = self
-            .security_policy
-            .as_ref()
-            .ok_or(ConfigError::MissingSecurityPolicy)?;
+        let Some(policy) = self.security_policy.as_ref() else {
+            return Ok(None);
+        };
         match policy.wire.custody.hype_staking_custodian {
             HypeStakingCustodian::None => Ok(None),
             HypeStakingCustodian::DesignatedParent => {
