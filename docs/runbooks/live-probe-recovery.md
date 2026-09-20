@@ -647,8 +647,10 @@ Failure cases the ledger already handles:
 
 `<journal>.network-binding.json` records which venue endpoint/network and
 vault-address routing mode `prepare` resolved that journal under, and
-`prepare`'s residual aggregation admits a historical journal only when its
-sidecar matches the current run's binding. The sidecar is a plain,
+`prepare`'s residual aggregation admits a historical journal only when the
+network (`is_mainnet`) and routing mode its sidecar records match the
+current run's (the endpoint is deliberately not compared there; `submit` and
+`reconcile` verify the whole binding). The sidecar is a plain,
 write-once file: it is not part of the journal's hash chain and is not
 anchored by the protected head, so a principal with write access to it could
 relabel a journal's context without touching the journal itself.

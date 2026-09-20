@@ -2442,29 +2442,6 @@ fn historical_protected_head_store_for(
         .map_err(WorkflowError::ProtectedHead)
 }
 
-/// `execution_identity_hash` alone does not distinguish testnet from
-/// mainnet, or one vault-address routing mode from another, for the same
-/// address — this checks each historical journal's own `PrepareTimeBinding`
-/// sidecar against `current`, so a foreign-network or foreign-routing
-/// journal sharing this directory is rejected by
-/// `aggregate_terminal_residual_hype` rather than silently aggregated.
-///
-/// Accepted limitation (bot-strategy#942, owner decision 2026-09-20): this
-/// reads the sidecar `.network-binding.json` written by plain `fs::write`,
-/// not a journal's own hash-chained, protected-head-anchored content. The
-/// sidecar is accepted at the strength of its neighbours, not on its own:
-/// whoever can write it owns the journal directory, and can equally
-/// rewrite a journal together with its colocated protected head or the
-/// operational file `is_mainnet` is read from, so protecting this one file
-/// would not raise the bar. What that principal cannot reach is `/etc`
-/// (endpoint, policy, routing kind), and in the documented unit it is the
-/// user the signer is already handed to. The aggregation's live-balance
-/// bound still caps any relabeled or forged residual. Accepted for a single
-/// account on a single network; see
-/// `docs/security/custody-threat-model.md` (threat analysis) and the
-/// runbook's "network-binding sidecar" section. Reopen #942 before a second
-/// network or account context is ever configured, or if a principal ever
-/// exists that can write the sidecar but not the files beside it.
 /// Records the journals a verified history scan just validated.
 ///
 /// Called by the aggregation itself, through [`HistoryScanRecorder`], the
@@ -2519,6 +2496,29 @@ fn collecting_journal_admissible<'a>(
     }
 }
 
+/// `execution_identity_hash` alone does not distinguish testnet from
+/// mainnet, or one vault-address routing mode from another, for the same
+/// address — this checks each historical journal's own `PrepareTimeBinding`
+/// sidecar against `current`, so a foreign-network or foreign-routing
+/// journal sharing this directory is rejected by
+/// `aggregate_terminal_residual_hype` rather than silently aggregated.
+///
+/// Accepted limitation (bot-strategy#942, owner decision 2026-09-20): this
+/// reads the sidecar `.network-binding.json` written by plain `fs::write`,
+/// not a journal's own hash-chained, protected-head-anchored content. The
+/// sidecar is accepted at the strength of its neighbours, not on its own:
+/// whoever can write it owns the journal directory, and can equally
+/// rewrite a journal together with its colocated protected head or the
+/// operational file `is_mainnet` is read from, so protecting this one file
+/// would not raise the bar. What that principal cannot reach is `/etc`
+/// (endpoint, policy, routing kind), and in the documented unit it is the
+/// user the signer is already handed to. The aggregation's live-balance
+/// bound still caps any relabeled or forged residual. Accepted for a single
+/// account on a single network; see
+/// `docs/security/custody-threat-model.md` (threat analysis) and the
+/// runbook's "network-binding sidecar" section. Reopen #942 before a second
+/// network or account context is ever configured, or if a principal ever
+/// exists that can write the sidecar but not the files beside it.
 fn network_routing_admissible_for(
     current: &PrepareTimeBinding,
 ) -> impl Fn(&Path) -> Result<(), WorkflowError> + '_ {
