@@ -2451,13 +2451,14 @@ fn historical_protected_head_store_for(
 ///
 /// Accepted limitation (bot-strategy#942, owner decision 2026-09-20): this
 /// reads the sidecar `.network-binding.json` written by plain `fs::write`,
-/// not a journal's own hash-chained, protected-head-anchored content — a
-/// principal with write access to that file (not the journal itself) can
-/// relabel a journal's network/routing context without invalidating its
-/// protected head, and one that can also write the config beside it can
-/// defeat the prepare→submit drift check the sidecar exists for. Accepted
-/// for a single account on a single network, where that write access
-/// already reaches the signer and routing configuration; see
+/// not a journal's own hash-chained, protected-head-anchored content. A
+/// writer of the journal directory alone can relabel a journal's
+/// network/routing context for this aggregation (bounded by the
+/// live-balance check) or make `submit`/`reconcile` refuse it (fail-closed);
+/// only a writer of the configuration as well can defeat the
+/// prepare→submit drift check the sidecar exists for, and that access
+/// already reaches the signer and routing configuration. Accepted for a
+/// single account on a single network; see
 /// `docs/security/custody-threat-model.md` (threat analysis) and the
 /// runbook's "network-binding sidecar" section. Reopen #942 before a second
 /// network or account context is ever configured.

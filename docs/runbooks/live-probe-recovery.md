@@ -654,28 +654,37 @@ anchored by the protected head, so a principal with write access to it could
 relabel a journal's context without touching the journal itself.
 
 This is accepted as a permanent limitation (owner decision 2026-09-20) rather
-than fixed: the deployment is a single execution account on a single
-network, and the write access needed is the same access that already reaches
-the operational config beside it. The two candidate fixes — folding the
-context into `execution_identity_hash`, or a second protected anchor for the
-sidecar — were judged not worth their blast radius for that shape.
+than fixed, for a deployment of a single execution account on a single
+network. The two candidate fixes — folding the context into
+`execution_identity_hash`, or a second protected anchor for the sidecar — were
+judged not worth their blast radius for that shape.
 
-What the sidecar still does: `submit` and `reconcile` derive the binding
-afresh from the *current* config and refuse a journal whose sidecar disagrees,
-which catches an operator editing the config between `prepare` and `submit`
-(the drift the sidecar exists for). What it cannot do: a principal that can
-write **both** the sidecar and the config beside it — the same host write
-access — can make the two agree and defeat that drift detection, for example
-by flipping a journal's recorded routing mode together with
-`execution_account_kind` so the prepared IOC is submitted with a different
-`vaultAddress`. That access already reaches the signer and routing
-configuration, so accepting this adds no privilege that was not already
-there. Independently of the sidecar, the aggregation's live-balance bound
-rejects any residual total larger than the account actually holds. Do not
-edit a sidecar by hand for any reason; if one is lost or corrupt, restore it
-from backup beside its journal. **Reopen bot-strategy#942 before configuring
-a second network or a second execution account** — that is the shape the
-limitation was accepted against.
+Two principals, because the sidecar and the configuration do not share a
+writer here: the sidecar lives beside the journal, in the directory the
+trading user owns; the configuration lives under `/etc`, read-only to that
+user.
+
+- A **sidecar-only writer** (the trading user, or whatever can write the
+  journal directory) can relabel a historical journal's context so that
+  `prepare`'s residual aggregation admits or rejects it, or make `submit` and
+  `reconcile` refuse the current journal — they derive the binding afresh from
+  the current config and stop on a mismatch, which is fail-closed. It cannot
+  redirect a submission, and a journal's own content is still checked against
+  its protected head. The aggregation's live-balance bound rejects any
+  residual total larger than the account actually holds.
+- A **sidecar-and-config writer** (root) can additionally make the two agree
+  and defeat the prepare→submit drift detection the sidecar exists for, for
+  example by flipping a journal's recorded routing mode together with
+  `execution_account_kind` so the prepared IOC is submitted with a different
+  `vaultAddress`. That access already reaches the signer and routing
+  configuration, so accepting this adds no privilege that was not already
+  there.
+
+Do not edit a sidecar by hand for any reason; if one is lost or corrupt,
+restore it from backup beside its journal. **Reopen bot-strategy#942 before
+configuring a second network or a second execution account, or if the journal
+directory and the configuration ever get a common writer by design** — those
+are the shapes the limitation was accepted against.
 
 ## Settlement is final; late contradictory evidence is a manual review
 
