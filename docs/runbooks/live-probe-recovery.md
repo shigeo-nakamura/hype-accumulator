@@ -586,9 +586,10 @@ policy of **both** pairs (`security-policy.toml` and
 hype_staking_custodian = "designated_parent"
 ```
 
-The value is digest-bound, so each pair's `live_acknowledgement` has to be
+The value is digest-bound, so the live pair's `live_acknowledgement` has to be
 re-issued (`--print-expected-acknowledgement`, the same owner-run step as a cap
-change). No runtime-state field changes; the recorded movements are the same,
+change); the recurring pair carries no acknowledgement and only needs the
+line. No runtime-state field changes; the recorded movements are the same,
 only reported under a second label. Deploy both binaries together as usual.
 
 Once enabled, the status document carries `hype_transferred_to_custodian`,
