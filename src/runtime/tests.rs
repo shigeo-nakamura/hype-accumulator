@@ -4533,6 +4533,148 @@ fn outflows_to_the_staking_custodian_are_reported_separately_and_other_first() {
     }
 }
 
+/// bot-strategy#847 (Codex review of PR #70): the custodian attribution
+/// rests on the recorded counterparty, so it is canonical on record, a
+/// record first seen without one is filled in by the first re-observation
+/// that names it (and counted as custodian outflow from that cycle on,
+/// without re-counting its amount), and a re-observation naming a
+/// *different* address is a contradiction the cycle refuses.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_counterparty_is_canonical_filled_in_on_reobservation_and_never_contradicted() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let credited = 29_979_000_u64;
+    let runtime_config = config(directory.path(), ms(start)).with_hype_staking_custodian(Some(
+        HypeStakingCustodianConfig {
+            account: "0xmaster".to_owned(),
+            residual_hype_atoms: 0,
+        },
+    ));
+    let (mut runtime, admission) =
+        runtime_with_settled_purchase(&runtime_config, start, decision_at, credited);
+
+    // First seen by a connector that reports no counterparty at all.
+    let transfer_at = decision_at + TimeDelta::hours(2);
+    let blind = HyperliquidAccountMovement {
+        counterparty: None,
+        ..hype_transfer(
+            "to-custodian",
+            transfer_at,
+            Decimal::new(-20_000_000, 8),
+            HyperliquidAccountMovementKind::InternalTransfer,
+        )
+    };
+    let first_scan_at = transfer_at + TimeDelta::minutes(5);
+    observe_cycle_with(
+        &mut runtime,
+        first_scan_at,
+        std::slice::from_ref(&blind),
+        &admission,
+    )
+    .expect("first observation");
+    let recorded = runtime.attributed_hype();
+    assert_eq!(recorded.outflow_hype_atoms, 20_000_000);
+    assert_eq!(recorded.transferred_out_hype_atoms(), 20_000_000);
+    assert_eq!(
+        recorded.transferred_to_custodian_hype_atoms(),
+        Some(0),
+        "no counterparty recorded, so not attributable to the custodian"
+    );
+    assert_eq!(
+        runtime.state.hype_movements["to-custodian"].counterparty,
+        None
+    );
+
+    // The overlapping re-scan names the custodian, spelled with mixed case
+    // and surrounding whitespace: the same movement, now with a
+    // counterparty — netted as custodian outflow before the commit, at the
+    // same totals, and recorded canonical by it.
+    let named = HyperliquidAccountMovement {
+        counterparty: Some(" 0xMASTER ".to_owned()),
+        ..blind.clone()
+    };
+    let second_scan_at = first_scan_at + TimeDelta::minutes(10);
+    let pending = runtime
+        .attributed_hype_with(std::slice::from_ref(&named), second_scan_at)
+        .expect("fill-in nets before the commit");
+    assert_eq!(
+        pending.outflow_hype_atoms, 20_000_000,
+        "amount not re-counted"
+    );
+    assert_eq!(
+        pending.transferred_to_custodian_hype_atoms(),
+        Some(20_000_000)
+    );
+    observe_cycle_with(
+        &mut runtime,
+        second_scan_at,
+        std::slice::from_ref(&named),
+        &admission,
+    )
+    .expect("re-observation with a counterparty");
+    assert_eq!(runtime.attributed_hype(), pending);
+    assert_eq!(
+        runtime.state.hype_movements["to-custodian"]
+            .counterparty
+            .as_deref(),
+        Some("0xmaster")
+    );
+
+    // Seen again with the same address in another spelling: the same
+    // movement, nothing to fill in, nothing refused.
+    let respelled = HyperliquidAccountMovement {
+        counterparty: Some("0xMaster".to_owned()),
+        ..blind.clone()
+    };
+    observe_cycle_with(
+        &mut runtime,
+        second_scan_at + TimeDelta::minutes(10),
+        std::slice::from_ref(&respelled),
+        &admission,
+    )
+    .expect("same counterparty, differently spelled");
+    assert_eq!(
+        runtime
+            .attributed_hype()
+            .transferred_to_custodian_hype_atoms(),
+        Some(20_000_000)
+    );
+
+    // A re-observation naming a different other party contradicts the
+    // record and is refused, like a changed amount; the record is unchanged.
+    let contradicted = HyperliquidAccountMovement {
+        counterparty: Some("0xelsewhere".to_owned()),
+        ..blind
+    };
+    assert!(matches!(
+        observe_cycle_with(
+            &mut runtime,
+            second_scan_at + TimeDelta::minutes(20),
+            std::slice::from_ref(&contradicted),
+            &admission,
+        ),
+        Err(RuntimeError::InvalidMovement(_))
+    ));
+    assert_eq!(
+        runtime.state.hype_movements["to-custodian"]
+            .counterparty
+            .as_deref(),
+        Some("0xmaster")
+    );
+
+    // The fill-in is committed state: a reopen reads the custodian figure.
+    drop(runtime);
+    let reopened = SignerFreeRuntime::open(runtime_config, limits()).expect("reopen");
+    assert_eq!(
+        reopened
+            .attributed_hype()
+            .transferred_to_custodian_hype_atoms(),
+        Some(20_000_000)
+    );
+}
+
 /// bot-strategy#929 slice C: a HYPE row finer than an atom is refused, not
 /// rounded into the record — the cycle fails before it commits anything.
 #[test]

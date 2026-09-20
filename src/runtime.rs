@@ -635,9 +635,12 @@ struct RuntimeHypeMovement {
     /// refused rather than rounded.
     amount_hype_atoms: u64,
     occurred_at: DateTime<Utc>,
-    /// The other account of a directional transfer, lowercased, when the
-    /// connector reported one. Kept in this private state for the audit
-    /// trail; never published.
+    /// The other account of a directional transfer, canonical (trimmed,
+    /// lowercased — [`canonical_counterparty`]), when the connector reported
+    /// one. Kept in this private state for the audit trail, never
+    /// published, and since bot-strategy#847 the basis of the custodian
+    /// attribution; a record first seen without one is filled in by the
+    /// first re-observation that supplies it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     counterparty: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -685,25 +688,45 @@ impl RuntimeHypeMovement {
             direction,
             amount_hype_atoms,
             occurred_at: timestamp_ms(movement.timestamp_ms)?,
-            counterparty: movement.counterparty.clone(),
+            counterparty: movement
+                .counterparty
+                .as_deref()
+                .and_then(canonical_counterparty),
             transaction_hash: movement.transaction_hash.clone(),
             recorded_at,
         }))
     }
 
     /// Whether `other` is the same venue movement re-observed (an
-    /// overlapping scan). Compares only what the netting depends on —
-    /// direction, amount, time — so a connector release that normalizes a
-    /// row's metadata differently (counterparty casing, a tx-hash fallback)
-    /// re-observes an already recorded row as the same one instead of
-    /// wedging every later cycle on it; the record keeps what was first
-    /// seen. A changed amount or direction under the same id is a real
-    /// contradiction and is refused.
+    /// overlapping scan). Compares what the netting depends on — direction,
+    /// amount, time — and, since the custodian attribution depends on it
+    /// too (bot-strategy#847), the counterparty when both observations
+    /// name one: both are canonical (see [`canonical_counterparty`]), so a
+    /// different address under the same id is a real contradiction, like a
+    /// changed amount, and is refused. A record with no counterparty
+    /// re-observed with one is the same movement seen by a connector that
+    /// now reports the other party; [`Self::counterparty_fill_in`] lets the
+    /// cycle record it. Other metadata (a tx-hash fallback) may differ and
+    /// the record keeps what was first seen.
     fn same_movement(&self, other: &Self) -> bool {
         self.movement_id == other.movement_id
             && self.direction == other.direction
             && self.amount_hype_atoms == other.amount_hype_atoms
             && self.occurred_at == other.occurred_at
+            && match (&self.counterparty, &other.counterparty) {
+                (Some(recorded), Some(observed)) => recorded == observed,
+                _ => true,
+            }
+    }
+
+    /// The counterparty a re-observation of this same movement supplies
+    /// that the record lacks, if any (bot-strategy#847): a fill-in, never
+    /// an overwrite.
+    fn counterparty_fill_in(&self, other: &Self) -> Option<String> {
+        match (&self.counterparty, &other.counterparty) {
+            (None, Some(observed)) => Some(observed.clone()),
+            _ => None,
+        }
     }
 
     /// Whether this is an outflow whose recorded counterparty is `account`
@@ -902,6 +925,25 @@ impl LiveHypeAcquisition {
     }
 }
 
+/// The connector reports a transfer's other party lowercased already; this
+/// makes the record independent of that (bot-strategy#847): trimmed,
+/// ASCII-lowercased, and absent rather than empty, so a re-observation by a
+/// connector that cases differently is the same counterparty and the
+/// custodian comparison never depends on how the address was spelled.
+fn canonical_counterparty(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_ascii_lowercase())
+}
+
+/// What a scan adds to the recorded HYPE movements (bot-strategy#847):
+/// movements not recorded yet, and counterparties for recorded movements
+/// that were first seen without one.
+#[derive(Debug, Default)]
+struct PendingHypeMovements {
+    new: Vec<RuntimeHypeMovement>,
+    counterparty_fill_ins: Vec<(String, String)>,
+}
+
 /// HYPE this runtime's own settled history proves the workflow acquired,
 /// plus how much of that history is still missing its evidence.
 ///
@@ -1034,6 +1076,36 @@ impl AttributedHype {
     /// attribution that must already account for an outflow the same scan
     /// just found — otherwise the cycle that first sees a transfer would
     /// halt on it and never reach the commit that explains it.
+    /// Adds to the custodian outflow the recorded outflows whose
+    /// counterparty a pending fill-in names as the custodian; their
+    /// amounts are already in the totals (bot-strategy#847).
+    fn with_counterparty_fill_ins(
+        mut self,
+        recorded: &BTreeMap<String, RuntimeHypeMovement>,
+        fill_ins: &[(String, String)],
+        custodian_account: Option<&str>,
+    ) -> Result<Self, RuntimeError> {
+        let Some(custodian) = self.custodian.as_mut() else {
+            return Ok(self);
+        };
+        for (movement_id, counterparty) in fill_ins {
+            let Some(movement) = recorded.get(movement_id) else {
+                return Err(RuntimeError::IncompatibleRuntimeState);
+            };
+            let filled = RuntimeHypeMovement {
+                counterparty: Some(counterparty.clone()),
+                ..movement.clone()
+            };
+            if filled.is_outflow_to(custodian_account) {
+                custodian.outflow_hype_atoms = custodian
+                    .outflow_hype_atoms
+                    .checked_add(filled.amount_hype_atoms)
+                    .ok_or(RuntimeError::CounterOverflow)?;
+            }
+        }
+        Ok(self)
+    }
+
     fn net_of(
         mut self,
         pending: &[RuntimeHypeMovement],
@@ -1446,16 +1518,24 @@ impl SignerFreeRuntime {
     ) -> Result<AttributedHype, RuntimeError> {
         let pending = self.unrecorded_hype_movements(movements, as_of)?;
         let settled = pending
+            .new
             .into_iter()
             .filter(|movement| movement.occurred_at <= as_of)
             .collect::<Vec<_>>();
-        self.attributed_hype().net_of(
-            &settled,
-            self.config
-                .hype_staking_custodian
-                .as_ref()
-                .map(|custodian| custodian.account.as_str()),
-        )
+        let custodian_account = self
+            .config
+            .hype_staking_custodian
+            .as_ref()
+            .map(|custodian| custodian.account.as_str());
+        // A fill-in names a movement that is already recorded and already
+        // in the balance, so it is not subject to the `as_of` cut.
+        self.attributed_hype()
+            .net_of(&settled, custodian_account)?
+            .with_counterparty_fill_ins(
+                &self.state.hype_movements,
+                &pending.counterparty_fill_ins,
+                custodian_account,
+            )
     }
 
     /// The HYPE movements among `movements` this state has not recorded, in
@@ -1466,21 +1546,27 @@ impl SignerFreeRuntime {
         &self,
         movements: &[HyperliquidAccountMovement],
         recorded_at: DateTime<Utc>,
-    ) -> Result<Vec<RuntimeHypeMovement>, RuntimeError> {
-        let mut pending = Vec::new();
+    ) -> Result<PendingHypeMovements, RuntimeError> {
+        let mut pending = PendingHypeMovements::default();
         for movement in unique_ordered_movements(movements)? {
             let Some(record) = RuntimeHypeMovement::classify(movement, recorded_at)? else {
                 continue;
             };
             match self.state.hype_movements.get(&record.movement_id) {
-                Some(existing) if existing.same_movement(&record) => {}
+                Some(existing) if existing.same_movement(&record) => {
+                    if let Some(counterparty) = existing.counterparty_fill_in(&record) {
+                        pending
+                            .counterparty_fill_ins
+                            .push((record.movement_id, counterparty));
+                    }
+                }
                 Some(_) => {
                     return Err(RuntimeError::InvalidMovement(format!(
                         "HYPE movement {} re-observed with different content than recorded",
                         record.movement_id
                     )))
                 }
-                None => pending.push(record),
+                None => pending.new.push(record),
             }
         }
         Ok(pending)
@@ -2324,13 +2410,21 @@ impl SignerFreeRuntime {
         // them as already recorded. What matters is that a movement the
         // divergence check above already netted is committed by the same
         // cycle, never left for a later one to explain again.
-        for movement in pending_hype_movements {
+        for movement in pending_hype_movements.new {
             if next_state
                 .hype_movements
                 .insert(movement.movement_id.clone(), movement)
                 .is_some()
             {
                 return Err(RuntimeError::IncompatibleRuntimeState);
+            }
+        }
+        for (movement_id, counterparty) in pending_hype_movements.counterparty_fill_ins {
+            match next_state.hype_movements.get_mut(&movement_id) {
+                Some(movement) if movement.counterparty.is_none() => {
+                    movement.counterparty = Some(counterparty);
+                }
+                _ => return Err(RuntimeError::IncompatibleRuntimeState),
             }
         }
         if let DecisionMode::Live { history_directory } = &input.decision_mode {
