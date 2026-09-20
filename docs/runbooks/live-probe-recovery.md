@@ -659,32 +659,51 @@ network. The two candidate fixes — folding the context into
 `execution_identity_hash`, or a second protected anchor for the sidecar — were
 judged not worth their blast radius for that shape.
 
-Two principals, because the sidecar and the configuration do not share a
-writer here: the sidecar lives beside the journal, in the directory the
-trading user owns; the configuration lives under `/etc`, read-only to that
-user.
+What this protects against is measured by who can write the sidecar and
+what else that principal can already write, because the sidecar is no
+weaker than its neighbours:
 
-- A **sidecar-only writer** (the trading user, or whatever can write the
-  journal directory) can relabel a historical journal's context so that
-  `prepare`'s residual aggregation admits or rejects it, or make `submit` and
-  `reconcile` refuse the current journal — they derive the binding afresh from
-  the current config and stop on a mismatch, which is fail-closed. It cannot
-  redirect a submission, and a journal's own content is still checked against
-  its protected head. The aggregation's live-balance bound rejects any
-  residual total larger than the account actually holds.
-- A **sidecar-and-config writer** (root) can additionally make the two agree
-  and defeat the prepare→submit drift detection the sidecar exists for, for
-  example by flipping a journal's recorded routing mode together with
-  `execution_account_kind` so the prepared IOC is submitted with a different
-  `vaultAddress`. That access already reaches the signer and routing
-  configuration, so accepting this adds no privilege that was not already
-  there.
+- The **journal-directory owner** — the trading user in the unit shape
+  above, i.e. the service user `run-cycle` runs as — can rewrite the
+  sidecar, but it can just as well rewrite the journal *together with* its
+  protected head: `FileProtectedWorkflowHeadStore` keeps
+  `<journal>.protected-head.json` beside the journal, so an internally
+  consistent forged pair passes the per-journal check regardless of either
+  file's mode. It can also rewrite the operational parameters:
+  `live-probe-operational.toml` lives under `/var/lib/hype-accumulator/`
+  because the history binding is kept beside it and the service must write
+  that binding (bot-strategy#972), and `prepare`'s network binding takes
+  `is_mainnet` from that file. So this principal can relabel a historical
+  journal's context for `prepare`'s residual aggregation (bounded by the
+  live-balance check, which rejects any residual total larger than the
+  account holds), forge the residual being aggregated, or make the sidecar
+  and the operational file agree on a flipped `is_mainnet` and pass the
+  network half of the prepare→submit drift check without root. What it
+  cannot change is anything under `/etc`, which is root-owned and read-only
+  to it: the venue endpoint, the security policy and
+  `custody.execution_account_kind`, so a submission still goes to the
+  configured endpoint under the configured `vaultAddress` routing. And in
+  this unit shape the process that signs runs as this same user (the unit
+  loads `signer.env` into it), so a principal at this level is not gaining
+  a signature it did not already have. Protecting the sidecar
+  alone would not raise the bar against this principal; the bar is the
+  directory's ACL, and the sidecar is accepted at the same strength as the
+  journal, its head, the history binding and the operational file next to
+  it.
+- A **configuration writer** (root) can additionally change the endpoint,
+  the policy and the routing kind, for example flip a journal's recorded
+  routing mode together with `execution_account_kind` so the prepared IOC is
+  submitted with a different `vaultAddress`. That access already reaches the
+  signer material at rest and everything above, so accepting this adds no
+  privilege that was not already there.
 
 Do not edit a sidecar by hand for any reason; if one is lost or corrupt,
 restore it from backup beside its journal. **Reopen bot-strategy#942 before
-configuring a second network or a second execution account, or if the journal
-directory and the configuration ever get a common writer by design** — those
-are the shapes the limitation was accepted against.
+configuring a second network or a second execution account, or if the
+deployment ever gains a principal that can write the sidecar but not the
+journal, its protected head and the operational file beside it** — at that
+point the sidecar would be the weakest link in the directory rather than one
+of equals, and those are the shapes the limitation was accepted against.
 
 ## Settlement is final; late contradictory evidence is a manual review
 
