@@ -2449,17 +2449,18 @@ fn historical_protected_head_store_for(
 /// journal sharing this directory is rejected by
 /// `aggregate_terminal_residual_hype` rather than silently aggregated.
 ///
-/// Known residual risk, deliberately out of scope here: this reads the
-/// sidecar `.network-binding.json` written by plain `fs::write`, not a
-/// journal's own hash-chained, protected-head-anchored content — an
-/// attacker with write access to just this file (not the journal itself)
-/// could still relabel a testnet journal's residual as mainnet-admissible
-/// without invalidating the journal's own protected head. Closing this
-/// fully means either folding network/routing identity into
-/// `live_probe.rs`'s already-merged `execution_identity_hash` computation,
-/// or building an independent protection mechanism for this sidecar —
-/// both out of scope for this aggregator-foundation PR. Tracked in
-/// bot-strategy#942.
+/// Accepted limitation (bot-strategy#942, owner decision 2026-09-20): this
+/// reads the sidecar `.network-binding.json` written by plain `fs::write`,
+/// not a journal's own hash-chained, protected-head-anchored content — a
+/// principal with write access to that file (not the journal itself) can
+/// relabel a journal's network/routing context without invalidating its
+/// protected head, and one that can also write the config beside it can
+/// defeat the prepare→submit drift check the sidecar exists for. Accepted
+/// for a single account on a single network, where that write access
+/// already reaches the signer and routing configuration; see
+/// `docs/security/custody-threat-model.md` (threat analysis) and the
+/// runbook's "network-binding sidecar" section. Reopen #942 before a second
+/// network or account context is ever configured.
 /// Records the journals a verified history scan just validated.
 ///
 /// Called by the aggregation itself, through [`HistoryScanRecorder`], the

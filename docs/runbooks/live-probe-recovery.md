@@ -660,14 +660,22 @@ the operational config beside it. The two candidate fixes — folding the
 context into `execution_identity_hash`, or a second protected anchor for the
 sidecar — were judged not worth their blast radius for that shape.
 
-What still holds regardless of the sidecar: `submit` and `reconcile` derive
-the binding afresh from their own config and refuse a journal whose sidecar
-disagrees, so a relabeled sidecar cannot redirect a submission; and the
-aggregation's live-balance bound rejects any residual total larger than the
-account actually holds. Do not edit a sidecar by hand for any reason; if one
-is lost or corrupt, restore it from backup beside its journal. **Reopen
-bot-strategy#942 before configuring a second network or a second execution
-account** — that is the shape the limitation was accepted against.
+What the sidecar still does: `submit` and `reconcile` derive the binding
+afresh from the *current* config and refuse a journal whose sidecar disagrees,
+which catches an operator editing the config between `prepare` and `submit`
+(the drift the sidecar exists for). What it cannot do: a principal that can
+write **both** the sidecar and the config beside it — the same host write
+access — can make the two agree and defeat that drift detection, for example
+by flipping a journal's recorded routing mode together with
+`execution_account_kind` so the prepared IOC is submitted with a different
+`vaultAddress`. That access already reaches the signer and routing
+configuration, so accepting this adds no privilege that was not already
+there. Independently of the sidecar, the aggregation's live-balance bound
+rejects any residual total larger than the account actually holds. Do not
+edit a sidecar by hand for any reason; if one is lost or corrupt, restore it
+from backup beside its journal. **Reopen bot-strategy#942 before configuring
+a second network or a second execution account** — that is the shape the
+limitation was accepted against.
 
 ## Settlement is final; late contradictory evidence is a manual review
 
