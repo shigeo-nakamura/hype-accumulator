@@ -172,6 +172,18 @@ by the authoritative accumulator ledger:
 HYPE_ACCOUNT_ID=0x... cargo run --locked --bin hype-status -- config.local.toml status.json
 ```
 
+Passing the security policy as a third argument attaches it before the
+observer is built; that is what lets `hype-status` name the HYPE staking
+custodian (bot-strategy#847) and publish the `custodian_staking` view. The
+custodian resolves through the policy's designated-parent route, so the
+environment value named by the policy's `custody.admitted_parent_account_env`
+must be present, exactly as it is for the accumulator:
+
+```text
+HYPE_ACCOUNT_ID=0x... cargo run --locked --bin hype-status -- \
+  config.local.toml status.json security-policy.local.toml
+```
+
 This networked one-shot path is suitable for signer-free, read-only DRY_RUN
 verification. S3 emission and deployed scheduling remain gated by the
 observability rollout.
