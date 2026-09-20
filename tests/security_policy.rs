@@ -1055,10 +1055,10 @@ fn designated_parent_funding_binds_the_source_and_rejects_inheritance_claims() {
 /// acknowledgement; and it requires designated-parent funding.
 #[test]
 fn staking_custodian_is_the_designated_parent_and_digest_bound_only_when_set() {
-    let mut env = live_environment();
-    env.insert("HYPE_PARENT_ACCOUNT".to_owned(), PARENT_ACCOUNT.to_owned());
     const NONE: &str = "hype_staking_custodian = \"none\"";
     const PARENT: &str = "hype_staking_custodian = \"designated_parent\"";
+    let mut env = live_environment();
+    env.insert("HYPE_PARENT_ACCOUNT".to_owned(), PARENT_ACCOUNT.to_owned());
     let explicit_none = designated_parent_policy();
     assert!(
         explicit_none.contains(NONE),
