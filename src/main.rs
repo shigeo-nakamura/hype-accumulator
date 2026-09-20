@@ -9,7 +9,8 @@ use hype_accumulator::{
     },
     pacing::PacingLimits,
     runtime::{
-        AdmissionApprovals, DecisionMode, RuntimeConfig, RuntimeCycleInput, SignerFreeRuntime,
+        AdmissionApprovals, DecisionMode, HypeStakingCustodianConfig, RuntimeConfig,
+        RuntimeCycleInput, SignerFreeRuntime,
     },
     signal::SignalSnapshot,
     signal_source::{
@@ -263,8 +264,10 @@ async fn run_dry_run_cycle(
     let config = load_config(config_path, Some(security_policy_path))?;
     config.validate_signer_free_runtime(&ProcessEnvironment)?;
     let limits = PacingLimits::from_config(&config)?;
+    let custodian = config.hype_staking_custodian(&ProcessEnvironment)?;
     let runtime_config = RuntimeConfig::from_toml(&fs::read_to_string(runtime_config_path)?)?
-        .with_parent_funding_route(config.parent_funding_route(&ProcessEnvironment)?);
+        .with_parent_funding_route(config.parent_funding_route(&ProcessEnvironment)?)
+        .with_hype_staking_custodian(staking_custodian_config(&config, custodian.as_deref())?);
     let approvals_path = runtime_config.admission_approvals_path().to_path_buf();
     let signal_path = runtime_config.signal_snapshot_path().to_path_buf();
     let status_path = runtime_config.status_path().to_path_buf();
@@ -272,7 +275,8 @@ async fn run_dry_run_cycle(
     let approvals = AdmissionApprovals::from_json(&fs::read_to_string(approvals_path)?)?;
     let signal = load_cycle_signal(&signal_path)?;
     let account = config.observation_account(&ProcessEnvironment)?;
-    let observer = HyperliquidObserver::new(&config.hyperliquid.endpoint, &account)?;
+    let observer = HyperliquidObserver::new(&config.hyperliquid.endpoint, &account)?
+        .with_custodian(custodian.as_deref())?;
     // The account read comes first and the movement scan second, so the
     // scan window closes at `observed_at`, after the balance read — and the
     // attribution judged against that balance can already net any HYPE
@@ -388,6 +392,21 @@ async fn run_dry_run_cycle(
         config.decision_owner.as_str()
     );
     Ok(())
+}
+
+/// The runtime's view of the staking custodian the policy names
+/// (bot-strategy#847): the resolved account plus the residual buffer.
+fn staking_custodian_config(
+    config: &Config,
+    custodian: Option<&str>,
+) -> Result<Option<HypeStakingCustodianConfig>, Box<dyn std::error::Error>> {
+    Ok(match custodian {
+        Some(account) => Some(HypeStakingCustodianConfig {
+            account: account.to_owned(),
+            residual_hype_atoms: config.staking_residual_hype_atoms()?,
+        }),
+        None => None,
+    })
 }
 
 /// The signal snapshot for a cycle, or `None` (fail-closed unavailable

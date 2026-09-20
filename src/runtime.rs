@@ -13,7 +13,7 @@ use crate::{
         ProtectedHeadAnchor,
     },
     metrics::{MetricsError, MetricsSnapshot},
-    monitor::HypeAttribution,
+    monitor::{CustodianAttribution, HypeAttribution},
     pacing::{
         CapitalEvent, DailyDecision, DecisionInput, DecisionResult, DepositEvent, PacingError,
         PacingLimits, PacingState, UsdcMicros, WithdrawalEvent,
@@ -209,6 +209,20 @@ pub struct RuntimeConfig {
     account_observation_max_age_seconds: u64,
     signal_snapshot_stale_after_seconds: u64,
     parent_funding_route: Option<ParentFundingRoute>,
+    /// The one account an outflow of bot-acquired HYPE is attributed to as
+    /// a transfer for staking (bot-strategy#847); `None` names no custodian.
+    hype_staking_custodian: Option<HypeStakingCustodianConfig>,
+}
+
+/// Startup-resolved staking-custodian policy (bot-strategy#847): the
+/// custodian account and the HYPE the policy keeps back when the eligible
+/// transfer amount is reported. Configuration, not state — changing it
+/// relabels how the recorded movements are reported, never what they are.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HypeStakingCustodianConfig {
+    /// Canonical lowercased address, as the connector reports counterparties.
+    pub account: String,
+    pub residual_hype_atoms: u64,
 }
 
 impl RuntimeConfig {
@@ -295,6 +309,7 @@ impl RuntimeConfig {
             stuck_after_seconds: wire.stuck_after_seconds,
             account_observation_max_age_seconds: wire.account_observation_max_age_seconds,
             signal_snapshot_stale_after_seconds: wire.signal_snapshot_stale_after_seconds,
+            hype_staking_custodian: None,
         })
     }
 
@@ -302,6 +317,18 @@ impl RuntimeConfig {
     #[must_use]
     pub fn with_parent_funding_route(mut self, route: Option<ParentFundingRoute>) -> Self {
         self.parent_funding_route = route;
+        self
+    }
+
+    /// Names the account bot-acquired HYPE may leave for offline staking
+    /// (bot-strategy#847). Attribution reports an outflow to it separately
+    /// from every other outflow; nothing about the halt changes.
+    #[must_use]
+    pub fn with_hype_staking_custodian(
+        mut self,
+        custodian: Option<HypeStakingCustodianConfig>,
+    ) -> Self {
+        self.hype_staking_custodian = custodian;
         self
     }
 
@@ -678,6 +705,16 @@ impl RuntimeHypeMovement {
             && self.amount_hype_atoms == other.amount_hype_atoms
             && self.occurred_at == other.occurred_at
     }
+
+    /// Whether this is an outflow whose recorded counterparty is `account`
+    /// (bot-strategy#847). Both sides are the connector's lowercased
+    /// canonical form; a movement without a counterparty (an external
+    /// withdrawal) is never one.
+    fn is_outflow_to(&self, account: Option<&str>) -> bool {
+        self.direction == HypeMovementDirection::Outflow
+            && account.is_some()
+            && self.counterparty.as_deref() == account
+    }
 }
 
 /// The venue's spot token symbol for HYPE as it appears in account-movement
@@ -904,6 +941,20 @@ pub struct AttributedHype {
     pub inflow_hype_atoms: u64,
     /// HYPE that left by recorded transfers/withdrawals, summed.
     pub outflow_hype_atoms: u64,
+    /// The part of `outflow_hype_atoms` whose counterparty is the configured
+    /// staking custodian (bot-strategy#847), with the policy's residual
+    /// buffer; `None` when the runtime names no custodian, in which case no
+    /// custodian figure is reported at all.
+    pub custodian: Option<AttributedCustodianHype>,
+}
+
+/// The staking-custodian view of an attribution (bot-strategy#847).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AttributedCustodianHype {
+    /// Recorded outflows whose counterparty is the custodian, summed.
+    pub outflow_hype_atoms: u64,
+    /// HYPE the policy keeps in the execution account.
+    pub residual_hype_atoms: u64,
 }
 
 impl AttributedHype {
@@ -939,6 +990,43 @@ impl AttributedHype {
             .saturating_sub(self.transferred_out_hype_atoms())
     }
 
+    /// The part of [`Self::transferred_out_hype_atoms`] that went to the
+    /// staking custodian (bot-strategy#847), or `None` without a custodian.
+    ///
+    /// Bot-acquired outflow is assigned to the *other* destinations first
+    /// and to the custodian only beyond them — the same direction as the
+    /// netting above: the figure the owner compares with the custodian's
+    /// staking balance is never overstated, and whatever bot HYPE left for
+    /// an address that is not the custodian stays visible in the difference
+    /// `hype_transferred_out − hype_transferred_to_custodian` at the highest
+    /// value the ledger can justify.
+    #[must_use]
+    pub const fn transferred_to_custodian_hype_atoms(&self) -> Option<u64> {
+        let Some(custodian) = self.custodian else {
+            return None;
+        };
+        let bot_outflow = self.transferred_out_hype_atoms();
+        let other_outflow = self
+            .outflow_hype_atoms
+            .saturating_sub(custodian.outflow_hype_atoms);
+        Some(bot_outflow.saturating_sub(other_outflow))
+    }
+
+    /// Bot-acquired HYPE the owner may transfer to the custodian now: what
+    /// the ledger says is still held, less the policy's residual buffer
+    /// (bot-strategy#847). `None` without a custodian. Advisory: nothing
+    /// acts on it.
+    #[must_use]
+    pub const fn eligible_for_transfer_hype_atoms(&self) -> Option<u64> {
+        let Some(custodian) = self.custodian else {
+            return None;
+        };
+        Some(
+            self.held_hype_atoms()
+                .saturating_sub(custodian.residual_hype_atoms),
+        )
+    }
+
     /// Nets `movements` the scan observed but this state has not recorded
     /// yet, exactly as [`SignerFreeRuntime::apply_cycle`] will record them.
     ///
@@ -946,7 +1034,11 @@ impl AttributedHype {
     /// attribution that must already account for an outflow the same scan
     /// just found — otherwise the cycle that first sees a transfer would
     /// halt on it and never reach the commit that explains it.
-    fn net_of(mut self, pending: &[RuntimeHypeMovement]) -> Result<Self, RuntimeError> {
+    fn net_of(
+        mut self,
+        pending: &[RuntimeHypeMovement],
+        custodian_account: Option<&str>,
+    ) -> Result<Self, RuntimeError> {
         for movement in pending {
             let total = match movement.direction {
                 HypeMovementDirection::Inflow => &mut self.inflow_hype_atoms,
@@ -955,6 +1047,14 @@ impl AttributedHype {
             *total = total
                 .checked_add(movement.amount_hype_atoms)
                 .ok_or(RuntimeError::CounterOverflow)?;
+            if let Some(custodian) = self.custodian.as_mut() {
+                if movement.is_outflow_to(custodian_account) {
+                    custodian.outflow_hype_atoms = custodian
+                        .outflow_hype_atoms
+                        .checked_add(movement.amount_hype_atoms)
+                        .ok_or(RuntimeError::CounterOverflow)?;
+                }
+            }
         }
         Ok(self)
     }
@@ -973,6 +1073,16 @@ impl AttributedHype {
                 transferred_out_hype: crate::hype_asset::atoms_to_hype_f64(
                     self.transferred_out_hype_atoms(),
                 ),
+                custodian: match (
+                    self.transferred_to_custodian_hype_atoms(),
+                    self.eligible_for_transfer_hype_atoms(),
+                ) {
+                    (Some(transferred), Some(eligible)) => Some(CustodianAttribution {
+                        transferred_hype: crate::hype_asset::atoms_to_hype_f64(transferred),
+                        eligible_for_transfer_hype: crate::hype_asset::atoms_to_hype_f64(eligible),
+                    }),
+                    _ => None,
+                },
             }
         } else {
             HypeAttribution::Unavailable
@@ -1258,7 +1368,15 @@ impl SignerFreeRuntime {
     /// report the partial sum.
     #[must_use]
     pub fn attributed_hype(&self) -> AttributedHype {
-        let mut aggregate = AttributedHype::default();
+        let custodian = self.config.hype_staking_custodian.as_ref();
+        let mut aggregate = AttributedHype {
+            custodian: custodian.map(|custodian| AttributedCustodianHype {
+                outflow_hype_atoms: 0,
+                residual_hype_atoms: custodian.residual_hype_atoms,
+            }),
+            ..AttributedHype::default()
+        };
+        let custodian_account = custodian.map(|custodian| custodian.account.as_str());
         for movement in self.state.hype_movements.values() {
             let total = match movement.direction {
                 HypeMovementDirection::Inflow => &mut aggregate.inflow_hype_atoms,
@@ -1268,6 +1386,13 @@ impl SignerFreeRuntime {
             // reported, never refused, and a saturated outflow total errs
             // toward claiming less.
             *total = total.saturating_add(movement.amount_hype_atoms);
+            if let Some(custodian) = aggregate.custodian.as_mut() {
+                if movement.is_outflow_to(custodian_account) {
+                    custodian.outflow_hype_atoms = custodian
+                        .outflow_hype_atoms
+                        .saturating_add(movement.amount_hype_atoms);
+                }
+            }
         }
         for decision in self.settled_purchases() {
             match self.state.hype_acquisitions.get(&decision.decision_id) {
@@ -1324,7 +1449,13 @@ impl SignerFreeRuntime {
             .into_iter()
             .filter(|movement| movement.occurred_at <= as_of)
             .collect::<Vec<_>>();
-        self.attributed_hype().net_of(&settled)
+        self.attributed_hype().net_of(
+            &settled,
+            self.config
+                .hype_staking_custodian
+                .as_ref()
+                .map(|custodian| custodian.account.as_str()),
+        )
     }
 
     /// The HYPE movements among `movements` this state has not recorded, in

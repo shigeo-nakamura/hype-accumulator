@@ -573,6 +573,71 @@ journals as a fresh, staking-eligible fill. If history genuinely has to be
 abandoned (a decommissioned account), start a new operational config path
 instead, which binds a new directory and a new record.
 
+## Staking bot-acquired HYPE under the master (bot-strategy#847)
+
+The execution account is a subaccount, so its HYPE can only be staked after a
+transfer to the master (the designated funding parent). Both steps are owner
+actions from the master's own key, off the host; the bot signs nothing and
+only recognizes, reconciles and publishes. Enable recognition first, on the
+policy of **both** pairs (`security-policy.toml` and
+`live-probe-security-policy.toml`, `[custody]`):
+
+```toml
+hype_staking_custodian = "designated_parent"
+```
+
+The value is digest-bound, so each pair's `live_acknowledgement` has to be
+re-issued (`--print-expected-acknowledgement`, the same owner-run step as a cap
+change). No runtime-state field changes; the recorded movements are the same,
+only reported under a second label. Deploy both binaries together as usual.
+
+Once enabled, the status document carries `hype_transferred_to_custodian`,
+`hype_eligible_for_transfer` and a `custodian_staking` block. The procedure,
+batched (about monthly — every daily purchase raises the eligible amount and
+nothing is lost by waiting):
+
+1. **Read the amount** from the dashboard: `hype_eligible_for_transfer` is what
+   the ledger says the bot holds, less `staking.residual_hype_wei`. Never send
+   more than `hype_balance`; the ledger nets an outflow from external inflows
+   first and then from bot inventory, so a larger send is reported as bot HYPE
+   leaving and, once it exceeds what the account can justify, halts.
+2. **Transfer** exactly that amount of spot HYPE from the execution subaccount
+   to the master (a spot `send` from the Hyperliquid UI, signed by the master).
+   It arrives in the next cycle's ledger scan as an outflow whose counterparty
+   is the custodian.
+3. **Confirm recognition** on the next 12:05 UTC `status.json` (the first
+   recurring cycle whose scan covers the send): `hype_balance` dropped by the amount,
+   `hype_transferred_to_custodian` rose by it, `hype_transferred_out −
+   hype_transferred_to_custodian` is unchanged, `healthy` is true apart from
+   `CUSTODIAN_STAKING_SHORTFALL` — which is expected between steps 2 and 4 and
+   tells you the transfer is not staked yet.
+4. **Stake on the master**: `cDeposit` (spot → staking, immediate) then
+   `tokenDelegate` to a validator on the policy's allowlist (one-day lockup).
+   Both signed by the master, off the host. Never `cWithdraw` or undelegate as
+   part of this procedure.
+5. **Confirm** on the following status: `custodian_staking.shortfall_hype` is
+   0 and the health reason is gone; `custodian_staking.delegated_hype` moved by
+   the amount (it is the master's whole staking balance, so it may already have
+   been larger).
+
+Failure cases the ledger already handles:
+
+- **Sent to the wrong address**: recorded as an outflow to a non-custodian
+  counterparty; `hype_transferred_out` rises but
+  `hype_transferred_to_custodian` does not. Nothing halts (the ledger explains
+  the movement) — the difference between the two figures is the audit trail,
+  and it never shrinks. Recover the HYPE by hand if you can; do not edit the
+  record.
+- **Sent more than the bot holds**: the excess beyond external inflows is
+  reported as bot HYPE that left; beyond what the account can justify, the
+  divergence halt fires as it always has.
+- **Forgot step 4**: `CUSTODIAN_STAKING_SHORTFALL` stays until the master's
+  staking balance covers everything transferred. Because the master commingles
+  other HYPE, a master that already had more in staking than was transferred
+  never shows a shortfall — the figure is a bound, not an attribution.
+- **Custodian read fails**: `staking custodian read unavailable` degrades the
+  status; the execution account's own figures are published regardless.
+
 ## Settlement is final; late contradictory evidence is a manual review
 
 `submit`/`reconcile` settle the pacing decision once the workflow holds a

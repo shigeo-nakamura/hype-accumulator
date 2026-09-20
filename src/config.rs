@@ -386,6 +386,51 @@ impl Config {
         Ok(Some(ParentFundingRoute::new(&execution, &parent)?))
     }
 
+    /// The account bot-acquired HYPE may leave for offline staking
+    /// (bot-strategy#847), canonical and lowercased, or `None` when the
+    /// policy names no custodian. Resolving it neither admits funds nor
+    /// authorizes any signed action: the bot never moves or stakes HYPE
+    /// itself, it only recognizes a transfer to this account as explained
+    /// and reads this account's staking balances.
+    ///
+    /// # Errors
+    /// Rejects a custodian policy whose parent route cannot be resolved.
+    pub fn hype_staking_custodian<E: Environment>(
+        &self,
+        env: &E,
+    ) -> Result<Option<String>, ConfigError> {
+        let policy = self
+            .security_policy
+            .as_ref()
+            .ok_or(ConfigError::MissingSecurityPolicy)?;
+        match policy.wire.custody.hype_staking_custodian {
+            HypeStakingCustodian::None => Ok(None),
+            HypeStakingCustodian::DesignatedParent => {
+                let route = self.parent_funding_route(env)?.ok_or_else(|| {
+                    ConfigError::Invalid(
+                        "a designated-parent staking custodian requires designated parent \
+                         funding"
+                            .into(),
+                    )
+                })?;
+                Ok(Some(route.parent_account))
+            }
+        }
+    }
+
+    /// HYPE the policy keeps in the execution account when the eligible
+    /// transfer amount is reported (`staking.residual_hype_wei`), in atoms.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::MissingSecurityPolicy`] without a policy.
+    pub fn staking_residual_hype_atoms(&self) -> Result<u64, ConfigError> {
+        let policy = self
+            .security_policy
+            .as_ref()
+            .ok_or(ConfigError::MissingSecurityPolicy)?;
+        Ok(policy.wire.staking.residual_hype_wei)
+    }
+
     /// Validates configuration at an injected UTC instant.
     ///
     /// This entry point keeps acknowledgement-expiry boundary tests
@@ -864,6 +909,11 @@ struct CustodyPolicy {
     funding_mode: FundingMode,
     allow_traced_parent_transfer_admission: bool,
     admitted_parent_account_env: String,
+    /// Where bot-acquired HYPE is allowed to go for staking
+    /// (bot-strategy#847). Absent means `none`: no account is a custodian
+    /// and every recorded outflow is reported only as `hype_transferred_out`.
+    #[serde(default)]
+    hype_staking_custodian: HypeStakingCustodian,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -946,6 +996,23 @@ enum HotBalanceEnforcement {
     AcceptedUncappedAuthority,
 }
 
+/// The account bot-acquired HYPE may be transferred to for offline staking
+/// (bot-strategy#847, owner decision 2026-09-20: stake under the master).
+///
+/// The custodian is never a new address in the policy: `designated_parent`
+/// names the account `admitted_parent_account_env` already resolves for
+/// designated-parent funding, so the same identity that funds the execution
+/// subaccount is the only one its HYPE may leave for. Part of the
+/// acknowledged policy digest only when set, so a policy written before this
+/// field existed keeps its acknowledgement.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum HypeStakingCustodian {
+    #[default]
+    None,
+    DesignatedParent,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum FundingMode {
@@ -1022,6 +1089,10 @@ struct CanonicalCustodyPolicy<'a> {
     hot_balance_enforcement_change_ref: &'a str,
     funding_mode: &'a str,
     allow_traced_parent_transfer_admission: bool,
+    /// Skipped when unset so the acknowledgement digest of every policy
+    /// written before bot-strategy#847 is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hype_staking_custodian: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -1101,6 +1172,13 @@ impl SecurityPolicy {
         }
         if policy.staking.enabled {
             return invalid_policy("runtime staking must remain disabled");
+        }
+        if policy.custody.hype_staking_custodian == HypeStakingCustodian::DesignatedParent
+            && policy.custody.funding_mode != FundingMode::DesignatedParentFunding
+        {
+            return invalid_policy(
+                "a designated-parent staking custodian requires designated parent funding",
+            );
         }
         if !policy
             .custody
@@ -1287,6 +1365,10 @@ impl SecurityPolicy {
                 },
                 allow_traced_parent_transfer_admission: custody
                     .allow_traced_parent_transfer_admission,
+                hype_staking_custodian: match custody.hype_staking_custodian {
+                    HypeStakingCustodian::None => None,
+                    HypeStakingCustodian::DesignatedParent => Some("designated_parent"),
+                },
             },
             execution: &self.wire.execution,
             staking: CanonicalStakingPolicy {

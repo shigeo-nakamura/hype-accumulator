@@ -27,7 +27,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_toml(&fs::read_to_string(config_path)?)?;
     let account = config.observation_account(&ProcessEnvironment)?;
     let process_started_at = Utc::now();
-    let observer = HyperliquidObserver::new(&config.hyperliquid.endpoint, &account)?;
+    let observer = HyperliquidObserver::new(&config.hyperliquid.endpoint, &account)?
+        .with_custodian(
+            config
+                .hype_staking_custodian(&ProcessEnvironment)?
+                .as_deref(),
+        )?;
     let accumulator = observer
         .observe(
             &HypeAttribution::Unavailable,

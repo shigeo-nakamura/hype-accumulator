@@ -1,7 +1,7 @@
 use crate::{
     config::UtcSchedule,
     hype_asset::HYPE_SPOT_MARKET,
-    status::{AccumulatorStatus, StatusError},
+    status::{AccumulatorStatus, CustodianStakingStatus, StatusError, CUSTODIAN_STAKING_SHORTFALL},
 };
 use chrono::{DateTime, Utc};
 use dex_connector::{
@@ -46,6 +46,37 @@ pub enum HypeAttribution {
         /// Bot-acquired HYPE that left the account by a movement the venue's
         /// ledger records (bot-strategy#929 slice C); reported, not held.
         transferred_out_hype: f64,
+        /// The staking-custodian view (bot-strategy#847), present only when
+        /// the policy names a custodian.
+        custodian: Option<CustodianAttribution>,
+    },
+}
+
+/// What the ledger says about the staking custodian (bot-strategy#847).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CustodianAttribution {
+    /// The part of `transferred_out_hype` whose destination was the
+    /// custodian.
+    pub transferred_hype: f64,
+    /// Bot-acquired HYPE still held less the policy's residual buffer: the
+    /// amount the owner may transfer next. Advisory.
+    pub eligible_for_transfer_hype: f64,
+}
+
+/// The custodian's own staking balances, read from the public info endpoint
+/// for the custodian account (bot-strategy#847). An upper bound on bot HYPE
+/// staked there — the custodian commingles other holdings — never an exact
+/// attribution.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CustodianObservation {
+    /// The policy names no custodian; nothing was read.
+    NotConfigured,
+    /// The read failed; the status degrades instead of going stale.
+    Unavailable,
+    Observed {
+        delegated_hype: f64,
+        undelegated_hype: f64,
+        pending_withdrawal_hype: f64,
     },
 }
 
@@ -55,6 +86,7 @@ pub enum HypeAttribution {
 pub struct AccountObservation {
     pub balances: BalanceObservation,
     pub staking: StakingObservation,
+    pub custodian: CustodianObservation,
     pub balance_observation_started_at: DateTime<Utc>,
     pub balance_observed_at: DateTime<Utc>,
 }
@@ -74,6 +106,7 @@ impl AccountObservation {
         reconcile_status_with_balance_window(
             &self.balances,
             &self.staking,
+            &self.custodian,
             attribution,
             self.balance_observation_started_at,
             self.balance_observed_at,
@@ -114,6 +147,9 @@ pub struct HyperliquidObserver {
     client: Client,
     info_url: String,
     account: String,
+    /// The staking custodian whose public staking balances are read beside
+    /// the execution account's (bot-strategy#847), canonical lowercased.
+    custodian: Option<String>,
 }
 
 impl HyperliquidObserver {
@@ -174,7 +210,30 @@ impl HyperliquidObserver {
             client,
             info_url: format!("{base_url}/info"),
             account,
+            custodian: None,
         })
+    }
+
+    /// Also reads the staking custodian's public staking balances on every
+    /// account observation (bot-strategy#847). Read-only: the custodian's
+    /// signer is never involved, and this observer never holds one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MonitorError::InvalidAccount`] for a malformed custodian or
+    /// one equal to the execution account, which could not be a custodian.
+    pub fn with_custodian(mut self, custodian: Option<&str>) -> Result<Self, MonitorError> {
+        self.custodian = match custodian {
+            Some(custodian) => {
+                let custodian = canonical_account(custodian)?;
+                if custodian == self.account {
+                    return Err(MonitorError::InvalidAccount);
+                }
+                Some(custodian)
+            }
+            None => None,
+        };
+        Ok(self)
     }
 
     /// Reads normalized authoritative account movements without constructing
@@ -262,12 +321,48 @@ impl HyperliquidObserver {
                 },
             )?,
         };
+        let custodian = match &self.custodian {
+            None => CustodianObservation::NotConfigured,
+            Some(custodian) => self.observe_custodian(custodian).await,
+        };
         Ok(AccountObservation {
             balances,
             staking,
+            custodian,
             balance_observation_started_at,
             balance_observed_at,
         })
+    }
+
+    /// The custodian's `delegatorSummary`, degraded rather than failed: the
+    /// execution account's own read is the one this cycle must not lose,
+    /// and a custodian figure is advisory (bot-strategy#847).
+    async fn observe_custodian(&self, custodian: &str) -> CustodianObservation {
+        let Ok(summary) = self
+            .post_info::<DelegatorSummaryWire>(
+                json!({"type": "delegatorSummary", "user": custodian}),
+            )
+            .await
+        else {
+            return CustodianObservation::Unavailable;
+        };
+        match (
+            parse_amount(&summary.delegated, "custodian delegated HYPE"),
+            parse_amount(&summary.undelegated, "custodian undelegated HYPE"),
+            parse_amount(
+                &summary.total_pending_withdrawal,
+                "custodian pending-withdrawal HYPE",
+            ),
+        ) {
+            (Ok(delegated_hype), Ok(undelegated_hype), Ok(pending_withdrawal_hype)) => {
+                CustodianObservation::Observed {
+                    delegated_hype,
+                    undelegated_hype,
+                    pending_withdrawal_hype,
+                }
+            }
+            _ => CustodianObservation::Unavailable,
+        }
     }
 
     async fn post_info<T: DeserializeOwned>(&self, body: Value) -> Result<T, MonitorError> {
@@ -304,6 +399,32 @@ pub fn reconcile_status(
     reconcile_status_with_balance_window(
         balances,
         staking,
+        &CustodianObservation::NotConfigured,
+        attribution,
+        observed_at,
+        observed_at,
+        trade_cadence,
+    )
+}
+
+/// [`reconcile_status`] with the staking custodian's read
+/// (bot-strategy#847).
+///
+/// # Errors
+///
+/// As [`reconcile_status`].
+pub fn reconcile_status_with_custodian(
+    balances: &BalanceObservation,
+    staking: &StakingObservation,
+    custodian: &CustodianObservation,
+    attribution: &HypeAttribution,
+    observed_at: DateTime<Utc>,
+    trade_cadence: impl Into<String>,
+) -> Result<AccumulatorStatus, MonitorError> {
+    reconcile_status_with_balance_window(
+        balances,
+        staking,
+        custodian,
         attribution,
         observed_at,
         observed_at,
@@ -314,6 +435,7 @@ pub fn reconcile_status(
 fn reconcile_status_with_balance_window(
     balances: &BalanceObservation,
     staking: &StakingObservation,
+    custodian: &CustodianObservation,
     attribution: &HypeAttribution,
     balance_observation_started_at: DateTime<Utc>,
     balance_observed_at: DateTime<Utc>,
@@ -340,44 +462,70 @@ fn reconcile_status_with_balance_window(
     if mismatch > delegation_tolerance {
         health_reasons.push("staking delegation total does not match delegator summary");
     }
-    let (attributed_hype, last_trade_at, transferred_out_hype) = match attribution {
-        HypeAttribution::Unavailable => {
-            health_reasons.push("HYPE attribution unavailable; account holdings excluded");
-            (0.0, None, None)
-        }
-        HypeAttribution::Reconciled {
-            hype,
-            last_trade_at,
-            transferred_out_hype,
-        } => {
-            finite_nonnegative("attributed HYPE", *hype)?;
-            finite_nonnegative("transferred-out HYPE", *transferred_out_hype)?;
-            if *hype > observed_hype + attribution_tolerance {
-                // The workflow ledger says this account should still hold
-                // more bot-owned HYPE than it does: HYPE the bot acquired has
-                // left the account (an external sale, a transfer, or a
-                // staking movement no workflow recorded).
-                //
-                // Deliberately a health failure rather than an error
-                // (bot-strategy#929): refusing to produce a status document
-                // would take the dashboard down — and stall the recurring
-                // cycle that publishes it — in exactly the situation that
-                // most needs to be visible. What is reported as bot-owned is
-                // zero, the same as `Unavailable`: the ledger's claim would
-                // overstate, and the account total includes whatever else
-                // the account holds, which `hype_balance` must never
-                // include. The reason carries the fact; the number does not
-                // guess.
-                health_reasons.push(ATTRIBUTION_EXCEEDS_HOLDINGS);
-                (0.0, *last_trade_at, Some(*transferred_out_hype))
-            } else {
-                if observed_hype - *hype > attribution_tolerance {
-                    health_reasons.push("unattributed HYPE account holdings excluded");
-                }
-                (*hype, *last_trade_at, Some(*transferred_out_hype))
+    let (attributed_hype, last_trade_at, transferred_out_hype, custodian_attribution) =
+        match attribution {
+            HypeAttribution::Unavailable => {
+                health_reasons.push("HYPE attribution unavailable; account holdings excluded");
+                (0.0, None, None, None)
             }
-        }
-    };
+            HypeAttribution::Reconciled {
+                hype,
+                last_trade_at,
+                transferred_out_hype,
+                custodian: custodian_attribution,
+            } => {
+                finite_nonnegative("attributed HYPE", *hype)?;
+                finite_nonnegative("transferred-out HYPE", *transferred_out_hype)?;
+                validate_custodian_attribution(
+                    custodian_attribution.as_ref(),
+                    *transferred_out_hype,
+                    attribution_tolerance,
+                )?;
+                if *hype > observed_hype + attribution_tolerance {
+                    // The workflow ledger says this account should still hold
+                    // more bot-owned HYPE than it does: HYPE the bot acquired has
+                    // left the account (an external sale, a transfer, or a
+                    // staking movement no workflow recorded).
+                    //
+                    // Deliberately a health failure rather than an error
+                    // (bot-strategy#929): refusing to produce a status document
+                    // would take the dashboard down — and stall the recurring
+                    // cycle that publishes it — in exactly the situation that
+                    // most needs to be visible. What is reported as bot-owned is
+                    // zero, the same as `Unavailable`: the ledger's claim would
+                    // overstate, and the account total includes whatever else
+                    // the account holds, which `hype_balance` must never
+                    // include. The reason carries the fact; the number does not
+                    // guess.
+                    health_reasons.push(ATTRIBUTION_EXCEEDS_HOLDINGS);
+                    // The eligible figure is derived from a claim this read just
+                    // refused; publishing it would invite a transfer of HYPE the
+                    // account may not hold. The transferred figure is a record
+                    // of the past and stays.
+                    (
+                        0.0,
+                        *last_trade_at,
+                        Some(*transferred_out_hype),
+                        custodian_attribution.map(|custodian| CustodianAttribution {
+                            eligible_for_transfer_hype: 0.0,
+                            ..custodian
+                        }),
+                    )
+                } else {
+                    if observed_hype - *hype > attribution_tolerance {
+                        health_reasons.push("unattributed HYPE account holdings excluded");
+                    }
+                    (
+                        *hype,
+                        *last_trade_at,
+                        Some(*transferred_out_hype),
+                        *custodian_attribution,
+                    )
+                }
+            }
+        };
+    let custodian_staking =
+        custodian_staking_status(custodian, custodian_attribution, &mut health_reasons)?;
     // A last-trade timestamp after the balance read is rejected by
     // `AccumulatorStatus`, and now that a real journal-derived fill time is
     // attributed (bot-strategy#929) a clock that steps backwards — an NTP
@@ -406,11 +554,113 @@ fn reconcile_status_with_balance_window(
         trade_cadence,
         health_reason,
     )?;
-    match transferred_out_hype {
-        Some(hype) => status.with_hype_transferred_out(hype),
-        None => Ok(status),
+    with_transfer_figures(
+        status,
+        transferred_out_hype,
+        custodian_attribution,
+        custodian_staking,
+    )
+}
+
+/// Attaches the transfer and custodian figures (each optional) to a
+/// validated status.
+fn with_transfer_figures(
+    status: AccumulatorStatus,
+    transferred_out_hype: Option<f64>,
+    custodian_attribution: Option<CustodianAttribution>,
+    custodian_staking: Option<CustodianStakingStatus>,
+) -> Result<AccumulatorStatus, MonitorError> {
+    let status = match transferred_out_hype {
+        Some(hype) => status.with_hype_transferred_out(hype)?,
+        None => status,
+    };
+    let status = match custodian_attribution {
+        Some(custodian) => status.with_custodian_attribution(
+            custodian.transferred_hype,
+            custodian.eligible_for_transfer_hype,
+        )?,
+        None => status,
+    };
+    Ok(match custodian_staking {
+        Some(staking) => status.with_custodian_staking(staking)?,
+        None => status,
+    })
+}
+
+/// The custodian view of an attribution is a part of its transferred-out
+/// total (bot-strategy#847); anything else is not an attribution this
+/// reconciliation will publish.
+fn validate_custodian_attribution(
+    custodian: Option<&CustodianAttribution>,
+    transferred_out_hype: f64,
+    tolerance: f64,
+) -> Result<(), MonitorError> {
+    let Some(custodian) = custodian else {
+        return Ok(());
+    };
+    finite_nonnegative("transferred-to-custodian HYPE", custodian.transferred_hype)?;
+    finite_nonnegative(
+        "eligible-for-transfer HYPE",
+        custodian.eligible_for_transfer_hype,
+    )?;
+    if custodian.transferred_hype > transferred_out_hype + tolerance {
+        return Err(MonitorError::InvalidResponse(
+            "transferred-to-custodian HYPE exceeds transferred-out HYPE".to_owned(),
+        ));
     }
-    .map_err(MonitorError::from)
+    Ok(())
+}
+
+/// The custodian's staking balances bound what the owner staked there from
+/// above (they commingle other HYPE), so the only thing this can say is that
+/// a transfer has *not* been staked yet: transferred more than the custodian
+/// holds in staking at all (bot-strategy#847). Alert only — no capital
+/// decision depends on it.
+fn custodian_staking_status(
+    custodian: &CustodianObservation,
+    custodian_attribution: Option<CustodianAttribution>,
+    health_reasons: &mut Vec<&'static str>,
+) -> Result<Option<CustodianStakingStatus>, MonitorError> {
+    Ok(match custodian {
+        CustodianObservation::NotConfigured => None,
+        CustodianObservation::Unavailable => {
+            health_reasons.push("staking custodian read unavailable");
+            None
+        }
+        CustodianObservation::Observed {
+            delegated_hype,
+            undelegated_hype,
+            pending_withdrawal_hype,
+        } => {
+            for (label, value) in [
+                ("custodian delegated HYPE", *delegated_hype),
+                ("custodian undelegated HYPE", *undelegated_hype),
+                (
+                    "custodian pending-withdrawal HYPE",
+                    *pending_withdrawal_hype,
+                ),
+            ] {
+                finite_nonnegative(label, value)?;
+            }
+            let staked_hype = delegated_hype + undelegated_hype + pending_withdrawal_hype;
+            let shortfall_hype = custodian_attribution.map(|custodian| {
+                let shortfall = custodian.transferred_hype - staked_hype;
+                let tolerance = 1e-8_f64.max(custodian.transferred_hype.abs() * 1e-10);
+                if shortfall > tolerance {
+                    health_reasons.push(CUSTODIAN_STAKING_SHORTFALL);
+                    shortfall
+                } else {
+                    0.0
+                }
+            });
+            Some(CustodianStakingStatus {
+                delegated_hype: *delegated_hype,
+                undelegated_hype: *undelegated_hype,
+                pending_withdrawal_hype: *pending_withdrawal_hype,
+                shortfall_hype,
+            })
+        }
+    })
 }
 
 #[must_use]

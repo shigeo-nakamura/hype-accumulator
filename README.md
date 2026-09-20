@@ -109,6 +109,21 @@ a path the ledger does not show. The bot-acquired part that left is published as
 `hype_transferred_out` beside `hype_balance`, never inside it. A sale is a fill,
 not a movement: it stays an unexplained outflow and halts as above.
 
+When the policy names a staking custodian (`custody.hype_staking_custodian =
+"designated_parent"`, bot-strategy#847), the part of `hype_transferred_out`
+whose destination was that account is reported as
+`hype_transferred_to_custodian` — assigned to other destinations first, so it
+is never overstated and any bot HYPE that left for somewhere else stays visible
+in the difference — together with `hype_eligible_for_transfer` (what is still
+held less `staking.residual_hype_wei`) and a `custodian_staking` block with the
+custodian's own delegated / undelegated / pending-withdrawal HYPE. Those
+custodian balances are an upper bound on bot HYPE staked there, since the
+custodian commingles other holdings; the one thing the comparison can say is
+that a transfer has *not* been staked yet, reported as `shortfall_hype` and a
+degraded health reason. The bot signs neither the transfer nor the staking
+action: the owner performs both offline from the custodian's own key, and the
+bot recognizes them. Nothing about the divergence halt changes.
+
 ## Offline staking workflow fault injection
 
 The optional `offline-staking-simulation` feature exercises the durable

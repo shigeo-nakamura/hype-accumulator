@@ -3256,6 +3256,7 @@ fn live_settlement_records_the_hype_it_bought_and_attributes_it() {
             hype: 0.299_79,
             last_trade_at: Some(fill_at),
             transferred_out_hype: 0.0,
+            custodian: None,
         }
     );
 
@@ -4230,6 +4231,7 @@ fn an_explained_hype_outflow_is_recorded_once_and_netted_from_attribution() {
             hype: 0.199_79,
             last_trade_at: before.last_fill_at,
             transferred_out_hype: 0.1,
+            custodian: None,
         }
     );
     assert_eq!(runtime.attributed_hype(), before);
@@ -4374,6 +4376,161 @@ fn hype_outflows_consume_external_inflows_before_bot_inventory() {
     };
     assert_eq!(inflow_only.transferred_out_hype_atoms(), 0);
     assert_eq!(inflow_only.held_hype_atoms(), credited);
+}
+
+/// bot-strategy#847: with a staking custodian named, the part of the
+/// bot-acquired outflow that went to the custodian is reported separately,
+/// assigned to *other* destinations first so it is never overstated; the
+/// eligible-to-transfer figure is what is held less the residual buffer;
+/// the halt semantics (held, transferred out) are exactly what they were
+/// without a custodian; and none of it is state — the same record reports
+/// no custodian figure at all when the runtime names none.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn outflows_to_the_staking_custodian_are_reported_separately_and_other_first() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let start = at(2026, 7, 6, 8, 0);
+    let decision_at = at(2026, 7, 6, 12, 0);
+    let credited = 29_979_000_u64;
+    let residual = 1_000_000_u64;
+    let custodian_config = config(directory.path(), ms(start)).with_hype_staking_custodian(Some(
+        HypeStakingCustodianConfig {
+            account: "0xmaster".to_owned(),
+            residual_hype_atoms: residual,
+        },
+    ));
+    let (mut runtime, admission) =
+        runtime_with_settled_purchase(&custodian_config, start, decision_at, credited);
+    let before = runtime.attributed_hype();
+    assert_eq!(before.transferred_to_custodian_hype_atoms(), Some(0));
+    assert_eq!(
+        before.eligible_for_transfer_hype_atoms(),
+        Some(credited - residual)
+    );
+
+    let inflow_at = decision_at + TimeDelta::hours(1);
+    let outflow_at = decision_at + TimeDelta::hours(2);
+    let scan = [
+        // 0.05 HYPE arrived from outside (never bot-owned)
+        hype_transfer(
+            "hype-in",
+            inflow_at,
+            Decimal::new(5_000_000, 8),
+            HyperliquidAccountMovementKind::InternalTransfer,
+        ),
+        // 0.2 HYPE to the custodian (counterparty "0xmaster" by the helper)
+        hype_transfer(
+            "to-custodian",
+            outflow_at,
+            Decimal::new(-20_000_000, 8),
+            HyperliquidAccountMovementKind::InternalTransfer,
+        ),
+        // 0.07 HYPE to somewhere else
+        HyperliquidAccountMovement {
+            counterparty: Some("0xelsewhere".to_owned()),
+            ..hype_transfer(
+                "to-other",
+                outflow_at + TimeDelta::minutes(1),
+                Decimal::new(-7_000_000, 8),
+                HyperliquidAccountMovementKind::InternalTransfer,
+            )
+        },
+        // an external withdrawal has no counterparty: never the custodian
+        HyperliquidAccountMovement {
+            counterparty: None,
+            ..hype_transfer(
+                "withdrawn",
+                outflow_at + TimeDelta::minutes(2),
+                Decimal::new(-1_000_000, 8),
+                HyperliquidAccountMovementKind::ExternalWithdrawal,
+            )
+        },
+    ];
+    // Netted the same way before the commit (`attributed_hype_with`) and
+    // after it (`attributed_hype`).
+    let as_of = outflow_at + TimeDelta::minutes(5);
+    let pending = runtime
+        .attributed_hype_with(&scan, as_of)
+        .expect("pending attribution");
+    observe_cycle_with(&mut runtime, as_of, &scan, &admission).expect("observe cycle");
+    let attributed = runtime.attributed_hype();
+    assert_eq!(attributed, pending);
+
+    // Totals: 0.28 out, 0.05 in → 0.23 bot outflow; other destinations
+    // account for 0.08 of it, the custodian for the remaining 0.15.
+    assert_eq!(attributed.outflow_hype_atoms, 28_000_000);
+    assert_eq!(attributed.inflow_hype_atoms, 5_000_000);
+    assert_eq!(attributed.transferred_out_hype_atoms(), 23_000_000);
+    assert_eq!(attributed.held_hype_atoms(), credited - 23_000_000);
+    assert_eq!(
+        attributed.custodian,
+        Some(AttributedCustodianHype {
+            outflow_hype_atoms: 20_000_000,
+            residual_hype_atoms: residual,
+        })
+    );
+    assert_eq!(
+        attributed.transferred_to_custodian_hype_atoms(),
+        Some(15_000_000)
+    );
+    assert_eq!(
+        attributed.eligible_for_transfer_hype_atoms(),
+        Some(credited - 23_000_000 - residual)
+    );
+    match attributed.to_attribution() {
+        HypeAttribution::Reconciled { custodian, .. } => {
+            let custodian = custodian.expect("custodian view");
+            assert!((custodian.transferred_hype - 0.15).abs() < 1e-9);
+            assert!(
+                (custodian.eligible_for_transfer_hype - 0.059_79).abs() < 1e-9,
+                "{custodian:?}"
+            );
+        }
+        HypeAttribution::Unavailable => panic!("attribution is complete"),
+    }
+
+    // A residual larger than what is held leaves nothing eligible, never a
+    // negative amount; a bot outflow entirely explained by other
+    // destinations leaves the custodian figure at zero.
+    let large_residual = AttributedHype {
+        custodian: Some(AttributedCustodianHype {
+            residual_hype_atoms: credited,
+            ..attributed.custodian.expect("custodian")
+        }),
+        ..attributed
+    };
+    assert_eq!(large_residual.eligible_for_transfer_hype_atoms(), Some(0));
+    let other_only = AttributedHype {
+        outflow_hype_atoms: 8_000_000,
+        custodian: Some(AttributedCustodianHype {
+            outflow_hype_atoms: 0,
+            residual_hype_atoms: residual,
+        }),
+        ..attributed
+    };
+    assert_eq!(other_only.transferred_to_custodian_hype_atoms(), Some(0));
+
+    // The same committed state read without a custodian reports the same
+    // held/transferred figures and no custodian view at all.
+    drop(runtime);
+    let plain = SignerFreeRuntime::open(config(directory.path(), ms(start)), limits())
+        .expect("reopen without custodian");
+    let plain_attributed = plain.attributed_hype();
+    assert_eq!(plain_attributed.custodian, None);
+    assert_eq!(plain_attributed.transferred_to_custodian_hype_atoms(), None);
+    assert_eq!(plain_attributed.eligible_for_transfer_hype_atoms(), None);
+    assert_eq!(
+        plain_attributed.transferred_out_hype_atoms(),
+        attributed.transferred_out_hype_atoms()
+    );
+    assert_eq!(
+        plain_attributed.held_hype_atoms(),
+        attributed.held_hype_atoms()
+    );
+    match plain_attributed.to_attribution() {
+        HypeAttribution::Reconciled { custodian, .. } => assert_eq!(custodian, None),
+        HypeAttribution::Unavailable => panic!("attribution is complete"),
+    }
 }
 
 /// bot-strategy#929 slice C: a HYPE row finer than an atom is refused, not
