@@ -643,6 +643,32 @@ Failure cases the ledger already handles:
 - **Custodian read fails**: `staking custodian read unavailable` degrades the
   status; the execution account's own figures are published regardless.
 
+## The network-binding sidecar is not tamper-evident (accepted, bot-strategy#942)
+
+`<journal>.network-binding.json` records which venue endpoint/network and
+vault-address routing mode `prepare` resolved that journal under, and
+`prepare`'s residual aggregation admits a historical journal only when its
+sidecar matches the current run's binding. The sidecar is a plain,
+write-once file: it is not part of the journal's hash chain and is not
+anchored by the protected head, so a principal with write access to it could
+relabel a journal's context without touching the journal itself.
+
+This is accepted as a permanent limitation (owner decision 2026-09-20) rather
+than fixed: the deployment is a single execution account on a single
+network, and the write access needed is the same access that already reaches
+the operational config beside it. The two candidate fixes — folding the
+context into `execution_identity_hash`, or a second protected anchor for the
+sidecar — were judged not worth their blast radius for that shape.
+
+What still holds regardless of the sidecar: `submit` and `reconcile` derive
+the binding afresh from their own config and refuse a journal whose sidecar
+disagrees, so a relabeled sidecar cannot redirect a submission; and the
+aggregation's live-balance bound rejects any residual total larger than the
+account actually holds. Do not edit a sidecar by hand for any reason; if one
+is lost or corrupt, restore it from backup beside its journal. **Reopen
+bot-strategy#942 before configuring a second network or a second execution
+account** — that is the shape the limitation was accepted against.
+
 ## Settlement is final; late contradictory evidence is a manual review
 
 `submit`/`reconcile` settle the pacing decision once the workflow holds a
