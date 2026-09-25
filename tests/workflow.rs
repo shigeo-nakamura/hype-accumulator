@@ -9,11 +9,11 @@ use hype_accumulator::{
     runtime::LiveHypeAcquisition,
     workflow::{
         ActionKind, AppendOutcome, AuthenticatedOrderSubmission, AuthorizationInputFreshness,
-        BoundFillEvidence, BoundMovementEvidence, ConclusiveAbsenceEvidence, DecisionBinding,
-        DisabledStakingProof, DurableWorkflow, EligibilityPolicyBinding, ExchangeFillOwner,
-        ExchangeOrderOwner, ExchangeOrderOwnerStore, ExternalAction, ExternalReceipt,
-        FileExchangeOrderOwnerStore, FileProtectedWorkflowHeadStore, GapFreeHistoryWatermark,
-        HistoryDomain, HypeAtoms, InventoryBaseline, JournalCommitStatus,
+        BoundFillEvidence, BoundMovementEvidence, ConclusiveAbsenceEvidence, CustodianOutflow,
+        DecisionBinding, DisabledStakingProof, DurableWorkflow, EligibilityPolicyBinding,
+        ExchangeFillOwner, ExchangeOrderOwner, ExchangeOrderOwnerStore, ExternalAction,
+        ExternalReceipt, FileExchangeOrderOwnerStore, FileProtectedWorkflowHeadStore,
+        GapFreeHistoryWatermark, HistoryDomain, HypeAtoms, InventoryBaseline, JournalCommitStatus,
         OrderBoundEligibilityEvidence, OrderEnvelopeBinding, OrderFinality, OwnershipCommitOutcome,
         PrepareOutcome, ProtectedWorkflowHead, ProtectedWorkflowHeadStore, WorkflowError,
         WorkflowStage,
@@ -5158,6 +5158,17 @@ fn complete_workflow_with_residual_and_eligible(
     residual_atoms: u64,
     eligible_atoms: u64,
 ) -> DecisionBinding {
+    complete_workflow_with_residual_and_eligible_at(path, residual_atoms, eligible_atoms, 0)
+}
+
+/// As [`complete_workflow_with_residual_and_eligible`], with every event
+/// `minutes` later (the fill lands at `at(minutes + 3)`).
+fn complete_workflow_with_residual_and_eligible_at(
+    path: &Path,
+    residual_atoms: u64,
+    eligible_atoms: u64,
+    minutes: u32,
+) -> DecisionBinding {
     let purchased_atoms = residual_atoms + eligible_atoms;
     let mut binding = binding();
     binding.decision_id = distinct_decision_id(path);
@@ -5165,8 +5176,13 @@ fn complete_workflow_with_residual_and_eligible(
     binding.inventory_before.unconsumed_residual_spot_hype_atoms = hype(0);
     binding.inventory_before.configured_residual_hype_atoms = hype(residual_atoms);
     let mut workflow = reopen(path, &binding);
-    ready(workflow.prepare_order(at(1)).expect("order prepared"));
-    observe_submission(&mut workflow, "exchange-order-1", at(2)).expect("submission observed");
+    ready(
+        workflow
+            .prepare_order(at(minutes + 1))
+            .expect("order prepared"),
+    );
+    observe_submission(&mut workflow, "exchange-order-1", at(minutes + 2))
+        .expect("submission observed");
     let filled_usdc_micros = purchased_atoms
         .checked_mul(200_000)
         .expect("fixture notional fits");
@@ -5179,7 +5195,7 @@ fn complete_workflow_with_residual_and_eligible(
             usdc(filled_usdc_micros),
             usdc(debited_usdc_micros),
             false,
-            at(3),
+            at(minutes + 3),
         )
         .expect("fill observed");
     workflow
@@ -5189,16 +5205,22 @@ fn complete_workflow_with_residual_and_eligible(
             usdc(filled_usdc_micros),
             usdc(debited_usdc_micros),
             OrderFinality::Canceled,
-            at(4),
+            at(minutes + 4),
         )
         .expect("order finalized");
-    let evidence = bound_evidence(&workflow, &[("fill", purchased_atoms, 3)], at(5));
+    let evidence = bound_evidence(
+        &workflow,
+        &[("fill", purchased_atoms, minutes + 3)],
+        at(minutes + 5),
+    );
     let eligibility = workflow
-        .record_staking_eligibility(Some(evidence), at(5))
+        .record_staking_eligibility(Some(evidence), at(minutes + 5))
         .expect("eligibility recorded");
     assert_eq!(eligibility.residual_hype, hype(residual_atoms));
     assert_eq!(eligibility.eligible_hype, hype(eligible_atoms));
-    workflow.complete(at(6)).expect("workflow completed");
+    workflow
+        .complete(at(minutes + 6))
+        .expect("workflow completed");
     binding
 }
 
@@ -5242,16 +5264,26 @@ fn aggregate_terminal_residual_hype_reconciles_against_residual_plus_unstaked_el
     assert_eq!(aggregated, hype(10));
 }
 
+fn custodian_outflow(id: &str, atoms: u64, minute: u32) -> CustodianOutflow {
+    CustodianOutflow {
+        movement_id: id.to_owned(),
+        amount_hype: hype(atoms),
+        occurred_at: at(minute),
+    }
+}
+
 fn aggregate_net_of_custodian(
     directory: &Path,
     live_spot_atoms: u64,
-    custodian_outflow_atoms: u64,
+    outflows: &[CustodianOutflow],
+    cap_atoms: u64,
 ) -> Result<HypeAtoms, WorkflowError> {
     DurableWorkflow::aggregate_terminal_residual_hype_net_of_custodian(
         directory,
         None,
         hype(live_spot_atoms),
-        hype(custodian_outflow_atoms),
+        outflows,
+        hype(cap_atoms),
         "signer-identity-hash-a",
         &memory_protected_head_store_for,
         &always_admissible,
@@ -5262,31 +5294,36 @@ fn aggregate_net_of_custodian(
 #[test]
 fn aggregate_terminal_residual_hype_accepts_hype_the_owner_moved_to_the_staking_custodian() {
     // bot-strategy#847: the owner sends bot HYPE to the staking custodian
-    // by hand. Spot is then empty although history expects residual (10) +
-    // eligible (100) there; the recorded custodian outflow explains it.
+    // by hand. Spot is then short of the residual (10) + eligible (100)
+    // history expects there; the recorded custodian outflow explains it.
     let temp = tempfile::tempdir().expect("temp directory");
     complete_workflow_with_residual_and_eligible(&temp.path().join("day-1.jsonl"), 10, 100);
 
     // Only the eligible HYPE moved: the residual is still in spot and
     // still counted as unconsumed.
+    let eligible_only = [custodian_outflow("m-1", 100, 20)];
     assert_eq!(
-        aggregate_net_of_custodian(temp.path(), 10, 100).expect("eligible HYPE transferred"),
+        aggregate_net_of_custodian(temp.path(), 10, &eligible_only, 100)
+            .expect("eligible HYPE transferred"),
         hype(10)
     );
     // Everything moved, residual included: none of the residual is left to
     // count, so the next decision reserves it again.
+    let everything = [custodian_outflow("m-1", 110, 20)];
     assert_eq!(
-        aggregate_net_of_custodian(temp.path(), 0, 110).expect("all HYPE transferred"),
+        aggregate_net_of_custodian(temp.path(), 0, &everything, 110).expect("all HYPE transferred"),
         hype(0)
     );
     // Part of the residual moved.
+    let part = [custodian_outflow("m-1", 105, 20)];
     assert_eq!(
-        aggregate_net_of_custodian(temp.path(), 5, 105).expect("part of the residual transferred"),
+        aggregate_net_of_custodian(temp.path(), 5, &part, 105)
+            .expect("part of the residual transferred"),
         hype(5)
     );
-    // Zero custodian outflow is exactly the spot-only reconciliation.
+    // No outflow is exactly the spot-only reconciliation.
     assert_eq!(
-        aggregate_net_of_custodian(temp.path(), 110, 0).expect("nothing transferred"),
+        aggregate_net_of_custodian(temp.path(), 110, &[], 0).expect("nothing transferred"),
         hype(10)
     );
 }
@@ -5298,13 +5335,41 @@ fn aggregate_terminal_residual_hype_net_of_custodian_still_fails_closed_on_unexp
 
     // 100 went to the custodian, but only 5 of the remaining 10 is in spot:
     // the other 5 left by a path the custodian figure does not cover.
+    let outflows = [custodian_outflow("m-1", 100, 20)];
     assert!(matches!(
-        aggregate_net_of_custodian(temp.path(), 5, 100),
+        aggregate_net_of_custodian(temp.path(), 5, &outflows, 100),
         Err(WorkflowError::ResidualReconciliationGap(_))
     ));
-    // Without the custodian figure, the transfer itself is unexplained.
+    // The ledger's bot-attributed figure caps what an outflow may explain:
+    // a 110 transfer of which only 100 was bot HYPE leaves 10 expected.
+    let larger = [custodian_outflow("m-1", 110, 20)];
     assert!(matches!(
-        aggregate_net_of_custodian(temp.path(), 0, 0),
+        aggregate_net_of_custodian(temp.path(), 0, &larger, 100),
+        Err(WorkflowError::ResidualReconciliationGap(_))
+    ));
+}
+
+#[test]
+fn a_custodian_outflow_consumes_only_hype_already_in_spot_at_its_time() {
+    // Codex P2 on #71: day 1 (10 residual + 100 eligible) is transferred in
+    // full; day 2 then reserves the residual again and buys 100 more. The
+    // earlier transfer must not be re-read as consuming day 2's eligible
+    // HYPE, which would leave day 1's transferred residual counted as still
+    // in spot.
+    let temp = tempfile::tempdir().expect("temp directory");
+    complete_workflow_with_residual_and_eligible(&temp.path().join("day-1.jsonl"), 10, 100);
+    complete_workflow_with_residual_and_eligible_at(&temp.path().join("day-2.jsonl"), 10, 100, 10);
+    let outflows = [custodian_outflow("m-1", 110, 8)];
+
+    assert_eq!(
+        aggregate_net_of_custodian(temp.path(), 110, &outflows, 110)
+            .expect("day 2 is what is left in spot"),
+        hype(10)
+    );
+    // A transfer before any purchase explains none of them.
+    let early = [custodian_outflow("m-0", 110, 1)];
+    assert!(matches!(
+        aggregate_net_of_custodian(temp.path(), 110, &early, 110),
         Err(WorkflowError::ResidualReconciliationGap(_))
     ));
 }
@@ -5769,6 +5834,20 @@ fn aggregate_terminal_residual_hype_reconciles_using_movement_adjusted_residual(
     )
     .expect("aggregation uses the movement-adjusted residual, not the raw split");
     assert_eq!(aggregated, hype(6));
+
+    // Codex P1 on #71: that movement went to the custodian. Its 4 are
+    // already netted from the residual, so crediting them again would let
+    // a spot of 2 pass with 4 atoms unexplained.
+    let outflows = [custodian_outflow("movement-a", 4, 4)];
+    assert!(matches!(
+        aggregate_net_of_custodian(temp.path(), 2, &outflows, 4),
+        Err(WorkflowError::ResidualReconciliationGap(_))
+    ));
+    assert_eq!(
+        aggregate_net_of_custodian(temp.path(), 6, &outflows, 4)
+            .expect("the bound part is not credited twice"),
+        hype(6)
+    );
 }
 
 #[test]

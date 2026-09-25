@@ -1491,6 +1491,28 @@ impl SignerFreeRuntime {
         aggregate
     }
 
+    /// Every recorded HYPE outflow to the configured staking custodian
+    /// (bot-strategy#847), for the live history reconciliation to replay;
+    /// empty when the runtime names no custodian.
+    #[must_use]
+    pub fn custodian_outflows(&self) -> Vec<crate::workflow::CustodianOutflow> {
+        let custodian_account = self
+            .config
+            .hype_staking_custodian
+            .as_ref()
+            .map(|custodian| custodian.account.as_str());
+        self.state
+            .hype_movements
+            .values()
+            .filter(|movement| movement.is_outflow_to(custodian_account))
+            .map(|movement| crate::workflow::CustodianOutflow {
+                movement_id: movement.movement_id.clone(),
+                amount_hype: crate::workflow::HypeAtoms::from_atoms(movement.amount_hype_atoms),
+                occurred_at: movement.occurred_at,
+            })
+            .collect()
+    }
+
     /// [`Self::attributed_hype`] with the HYPE movements in `movements` that
     /// this state has not recorded yet netted in, as the cycle that is about
     /// to consume `movements` will record them (bot-strategy#929 slice C).

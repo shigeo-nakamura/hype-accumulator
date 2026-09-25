@@ -639,6 +639,69 @@ pub struct BoundFillEvidence {
     pub registration_deadline_at: DateTime<Utc>,
 }
 
+/// HYPE one historical journal left in spot, from the time it got there.
+struct SpotLot {
+    in_spot_from: DateTime<Utc>,
+    residual: HypeAtoms,
+    unstaked_eligible: HypeAtoms,
+}
+
+/// Replays `outflows` in time order against `lots` (bot-strategy#847) and
+/// returns what history still expects in spot and its residual part. Each
+/// outflow, less what journal evidence already bound of it and within what
+/// is left of `cap`, consumes the unstaked eligible HYPE of the lots already
+/// in spot at its time, then their residual; any excess was never expected.
+/// `None` on overflow.
+fn replay_custodian_outflows(
+    mut lots: Vec<SpotLot>,
+    outflows: &[CustodianOutflow],
+    bound: &BTreeMap<String, HypeAtoms>,
+    cap: HypeAtoms,
+) -> Option<(HypeAtoms, HypeAtoms)> {
+    lots.sort_by_key(|lot| lot.in_spot_from);
+    let mut ordered: Vec<&CustodianOutflow> = outflows.iter().collect();
+    ordered.sort_by(|a, b| {
+        a.occurred_at
+            .cmp(&b.occurred_at)
+            .then_with(|| a.movement_id.cmp(&b.movement_id))
+    });
+    let mut cap = cap;
+    let mut eligible = HypeAtoms::default();
+    let mut residual = HypeAtoms::default();
+    let mut next_lot = lots.into_iter().peekable();
+    for outflow in ordered {
+        while let Some(lot) = next_lot.next_if(|lot| lot.in_spot_from <= outflow.occurred_at) {
+            eligible = eligible.checked_add(lot.unstaked_eligible)?;
+            residual = residual.checked_add(lot.residual)?;
+        }
+        let already_bound = bound.get(&outflow.movement_id).copied().unwrap_or_default();
+        let credit = outflow
+            .amount_hype
+            .checked_sub(already_bound)
+            .unwrap_or_default()
+            .min(cap);
+        cap = cap.checked_sub(credit)?;
+        let from_eligible = credit.min(eligible);
+        eligible = eligible.checked_sub(from_eligible)?;
+        let from_residual = credit.checked_sub(from_eligible)?.min(residual);
+        residual = residual.checked_sub(from_residual)?;
+    }
+    for lot in next_lot {
+        eligible = eligible.checked_add(lot.unstaked_eligible)?;
+        residual = residual.checked_add(lot.residual)?;
+    }
+    Some((eligible.checked_add(residual)?, residual))
+}
+
+/// A recorded HYPE outflow from the execution account to the staking
+/// custodian (bot-strategy#847), as the runtime's movement ledger holds it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CustodianOutflow {
+    pub movement_id: String,
+    pub amount_hype: HypeAtoms,
+    pub occurred_at: DateTime<Utc>,
+}
+
 /// One authoritative movement consuming quantity attributed to this workflow.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BoundMovementEvidence {
@@ -862,6 +925,13 @@ pub struct WorkflowState {
     staking_eligible_hype: HypeAtoms,
     #[serde(default)]
     residual_consumed_by_movements_hype: HypeAtoms,
+    /// Per movement ID, the HYPE this workflow's eligibility evidence
+    /// recorded as consumed by that movement (bot-strategy#847): already
+    /// netted from the terminal residual, so a custodian reconciliation must
+    /// not credit it a second time. Derived on replay; omitted when empty so
+    /// a serialized state without bound movements is unchanged.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    bound_movement_consumption: BTreeMap<String, HypeAtoms>,
     eligibility_workflow_id: Option<String>,
     staking_target_hype: HypeAtoms,
     #[serde(default)]
@@ -1057,6 +1127,7 @@ impl WorkflowState {
             residual_hype: HypeAtoms::default(),
             staking_eligible_hype: HypeAtoms::default(),
             residual_consumed_by_movements_hype: HypeAtoms::default(),
+            bound_movement_consumption: BTreeMap::new(),
             eligibility_workflow_id: None,
             staking_target_hype: HypeAtoms::default(),
             staking_confirmed_hype: HypeAtoms::default(),
@@ -1328,6 +1399,18 @@ impl WorkflowState {
                 self.residual_hype = *residual_hype;
                 self.staking_eligible_hype = *eligible_hype;
                 self.residual_consumed_by_movements_hype = consumed_by_movements;
+                let mut bound_movement_consumption = BTreeMap::<String, HypeAtoms>::new();
+                for movement in evidence.iter().flat_map(|evidence| &evidence.movements) {
+                    let total = bound_movement_consumption
+                        .entry(movement.movement_id.clone())
+                        .or_default();
+                    *total = total.checked_add(movement.consumed_hype).ok_or_else(|| {
+                        WorkflowError::CorruptJournal(
+                            "bound movement consumption overflowed".into(),
+                        )
+                    })?;
+                }
+                self.bound_movement_consumption = bound_movement_consumption;
                 self.eligibility_workflow_id = Some(eligibility_workflow_id.clone());
                 self.stage = WorkflowStage::StakingEligibilityRecorded;
             }
@@ -3334,6 +3417,7 @@ impl DurableWorkflow {
             journal_directory,
             exclude_path,
             live_spot_hype_atoms,
+            &[],
             HypeAtoms::from_atoms(0),
             execution_identity_hash,
             protected_head_store_for,
@@ -3344,30 +3428,38 @@ impl DurableWorkflow {
 
     /// [`Self::aggregate_terminal_residual_hype`] for an account whose owner
     /// moves bot-acquired HYPE to the staking custodian by hand
-    /// (bot-strategy#847): `custodian_outflow_hype_atoms` is the bot HYPE the
-    /// runtime's movement ledger records as sent to the custodian
-    /// ([`crate::runtime::AttributedHype::transferred_to_custodian_hype_atoms`]),
-    /// which has left spot by an explained path. The history's expectation
-    /// is reconciled against `live_spot_hype_atoms + custodian_outflow_hype_atoms`
-    /// instead of spot alone; any other outflow (a sale, a transfer to
-    /// another address) is not in that figure and still fails closed.
+    /// (bot-strategy#847). `custodian_outflows` are the outflows to the
+    /// custodian the runtime's movement ledger records; they left spot by an
+    /// explained path, so they are replayed against history instead of
+    /// counting as missing HYPE. Any other outflow (a sale, a transfer to
+    /// another address) is not among them and still fails closed.
     ///
-    /// The transferred HYPE is taken from the still-unstaked eligible HYPE
-    /// first and from residual only beyond it, so the returned unconsumed
-    /// residual never counts residual HYPE that went to the custodian: the
-    /// next decision then reserves it again instead of trusting spot HYPE
-    /// that is not there.
+    /// The replay is chronological: an outflow only consumes HYPE from
+    /// journals whose last fill is at or before it, eligible first and
+    /// residual only beyond that, so a later purchase can never absorb an
+    /// earlier transfer, and residual that went to the custodian is not
+    /// counted as unconsumed (the next decision reserves it again). The part
+    /// of a movement a journal's eligibility evidence already bound — and
+    /// netted from that journal's residual — is not credited again. The
+    /// total credited is capped at `custodian_outflow_cap_hype_atoms`, the
+    /// ledger's bot-attributed custodian figure
+    /// ([`crate::runtime::AttributedHype::transferred_to_custodian_hype_atoms`]),
+    /// so non-bot HYPE that arrived and was forwarded to the custodian
+    /// cannot stand in for bot HYPE that left another way. An outflow larger
+    /// than the HYPE history expects in spot at its time only drops the
+    /// excess, which was never part of that expectation.
     ///
     /// # Errors
     ///
-    /// As [`Self::aggregate_terminal_residual_hype`], with the total
-    /// compared against `live_spot_hype_atoms + custodian_outflow_hype_atoms`.
+    /// As [`Self::aggregate_terminal_residual_hype`], with the total that
+    /// survives the replay compared against `live_spot_hype_atoms`.
     #[allow(clippy::too_many_arguments)]
     pub fn aggregate_terminal_residual_hype_net_of_custodian(
         journal_directory: &Path,
         exclude_path: Option<&Path>,
         live_spot_hype_atoms: HypeAtoms,
-        custodian_outflow_hype_atoms: HypeAtoms,
+        custodian_outflows: &[CustodianOutflow],
+        custodian_outflow_cap_hype_atoms: HypeAtoms,
         execution_identity_hash: &str,
         protected_head_store_for: &ProtectedHeadStoreFactory<'_>,
         journal_admissible: &JournalAdmissibilityCheck<'_>,
@@ -3394,7 +3486,6 @@ impl DurableWorkflow {
             ))
         };
 
-        let mut aggregated_residual = HypeAtoms::from_atoms(0);
         // Reconciled against more than just residual HYPE: eligible HYPE
         // is only actually moved out of spot once it is durably delegated
         // (`delegated_hype() >= eligible_hype`; today's hard-disabled
@@ -3405,8 +3496,9 @@ impl DurableWorkflow {
         // sale or transfer of that HYPE go undetected — the live balance
         // would still cover the (too-small) residual-only total even
         // though real HYPE this account's own history expects is missing.
-        let mut aggregated_still_in_spot = HypeAtoms::from_atoms(0);
         let mut seen_workflow_ids: BTreeSet<String> = BTreeSet::new();
+        let mut lots: Vec<SpotLot> = Vec::new();
+        let mut bound_consumption: BTreeMap<String, HypeAtoms> = BTreeMap::new();
         for path in &journal_paths {
             journal_admissible(path)?;
             let protected_head_store = protected_head_store_for(path)?;
@@ -3451,40 +3543,40 @@ impl DurableWorkflow {
                     .checked_add(eligibility.eligible_hype)
                     .ok_or_else(|| overflowed("still-in-spot"))?
             };
-            aggregated_residual = aggregated_residual
-                .checked_add(eligibility.residual_hype)
-                .ok_or_else(|| overflowed("residual"))?;
-            aggregated_still_in_spot = aggregated_still_in_spot
-                .checked_add(still_in_spot)
-                .ok_or_else(|| overflowed("still-in-spot"))?;
+            lots.push(SpotLot {
+                in_spot_from: state.last_fill_at().unwrap_or(state.last_transition_at()),
+                residual: eligibility.residual_hype,
+                unstaked_eligible: still_in_spot
+                    .checked_sub(eligibility.residual_hype)
+                    .unwrap_or_default(),
+            });
+            for (movement_id, consumed) in &state.bound_movement_consumption {
+                let total = bound_consumption.entry(movement_id.clone()).or_default();
+                *total = total
+                    .checked_add(*consumed)
+                    .ok_or_else(|| overflowed("bound-movement"))?;
+            }
         }
 
-        let accounted_hype_atoms = live_spot_hype_atoms
-            .checked_add(custodian_outflow_hype_atoms)
-            .ok_or_else(|| overflowed("spot-plus-custodian"))?;
-        if aggregated_still_in_spot > accounted_hype_atoms {
+        let (still_in_spot, unconsumed_residual) = replay_custodian_outflows(
+            lots,
+            custodian_outflows,
+            &bound_consumption,
+            custodian_outflow_cap_hype_atoms,
+        )
+        .ok_or_else(|| overflowed("replayed"))?;
+        if still_in_spot > live_spot_hype_atoms {
             return Err(WorkflowError::ResidualReconciliationGap(format!(
                 "aggregated {} HYPE atoms still expected in spot across {} historical \
-                 journal(s) exceeds live spot balance {} HYPE atoms plus {} HYPE atoms \
-                 transferred to the staking custodian",
-                aggregated_still_in_spot.as_atoms(),
+                 journal(s) (after {} recorded custodian outflow(s)) exceeds live spot \
+                 balance {} HYPE atoms",
+                still_in_spot.as_atoms(),
                 journal_paths.len(),
-                live_spot_hype_atoms.as_atoms(),
-                custodian_outflow_hype_atoms.as_atoms()
+                custodian_outflows.len(),
+                live_spot_hype_atoms.as_atoms()
             )));
         }
-
-        // Eligible first, residual only beyond it: the part of the transfer
-        // the still-unstaked eligible HYPE cannot absorb consumed residual.
-        let unstaked_eligible = aggregated_still_in_spot
-            .checked_sub(aggregated_residual)
-            .unwrap_or_default();
-        let residual_transferred = custodian_outflow_hype_atoms
-            .checked_sub(unstaked_eligible)
-            .unwrap_or_default();
-        Ok(aggregated_residual
-            .checked_sub(residual_transferred)
-            .unwrap_or_default())
+        Ok(unconsumed_residual)
     }
 
     /// Every pacing decision ID some workflow journal directly inside

@@ -286,24 +286,26 @@ pub async fn prepare_live_order_workflow(
         //
         // HYPE the owner moved to the staking custodian by hand
         // (bot-strategy#847) has left spot by an explained path and is
-        // reconciled as such. Read from the movement ledger the cycle above
-        // just committed, which the balance read after it already reflects;
-        // an incomplete attribution nets nothing, so the scan fails closed
-        // exactly as it did before custody transfers existed.
+        // replayed against history as such. Read from the movement ledger
+        // the cycle above just committed, which the balance read after it
+        // already reflects; an incomplete attribution credits nothing, so
+        // the scan fails closed exactly as it did before custody transfers
+        // existed.
         let attribution = runtime.attributed_hype();
-        let custodian_outflow_hype_atoms = HypeAtoms::from_atoms(if attribution.is_complete() {
-            attribution
-                .transferred_to_custodian_hype_atoms()
-                .unwrap_or(0)
-        } else {
-            0
-        });
+        let (custodian_outflows, custodian_outflow_cap) =
+            match attribution.transferred_to_custodian_hype_atoms() {
+                Some(cap) if attribution.is_complete() => {
+                    (runtime.custodian_outflows(), HypeAtoms::from_atoms(cap))
+                }
+                _ => (Vec::new(), HypeAtoms::from_atoms(0)),
+            };
         let unconsumed_residual_spot_hype_atoms =
             DurableWorkflow::aggregate_terminal_residual_hype_net_of_custodian(
                 journal_directory,
                 Some(journal_path),
                 spot_hype_atoms,
-                custodian_outflow_hype_atoms,
+                &custodian_outflows,
+                custodian_outflow_cap,
                 &probe_binding.execution_identity_hash,
                 historical_protected_head_store_for,
                 historical_journal_admissible,
