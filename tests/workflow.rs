@@ -5242,6 +5242,73 @@ fn aggregate_terminal_residual_hype_reconciles_against_residual_plus_unstaked_el
     assert_eq!(aggregated, hype(10));
 }
 
+fn aggregate_net_of_custodian(
+    directory: &Path,
+    live_spot_atoms: u64,
+    custodian_outflow_atoms: u64,
+) -> Result<HypeAtoms, WorkflowError> {
+    DurableWorkflow::aggregate_terminal_residual_hype_net_of_custodian(
+        directory,
+        None,
+        hype(live_spot_atoms),
+        hype(custodian_outflow_atoms),
+        "signer-identity-hash-a",
+        &memory_protected_head_store_for,
+        &always_admissible,
+        &BTreeSet::new(),
+    )
+}
+
+#[test]
+fn aggregate_terminal_residual_hype_accepts_hype_the_owner_moved_to_the_staking_custodian() {
+    // bot-strategy#847: the owner sends bot HYPE to the staking custodian
+    // by hand. Spot is then empty although history expects residual (10) +
+    // eligible (100) there; the recorded custodian outflow explains it.
+    let temp = tempfile::tempdir().expect("temp directory");
+    complete_workflow_with_residual_and_eligible(&temp.path().join("day-1.jsonl"), 10, 100);
+
+    // Only the eligible HYPE moved: the residual is still in spot and
+    // still counted as unconsumed.
+    assert_eq!(
+        aggregate_net_of_custodian(temp.path(), 10, 100).expect("eligible HYPE transferred"),
+        hype(10)
+    );
+    // Everything moved, residual included: none of the residual is left to
+    // count, so the next decision reserves it again.
+    assert_eq!(
+        aggregate_net_of_custodian(temp.path(), 0, 110).expect("all HYPE transferred"),
+        hype(0)
+    );
+    // Part of the residual moved.
+    assert_eq!(
+        aggregate_net_of_custodian(temp.path(), 5, 105).expect("part of the residual transferred"),
+        hype(5)
+    );
+    // Zero custodian outflow is exactly the spot-only reconciliation.
+    assert_eq!(
+        aggregate_net_of_custodian(temp.path(), 110, 0).expect("nothing transferred"),
+        hype(10)
+    );
+}
+
+#[test]
+fn aggregate_terminal_residual_hype_net_of_custodian_still_fails_closed_on_unexplained_outflow() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    complete_workflow_with_residual_and_eligible(&temp.path().join("day-1.jsonl"), 10, 100);
+
+    // 100 went to the custodian, but only 5 of the remaining 10 is in spot:
+    // the other 5 left by a path the custodian figure does not cover.
+    assert!(matches!(
+        aggregate_net_of_custodian(temp.path(), 5, 100),
+        Err(WorkflowError::ResidualReconciliationGap(_))
+    ));
+    // Without the custodian figure, the transfer itself is unexplained.
+    assert!(matches!(
+        aggregate_net_of_custodian(temp.path(), 0, 0),
+        Err(WorkflowError::ResidualReconciliationGap(_))
+    ));
+}
+
 #[test]
 fn aggregate_terminal_residual_hype_refuses_a_history_directory_that_lost_journals() {
     let temp = tempfile::tempdir().expect("temp directory");

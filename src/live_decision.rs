@@ -283,11 +283,27 @@ pub async fn prepare_live_order_workflow(
         // treats an aggregate above the current target as zero deficit —
         // no new residual is reserved from today's fill, but the earlier
         // excess stays exactly what history says it is.
+        //
+        // HYPE the owner moved to the staking custodian by hand
+        // (bot-strategy#847) has left spot by an explained path and is
+        // reconciled as such. Read from the movement ledger the cycle above
+        // just committed, which the balance read after it already reflects;
+        // an incomplete attribution nets nothing, so the scan fails closed
+        // exactly as it did before custody transfers existed.
+        let attribution = runtime.attributed_hype();
+        let custodian_outflow_hype_atoms = HypeAtoms::from_atoms(if attribution.is_complete() {
+            attribution
+                .transferred_to_custodian_hype_atoms()
+                .unwrap_or(0)
+        } else {
+            0
+        });
         let unconsumed_residual_spot_hype_atoms =
-            DurableWorkflow::aggregate_terminal_residual_hype(
+            DurableWorkflow::aggregate_terminal_residual_hype_net_of_custodian(
                 journal_directory,
                 Some(journal_path),
                 spot_hype_atoms,
+                custodian_outflow_hype_atoms,
                 &probe_binding.execution_identity_hash,
                 historical_protected_head_store_for,
                 historical_journal_admissible,

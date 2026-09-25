@@ -3330,6 +3330,49 @@ impl DurableWorkflow {
         journal_admissible: &JournalAdmissibilityCheck<'_>,
         recorded_journals: &BTreeSet<String>,
     ) -> Result<HypeAtoms, WorkflowError> {
+        Self::aggregate_terminal_residual_hype_net_of_custodian(
+            journal_directory,
+            exclude_path,
+            live_spot_hype_atoms,
+            HypeAtoms::from_atoms(0),
+            execution_identity_hash,
+            protected_head_store_for,
+            journal_admissible,
+            recorded_journals,
+        )
+    }
+
+    /// [`Self::aggregate_terminal_residual_hype`] for an account whose owner
+    /// moves bot-acquired HYPE to the staking custodian by hand
+    /// (bot-strategy#847): `custodian_outflow_hype_atoms` is the bot HYPE the
+    /// runtime's movement ledger records as sent to the custodian
+    /// ([`crate::runtime::AttributedHype::transferred_to_custodian_hype_atoms`]),
+    /// which has left spot by an explained path. The history's expectation
+    /// is reconciled against `live_spot_hype_atoms + custodian_outflow_hype_atoms`
+    /// instead of spot alone; any other outflow (a sale, a transfer to
+    /// another address) is not in that figure and still fails closed.
+    ///
+    /// The transferred HYPE is taken from the still-unstaked eligible HYPE
+    /// first and from residual only beyond it, so the returned unconsumed
+    /// residual never counts residual HYPE that went to the custodian: the
+    /// next decision then reserves it again instead of trusting spot HYPE
+    /// that is not there.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::aggregate_terminal_residual_hype`], with the total
+    /// compared against `live_spot_hype_atoms + custodian_outflow_hype_atoms`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn aggregate_terminal_residual_hype_net_of_custodian(
+        journal_directory: &Path,
+        exclude_path: Option<&Path>,
+        live_spot_hype_atoms: HypeAtoms,
+        custodian_outflow_hype_atoms: HypeAtoms,
+        execution_identity_hash: &str,
+        protected_head_store_for: &ProtectedHeadStoreFactory<'_>,
+        journal_admissible: &JournalAdmissibilityCheck<'_>,
+        recorded_journals: &BTreeSet<String>,
+    ) -> Result<HypeAtoms, WorkflowError> {
         let Some(journal_paths) = Self::scan_journal_paths(journal_directory, exclude_path)? else {
             // No directory yet means no historical journals yet — this is
             // the normal state before this execution account's very first
@@ -3416,17 +3459,32 @@ impl DurableWorkflow {
                 .ok_or_else(|| overflowed("still-in-spot"))?;
         }
 
-        if aggregated_still_in_spot > live_spot_hype_atoms {
+        let accounted_hype_atoms = live_spot_hype_atoms
+            .checked_add(custodian_outflow_hype_atoms)
+            .ok_or_else(|| overflowed("spot-plus-custodian"))?;
+        if aggregated_still_in_spot > accounted_hype_atoms {
             return Err(WorkflowError::ResidualReconciliationGap(format!(
                 "aggregated {} HYPE atoms still expected in spot across {} historical \
-                 journal(s) exceeds live spot balance {} HYPE atoms",
+                 journal(s) exceeds live spot balance {} HYPE atoms plus {} HYPE atoms \
+                 transferred to the staking custodian",
                 aggregated_still_in_spot.as_atoms(),
                 journal_paths.len(),
-                live_spot_hype_atoms.as_atoms()
+                live_spot_hype_atoms.as_atoms(),
+                custodian_outflow_hype_atoms.as_atoms()
             )));
         }
 
-        Ok(aggregated_residual)
+        // Eligible first, residual only beyond it: the part of the transfer
+        // the still-unstaked eligible HYPE cannot absorb consumed residual.
+        let unstaked_eligible = aggregated_still_in_spot
+            .checked_sub(aggregated_residual)
+            .unwrap_or_default();
+        let residual_transferred = custodian_outflow_hype_atoms
+            .checked_sub(unstaked_eligible)
+            .unwrap_or_default();
+        Ok(aggregated_residual
+            .checked_sub(residual_transferred)
+            .unwrap_or_default())
     }
 
     /// Every pacing decision ID some workflow journal directly inside
