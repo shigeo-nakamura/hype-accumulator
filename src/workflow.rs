@@ -648,8 +648,8 @@ struct SpotLot {
 
 /// Replays `outflows` in time order against `lots` (bot-strategy#847) and
 /// returns what history still expects in spot and its residual part. Each
-/// outflow, less what journal evidence already bound of it and within what
-/// is left of `cap`, consumes the unstaked eligible HYPE of the lots already
+/// outflow, less what journal evidence already bound of it (which still
+/// draws on `cap`) and within what is left of `cap`, consumes the unstaked eligible HYPE of the lots already
 /// in spot at its time, then their residual; any excess was never expected.
 /// `None` on overflow.
 fn replay_custodian_outflows(
@@ -674,12 +674,15 @@ fn replay_custodian_outflows(
             eligible = eligible.checked_add(lot.unstaked_eligible)?;
             residual = residual.checked_add(lot.residual)?;
         }
-        let already_bound = bound.get(&outflow.movement_id).copied().unwrap_or_default();
-        let credit = outflow
-            .amount_hype
-            .checked_sub(already_bound)
+        // The bound part is bot HYPE the cap already covers: it uses up cap
+        // too, or another movement could spend that capacity again.
+        let already_bound = bound
+            .get(&outflow.movement_id)
+            .copied()
             .unwrap_or_default()
-            .min(cap);
+            .min(outflow.amount_hype);
+        cap = cap.checked_sub(already_bound.min(cap))?;
+        let credit = outflow.amount_hype.checked_sub(already_bound)?.min(cap);
         cap = cap.checked_sub(credit)?;
         let from_eligible = credit.min(eligible);
         eligible = eligible.checked_sub(from_eligible)?;

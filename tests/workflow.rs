@@ -5848,6 +5848,16 @@ fn aggregate_terminal_residual_hype_reconciles_using_movement_adjusted_residual(
             .expect("the bound part is not credited twice"),
         hype(6)
     );
+    // The bound 4 also used up 4 of the bot-attributed cap: a later 4-atom
+    // custodian send (forwarding an external inflow) cannot spend it again.
+    let with_forward = [
+        custodian_outflow("movement-a", 4, 4),
+        custodian_outflow("movement-b", 4, 20),
+    ];
+    assert!(matches!(
+        aggregate_net_of_custodian(temp.path(), 2, &with_forward, 4),
+        Err(WorkflowError::ResidualReconciliationGap(_))
+    ));
 }
 
 #[test]
