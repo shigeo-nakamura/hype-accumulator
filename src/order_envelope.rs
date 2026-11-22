@@ -254,6 +254,51 @@ pub async fn assemble_order_envelope_binding(
     })
 }
 
+/// [`assemble_order_envelope_binding`] anchored to a clock read taken
+/// immediately before assembly, never to an earlier cycle clock.
+///
+/// The order's requested expiry (`order_timeout_seconds`) and the book,
+/// account and fee-schedule reachability windows all describe evidence this
+/// assembly itself reads, so they must be measured from when it runs. A
+/// caller that passes the cycle's `observed_at` instead silently spends the
+/// whole signer-free cycle (ledger commit, history scan, venue reads) out of
+/// the order's expiry window: on Tokyo that work grew from ~5 s to 12-19 s
+/// and every prepared order was already expired at submission
+/// (bot-strategy#1028, zero fills 2026-10-30..11-22).
+///
+/// `not_before` is the cycle clock the decision was taken under; the
+/// reference instant is never earlier than it, so every
+/// `decided_at <= … < signed_expiry_at` invariant the caller relied on with
+/// the cycle clock still holds. Signal and policy-acknowledgement validity
+/// stay whatever the caller computed from its own clock.
+///
+/// # Errors
+///
+/// Exactly those of [`assemble_order_envelope_binding`].
+#[allow(clippy::too_many_arguments)]
+pub async fn assemble_order_envelope_binding_now(
+    connector: &HyperliquidConnector,
+    signer_identity_hash: String,
+    planned_usdc: UsdcMicros,
+    signal_evidence_valid_through_at: DateTime<Utc>,
+    policy_acknowledgement_valid_through_at: DateTime<Utc>,
+    policy: &OrderEnvelopeFreshnessPolicy,
+    not_before: DateTime<Utc>,
+    clock: impl Fn() -> DateTime<Utc>,
+) -> Result<OrderEnvelopeBinding, OrderEnvelopeError> {
+    let assembled_at = clock().max(not_before);
+    assemble_order_envelope_binding(
+        connector,
+        signer_identity_hash,
+        planned_usdc,
+        signal_evidence_valid_through_at,
+        policy_acknowledgement_valid_through_at,
+        policy,
+        assembled_at,
+    )
+    .await
+}
+
 fn seconds(value: u64, field: &'static str) -> Result<TimeDelta, OrderEnvelopeError> {
     let seconds =
         i64::try_from(value).map_err(|_| OrderEnvelopeError::InvalidExpiryWindow(field))?;
@@ -870,5 +915,95 @@ mod tests {
             envelope.effective_expiry_at - TimeDelta::milliseconds(2_001)
         );
         assert!(envelope.venue_clock_evidence_valid_through_at > envelope.effective_expiry_at);
+    }
+
+    /// bot-strategy#1028: the order window must start when the envelope is
+    /// assembled, not when the cycle began. A cycle clock read 12 s earlier
+    /// (the Tokyo prepare time that expired every order 11-15..11-22) must
+    /// not shorten the signed expiry.
+    #[tokio::test]
+    async fn expiry_is_measured_from_assembly_not_from_the_cycle_clock() {
+        let spot_meta = serde_json::json!({
+            "universe": [{"name": "HYPE/USDC", "tokens": [1, 0], "index": 0, "isCanonical": true}],
+            "tokens": [
+                {"name": "USDC", "szDecimals": 2, "weiDecimals": 6, "index": 0},
+                {"name": "HYPE", "szDecimals": 2, "weiDecimals": 8, "index": 1},
+            ],
+        })
+        .to_string();
+        let assembled_at = truncate_to_millis(Utc::now());
+        // Venue evidence observed at assembly (not ahead of the local clock).
+        let l2_book = serde_json::json!({
+            "coin": "HYPE",
+            "time": assembled_at.timestamp_millis(),
+            "levels": [
+                [{"px": "24.9", "sz": "100", "n": 1}],
+                [{"px": "25.0", "sz": "100", "n": 1}],
+            ],
+        })
+        .to_string();
+        let responses = std::collections::HashMap::from([
+            ("spotMeta", spot_meta),
+            ("l2Book", l2_book),
+            (
+                "spotClearinghouseState",
+                serde_json::json!({"balances": []}).to_string(),
+            ),
+            ("allMids", serde_json::json!({}).to_string()),
+            ("userFees", serde_json::json!({}).to_string()),
+        ]);
+        let (address, server) = spawn_typed_mock_server(responses, 6).await;
+        let nonce_path = std::env::temp_dir().join(format!(
+            "hype-assembly-clock-nonce-{}.json",
+            std::process::id()
+        ));
+        let connector = HyperliquidConnector::new(HyperliquidConnectorConfig {
+            base_url: format!("http://{address}"),
+            tracked_symbols: Vec::new(),
+        })
+        .unwrap()
+        .with_account(HyperliquidAccountConfig {
+            account_address: "0x0000000000000000000000000000000000000001".to_string(),
+            signer_private_key: Some(TEST_SIGNER_KEY.to_string()),
+            vault_address: None,
+            is_mainnet: false,
+            nonce_state_path: Some(nonce_path.clone()),
+            max_taker_notional: None,
+            max_taker_slippage_bps: None,
+            max_taker_book_age_ms: 60_000,
+        })
+        .unwrap();
+
+        let cycle_started_at = assembled_at - TimeDelta::seconds(12);
+        let envelope = assemble_order_envelope_binding_now(
+            &connector,
+            "signer-identity-hash-a".to_string(),
+            UsdcMicros::from_micros(25_000_000),
+            cycle_started_at + TimeDelta::hours(1),
+            cycle_started_at + TimeDelta::hours(1),
+            &policy(),
+            cycle_started_at,
+            || assembled_at,
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        let _ = std::fs::remove_file(nonce_path);
+
+        // policy(): order timeout 10 s, book 5 s → the book window binds,
+        // counted from assembly; lag 2 s → signed = effective - 2.001 s.
+        assert_eq!(
+            envelope.effective_expiry_at,
+            assembled_at + TimeDelta::seconds(5)
+        );
+        assert_eq!(
+            envelope.signed_expiry_at,
+            assembled_at + TimeDelta::seconds(5) - TimeDelta::milliseconds(2_001)
+        );
+        assert!(envelope.signed_expiry_at > assembled_at);
+        assert_eq!(
+            envelope.input_freshness.book_evidence_valid_through_at,
+            assembled_at + TimeDelta::seconds(5)
+        );
     }
 }

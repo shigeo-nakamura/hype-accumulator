@@ -960,10 +960,13 @@ async fn prepare_workflow(
     // account observation above (network round trips whose latency is
     // outside this binary's control) rather than reusing the `now` captured
     // before them. Every freshness/expiry computation below — policy
-    // acknowledgement validity, the movement-scan window, signal evidence,
-    // and the order envelope's `signed_expiry_at` — should be judged against
-    // a clock read as close as practical to the decision it gates, not one
-    // that already has an unbounded KMS round trip baked into its staleness.
+    // acknowledgement validity, the movement-scan window and signal
+    // evidence — should be judged against a clock read as close as practical
+    // to the decision it gates, not one that already has an unbounded KMS
+    // round trip baked into its staleness. The order envelope's expiry goes
+    // one step further and re-reads the clock at assembly, after the ledger
+    // commit and history scan (`order_envelope::assemble_order_envelope_binding_now`,
+    // bot-strategy#1028).
     // This is also what keeps `observed_at >= balance_observed_at` and
     // `scan_end_ms == observed_at` for `validate_cycle_range`.
     let now = Utc::now();

@@ -29,7 +29,7 @@ use crate::{
     hype_asset::hype_usdc_market_metadata_digest,
     live_probe::{LiveProbeBinding, LiveProbeError},
     order_envelope::{
-        assemble_order_envelope_binding, OrderEnvelopeError, OrderEnvelopeFreshnessPolicy,
+        assemble_order_envelope_binding_now, OrderEnvelopeError, OrderEnvelopeFreshnessPolicy,
     },
     runtime::{
         LiveDecisionAllocation, LiveDecisionIdentity, RuntimeCycleInput, RuntimeError,
@@ -327,7 +327,12 @@ pub async fn prepare_live_order_workflow(
             unconsumed_residual_spot_hype_atoms,
         };
 
-        let order_envelope = assemble_order_envelope_binding(
+        // Expiry and venue-evidence freshness are measured from a clock read
+        // here, after the ledger commit and history scan above, not from the
+        // cycle's `now`: that work is unbounded and was consuming the whole
+        // order window (bot-strategy#1028). `now` stays the decision /
+        // intent clock and the lower bound of the assembly instant.
+        let order_envelope = assemble_order_envelope_binding_now(
             connector,
             probe_binding.signer_identity_hash.clone(),
             decision.planned_usdc,
@@ -335,6 +340,7 @@ pub async fn prepare_live_order_workflow(
             policy_acknowledgement_valid_through_at,
             envelope_policy,
             now,
+            Utc::now,
         )
         .await?;
 
