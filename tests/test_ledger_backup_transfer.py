@@ -16,6 +16,9 @@ BACKUP_ID = "a" * 64
 PAYLOAD_BUCKET = "hype-ledger-payload"
 ANCHOR_BUCKET = "hype-ledger-anchor"
 OWNER = "123456789012"
+# Canonical (symlink-free) path: the transfer script rejects aliased binaries, and on
+# usrmerge hosts (e.g. ubuntu-24.04 runners) /bin is a symlink to /usr/bin.
+TRUE_BIN = Path("/usr/bin/true").resolve()
 
 
 class FakeAws:
@@ -121,7 +124,7 @@ class LedgerBackupTransferTests(unittest.TestCase):
             "bundle": self.bundle,
             "anchor": self.anchor,
             "receipt": self.root / receipt_name,
-            "verifier": Path("/bin/true"),
+            "verifier": TRUE_BIN,
             "aws": self.aws,
             "payload_bucket": PAYLOAD_BUCKET,
             "payload_owner": OWNER,
@@ -323,9 +326,9 @@ class LedgerBackupTransferTests(unittest.TestCase):
         ):
             status = transfer.main(
                 [
-                    "--aws-bin", "/bin/true", "--region", "eu-central-1", "upload",
+                    "--aws-bin", str(TRUE_BIN), "--region", "eu-central-1", "upload",
                     "--bundle", str(self.bundle), "--anchor", str(self.anchor),
-                    "--receipt", str(receipt), "--verifier", "/bin/true",
+                    "--receipt", str(receipt), "--verifier", str(TRUE_BIN),
                     "--payload-bucket", PAYLOAD_BUCKET, "--payload-owner", OWNER,
                     "--payload-kms-key", "payload-key", "--anchor-bucket", ANCHOR_BUCKET,
                     "--anchor-owner", OWNER, "--anchor-kms-key", "anchor-key",
@@ -344,7 +347,7 @@ class LedgerBackupTransferTests(unittest.TestCase):
         result = transfer.download_backup(
             receipt=self.root / "receipt.json",
             destination_root=self.root / "download",
-            verifier=Path("/bin/true"),
+            verifier=TRUE_BIN,
             aws=self.aws,
             verify=fake_verify,
         )
@@ -362,7 +365,7 @@ class LedgerBackupTransferTests(unittest.TestCase):
             transfer.download_backup(
                 receipt=self.root / "receipt.json",
                 destination_root=self.root / "damaged",
-                verifier=Path("/bin/true"),
+                verifier=TRUE_BIN,
                 aws=self.aws,
                 verify=fake_verify,
             )
@@ -376,7 +379,7 @@ class LedgerBackupTransferTests(unittest.TestCase):
             transfer.download_backup(
                 receipt=self.root / "receipt.json",
                 destination_root=self.root / "foreign",
-                verifier=Path("/bin/true"),
+                verifier=TRUE_BIN,
                 aws=self.aws,
                 verify=fake_verify,
             )
@@ -389,7 +392,7 @@ class LedgerBackupTransferTests(unittest.TestCase):
             transfer.download_backup(
                 receipt=self.root / "receipt.json",
                 destination_root=destination,
-                verifier=Path("/bin/true"),
+                verifier=TRUE_BIN,
                 aws=self.aws,
                 verify=fake_verify,
             )
@@ -403,7 +406,7 @@ class LedgerBackupTransferTests(unittest.TestCase):
             transfer.download_backup(
                 receipt=self.root / "receipt.json",
                 destination_root=unsafe_parent / "restore",
-                verifier=Path("/bin/true"),
+                verifier=TRUE_BIN,
                 aws=self.aws,
                 verify=fake_verify,
             )
@@ -483,7 +486,7 @@ class LedgerBackupTransferTests(unittest.TestCase):
             ),
             mock.patch.object(transfer.subprocess, "run", return_value=completed) as run,
         ):
-            cli = transfer.AwsCli(Path("/usr/bin/true"), "eu-central-1")
+            cli = transfer.AwsCli(TRUE_BIN, "eu-central-1")
             cli._json(
                 ["s3api", "get-bucket-versioning"], "test"
             )
@@ -515,13 +518,13 @@ class LedgerBackupTransferTests(unittest.TestCase):
     def test_full_replay_has_no_default_timeout(self) -> None:
         completed = SimpleNamespace(returncode=0, stdout="verified", stderr="")
         with mock.patch.object(transfer.subprocess, "run", return_value=completed) as run:
-            transfer.run_verifier(Path("/usr/bin/true"), self.bundle, self.anchor)
+            transfer.run_verifier(TRUE_BIN, self.bundle, self.anchor)
         self.assertIsNone(run.call_args.kwargs["timeout"])
 
     def test_explicit_transfer_timeout_and_nonfinite_values(self) -> None:
         completed = SimpleNamespace(returncode=0, stdout="{}", stderr="")
         cli = transfer.AwsCli(
-            Path("/usr/bin/true"),
+            TRUE_BIN,
             "eu-central-1",
             transfer_timeout_seconds=900,
         )
@@ -544,7 +547,7 @@ class LedgerBackupTransferTests(unittest.TestCase):
             "Metadata": {"sha256": transfer.sha256_file(source)},
             "ETag": '"etag"',
         }
-        cli = transfer.AwsCli(Path("/usr/bin/true"), "eu-central-1")
+        cli = transfer.AwsCli(TRUE_BIN, "eu-central-1")
         with self.assertRaisesRegex(transfer.TransferError, "verification failed"):
             cli._stored_from_response(
                 bucket=ANCHOR_BUCKET,
@@ -577,7 +580,7 @@ class LedgerBackupTransferTests(unittest.TestCase):
                 "SSEKMSKeyId": f"arn:aws:kms:eu-central-1:{OWNER}:key/unexpected",
             },
         )
-        cli = transfer.AwsCli(Path("/usr/bin/true"), "eu-central-1")
+        cli = transfer.AwsCli(TRUE_BIN, "eu-central-1")
         for index, boundary in enumerate(invalid_boundaries):
             with self.subTest(boundary=boundary):
                 destination = self.root / f"download-{index}"
@@ -594,7 +597,7 @@ class LedgerBackupTransferTests(unittest.TestCase):
                     cli.get_exact(stored, destination)
 
     def test_aws_cli_rejects_delete_marker_before_any_put(self) -> None:
-        cli = transfer.AwsCli(Path("/usr/bin/true"), "eu-central-1")
+        cli = transfer.AwsCli(TRUE_BIN, "eu-central-1")
         with (
             mock.patch.object(cli, "_key_history", return_value=([], ["delete-1"])),
             mock.patch.object(cli, "_head") as head,
@@ -612,7 +615,7 @@ class LedgerBackupTransferTests(unittest.TestCase):
         head.assert_not_called()
 
     def test_aws_cli_rejects_multiple_historical_versions(self) -> None:
-        cli = transfer.AwsCli(Path("/usr/bin/true"), "eu-central-1")
+        cli = transfer.AwsCli(TRUE_BIN, "eu-central-1")
         with (
             mock.patch.object(cli, "_key_history", return_value=(["v2", "v1"], [])),
             self.assertRaisesRegex(transfer.TransferError, "replacement or deletion"),
@@ -628,7 +631,7 @@ class LedgerBackupTransferTests(unittest.TestCase):
             )
 
     def test_pending_multipart_is_rejected_before_single_put(self) -> None:
-        cli = transfer.AwsCli(Path("/usr/bin/true"), "eu-central-1")
+        cli = transfer.AwsCli(TRUE_BIN, "eu-central-1")
         with (
             mock.patch.object(cli, "_key_history", return_value=([], [])),
             mock.patch.object(
@@ -668,7 +671,7 @@ class LedgerBackupTransferTests(unittest.TestCase):
             "ETag": '"etag"',
         }
         cli = transfer.AwsCli(
-            Path("/usr/bin/true"),
+            TRUE_BIN,
             "eu-central-1",
             put_object_limit_bytes=1,
         )
@@ -693,7 +696,7 @@ class LedgerBackupTransferTests(unittest.TestCase):
     def test_multipart_uses_composite_sha256_and_conditional_complete(self) -> None:
         kms_key = f"arn:aws:kms:eu-central-1:{OWNER}:key/payload"
         cli = transfer.AwsCli(
-            Path("/usr/bin/true"),
+            TRUE_BIN,
             "eu-central-1",
             multipart_part_bytes=transfer.MIN_MULTIPART_PART_BYTES,
         )
